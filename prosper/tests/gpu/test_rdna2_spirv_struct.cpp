@@ -1,6 +1,7 @@
 // test_rdna2_spirv_struct -- structural checks for RDNA2->SPIR-V output that do not require Vulkan.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "fixtures/checked_compute_launch.hpp"
+#include "fixtures/fragment_control_flow_inputs.hpp"
 #include "fixtures/native_structural_launch.hpp"
 #include "gpu/resources/mip_chain_plan.hpp"
 #include "gpu/resources/shader_resources.hpp"
@@ -1908,8 +1909,8 @@ int main() {
         0xf800000fu, 0x03020100u,             // exp mrt0 v0,v1,v2,v3
         0xbf810000u,
     };
-    const auto fragment_exec_ballot_lane_spill_spv = recompile_fragment(
-        fragment_exec_ballot_lane_spill, std::size(fragment_exec_ballot_lane_spill));
+    const auto fragment_exec_ballot_lane_spill_spv =
+        prosper::test::compile_fragment_control_flow_fixture(fragment_exec_ballot_lane_spill);
     if (fragment_exec_ballot_lane_spill_spv.empty() ||
         !has_opcode(fragment_exec_ballot_lane_spill_spv, 251) ||
         !has_opcode(fragment_exec_ballot_lane_spill_spv, 339) ||
@@ -1937,8 +1938,9 @@ int main() {
               std::end(fragment_exec_ballot_lane_spill),
               std::begin(fragment_exec_ballot_lane_spill_mutated));
     fragment_exec_ballot_lane_spill_mutated[0] = 0xbeac047cu; // s_mov_b64 s[44:45],m0
-    if (!recompile_fragment(fragment_exec_ballot_lane_spill_mutated,
-                            std::size(fragment_exec_ballot_lane_spill_mutated)).empty()) {
+    if (!prosper::test::compile_fragment_control_flow_fixture(
+             fragment_exec_ballot_lane_spill_mutated)
+             .empty()) {
         printf("  [FAIL] same-site unproven S_MOV_B64 source received a fragment ballot\n");
         return 1;
     }
@@ -1948,8 +1950,9 @@ int main() {
               std::begin(fragment_exec_ballot_lane_spill_mutated));
     fragment_exec_ballot_lane_spill_mutated[2] =
         0x0001027cu; // exact GTA pc28 site: v_writelane_b32 v20,m0,1
-    if (!recompile_fragment(fragment_exec_ballot_lane_spill_mutated,
-                            std::size(fragment_exec_ballot_lane_spill_mutated)).empty()) {
+    if (!prosper::test::compile_fragment_control_flow_fixture(
+             fragment_exec_ballot_lane_spill_mutated)
+             .empty()) {
         printf("  [FAIL] exact V_WRITELANE site accepted an unproven scalar source\n");
         return 1;
     }
@@ -1959,8 +1962,9 @@ int main() {
               std::begin(fragment_exec_ballot_lane_spill_mutated));
     fragment_exec_ballot_lane_spill_mutated[26] =
         0xbefe0408u; // exact restore site: s_mov_b64 exec,s[8:9]
-    if (!recompile_fragment(fragment_exec_ballot_lane_spill_mutated,
-                            std::size(fragment_exec_ballot_lane_spill_mutated)).empty()) {
+    if (!prosper::test::compile_fragment_control_flow_fixture(
+             fragment_exec_ballot_lane_spill_mutated)
+             .empty()) {
         printf("  [FAIL] exact EXEC restore site accepted an absent scalar pair\n");
         return 1;
     }
@@ -1984,7 +1988,8 @@ int main() {
         0xf800000fu, 0x03020100u, // exp mrt0 v0,v1,v2,v3
         0xbf810000u,
     };
-    const auto quadmask_spv = recompile_fragment(quadmask_fragment, std::size(quadmask_fragment));
+    const auto quadmask_spv =
+        prosper::test::compile_fragment_control_flow_fixture(quadmask_fragment);
     if (quadmask_spv.empty()) {
         printf("  [FAIL] fragment s_quadmask_b64 did not recompile\n");
         return 1;
@@ -2081,18 +2086,18 @@ int main() {
     // it. The scalar compare overwrites SCC before S_CSELECT, so only producer-to-consumer SSA
     // provenance may attach ScalarReduce.
     const uint32_t execz_vote_with_unrelated_scalar_select[] = {
-        0x7e020280u,              // v_mov_b32 v1, 0
-        0x7c2200f0u,              // v_cmp_* -> VCC
-        0xbf880002u,              // s_cbranch_execz +2 (WaveAny control-flow vote)
+        0x7e000280u,   // v_mov_b32 v0, 0: the vote's actual compared input
+        0xbe800380u,   // s_mov_b32 s0, 0: the unrelated scalar compare's input
+        0x7e020280u,   // v_mov_b32 v1, 0
+        0x7c2200f0u,   // v_cmp_* -> VCC
+        0xbf880002u,   // s_cbranch_execz +2 (WaveAny control-flow vote)
         0xbe8503f2u, 0x7e020205u,
-        0xbec0037eu,              // s_mov_b32 s64, exec_lo
-        0xbf060000u,              // s_cmp_eq_u32 s0, s0 -> fresh scalar SCC
-        0x856b807eu,              // s_cselect_b32 vcc_hi, exec_lo, 0
-        0x8a406b40u,              // s_andn2_b32 s64, s64, vcc_hi
-        0xbefe0940u,              // s_wqm_b32 exec_lo, s64
-        0x7e000280u, 0x7e040280u, 0x7e0602f2u,
-        0xf800180fu, 0x03020100u,
-        0xbf810000u,
+        0xbec0037eu,   // s_mov_b32 s64, exec_lo
+        0xbf060000u,   // s_cmp_eq_u32 s0, s0 -> fresh scalar SCC
+        0x856b807eu,   // s_cselect_b32 vcc_hi, exec_lo, 0
+        0x8a406b40u,   // s_andn2_b32 s64, s64, vcc_hi
+        0xbefe0940u,   // s_wqm_b32 exec_lo, s64
+        0x7e000280u, 0x7e040280u, 0x7e0602f2u, 0xf800180fu, 0x03020100u, 0xbf810000u,
     };
     const auto unrelated_scalar_select_spv = recompile_fragment_wave32_for_test(
         execz_vote_with_unrelated_scalar_select,
@@ -2203,13 +2208,14 @@ int main() {
         std::begin(fragment_scalar_vcc_suffix), std::end(fragment_scalar_vcc_suffix));
     fragment_live_vcc_suffix.insert(fragment_live_vcc_suffix.begin() + 8,
                                     0x02020100u); // v_cndmask observes implicit VCC
-    const auto fragment_live_vcc_suffix_spv = recompile_fragment(
-        fragment_live_vcc_suffix.data(), fragment_live_vcc_suffix.size());
+    const auto fragment_live_vcc_suffix_spv = prosper::test::compile_fragment_control_flow_fixture(
+        fragment_live_vcc_suffix, {RecompileDiagnosticStage::Fragment, 0x50630100u});
     if (fragment_live_vcc_suffix_spv.empty() ||
         fragment_spirv_required_subgroup_size(fragment_live_vcc_suffix_spv) != 64 ||
         !(fragment_spirv_required_subgroup_reasons(fragment_live_vcc_suffix_spv) &
           kFragmentWaveReasonLaneId)) {
         printf("  [FAIL] live fragment VCC mutation lost its exact lane-id contract\n");
+        printf("  terminal: %s\n", last_terminal_reject_reason(0x50630100u).c_str());
         return 1;
     }
     printf("  [ok]   scalar-only fragment VCC scratch avoids lane identity; mask use retains it\n");
@@ -2398,9 +2404,10 @@ int main() {
     // its data lifetime; the same sequence is intentionally invalid in Wave64, where VCC_HI is the
     // upper half of the compare mask and is therefore overwritten.
     const uint32_t wave32_compute_vopc_preserves_vcc_hi_data[] = {
-        0xbeeb03ffu, 0x3f400000u,            // s_mov_b32 vcc_hi, 0.75f
-        0x7d841680u,                         // v_cmp_eq_u32 vcc, 0, v11
-        0x7e4e026bu,                         // v_mov_b32 v39, vcc_hi
+        0xbeeb03ffu, 0x3f400000u,   // s_mov_b32 vcc_hi, 0.75f
+        0x7e160280u,   // v_mov_b32 v11, 0: the compare's actual input
+        0x7d841680u,   // v_cmp_eq_u32 vcc, 0, v11
+        0x7e4e026bu,   // v_mov_b32 v39, vcc_hi
         0xbf810000u,
     };
     if (recompile_compute(wave32_compute_vopc_preserves_vcc_hi_data,
@@ -2550,14 +2557,17 @@ int main() {
     wave32_vop3b_two_source_config.wave_size = 32;
     wave32_vop3b_two_source_config.local_x = 64;
     wave32_vop3b_two_source_config.native_subgroup_size = 0;
+    wave32_vop3b_two_source_config.tgid_x_en = true;
+    const auto declared_vop3b_two_source_join =
+        prosper::test::declared_two_source_cfg_fixture(wave32_compute_vop3b_two_source_join);
     const auto vop3b_two_source_join_spv = recompile_compute(
-        wave32_compute_vop3b_two_source_join,
-        std::size(wave32_compute_vop3b_two_source_join), nullptr,
-        wave32_vop3b_two_source_config);
+        declared_vop3b_two_source_join.data(), declared_vop3b_two_source_join.size(), nullptr,
+        wave32_vop3b_two_source_config, {RecompileDiagnosticStage::Compute, 0x50630240u});
     if (vop3b_two_source_join_spv.empty() || !has_opcode(vop3b_two_source_join_spv, 251) ||
         !type_result_ids_are_nonzero(vop3b_two_source_join_spv, nullptr) ||
         !phi_ids_are_nonzero(vop3b_two_source_join_spv)) {
         printf("  [FAIL] Wave32 CFG treated two-source VOP3B carry output as reading SRC2\n");
+        printf("  terminal: %s\n", last_terminal_reject_reason(0x50630240u).c_str());
         return 1;
     }
     printf("  [ok]   Wave32 CFG admits exact two-source VOP3B carry packet at an s0 join\n");
@@ -2582,9 +2592,10 @@ int main() {
         0x7e040d02u,                         // pc14: v_mov_b32_e32 v2, v2
         0xbf810000u,
     };
+    const auto declared_vop3_mul_two_source_join =
+        prosper::test::declared_two_source_cfg_fixture(wave32_compute_vop3_mul_two_source_join);
     const auto vop3_mul_two_source_join_spv = recompile_compute(
-        wave32_compute_vop3_mul_two_source_join,
-        std::size(wave32_compute_vop3_mul_two_source_join), nullptr,
+        declared_vop3_mul_two_source_join.data(), declared_vop3_mul_two_source_join.size(), nullptr,
         wave32_vop3b_two_source_config);
     if (vop3_mul_two_source_join_spv.empty() ||
         !has_opcode(vop3_mul_two_source_join_spv, 251) ||
@@ -2594,10 +2605,11 @@ int main() {
         return 1;
     }
     wave32_compute_vop3_mul_two_source_join[5] = 0xd5430001u;
-    if (!recompile_compute(
-             wave32_compute_vop3_mul_two_source_join,
-             std::size(wave32_compute_vop3_mul_two_source_join), nullptr,
-             wave32_vop3b_two_source_config).empty()) {
+    const auto declared_three_source_join =
+        prosper::test::declared_two_source_cfg_fixture(wave32_compute_vop3_mul_two_source_join);
+    if (!recompile_compute(declared_three_source_join.data(), declared_three_source_join.size(),
+                           nullptr, wave32_vop3b_two_source_config)
+             .empty()) {
         printf("  [FAIL] genuine three-source mutation lost its ambiguous s0 dependency\n");
         return 1;
     }
@@ -2638,13 +2650,15 @@ int main() {
     wave32_carry_cfg_config.wave_size = 32;
     wave32_carry_cfg_config.local_x = 64;
     wave32_carry_cfg_config.native_subgroup_size = 0;
+    wave32_carry_cfg_config.tgid_x_en = true;
     const auto fresh_carry_cfg_spv = recompile_compute(
         wave32_compute_fresh_carry_cfg, std::size(wave32_compute_fresh_carry_cfg), nullptr,
-        wave32_carry_cfg_config);
+        wave32_carry_cfg_config, {RecompileDiagnosticStage::Compute, 0x50630241u});
     if (fresh_carry_cfg_spv.empty() || !has_opcode(fresh_carry_cfg_spv, 251) ||
         !type_result_ids_are_nonzero(fresh_carry_cfg_spv, nullptr) ||
         !phi_ids_are_nonzero(fresh_carry_cfg_spv)) {
         printf("  [FAIL] Wave32 CFG lost a fresh VOP3B carry before its implicit VCC consumer\n");
+        printf("  terminal: %s\n", last_terminal_reject_reason(0x50630241u).c_str());
         return 1;
     }
     std::vector<uint32_t> fresh_carry_wrong_sdst(
@@ -2987,6 +3001,7 @@ int main() {
     ComputeShaderConfig native_gta_compute_dpp_config = portable_wave64_compute_config;
     native_gta_compute_dpp_config.local_x = 64;
     native_gta_compute_dpp_config.native_subgroup_size = 64;
+    prosper::test::complete_compute_launch(native_gta_compute_dpp_config);
     const auto native_gta_compute_dpp_spv = recompile_compute(
         gta_compute_dpp_add_cfg.data(), gta_compute_dpp_add_cfg.size(),
         &gta_compute_dpp_table, native_gta_compute_dpp_config);
@@ -3336,9 +3351,14 @@ int main() {
         0x7e147208u,   // pc10: exact v_ffbh_u32 v10,s8 (low half)
         0xbf810000u,   // pc11: s_endpgm
     };
+    std::vector<uint32_t> declared_mask_ffbh_cfg{
+        0x7e260280u};   // v19=0: the SDWA comparison input.
+    declared_mask_ffbh_cfg.insert(declared_mask_ffbh_cfg.end(),
+                                  std::begin(gta_portable_mask_ffbh_cfg),
+                                  std::end(gta_portable_mask_ffbh_cfg));
     const auto gta_portable_mask_ffbh_spv = recompile_compute(
-        gta_portable_mask_ffbh_cfg, std::size(gta_portable_mask_ffbh_cfg), nullptr,
-        portable_wave64_compute_config);
+        declared_mask_ffbh_cfg.data(), declared_mask_ffbh_cfg.size(), nullptr,
+        portable_wave64_compute_config, {RecompileDiagnosticStage::Compute, 0x50630242u});
     if (gta_portable_mask_ffbh_spv.empty() ||
         !has_opcode(gta_portable_mask_ffbh_spv, 251) || // arbitrary CFG dispatcher
         !has_opcode(gta_portable_mask_ffbh_spv, 224) || // synchronized scratch phase
@@ -3347,6 +3367,7 @@ int main() {
         !type_result_ids_are_nonzero(gta_portable_mask_ffbh_spv, nullptr) ||
         !phi_ids_are_nonzero(gta_portable_mask_ffbh_spv)) {
         printf("  [FAIL] GTA portable saved-mask FFBH did not assemble both physical halves\n");
+        printf("  terminal: %s\n", last_terminal_reject_reason(0x50630242u).c_str());
         return 1;
     }
     printf("  [ok]   GTA portable saved-mask FFBH uses a synchronized dword phase\n");
@@ -3354,9 +3375,9 @@ int main() {
     ComputeShaderConfig native_wave64_mask_ffbh_config = portable_wave64_compute_config;
     native_wave64_mask_ffbh_config.native_subgroup_size = 64;
     prosper::test::complete_compute_launch(native_wave64_mask_ffbh_config);
-    const auto gta_native_mask_ffbh_spv = recompile_compute(
-        gta_portable_mask_ffbh_cfg, std::size(gta_portable_mask_ffbh_cfg), nullptr,
-        native_wave64_mask_ffbh_config);
+    const auto gta_native_mask_ffbh_spv =
+        recompile_compute(declared_mask_ffbh_cfg.data(), declared_mask_ffbh_cfg.size(), nullptr,
+                          native_wave64_mask_ffbh_config);
     if (gta_native_mask_ffbh_spv.empty() ||
         !has_opcode(gta_native_mask_ffbh_spv, 251) || // arbitrary CFG dispatcher
         !has_opcode(gta_native_mask_ffbh_spv, 339) || // exact saved-mask dword ballot
@@ -3882,14 +3903,13 @@ int main() {
     // The same live shader selects EXEC_LO or an empty mask into VCC_HI from an ordinary scalar
     // comparison. This is s_cselect_b32's mask-domain form, not a scalar integer selection.
     const uint32_t wave32_fragment_b32_cselect[] = {
-        0xbec0037eu,                         // s_mov_b32 s64, exec_lo
-        0xbf060000u,                         // s_cmp_eq_u32 s0, s0
-        0x856b807eu,                         // s_cselect_b32 vcc_hi, exec_lo, 0
-        0x8a406b40u,                         // s_andn2_b32 s64, s64, vcc_hi
-        0xbefe0940u,                         // s_wqm_b32 exec_lo, s64
-        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
-        0xf800000fu, 0x03020100u,
-        0xbf810000u,
+        0xbe800380u,   // s0=0: the original scalar comparison input.
+        0xbec0037eu,   // s_mov_b32 s64, exec_lo
+        0xbf060000u,   // s_cmp_eq_u32 s0, s0
+        0x856b807eu,   // s_cselect_b32 vcc_hi, exec_lo, 0
+        0x8a406b40u,   // s_andn2_b32 s64, s64, vcc_hi
+        0xbefe0940u,   // s_wqm_b32 exec_lo, s64
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u, 0xf800000fu, 0x03020100u, 0xbf810000u,
     };
     const auto wave32_fragment_b32_cselect_spv = recompile_fragment_wave32_for_test(
         wave32_fragment_b32_cselect, std::size(wave32_fragment_b32_cselect));
@@ -3906,13 +3926,14 @@ int main() {
     // The live barycentric block compares into s0 and VCC_HI, writes an independent carry mask to
     // VCC_LO, then ANDs s0 and the still-live VCC_HI mask back into VCC_LO.
     const uint32_t wave32_fragment_explicit_vopc_masks[] = {
-        0x7d8654f9u, 0x06868004u,            // v_cmp_le_u32_sdwa s0, s4, v42
-        0x7d865cf9u, 0x0686eb04u,            // v_cmp_le_u32_sdwa vcc_hi, s4, v46
-        0xd5286a29u, 0x00025880u,            // v_add_co_ci_u32 v41, vcc_lo, 0, v44, s0
-        0x876a6b00u,                         // s_and_b32 vcc_lo, s0, vcc_hi
-        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
-        0xf800000fu, 0x03020100u,
-        0xbf810000u,
+        0xbe840380u,   // s4=0: the original SDWA comparisons' scalar input.
+        0x7e540281u, 0x7e5c0281u, 0x7e580280u,   // v42/v46/v44: original compare/carry inputs.
+        0xbe810380u,   // explicit sibling word for conservative carry inventory.
+        0x7d8654f9u, 0x06868004u,   // v_cmp_le_u32_sdwa s0, s4, v42
+        0x7d865cf9u, 0x0686eb04u,   // v_cmp_le_u32_sdwa vcc_hi, s4, v46
+        0xd5286a29u, 0x00025880u,   // v_add_co_ci_u32 v41, vcc_lo, 0, v44, s0
+        0x876a6b00u,   // s_and_b32 vcc_lo, s0, vcc_hi
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u, 0xf800000fu, 0x03020100u, 0xbf810000u,
     };
     const auto wave32_fragment_explicit_vopc_masks_spv = recompile_fragment_wave32_for_test(
         wave32_fragment_explicit_vopc_masks,
@@ -3931,12 +3952,11 @@ int main() {
     // explicit compare destination occupies exactly one scalar word; the old generic inventory
     // incorrectly treated both compares as two-word writes.
     const uint32_t wave32_fragment_adjacent_vopc_masks[] = {
-        0x7d865cf9u, 0x06868104u,            // v_cmp_le_u32_sdwa s1, s4, v46
-        0x7d8654f9u, 0x06868004u,            // v_cmp_le_u32_sdwa s0, s4, v42
-        0x876a0100u,                         // s_and_b32 vcc_lo, s0, s1
-        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
-        0xf800000fu, 0x03020100u,
-        0xbf810000u,
+        0xbe840380u, 0x7e540281u, 0x7e5c0281u,   // original s4/v42/v46 comparison inputs.
+        0x7d865cf9u, 0x06868104u,   // v_cmp_le_u32_sdwa s1, s4, v46
+        0x7d8654f9u, 0x06868004u,   // v_cmp_le_u32_sdwa s0, s4, v42
+        0x876a0100u,   // s_and_b32 vcc_lo, s0, s1
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u, 0xf800000fu, 0x03020100u, 0xbf810000u,
     };
     if (recompile_fragment_wave32_for_test(
             wave32_fragment_adjacent_vopc_masks,
@@ -3949,12 +3969,11 @@ int main() {
     // VCC_LO/HI remain physical scalar scratch registers too. A B32 ALU destination alone does not
     // prove mask-domain use: the live shader builds M0 from ordinary integer data through VCC_LO.
     const uint32_t wave32_fragment_vcc_scratch[] = {
-        0x876a8744u,                         // s_and_b32 vcc_lo, s68, 7
-        0x936a856au,                         // s_lshl_b32 vcc_lo, vcc_lo, 5
-        0xbefc036au,                         // s_mov_b32 m0, vcc_lo
-        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u,
-        0xf800000fu, 0x03020100u,
-        0xbf810000u,
+        0xbec40380u,   // s68=0: the original scalar scratch-chain input.
+        0x876a8744u,   // s_and_b32 vcc_lo, s68, 7
+        0x936a856au,   // s_lshl_b32 vcc_lo, vcc_lo, 5
+        0xbefc036au,   // s_mov_b32 m0, vcc_lo
+        0x7e000280u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u, 0xf800000fu, 0x03020100u, 0xbf810000u,
     };
     if (recompile_fragment_wave32_for_test(
             wave32_fragment_vcc_scratch,
@@ -4021,8 +4040,8 @@ int main() {
         0xf800000fu, 0x03020100u,
         0xbf810000u,
     };
-    const auto wave32_fragment_andn1_saveexec_spv = recompile_fragment_wave32_for_test(
-        wave32_fragment_andn1_saveexec, std::size(wave32_fragment_andn1_saveexec));
+    const auto wave32_fragment_andn1_saveexec_spv =
+        prosper::test::compile_wave32_fragment_control_flow_fixture(wave32_fragment_andn1_saveexec);
     if (wave32_fragment_andn1_saveexec_spv.empty() ||
         !logical_not_of_false_feeds_and(wave32_fragment_andn1_saveexec_spv)) {
         printf("  [FAIL] s_andn1_saveexec_b32 did not compute old_EXEC & ~source\n");
@@ -4354,8 +4373,8 @@ int main() {
         0x4A0606C1u, 0x4A0404C1u, 0x7E060B03u, 0x7E040B02u,
         0xF80008CFu, 0x01000302u, 0xBF810000u,
     };
-    const auto ngg_exec_if_spv = recompile_vertex(
-        ngg_exec_if, sizeof(ngg_exec_if) / sizeof(ngg_exec_if[0]));
+    const auto ngg_exec_if_spv =
+        prosper::test::compile_ngg_phi_fixture_with_declared_predicate(ngg_exec_if);
     if (ngg_exec_if_spv.empty() || !phi_ids_are_nonzero(ngg_exec_if_spv)) {
         printf("  [FAIL] NGG EXEC wave-pack control flow emitted a zero-id OpPhi\n");
         return 1;
@@ -4604,9 +4623,10 @@ int main() {
     // so fragment recompilation ACCEPTS it and emits valid SPIR-V. (A VERTEX shader cannot discard — OpKill
     // is fragment-only — so the vertex cmpx-export case below still rejects.)
     const uint32_t cmpx_fragment[] = {
+        0x7e040280u, 0x7e0602f2u,   // declared v2/v3 export inputs
         0x7DA80300u, 0xF800180Fu, 0x03020100u, 0xBF810000u,
     };
-    auto frag_spv = recompile_fragment(cmpx_fragment, sizeof(cmpx_fragment) / sizeof(cmpx_fragment[0]));
+    auto frag_spv = prosper::test::compile_fragment_control_flow_fixture(cmpx_fragment);
     if (frag_spv.empty()) {
         printf("  [FAIL] fragment cmpx discard shader was rejected (should lower to OpKill + export)\n");
         return 1;
@@ -4641,8 +4661,8 @@ int main() {
         0xbf810000u,                         // pc17: s_endpgm
         0xbf810000u,                         // pc18: branch-target s_endpgm
     };
-    const auto fragment_cfg_spv = recompile_fragment(
-        fragment_cfg_dispatch, std::size(fragment_cfg_dispatch));
+    const auto fragment_cfg_spv =
+        prosper::test::compile_fragment_control_flow_fixture(fragment_cfg_dispatch);
     if (fragment_cfg_spv.empty() || !has_opcode(fragment_cfg_spv, 251) ||
         !type_result_ids_are_nonzero(fragment_cfg_spv, nullptr) ||
         !phi_ids_are_nonzero(fragment_cfg_spv)) {
@@ -4672,8 +4692,8 @@ int main() {
         std::begin(fragment_cfg_dispatch), std::end(fragment_cfg_dispatch));
     fragment_saveexec_scc[10] =
         0x85068081u;                         // replace pc8 work with SCC read after dispatcher reload
-    const auto fragment_saveexec_scc_spv = recompile_fragment(
-        fragment_saveexec_scc.data(), fragment_saveexec_scc.size());
+    const auto fragment_saveexec_scc_spv =
+        prosper::test::compile_fragment_control_flow_fixture(fragment_saveexec_scc);
     if (fragment_saveexec_scc_spv.empty() ||
         fragment_spirv_required_subgroup_size(fragment_saveexec_scc_spv) != 64 ||
         !has_opcode(fragment_saveexec_scc_spv, 251)) {
@@ -4684,8 +4704,8 @@ int main() {
     std::vector<uint32_t> fragment_saveexec_scc_mutated = fragment_saveexec_scc;
     fragment_saveexec_scc_mutated[1] =
         0xbe842400u;                         // same SAVEEXEC site reads unproved s[0:1]
-    if (!recompile_fragment(fragment_saveexec_scc_mutated.data(),
-                            fragment_saveexec_scc_mutated.size()).empty()) {
+    if (!prosper::test::compile_fragment_control_flow_fixture(fragment_saveexec_scc_mutated)
+             .empty()) {
         printf("  [FAIL] same-site SAVEEXEC source mutation certified an unproved mask\n");
         return 1;
     }
@@ -4696,31 +4716,32 @@ int main() {
     // s1 then s0: both independent masks must survive every dispatcher case and feed the later EXEC
     // restore. Treating either compare as a two-word write erases s1 or persists it as scalar zero.
     const uint32_t wave32_fragment_cfg_masks[] = {
-        0x7d865cf9u, 0x06868104u,            // pc0:  v_cmp_le_u32_sdwa s1, s4, v46
-        0x7d8654f9u, 0x06868004u,            // pc2:  v_cmp_le_u32_sdwa s0, s4, v42
-        0xbefe097eu,                         // pc4:  s_wqm_b32 exec_lo, exec_lo
-        0x7e040280u,                         // pc5:  v_mov_b32 v2, 0
-        0x7e060280u,                         // pc6:  v_mov_b32 v3, 0
-        0x7e080280u,                         // pc7:  v_mov_b32 v4, 0
-        0x7e0a0280u,                         // pc8:  v_mov_b32 v5, 0
-        0x7c020300u,                         // pc9:  v_cmp_lt_f32 vcc, v0, v1
-        0xbf860003u,                         // pc10: s_cbranch_vccz -> pc14
-        0x7c020300u,                         // pc11: v_cmp_lt_f32 vcc, v0, v1
-        0xbf860002u,                         // pc12: s_cbranch_vccz -> pc15 (crosses pc10 region)
-        0x7e040281u,                         // pc13: v_mov_b32 v2, 1
-        0x7e060281u,                         // pc14: v_mov_b32 v3, 1
-        0x7c020300u,                         // pc15: v_cmp_lt_f32 vcc, v0, v1
-        0xbf860004u,                         // pc16: s_cbranch_vccz -> alternate restore at pc21
-        0x877e0100u,                         // pc17: s_and_b32 exec_lo, s0, s1
-        0xf800180fu, 0x05040302u,            // pc18: exp mrt0 v2, v3, v4, v5 done vm
-        0xbf820004u,                         // pc20: s_branch -> verified tail exit at pc25
-        0x877e0100u,                         // pc21: alternate s_and_b32 exec_lo, s0, s1
-        0xf800180fu, 0x05040302u,            // pc22: alternate exp mrt0 v2, v3, v4, v5 done vm
-        0xbf810000u,                         // pc24: s_endpgm
-        0xbf810000u,                         // pc25: branch-target s_endpgm
+        0xbe840380u, 0x7e540281u, 0x7e5c0281u,   // declared s4/v42/v46 comparison inputs
+        0x7d865cf9u, 0x06868104u,   // pc0:  v_cmp_le_u32_sdwa s1, s4, v46
+        0x7d8654f9u, 0x06868004u,   // pc2:  v_cmp_le_u32_sdwa s0, s4, v42
+        0xbefe097eu,   // pc4:  s_wqm_b32 exec_lo, exec_lo
+        0x7e040280u,   // pc5:  v_mov_b32 v2, 0
+        0x7e060280u,   // pc6:  v_mov_b32 v3, 0
+        0x7e080280u,   // pc7:  v_mov_b32 v4, 0
+        0x7e0a0280u,   // pc8:  v_mov_b32 v5, 0
+        0x7c020300u,   // pc9:  v_cmp_lt_f32 vcc, v0, v1
+        0xbf860003u,   // pc10: s_cbranch_vccz -> pc14
+        0x7c020300u,   // pc11: v_cmp_lt_f32 vcc, v0, v1
+        0xbf860002u,   // pc12: s_cbranch_vccz -> pc15 (crosses pc10 region)
+        0x7e040281u,   // pc13: v_mov_b32 v2, 1
+        0x7e060281u,   // pc14: v_mov_b32 v3, 1
+        0x7c020300u,   // pc15: v_cmp_lt_f32 vcc, v0, v1
+        0xbf860004u,   // pc16: s_cbranch_vccz -> alternate restore at pc21
+        0x877e0100u,   // pc17: s_and_b32 exec_lo, s0, s1
+        0xf800180fu, 0x05040302u,   // pc18: exp mrt0 v2, v3, v4, v5 done vm
+        0xbf820004u,   // pc20: s_branch -> verified tail exit at pc25
+        0x877e0100u,   // pc21: alternate s_and_b32 exec_lo, s0, s1
+        0xf800180fu, 0x05040302u,   // pc22: alternate exp mrt0 v2, v3, v4, v5 done vm
+        0xbf810000u,   // pc24: s_endpgm
+        0xbf810000u,   // pc25: branch-target s_endpgm
     };
-    const auto wave32_fragment_cfg_spv = recompile_fragment_wave32_for_test(
-        wave32_fragment_cfg_masks, std::size(wave32_fragment_cfg_masks));
+    const auto wave32_fragment_cfg_spv =
+        prosper::test::compile_wave32_fragment_control_flow_fixture(wave32_fragment_cfg_masks);
     if (wave32_fragment_cfg_spv.empty() || !has_opcode(wave32_fragment_cfg_spv, 251) ||
         !type_result_ids_are_nonzero(wave32_fragment_cfg_spv, nullptr) ||
         !phi_ids_are_nonzero(wave32_fragment_cfg_spv)) {
@@ -4741,8 +4762,8 @@ int main() {
         std::begin(fragment_mask_compare_prelude), std::end(fragment_mask_compare_prelude));
     fragment_cfg_mask_compare.insert(fragment_cfg_mask_compare.end(),
         std::begin(fragment_cfg_dispatch), std::end(fragment_cfg_dispatch));
-    const auto fragment_cfg_mask_compare_spv = recompile_fragment(
-        fragment_cfg_mask_compare.data(), fragment_cfg_mask_compare.size());
+    const auto fragment_cfg_mask_compare_spv =
+        prosper::test::compile_fragment_control_flow_fixture(fragment_cfg_mask_compare);
     if (fragment_cfg_mask_compare_spv.empty() ||
         !has_opcode(fragment_cfg_mask_compare_spv, 251) ||
         !has_opcode(fragment_cfg_mask_compare_spv, 335) ||
@@ -4815,8 +4836,8 @@ int main() {
             phi_ids_are_nonzero(spirv);
     };
     std::vector<uint32_t> fragment_saved_mask_pair_eq = saved_mask_pair_shader();
-    const auto fragment_saved_mask_pair_eq_spv = recompile_fragment(
-        fragment_saved_mask_pair_eq.data(), fragment_saved_mask_pair_eq.size());
+    const auto fragment_saved_mask_pair_eq_spv =
+        prosper::test::compile_fragment_control_flow_fixture(fragment_saved_mask_pair_eq);
     if (!mask_pair_module_is_exact(fragment_saved_mask_pair_eq_spv, 64,
                                    /*inverted EQ vote*/true)) {
         printf("  [FAIL] House saved-mask equality did not feed CFG-persisted SCC in Wave64\n");
@@ -4824,19 +4845,17 @@ int main() {
     }
     std::vector<uint32_t> fragment_saved_mask_pair_lg = fragment_saved_mask_pair_eq;
     fragment_saved_mask_pair_lg[4] = 0xbf132e2cu; // s_cmp_lg_u64 s[44:45],s[46:47]
-    const auto fragment_saved_mask_pair_lg_spv = recompile_fragment(
-        fragment_saved_mask_pair_lg.data(), fragment_saved_mask_pair_lg.size());
+    const auto fragment_saved_mask_pair_lg_spv =
+        prosper::test::compile_fragment_control_flow_fixture(fragment_saved_mask_pair_lg);
     if (!mask_pair_module_is_exact(fragment_saved_mask_pair_lg_spv, 64,
                                    /*direct LG vote*/false)) {
         printf("  [FAIL] saved-mask inequality did not feed CFG-persisted SCC in Wave64\n");
         return 1;
     }
     const auto fragment_wave32_saved_mask_pair_eq_spv =
-        recompile_fragment_wave32_for_test(
-            fragment_saved_mask_pair_eq.data(), fragment_saved_mask_pair_eq.size());
+        prosper::test::compile_wave32_fragment_control_flow_fixture(fragment_saved_mask_pair_eq);
     const auto fragment_wave32_saved_mask_pair_lg_spv =
-        recompile_fragment_wave32_for_test(
-            fragment_saved_mask_pair_lg.data(), fragment_saved_mask_pair_lg.size());
+        prosper::test::compile_wave32_fragment_control_flow_fixture(fragment_saved_mask_pair_lg);
     if (!mask_pair_module_is_exact(fragment_wave32_saved_mask_pair_eq_spv, 32, true) ||
         !mask_pair_module_is_exact(fragment_wave32_saved_mask_pair_lg_spv, 32, false)) {
         printf("  [FAIL] saved-mask EQ/LG lost the complete-pair contract in Wave32\n");
@@ -4869,10 +4888,11 @@ int main() {
     saved_mask_pair_divergent_sites.insert(
         saved_mask_pair_divergent_sites.end(), std::begin(fragment_scalar_cfg_dispatch),
         std::end(fragment_scalar_cfg_dispatch));
-    const auto saved_mask_pair_divergent_wave64_spv = recompile_fragment(
-        saved_mask_pair_divergent_sites.data(), saved_mask_pair_divergent_sites.size());
-    const auto saved_mask_pair_divergent_wave32_spv = recompile_fragment_wave32_for_test(
-        saved_mask_pair_divergent_sites.data(), saved_mask_pair_divergent_sites.size());
+    const auto saved_mask_pair_divergent_wave64_spv =
+        prosper::test::compile_fragment_control_flow_fixture(saved_mask_pair_divergent_sites);
+    const auto saved_mask_pair_divergent_wave32_spv =
+        prosper::test::compile_wave32_fragment_control_flow_fixture(
+            saved_mask_pair_divergent_sites);
     if (!saved_mask_pair_votes_use_uniform_event_phase(
             saved_mask_pair_divergent_wave64_spv) ||
         !saved_mask_pair_votes_use_uniform_event_phase(
@@ -4887,8 +4907,7 @@ int main() {
     // producer skipped on one reachable predecessor cannot establish a mask at the join.
     std::vector<uint32_t> saved_mask_high_overwrite = fragment_saved_mask_pair_eq;
     saved_mask_high_overwrite.insert(saved_mask_high_overwrite.begin() + 4, 0xbead0380u);
-    if (!recompile_fragment(saved_mask_high_overwrite.data(),
-                            saved_mask_high_overwrite.size()).empty()) {
+    if (!prosper::test::compile_fragment_control_flow_fixture(saved_mask_high_overwrite).empty()) {
         printf("  [FAIL] high-half scalar overwrite retained a stale saved-mask pair\n");
         return 1;
     }
@@ -4896,8 +4915,8 @@ int main() {
     saved_mask_numeric_replacement.insert(
         saved_mask_numeric_replacement.begin() + 4,
         {0xbeae0381u, 0xbeaf0380u});          // numeric s[46:47] = 1
-    if (!recompile_fragment(saved_mask_numeric_replacement.data(),
-                            saved_mask_numeric_replacement.size()).empty()) {
+    if (!prosper::test::compile_fragment_control_flow_fixture(saved_mask_numeric_replacement)
+             .empty()) {
         printf("  [FAIL] numeric SGPR pair was reinterpreted as a saved wave mask\n");
         return 1;
     }
@@ -4916,8 +4935,8 @@ int main() {
     saved_mask_path_dependent.insert(
         saved_mask_path_dependent.end(), std::begin(fragment_scalar_cfg_dispatch),
         std::end(fragment_scalar_cfg_dispatch));
-    const auto saved_mask_path_dependent_spv = recompile_fragment(
-        saved_mask_path_dependent.data(), saved_mask_path_dependent.size());
+    const auto saved_mask_path_dependent_spv =
+        prosper::test::compile_fragment_control_flow_fixture(saved_mask_path_dependent);
     if (wave_vote_reaches_later_select(saved_mask_path_dependent_spv,
                                        /*inverted EQ vote*/true)) {
         printf("  [FAIL] path-dependent saved-mask vote reached a later select\n");
@@ -4984,10 +5003,11 @@ int main() {
     fragment_dpp_min_divergent_sites.insert(
         fragment_dpp_min_divergent_sites.end(),
         std::begin(fragment_scalar_cfg_dispatch), std::end(fragment_scalar_cfg_dispatch));
-    const auto fragment_dpp_min_divergent_wave64_spv = recompile_fragment(
-        fragment_dpp_min_divergent_sites.data(), fragment_dpp_min_divergent_sites.size());
-    const auto fragment_dpp_min_divergent_wave32_spv = recompile_fragment_wave32_for_test(
-        fragment_dpp_min_divergent_sites.data(), fragment_dpp_min_divergent_sites.size());
+    const auto fragment_dpp_min_divergent_wave64_spv =
+        prosper::test::compile_fragment_control_flow_fixture(fragment_dpp_min_divergent_sites);
+    const auto fragment_dpp_min_divergent_wave32_spv =
+        prosper::test::compile_wave32_fragment_control_flow_fixture(
+            fragment_dpp_min_divergent_sites);
     if (!dpp_min_module_is_exact(fragment_dpp_min_divergent_wave64_spv, 64) ||
         !dpp_min_module_is_exact(fragment_dpp_min_divergent_wave32_spv, 32)) {
         printf("  [FAIL] divergent-PC DPP sources escaped static-event isolation\n");
@@ -4996,10 +5016,10 @@ int main() {
     printf("  [ok]   divergent-PC DPP sources require matching Wave32/64 static events\n");
 
     std::vector<uint32_t> fragment_dpp_min_row = saved_mask_pair_dpp_shader();
-    const auto fragment_dpp_min_row_wave64_spv = recompile_fragment(
-        fragment_dpp_min_row.data(), fragment_dpp_min_row.size());
-    const auto fragment_dpp_min_row_wave32_spv = recompile_fragment_wave32_for_test(
-        fragment_dpp_min_row.data(), fragment_dpp_min_row.size());
+    const auto fragment_dpp_min_row_wave64_spv =
+        prosper::test::compile_fragment_control_flow_fixture(fragment_dpp_min_row);
+    const auto fragment_dpp_min_row_wave32_spv =
+        prosper::test::compile_wave32_fragment_control_flow_fixture(fragment_dpp_min_row);
     if (!dpp_min_module_is_exact(fragment_dpp_min_row_wave64_spv, 64) ||
         !dpp_min_module_is_exact(fragment_dpp_min_row_wave32_spv, 32)) {
         printf("  [FAIL] House DPP minimum did not persist through the Wave32/64 CFG common phase\n");
@@ -5012,12 +5032,12 @@ int main() {
     dpp_min_distinct_source[10] = 0xff011104u; // src0=v4, while VDST/SRC1 remain v3
     std::vector<uint32_t> dpp_min_wrong_amount = fragment_dpp_min_row;
     dpp_min_wrong_amount[10] = 0xff011203u; // duplicates :2; loses exact :1/:2/:4/:8 chain
-    const auto wrong_opcode_spv = recompile_fragment(
-        dpp_min_wrong_opcode.data(), dpp_min_wrong_opcode.size());
-    const auto distinct_source_spv = recompile_fragment(
-        dpp_min_distinct_source.data(), dpp_min_distinct_source.size());
-    const auto wrong_amount_spv = recompile_fragment(
-        dpp_min_wrong_amount.data(), dpp_min_wrong_amount.size());
+    const auto wrong_opcode_spv =
+        prosper::test::compile_fragment_control_flow_fixture(dpp_min_wrong_opcode);
+    const auto distinct_source_spv =
+        prosper::test::compile_fragment_control_flow_fixture(dpp_min_distinct_source);
+    const auto wrong_amount_spv =
+        prosper::test::compile_fragment_control_flow_fixture(dpp_min_wrong_amount);
     if (dpp_min_row_shr_updates_dispatch_vgpr(wrong_opcode_spv) ||
         dpp_min_row_shr_updates_dispatch_vgpr(distinct_source_spv) ||
         dpp_min_row_shr_updates_dispatch_vgpr(wrong_amount_spv)) {
@@ -5052,8 +5072,8 @@ int main() {
         0xbf810000u,                         // pc20: s_endpgm
         0xbf810000u,                         // pc21: branch-target s_endpgm
     };
-    const auto fragment_cfg_orn2_spv = recompile_fragment(
-        fragment_cfg_orn2_saveexec, std::size(fragment_cfg_orn2_saveexec));
+    const auto fragment_cfg_orn2_spv =
+        prosper::test::compile_fragment_control_flow_fixture(fragment_cfg_orn2_saveexec);
     if (fragment_cfg_orn2_spv.empty() || !has_opcode(fragment_cfg_orn2_spv, 251) ||
         !type_result_ids_are_nonzero(fragment_cfg_orn2_spv, nullptr) ||
         !phi_ids_are_nonzero(fragment_cfg_orn2_spv)) {
@@ -5079,8 +5099,8 @@ int main() {
         0xf800000fu, 0x0a0a0a0au,            // exp mrt0 v10,v10,v10,v10
         0xbf810000u,
     };
-    const auto fragment_dpp_row_or_spv = recompile_fragment(
-        fragment_dpp_row_or, std::size(fragment_dpp_row_or));
+    const auto fragment_dpp_row_or_spv =
+        prosper::test::compile_fragment_control_flow_fixture(fragment_dpp_row_or);
     if (fragment_dpp_row_or_spv.empty() ||
         !has_opcode(fragment_dpp_row_or_spv, 345) ||
         !has_builtin(fragment_dpp_row_or_spv, 41) ||
@@ -5100,8 +5120,8 @@ int main() {
         0xf800000fu, 0x02020202u,
         0xbf810000u,
     };
-    const auto fragment_dpp_distinct_spv = recompile_fragment(
-        fragment_dpp_distinct_row_or, std::size(fragment_dpp_distinct_row_or));
+    const auto fragment_dpp_distinct_spv =
+        prosper::test::compile_fragment_control_flow_fixture(fragment_dpp_distinct_row_or);
     const uint32_t fragment_dpp_features =
         fragment_spirv_required_subgroup_features(fragment_dpp_distinct_spv);
     if (fragment_dpp_distinct_spv.empty() ||
@@ -5135,8 +5155,8 @@ int main() {
         0xf800000fu, 0x0a0a0a0au,            // exp mrt0 v10,v10,v10,v10
         0xbf810000u,
     };
-    const auto fragment_dpp_row_min_spv = recompile_fragment(
-        fragment_dpp_row_min, std::size(fragment_dpp_row_min));
+    const auto fragment_dpp_row_min_spv =
+        prosper::test::compile_fragment_control_flow_fixture(fragment_dpp_row_min);
     if (fragment_dpp_row_min_spv.empty() ||
         !has_opcode(fragment_dpp_row_min_spv, 345) ||
         !has_builtin(fragment_dpp_row_min_spv, 41) ||
@@ -5158,8 +5178,7 @@ int main() {
         0xf800000fu, 0x0a0a0a0au,
         0xbf810000u,
     };
-    if (!recompile_fragment(fragment_dpp_row_carry,
-                            std::size(fragment_dpp_row_carry)).empty()) {
+    if (!prosper::test::compile_fragment_control_flow_fixture(fragment_dpp_row_carry).empty()) {
         printf("  [FAIL] unbounded fragment DPP admitted a VOP2 carry-out opcode\n");
         return 1;
     }
@@ -5199,7 +5218,7 @@ int main() {
         0xbf810000u,               // 12: s_endpgm
     };
     const auto overlapping_spv =
-        recompile_fragment(overlapping_loops, std::size(overlapping_loops));
+        prosper::test::compile_fragment_control_flow_fixture(overlapping_loops);
     if (overlapping_spv.empty() || !has_opcode(overlapping_spv, 251) ||
         !type_result_ids_are_nonzero(overlapping_spv, nullptr) ||
         !phi_ids_are_nonzero(overlapping_spv)) {
@@ -5241,8 +5260,8 @@ int main() {
         0xf800180fu, 0x05020302u,  // 12: exp mrt0
         0xbf810000u,               // 14: s_endpgm
     };
-    const auto numeric_cfg = recompile_fragment(overlapping_loops_numeric,
-                                                std::size(overlapping_loops_numeric));
+    const auto numeric_cfg =
+        prosper::test::compile_fragment_control_flow_fixture(overlapping_loops_numeric);
     if (numeric_cfg.empty() || !has_opcode(numeric_cfg, 251) || !has_opcode(numeric_cfg, 205) ||
         !type_result_ids_are_nonzero(numeric_cfg, nullptr) || !phi_ids_are_nonzero(numeric_cfg) ||
         output_store_stats(numeric_cfg).stores != 1) {
@@ -5252,12 +5271,12 @@ int main() {
     std::vector<uint32_t> same_site(std::begin(overlapping_loops_numeric),
                                     std::end(overlapping_loops_numeric));
     same_site[7] = 0x000100c1u; // all-ones source: physical lane-ID fast path, no peer scan
-    if (recompile_fragment(same_site.data(), same_site.size()).empty()) {
+    if (prosper::test::compile_fragment_control_flow_fixture(same_site).empty()) {
         printf("  [FAIL] all-ones MBCNT lane ID in a crossing fragment CFG must remain local\n");
         return 1;
     }
     same_site[7] = 0x0001007eu; // EXEC_LO is a live Boolean-domain mask, not numeric DATA
-    if (!recompile_fragment(same_site.data(), same_site.size()).empty()) {
+    if (!prosper::test::compile_fragment_control_flow_fixture(same_site).empty()) {
         printf("  [FAIL] #1474: peer-mask MBCNT inside an unstructured fragment region must reject\n");
         return 1;
     }
@@ -5293,8 +5312,8 @@ int main() {
         0xbf810000u,                         // pc22: s_endpgm
         0xbf810000u,                         // pc23: branch-target s_endpgm
     };
-    const auto fragment_cfg_kill_spv = recompile_fragment(
-        fragment_cfg_kill_dispatch, std::size(fragment_cfg_kill_dispatch));
+    const auto fragment_cfg_kill_spv =
+        prosper::test::compile_fragment_control_flow_fixture(fragment_cfg_kill_dispatch);
     if (fragment_cfg_kill_spv.empty() || !has_opcode(fragment_cfg_kill_spv, 251) ||
         !has_opcode(fragment_cfg_kill_spv, 252) ||
         !type_result_ids_are_nonzero(fragment_cfg_kill_spv, nullptr) ||
@@ -5324,7 +5343,7 @@ int main() {
         0xf800180fu, 0x05040302u,  // exp mrt0 v2, v3, v4, v5 done vm
         0xbf810000u,               // s_endpgm
     };
-    auto altest_spv = recompile_fragment(altest_kill_branch, sizeof(altest_kill_branch) / sizeof(altest_kill_branch[0]));
+    auto altest_spv = prosper::test::compile_fragment_control_flow_fixture(altest_kill_branch);
     if (altest_spv.empty()) {
         printf("  [FAIL] alpha-test scalar-branch discard (s_cbranch_scc0 on kill mask) was rejected\n");
         return 1;
@@ -5782,12 +5801,17 @@ int main() {
     constexpr uint32_t lod_v_bits = 0x3f400000u; // 0.75
     auto compile_get_lod = [&](uint32_t dmask) {
         const uint32_t export_mask = dmask == 3u ? 3u : 1u;
-        const std::array<uint32_t, 10> shader = {
-            0x7e1202ffu, lod_u_bits,           // v_mov_b32 v9, 0.25
-            0x7e1402ffu, lod_v_bits,           // v_mov_b32 v10, 0.75
-            0x7da40100u,                       // v_cmpx_eq_u32 v0,v0: force an EXEC-predicated write
-            0xf1800008u | (dmask << 8), 0x01480809u,
-            0xf8000000u | export_mask, 0x0b0a0908u, // export selected VDATA from v8[/v9]
+        const std::array<uint32_t, 11> shader = {
+            0x7e000280u,   // v0=0: genuine input to the original CMPX predicate.
+            0x7e1202ffu,
+            lod_u_bits,   // v_mov_b32 v9, 0.25
+            0x7e1402ffu,
+            lod_v_bits,   // v_mov_b32 v10, 0.75
+            0x7da40100u,   // v_cmpx_eq_u32 v0,v0: force an EXEC-predicated write
+            0xf1800008u | (dmask << 8),
+            0x01480809u,
+            0xf8000000u | export_mask,
+            0x0b0a0908u,   // export selected VDATA from v8[/v9]
             0xbf810000u,
         };
         return recompile_fragment(shader.data(), shader.size(), &rt_get_lod);

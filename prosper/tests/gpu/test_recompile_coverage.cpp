@@ -2,6 +2,7 @@
 // requiring a complete vertex/fragment. Pure (no Vulkan), so it runs in CI. It also drives the
 // data-driven coverage report over the real game shaders (shader_histo).
 #include "../fixtures/checked_compute_launch.hpp"
+#include "../fixtures/compute_coverage_inputs.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -21,6 +22,7 @@
 #endif
 
 using namespace prosper::gpu;
+namespace coverage_inputs = prosper::test::coverage_inputs;
 
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
@@ -284,18 +286,15 @@ int main() {
     // FLAT-window emit (#1171 piece 2): with a ConstantBuffer resource keyed by the flat_load's pc plus
     // flat_base_sgpr, recompile_compute LOWERS the general flat_load to a windowed SSBO read; without
     // the bound window it stays fail-visible (empty module).
-    const uint32_t flat_kernel[] = {
-        0xd70f6a01u, 0x00020c0cu,   // v_add_co_u32    v1, vcc, s12, v6
-        0x50041af9u, 0x86860680u,   // v_add_co_ci_u32 v2 (sdwa), s13
-        0xdc200000u, 0x007d0001u,   // flat_load_ubyte v0, v[1:2]
-        0xBF810000u,                // s_endpgm
-    };
-    const size_t nfk = sizeof(flat_kernel)/sizeof(flat_kernel[0]);
+    // The synthetic consumer needs a genuine v6 offset; launch TIDIG supplies v0 only.
+    // Keep the original carry/load packets shared with the missing-input negative control.
+    const auto& flat_kernel = prosper::test::coverage_inputs::flat_with_offset;
+    const size_t nfk = flat_kernel.size();
     ComputeShaderConfig fcfg;
     fcfg.user_sgprs.assign(16, 0);   // 16 user SGPRs; s12/s13 hold the (per-dispatch) base pointer
-    CHECK(recompile_compute(flat_kernel, nfk, nullptr, fcfg).empty(),
+    CHECK(recompile_compute(flat_kernel.data(), nfk, nullptr, fcfg).empty(),
           "general flat_load with no bound window still rejects the shader (fail-visible)");
-    FlatLoadAnalysis fka = analyze_flat_loads(flat_kernel, nfk, 16);
+    FlatLoadAnalysis fka = analyze_flat_loads(flat_kernel.data(), nfk, 16);
     ShaderResourceTable frt;
     ShaderResource fwin;
     fwin.cls = ResourceClass::ConstantBuffer;
@@ -305,7 +304,7 @@ int main() {
     fwin.fetch_pc = fka.loads[0].load_pc;
     fwin.flat_base_sgpr = static_cast<uint32_t>(fka.loads[0].base_sgpr);   // s12
     frt.resources.push_back(fwin);
-    std::vector<uint32_t> fk_spv = recompile_compute(flat_kernel, nfk, &frt, fcfg);
+    std::vector<uint32_t> fk_spv = recompile_compute(flat_kernel.data(), nfk, &frt, fcfg);
     CHECK(!fk_spv.empty() && fk_spv[0] == 0x07230203u,
           "general flat_load lowers to a valid SSBO-read module when its window is bound");
 
@@ -751,6 +750,7 @@ int main() {
     // Owned full preheader v1 seed covers inactive bits preserved by later masked writers.
     wave64_vcc_lo_scalar_offset[0] = 0x7E020280u;
     wave64_vcc_lo_scalar_offset[1] = 0x7E040280u;   // same full preheader seed for pc88/pc99 v2
+    wave64_vcc_lo_scalar_offset[2] = coverage_inputs::scalar_offset_input[0];   // supply pc74 v68
     const uint32_t wave64_vcc_lo_scalar_tail[] = {
         0x7d288812u,                         // pc74: v_cmp_* vcc,s18,v68
         0xbf88001bu,                         // pc75: s_cbranch_execz pc103
@@ -928,19 +928,11 @@ int main() {
     // snapshot has already supplied both exact image consumers; a subsequent read of s5 observes
     // the new mask's upper word. On Wave32, the same compare only replaces s4, so s5 still holds
     // descriptor data and the raw load must reject. The branch selects the path-sensitive proof.
-    const std::array<uint32_t, 12> x16_wave_mask_lifetime = {
-        0xf4100100u, 0xfa000000u,   // pc0: x16 s[4:19]
-        0xf0000108u, 0x00010704u,   // pc2: image_load through s[4:11]
-        0xf0000108u, 0x00030604u,   // pc4: image_load through s[12:19]
-        0xbf840001u,                 // pc6: conditional skip of pc7
-        0xbf800000u,                 // pc7: no-op
-        0x7d0424f9u, 0x0606840au,   // pc8: v_cmp_* s[4:5], v10, v18
-        0x7e020205u,                 // pc10: v_mov_b32 v1,s5
-        0xbf810000u,
-    };
+    const auto& x16_wave_mask_lifetime = coverage_inputs::x16_wave_mask_lifetime;
+    constexpr auto x16_input_words = coverage_inputs::x16_wave_mask_inputs.size();
     ShaderResourceTable x16_wave_mask_rt;
-    x16_wave_mask_rt.resources.push_back(x16_texture(4, 2));
-    x16_wave_mask_rt.resources.push_back(x16_texture(5, 4));
+    x16_wave_mask_rt.resources.push_back(x16_texture(4, 2 + x16_input_words));
+    x16_wave_mask_rt.resources.push_back(x16_texture(5, 4 + x16_input_words));
     ComputeShaderConfig x16_wave64_config;
     x16_wave64_config.local_x = 64;
     x16_wave64_config.threads_x = 64;
@@ -965,14 +957,14 @@ int main() {
           "Wave32 one-word mask write leaves descriptor high word observable");
     std::vector<uint32_t> x16_wave32_replaced_high(
         x16_wave_mask_lifetime.begin(), x16_wave_mask_lifetime.end());
-    x16_wave32_replaced_high.insert(x16_wave32_replaced_high.begin() + 10,
-                                    0xbe850380u); // s_mov_b32 s5,0 before the read
+    x16_wave32_replaced_high.insert(x16_wave32_replaced_high.begin() + 10 + x16_input_words,
+                                    0xbe850380u);   // s_mov_b32 s5,0 before the read
     CHECK(!recompile_compute(x16_wave32_replaced_high.data(),
                              x16_wave32_replaced_high.size(), &x16_wave_mask_rt,
                              x16_wave32_config).empty(),
           "Wave32 explicit high-word replacement restores descriptor-only lifetime");
     auto x16_linear_wave_mask_lifetime = x16_wave_mask_lifetime;
-    x16_linear_wave_mask_lifetime[6] = 0xbf800000u; // remove the only branch
+    x16_linear_wave_mask_lifetime[6 + x16_input_words] = 0xbf800000u;   // remove the only branch
     CHECK(!recompile_compute(x16_linear_wave_mask_lifetime.data(),
                              x16_linear_wave_mask_lifetime.size(), &x16_wave_mask_rt,
                              x16_wave64_config).empty() &&
@@ -981,13 +973,14 @@ int main() {
                                 x16_wave32_config).empty(),
           "branch-free x16 lifetime applies the same Wave64 pair and Wave32 word widths");
     auto x16_b32_mask_lifetime = x16_wave_mask_lifetime;
-    x16_b32_mask_lifetime[8] = 0xbe840380u; // s_mov_b32 s4,0, not a pair write
-    x16_b32_mask_lifetime[9] = 0xbf800000u;
+    x16_b32_mask_lifetime[8 + x16_input_words] = 0xbe840380u;   // s_mov_b32 s4,0, not a pair write
+    x16_b32_mask_lifetime[9 + x16_input_words] = 0xbf800000u;
     CHECK(recompile_compute(x16_b32_mask_lifetime.data(), x16_b32_mask_lifetime.size(),
                             &x16_wave_mask_rt, x16_wave64_config).empty(),
           "Wave64 B32 overwrite cannot hide a later descriptor high-word read");
     auto x16_bypassed_mask_lifetime = x16_wave_mask_lifetime;
-    x16_bypassed_mask_lifetime[6] = 0xbf820003u; // s_branch pc10, past the pair write
+    x16_bypassed_mask_lifetime[6 + x16_input_words] =
+        0xbf820003u;   // s_branch pc10, past the pair write
     CHECK(recompile_compute(x16_bypassed_mask_lifetime.data(),
                             x16_bypassed_mask_lifetime.size(), &x16_wave_mask_rt,
                             x16_wave64_config).empty(),
@@ -1662,19 +1655,13 @@ int main() {
     // Wave32 kernels use one-word mask instructions around EXEC: compare into VCC_LO, invert that
     // mask, copy it to EXEC_LO, then restore EXEC_LO. These are mask-domain operations, not scalar
     // reads of an unrepresentable VCC dword.
-    const uint32_t wave32_half_mask[] = {
-        0x7C000000u, // v_cmp_f_f32 vcc, v0, v0
-        0xBEEA076Au, // s_not_b32 vcc_lo, vcc_lo
-        0xBEFE036Au, // s_mov_b32 exec_lo, vcc_lo
-        0x7E000281u, // v_mov_b32 v0, 1 (EXEC-predicated)
-        0xBEFE03C1u, // s_mov_b32 exec_lo, -1
-        0xBF810000u,
-    };
+    const auto& wave32_half_mask = coverage_inputs::wave32_half_mask;
     ComputeShaderConfig wave32_half_mask_config;
     wave32_half_mask_config.wave_size = 32;
     wave32_half_mask_config.native_subgroup_size = 32;
-    CHECK(!recompile_compute(wave32_half_mask, std::size(wave32_half_mask), nullptr,
-                             wave32_half_mask_config).empty(),
+    CHECK(!recompile_compute(wave32_half_mask.data(), std::size(wave32_half_mask), nullptr,
+                             wave32_half_mask_config)
+               .empty(),
           "Wave32 VCC_LO inversion/copy/EXEC restore recompiles in the mask domain");
 
     // tbuffer_load_format_x v0, v0, s[8:11], 0 format:32_FLOAT ; s_endpgm.
@@ -1844,13 +1831,7 @@ int main() {
     // A genuinely nested/multi-branch compute CFG uses the hardware-wave-vote dispatcher fallback. This
     // is the reduced shape of UE4's volume-lighting kernel: varying VCC exit, an inner scalar branch,
     // and a backward loop edge. The simpler two-branch loop above deliberately remains rejected.
-    const uint32_t compute_cfg_dispatch[] = {
-        0xBE840380u,   // s4=0: explicit input of the tail SCC comparison
-        0xBE800380u, 0x7E000280u, 0x7E020300u, 0xD7610013u, 0x00014A7Eu, 0xD7610013u, 0x0001507Fu,
-        0xD760000Eu, 0x00014B13u, 0xD760000Fu, 0x00015113u, 0xBEFE040Eu, 0xE00C2000u, 0x80020400u,
-        0x7DB900F9u, 0x86050007u, 0x7D020200u, 0xBF860006u, 0xBF0A8204u, 0x360000FDu, 0xBF840001u,
-        0x81008100u, 0x81008100u, 0xBF82FFF4u, 0xBF810000u,
-    };
+    const auto& compute_cfg_dispatch = coverage_inputs::dispatch_tail;
     ShaderResourceTable dispatch_rt;
     ShaderResource dispatch_vb{}; dispatch_vb.cls = ResourceClass::VertexBuffer;
     dispatch_vb.binding = 3; dispatch_vb.sgpr_base = 8; dispatch_vb.stride = 16;
@@ -1882,14 +1863,11 @@ int main() {
     // Astro's world-map kernel materializes a Wave32 VCC predicate, then asks whether the physical
     // VCC_LO dword is greater than zero before a scalar branch. That is an exact guest-wave any vote,
     // not a per-invocation integer read. Exercise both the structured and dispatcher paths.
-    const uint32_t wave32_vcc_gt_zero[] = {
-        0x7C022880u, // v_cmp_eq_f32 vcc, 0, v20
-        0xBF08806Au, // s_cmp_gt_u32 vcc_lo, 0
-        0xBF810000u,
-    };
+    const auto& wave32_vcc_gt_zero = coverage_inputs::wave32_vcc_gt_zero;
     wave32_dispatch_config.native_subgroup_size = 32;
-    CHECK(!recompile_compute(wave32_vcc_gt_zero, std::size(wave32_vcc_gt_zero), nullptr,
-                             wave32_dispatch_config).empty(),
+    CHECK(!recompile_compute(wave32_vcc_gt_zero.data(), std::size(wave32_vcc_gt_zero), nullptr,
+                             wave32_dispatch_config)
+               .empty(),
           "Wave32 VCC_LO > 0 lowers to an exact native guest-wave vote");
     std::vector<uint32_t> compute_cfg_dispatch_vcc_gt_zero(
         std::begin(wave32_vcc_gt_zero), std::end(wave32_vcc_gt_zero) - 1);
@@ -1903,25 +1881,20 @@ int main() {
     // Astro's world-map traversal intersects three complete Wave32 predicates in VCC_LO, then
     // branches on the SCC written by the final s_and_b32. Hardware SCC is any(result mask), so an
     // exact 32-lane native subgroup can lower it without scalarizing or guessing at one lane.
-    std::vector<uint32_t> compute_cfg_dispatch_mask_scc = {
-        0xBE9B037Eu,              // s_mov_b32 s27, exec_lo
-        0x7D8A0A15u,              // v_cmp_* vcc, s21, v5       (Astro PC1079)
-        0x7D8A0AF9u, 0x0686EB19u, // v_cmp_* s107, s25, v5      (Astro PC1080)
-        0x7D8A0AF9u, 0x06869C1Au, // v_cmp_* s28, s26, v5       (Astro PC1082)
-        0x876A6A1Bu,              // s_and_b32 vcc_lo, s27, vcc_lo
-        0x876A6B6Au,              // s_and_b32 vcc_lo, vcc_lo, vcc_hi
-        0x876A1C6Au,              // s_and_b32 vcc_lo, vcc_lo, s28
-        0xBF840001u,              // s_cbranch_scc0 +1
-        0xBF800000u,              // fallthrough work
-    };
+    std::vector<uint32_t> compute_cfg_dispatch_mask_scc(coverage_inputs::mask_scc_prefix.begin(),
+                                                        coverage_inputs::mask_scc_prefix.end());
     compute_cfg_dispatch_mask_scc.insert(
         compute_cfg_dispatch_mask_scc.end(), compute_cfg_dispatch,
         compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    // This owned fixture launches one complete group; native width alone grants no entry authority.
+    ComputeShaderConfig native_mask_scc_config = wave32_dispatch_config;
+    prosper::test::complete_compute_launch(native_mask_scc_config);
     CHECK(!recompile_compute(compute_cfg_dispatch_mask_scc.data(),
                              compute_cfg_dispatch_mask_scc.size(), &dispatch_rt,
-                             wave32_dispatch_config).empty(),
+                             native_mask_scc_config)
+               .empty(),
           "the exact Wave32 dispatcher branches on the SCC from a B32 mask intersection");
-    ComputeShaderConfig portable_mask_scc_config = wave32_dispatch_config;
+    ComputeShaderConfig portable_mask_scc_config = native_mask_scc_config;
     portable_mask_scc_config.native_subgroup_size = 0;
     CHECK(recompile_compute(compute_cfg_dispatch_mask_scc.data(),
                             compute_cfg_dispatch_mask_scc.size(), &dispatch_rt,
@@ -2858,26 +2831,16 @@ int main() {
     // A forward exact-wave branch normally remains on the compact structured path. A real MBCNT
     // after its merge still needs the dispatcher's synchronized common phase (the all-ones
     // lane-index idiom remains locally scalarizable and does not take this route).
-    const uint32_t compute_structured_saved_mbcnt_b64[] = {
-        0xBE84047Eu,                // s_mov_b64 s[4:5], exec
-        0x7E060280u,                // v_mov_b32 v3, 0 (merge live-in)
-        0x7C020300u,                // v_cmp_lt_f32 vcc, v0, v1 (varying guest-wave branch)
-        0xBF860001u,                // s_cbranch_vccz +1 -> merge
-        0x7E060281u,                // guarded write keeps the structured branch live
-        0xD7650003u, 0x00010004u,   // v_mbcnt_lo_u32_b32 v3, s4, 0
-        0xD7660003u, 0x00020605u,   // v_mbcnt_hi_u32_b32 v3, s5, v3
-        0xBF810000u,
-    };
+    const auto& compute_structured_saved_mbcnt_b64 =
+        coverage_inputs::compute_structured_saved_mbcnt_b64;
     const std::vector<uint32_t> native_structured_saved_mbcnt_b64 = recompile_compute(
-        compute_structured_saved_mbcnt_b64,
-        std::size(compute_structured_saved_mbcnt_b64), nullptr,
-        wave64_dispatch_config);
+        compute_structured_saved_mbcnt_b64.data(), std::size(compute_structured_saved_mbcnt_b64),
+        nullptr, wave64_dispatch_config);
     CHECK(!native_structured_saved_mbcnt_b64.empty(),
           "structured compute routes saved-mask MBCNT through the native common phase");
     const std::vector<uint32_t> portable_structured_saved_mbcnt_b64 = recompile_compute(
-        compute_structured_saved_mbcnt_b64,
-        std::size(compute_structured_saved_mbcnt_b64), nullptr,
-        portable_wave64_dispatch_config);
+        compute_structured_saved_mbcnt_b64.data(), std::size(compute_structured_saved_mbcnt_b64),
+        nullptr, portable_wave64_dispatch_config);
     CHECK(!portable_structured_saved_mbcnt_b64.empty(),
           "structured compute routes saved-mask MBCNT through the portable common phase");
     // GTA V's exec_cs_413d88400 reaches the exact `beea147e` packet at PC336 after
@@ -2998,15 +2961,9 @@ int main() {
                              compute_cfg_dispatch_scalar_shift.size(), &dispatch_rt,
                              wave32_dispatch_config).empty(),
           "the dispatcher preserves 64-bit scalar address shifts through VCC");
-    std::vector<uint32_t> compute_cfg_dispatch_saved_mask_not = {
-        0xBE94037Eu, // s_mov_b32 s20, exec_lo (complete Wave32 mask)
-        0xBEEA0381u, // s_mov_b32 vcc_lo, 1 (older scalar-data lifetime)
-        0xBF070000u, // s_cmp_lg_u32 s0, s0 (false)
-        0xBF850003u, // s_cbranch_scc1 +3 -> mask merge
-        0x856B807Eu, // s_cselect_b32 vcc_hi, exec_lo, 0
-        0xBEEA0714u, // s_not_b32 vcc_lo, s20
-        0x8D6A6B6Au, // s_nor_b32 vcc_lo, vcc_lo, vcc_hi
-    };
+    std::vector<uint32_t> compute_cfg_dispatch_saved_mask_not(
+        coverage_inputs::compute_cfg_dispatch_saved_mask_not.begin(),
+        coverage_inputs::compute_cfg_dispatch_saved_mask_not.end());
     compute_cfg_dispatch_saved_mask_not.insert(
         compute_cfg_dispatch_saved_mask_not.end(), compute_cfg_dispatch,
         compute_cfg_dispatch + std::size(compute_cfg_dispatch));
@@ -3014,14 +2971,9 @@ int main() {
                              compute_cfg_dispatch_saved_mask_not.size(), &dispatch_rt,
                              wave32_dispatch_config).empty(),
           "the dispatcher inverts a saved Wave32 SGPR mask before recombining VCC");
-    std::vector<uint32_t> compute_cfg_dispatch_saved_mask_not_boundary = {
-        0xBE94037Eu, // s_mov_b32 s20, exec_lo (complete Wave32 mask)
-        0xBE950714u, // s_not_b32 s21, s20
-        0xBF060000u, // s_cmp_eq_u32 s0, s0 (true; creates a conditional CFG edge)
-        0xBF850001u, // s_cbranch_scc1 +1 -> consumer
-        0xBF800000u, // unreachable s_nop 0 fallthrough arm
-        0xBEFE0315u, // s_mov_b32 exec_lo, s21 (mask-only consumer)
-    };
+    std::vector<uint32_t> compute_cfg_dispatch_saved_mask_not_boundary(
+        coverage_inputs::compute_cfg_dispatch_saved_mask_not_boundary.begin(),
+        coverage_inputs::compute_cfg_dispatch_saved_mask_not_boundary.end());
     compute_cfg_dispatch_saved_mask_not_boundary.insert(
         compute_cfg_dispatch_saved_mask_not_boundary.end(), compute_cfg_dispatch,
         compute_cfg_dispatch + std::size(compute_cfg_dispatch));
@@ -3164,10 +3116,8 @@ int main() {
     };
     CHECK(!recompile_valu(scc_data_source, sizeof(scc_data_source)/sizeof(scc_data_source[0]), 0, 0).empty(),
           "SCC is accepted as its architectural scalar 0/1 ALU source");
-    const uint32_t mask_nor[] = {
-        0x7C040CF9u, 0x06869880u, 0x8DEA6A18u, 0xBF810000u,
-    };
-    CHECK(!recompile_valu(mask_nor, sizeof(mask_nor)/sizeof(mask_nor[0]), 0, 0).empty(),
+    const auto& mask_nor = coverage_inputs::mask_nor;
+    CHECK(!recompile_valu(mask_nor.data(), mask_nor.size(), 0, 0).empty(),
           "s_nor_b64 combines a saved comparison mask with VCC in the bool domain");
     // An s_barrier INSIDE the loop body also rejects: the uniformity proof is per-WAVE, and a
     // barrier inside a loop whose trip count could differ across the workgroup's waves would be

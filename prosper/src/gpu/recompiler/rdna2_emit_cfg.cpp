@@ -10,12 +10,16 @@
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_scalar_condition_marks.hpp"
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
+#include "gpu/recompiler/rdna2_cfg_trip_bound.hpp"
+#include "gpu/recompiler/rdna2_reject_words.hpp"
+#include "gpu/recompiler/rdna2_portable_mask_dispatch.hpp"
 #include "gpu/recompiler/rdna2_counted_loop_guard.hpp"
 #include "gpu/recompiler/rdna2_dead_wave_masks.hpp"
 #include "gpu/recompiler/rdna2_exec_skip_region.hpp"
 #include "gpu/recompiler/rdna2_lane_slot_carry.hpp"
 #include "gpu/recompiler/rdna2_loop_vcc_carry.hpp"
 #include "gpu/recompiler/rdna2_mask_half_alias.hpp"
+#include "gpu/recompiler/rdna2_barrier_mask_halves.hpp"
 #include "gpu/recompiler/rdna2_spill_slot_domain.hpp"
 #include "gpu/recompiler/rdna2_spilled_mask_halves.hpp"
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
@@ -44,6 +48,7 @@
 #include <unordered_set>
 #include <vector>
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include "gpu/recompiler/rdna2_portable_mask_slots.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_dpp_row_shr.hpp"
@@ -58,37 +63,6 @@
 #include "gpu/recompiler/rdna2_structured_saved_masks.hpp"
 
 namespace prosper::gpu {
-
-
-// #2319: render exactly the dwords the instruction HAS, not a fixed two.
-//
-// `words[]` is `uint32_t words[5] = {0,...}`, so a ONE-dword instruction printed as
-// `words=bf860051,00000000` is indistinguishable from a two-dword instruction whose second dword
-// is genuinely zero. That defeats the purpose of printing raw words (#2312), which is that a
-// reader can name the instruction with one command:
-//
-//     echo '0x0e,0x16,0xea,0xbe' | llvm-mc -arch=amdgcn -mcpu=gfx1010 -disassemble
-//
-// A reader who takes `words=x,00000000` at face value feeds EIGHT bytes, and llvm-mc decodes a
-// second, entirely fictitious instruction from the zero dword -- output that looks exactly as
-// authoritative as the correct answer. On the CrossWorlds census pc=101 needed four bytes and
-// pc=2038 needed eight, and nothing in either line said which.
-//
-// Clamped to the array bound as well as to len_dwords: len_dwords comes from the decoder, and a
-// decode that failed badly enough to be rejected here is not a source to trust for indexing.
-inline std::string reject_words_text(const Rdna2Inst& in) {
-    const uint32_t count = std::min<uint32_t>(in.len_dwords ? in.len_dwords : 1u,
-                                              (uint32_t)(sizeof(in.words) / sizeof(in.words[0])));
-    std::string out;
-    char buf[16];
-    for (uint32_t i = 0; i < count; ++i) {
-        std::snprintf(buf, sizeof buf, "%08x", in.words[i]);
-        if (i) out += ',';
-        out += buf;
-    }
-    return out;
-}
-
 namespace {
 
 
@@ -549,100 +523,19 @@ int entry_m0_save_in_range(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint3
     return -1;
 }
 
-// True when the guest program itself reads or writes GDS. The witness lives in the internal GDS
-// buffer, which is guest-addressable, so instrumenting such a program would change its INPUT -- and
-// a diagnostic that perturbs the state it measures can manufacture or suppress the behaviour under
-// test. Decoded from the whole program rather than one phase: a GDS access in any phase disqualifies
-// the program, and `ins` here is only the current phase's slice.
-bool program_touches_guest_gds(const uint32_t* code, size_t dwords) {
-    if (!code || !dwords) return false;
-    std::vector<Rdna2Inst> decoded;
-    if (!rdna2_walk(code, dwords, decoded)) return true;   // undecodable: refuse, fail closed
-    return std::any_of(decoded.begin(), decoded.end(), [](const Rdna2Inst& in) {
-        return in.fmt == Rdna2Format::DS && in.ds_gds;
-    });
-}
-
-uint32_t emitted_loop_trip_bound(uint64_t program_address, uint32_t phase,
-                                uint32_t start_pc, uint32_t end_pc,
-                                const uint32_t* code, size_t dwords) {
-    const ComputeTripBoundSettings settings = compute_trip_bound_settings();
-    const uint32_t bound = settings.bound;
-    if (!bound) return 0u;
-    if (settings.only_program && program_address != settings.only_program) return 0u;
-
-    // A PHASE SELECTOR IS REQUIRED, and this is a coherence requirement rather than ergonomics.
-    //
-    // A barrier-phased program emits one dispatcher per phase, and each phase has its OWN dispatch
-    // table -- ordinal 9 means different guest pcs in phase 0 and phase 2. The witness is a single
-    // record: if two phases can hit during one dispatch, its phase field is whichever invocation
-    // stored last and its ordinal extrema are a mixture of two incompatible maps, which the host then
-    // prints as one phase's range. There is no reading of that record that is true.
-    //
-    // Discovery still works with the bound armed and no phase chosen: every phase prints its dispatch
-    // map (see the caller), so one run tells you how many phases exist and what each covers. Only the
-    // emission is withheld.
-    if (settings.only_phase == ComputeTripBoundSettings::kAllPhases) {
-        static std::once_flag once;
-        std::call_once(once, [] {
-            fprintf(stderr,
-                    "[cfg-trip-bound] PROSPER_CFG_TRIP_BOUND_PHASE is REQUIRED and is unset: no "
-                    "bound emitted. One witness record cannot describe two phases -- their dispatch "
-                    "ordinals index different tables. The dispatch maps below list every phase; "
-                    "re-run with PROSPER_CFG_TRIP_BOUND_PHASE=<k>.\n");
-        });
-        return 0u;
-    }
-    if (phase != settings.only_phase) return 0u;
-
-    // Refuse to instrument a program that uses GDS itself; see program_touches_guest_gds.
-    if (program_touches_guest_gds(code, dwords)) {
-        static std::mutex refused_mutex;
-        static std::set<uint64_t> refused;
-        bool first = false;
-        {
-            std::lock_guard lock(refused_mutex);
-            first = refused.insert(program_address).second;
-        }
-        if (first)
-            fprintf(stderr,
-                    "[cfg-trip-bound] program 0x%llx REFUSED: it accesses GDS itself, and the "
-                    "witness would overwrite its data. Not instrumented.\n",
-                    static_cast<unsigned long long>(program_address));
-        return 0u;
-    }
-
-    static std::mutex announce_mutex;
-    static std::set<std::pair<uint64_t, uint32_t>> announced;
-    bool first = false;
-    {
-        std::lock_guard lock(announce_mutex);
-        first = announced.insert({program_address, phase}).second;
-    }
-    if (first) {
-        char scope[128] = "every back-edge traversal";
-        if (settings.only_ordinal != ComputeTripBoundSettings::kAllOrdinals)
-            snprintf(scope, sizeof scope,
-                     "ONLY traversals about to dispatch ordinal %u (see this phase's dispatch map)",
-                     settings.only_ordinal);
-        fprintf(stderr,
-                "[cfg-trip-bound] program 0x%llx phase %u (guest pc %u..<%u, end-exclusive) "
-                "bounded at %u iterations counting %s "
-                "(DIAGNOSTIC: truncates guest control flow)\n",
-                static_cast<unsigned long long>(program_address), phase, start_pc, end_pc, bound,
-                scope);
-    }
-    return bound;
-}
-
 bool emit_cfg_state_machine(
     SpirvCompute& b, RegState& initial, const std::vector<Rdna2Inst>& ins,
     const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt, bool allow_exec_update,
     bool allow_smem, const std::function<bool(RegState&, const Rdna2Inst&)>& exp_fn,
     const uint32_t* code, size_t dwords, uint32_t initial_active, bool synchronize_lds_fminmax,
     const std::function<int(RegState&, const Rdna2Inst&)>& packet_instruction,
-    PacketVgprDefinedness* packet_definedness, const FragmentPacketMaskRequirements* packet_masks) {
+    PacketVgprDefinedness* packet_definedness, const FragmentPacketMaskRequirements* packet_masks,
+    NativeBarrierHalfProof* barrier_halves) {
     prepare_ngg_row_source_proof(b, initial, ins);
+    PortableMaskHalfEntryScope half_entry_scope(b, initial_active);
+    PortableMaskHalfBodyScope half_scope(b, initial, ins);
+    const bool barrier_half_phase =
+        barrier_halves && barrier_halves->begin_phase(b, ins, code, dwords, initial_active);
     initialize_saved_mask_word_proof(b, ins, code, dwords, initial_active, &initial);
     const SavedMaskDispatcherScope saved_mask_dispatcher_scope(b);
     const bool graphics = !b.has_workgroup_execution() && (b.is_fragment || b.is_vertex);
@@ -1594,18 +1487,21 @@ bool emit_cfg_state_machine(
     std::unordered_set<uint32_t> proven_saved_mask_pair_compare_pcs;
     if (!analyze_wave32_dispatch_words(
             b, ins, initial, starts, successors, direct_descriptor_sregs, wave32_words,
-            static_mask_keys, proven_saved_mask_pair_compare_pcs, saved_mask_pair_compare_sources))
+            static_mask_keys, proven_saved_mask_pair_compare_pcs, saved_mask_pair_compare_sources,
+            native_b32_mask_scc_vote_pcs))
         return false;
 
     // Which Wave64 mask half each spill slot and reloaded SGPR holds (rdna2_mask_half_alias.hpp).
     std::vector<std::map<int, uint32_t>> wave64_mask_half_sreg_in(starts.size());
     std::vector<bool> wave64_mask_half_reachable(starts.size(), false);
+    PhysicalMaskHalfSlots terminal_mask_half_slots;
     analyze_wave64_mask_half_aliases(
         b, ins, starts, successors,
         [&](const Rdna2Inst& in, const std::function<void(int)>& visit) {
             for_each_possible_vector_write(in, visit);
         },
-        wave64_mask_half_sreg_in, wave64_mask_half_reachable);
+        wave64_mask_half_sreg_in, wave64_mask_half_reachable,
+        barrier_half_phase ? barrier_halves : nullptr, &terminal_mask_half_slots, end_pc);
     // Type spill reloads as emit_alu did. Wave64 reload destinations also have Bool variables,
     // whose presence alone cannot prove a slot's domain (rdna2_spill_slot_domain.hpp).
     std::set<int> spill_mask_keys = static_mask_keys;
@@ -1663,6 +1559,8 @@ bool emit_cfg_state_machine(
     // so `s_mov_b64 dst, s[N:N+1]` over both reloaded halves of one mask stays a mask. Tracked only
     // with an exact native Wave64 subgroup, where that move also materializes the ballot words.
     std::vector<SpilledMaskHalves> wave64_spilled_halves_in(starts.size());
+    const bool track_active_vectors = tracks_active_vector_words(b, barrier_half_phase);
+    std::map<uint32_t, std::set<int>> active_vectors_after;
     const bool track_spilled_halves =
         b.is_compute && b.wave_size == 64 && b.native_subgroup_size == 64;
     // Dispatcher Function variables persist SCC's Boolean value but not whether that value is an
@@ -1715,20 +1613,12 @@ bool emit_cfg_state_machine(
         return root >= 0 && root <= 105 ? root : -1;
     };
     if ((b.is_compute || b.is_fragment) && b.wave_size == 64 && !starts.empty()) {
-        seed_native_logical_entry_marks(wave64_spilled_halves_in.front(), initial);
-        for (const auto& mask : initial.sreg_bool)
-            if (!initial.sreg_bool_b32.contains(mask.first) && mask.first <= 105)
-                wave64_b64_mask_in.front().insert(mask.first);
-        if (initial.vcc) wave64_b64_mask_in.front().insert(106);
-        for (const auto& value : initial.sreg)
-            if (value.first <= 124) wave64_scalar_word_in.front().insert(value.first);
-        for (const auto& value : initial.sreg_input)
-            if (value.first <= 124) wave64_scalar_word_in.front().insert(value.first);
-        // Direct descriptors intentionally live outside RegState's ordinary scalar map, but their
-        // entry words are real scalar data until shader code overwrites them. Seed the MUST facts
-        // from the same resource-table ranges used by the emitter's direct-descriptor fallback.
-        for (int reg : direct_descriptor_sregs)
-            if (reg <= 124) wave64_scalar_word_in.front().insert(reg);
+        seed_native_logical_entry_domains(wave64_spilled_halves_in.front(), initial,
+                                          direct_descriptor_sregs, wave64_b64_mask_in.front(),
+                                          wave64_scalar_word_in.front());
+        if (track_active_vectors)
+            seed_active_vector_words(wave64_spilled_halves_in.front().active_vectors, initial,
+                                     wave64_spilled_halves_in.front().relayed_vectors);
         wave64_scalar_scc_valid_in.front() = initial.scc != 0;
         for (int reg : inherited_entry_m0)
             if (reg <= 105) wave64_m0_token_word_in.front().insert(reg);
@@ -1741,6 +1631,9 @@ bool emit_cfg_state_machine(
             for (const auto& [vgpr, lanes] : *slots)
                 for (const auto& lane : lanes)
                     wave64_slot_domain_in.front()[{vgpr, lane.first}] = SpillSlotDomain::Other;
+        if (barrier_half_phase)
+            barrier_halves->seed_entry(wave64_spilled_halves_in.front(),
+                                       wave64_slot_domain_in.front());
 
         enum class ScalarSourceRead : uint8_t {
             None = 0, B32 = 1, Pair = 2, Quad = 4, Oct = 8,
@@ -1954,7 +1847,9 @@ bool emit_cfg_state_machine(
             // live mask, so it is exact wherever the source helper admits it.
             const bool exact_mask_reduction =
                 reduction_source == 126 ||
-                (reduction_source >= 0 && masks.contains(reduction_source));
+                (reduction_source >= 0 &&
+                 portable_mask_common_pair_is_proven(b, in, reduction_source,
+                                                     masks.contains(reduction_source)));
             if (record_compare && exact_mask_reduction)
                 proven_wave64_mask_reduction_pcs.insert(in.pc);
             const int mbcnt_root = wave64_mbcnt_mask_root(in);
@@ -1962,20 +1857,33 @@ bool emit_cfg_state_machine(
                 proven_wave64_mbcnt_mask_root_for_pc.emplace(in.pc, mbcnt_root);
             const int zero_compare_source = mask_zero_compare_candidate_source(in);
             if (record_compare && zero_compare_source >= 0 &&
-                masks.contains(zero_compare_source))
+                portable_mask_common_pair_is_proven(b, in, zero_compare_source,
+                                                    masks.contains(zero_compare_source)))
                 proven_wave64_mask_zero_compare_pcs.insert(in.pc);
             const int compare_source = exec_saved_mask_compare_source(in);
-            if (record_compare && compare_source >= 0 && masks.contains(compare_source))
+            if (record_compare && compare_source >= 0 &&
+                portable_mask_common_pair_is_proven(b, in, compare_source,
+                                                    masks.contains(compare_source)))
                 proven_exec_saved_mask_compare_pcs.insert(in.pc);
             const auto pair_compare = saved_mask_pair_compare_sources(in);
             if (record_compare && pair_compare[0] >= 0 &&
-                masks.contains(pair_compare[0]) && masks.contains(pair_compare[1]))
+                portable_mask_common_pair_is_proven(b, in, pair_compare[0],
+                                                    masks.contains(pair_compare[0])) &&
+                portable_mask_common_pair_is_proven(b, in, pair_compare[1],
+                                                    masks.contains(pair_compare[1])))
                 proven_saved_mask_pair_compare_pcs.insert(in.pc);
             const bool writes_exact_wave_scc =
-                (zero_compare_source >= 0 && masks.contains(zero_compare_source)) ||
-                (compare_source >= 0 && masks.contains(compare_source)) ||
-                (pair_compare[0] >= 0 && masks.contains(pair_compare[0]) &&
-                 masks.contains(pair_compare[1]));
+                (zero_compare_source >= 0 &&
+                 portable_mask_common_pair_is_proven(b, in, zero_compare_source,
+                                                     masks.contains(zero_compare_source))) ||
+                (compare_source >= 0 &&
+                 portable_mask_common_pair_is_proven(b, in, compare_source,
+                                                     masks.contains(compare_source))) ||
+                (pair_compare[0] >= 0 &&
+                 portable_mask_common_pair_is_proven(b, in, pair_compare[0],
+                                                     masks.contains(pair_compare[0])) &&
+                 portable_mask_common_pair_is_proven(b, in, pair_compare[1],
+                                                     masks.contains(pair_compare[1])));
 
             // Scalar-data presence and SCC validity share the same provenance contract. SOPK
             // exposes its old SDST only as an implicit source; accepting ADDK, CMPK, or CMOVK after
@@ -2251,6 +2159,12 @@ bool emit_cfg_state_machine(
                         readlane_words.insert(base + static_cast<int>(word));
             std::vector<int> vector_writes;
             for_each_possible_vector_write(in, [&](int reg) { vector_writes.push_back(reg); });
+            if (track_active_vectors) {
+                advance_active_vector_words(halves.active_vectors, in, scalar_writes, vector_writes,
+                                            mask_write, relay_sources.active_defined,
+                                            vector_write_completes_active_word(in));
+                if (record_compare) active_vectors_after[in.pc] = halves.active_vectors.current;
+            }
             if (track_spilled_halves)
                 advance_spilled_mask_halves(halves, in, masks, static_mask_keys, scalar_writes,
                                             vector_writes, mask_write);
@@ -2267,6 +2181,8 @@ bool emit_cfg_state_machine(
                                            {masks, ambiguous, scalar_words, readlane_words},
                                            slot_context, vector_writes,
                                            record_compare ? &proven_mask_writelane_pcs : nullptr);
+            refine_portable_mask_dispatch(b, in, writes_exact_wave_scc, relay_sources, halves,
+                                          slot_domains);
             if (record_compare && in.fmt == Rdna2Format::SOPP &&
                 (in.opcode == 0x04 || in.opcode == 0x05) && definite_scc)
                 proven_wave64_scalar_scc_branch_pcs.insert(in.pc);
@@ -2294,12 +2210,9 @@ bool emit_cfg_state_machine(
                                               /*record_compare*/ false))
                     return false;
             }
-            // Which SGPR holds a reloaded half is block-local: emit_alu's per-lane mask for a
-            // v_readlane'd half does not survive a dispatcher edge, so a move into VCC after the
-            // edge would copy data words while the analysis called it a mask (#4603 review). The
-            // spill-slot and pair-definition facts describe memory and stay valid across edges.
-            halves.sregs.clear();
             for (uint32_t successor : successors[block]) {
+                const auto edge_halves =
+                    active_vector_edge_state(halves, ins, lo, hi, starts[successor], vregs);
                 if (!wave64_b64_reachable[successor]) {
                     wave64_b64_reachable[successor] = true;
                     wave64_b64_mask_in[successor] = masks;
@@ -2307,7 +2220,7 @@ bool emit_cfg_state_machine(
                     wave64_scalar_word_in[successor] = scalar_words;
                     wave64_m0_token_word_in[successor] = m0_tokens;
                     wave64_readlane_word_in[successor] = readlane_words;
-                    wave64_spilled_halves_in[successor] = halves;
+                    wave64_spilled_halves_in[successor] = edge_halves;
                     wave64_slot_domain_in[successor] = slot_domains;
                     wave64_scalar_scc_valid_in[successor] = scalar_scc;
                     pending.push_back(successor);
@@ -2341,7 +2254,7 @@ bool emit_cfg_state_machine(
                 std::set<int> joined_readlane_words = wave64_readlane_word_in[successor];
                 joined_readlane_words.insert(readlane_words.begin(), readlane_words.end());
                 SpilledMaskHalves joined_halves = wave64_spilled_halves_in[successor];
-                meet_spilled_mask_halves(joined_halves, halves);
+                meet_spilled_mask_halves(joined_halves, edge_halves);
                 SpillSlotDomains joined_slots = wave64_slot_domain_in[successor];
                 meet_spill_slot_domains(joined_slots, slot_domains);
                 const bool joined_scalar_scc = wave64_scalar_scc_valid_in[successor] && scalar_scc;
@@ -2525,6 +2438,7 @@ bool emit_cfg_state_machine(
 
     // Saved mask pairs and scalar-spill lane slots have their own value domains.
     std::set<int> mask_keys = spill_mask_keys;
+    add_portable_mask_half_keys(b, mask_keys);
     std::set<int> mask_half_alias_keys;
     for (uint32_t block = 0; block < starts.size(); ++block)
         if (wave64_mask_half_reachable[block])
@@ -3047,6 +2961,7 @@ bool emit_cfg_state_machine(
         RegState state;
         state.vector_native_interpolation = initial.vector_native_interpolation;
         state.vector_wave_size = initial.vector_wave_size;
+        state.track_scc_definition = initial.track_scc_definition;
         state.scalar_presence_has_no_placeholders = false;
         state.max_vgpr = initial.max_vgpr;
         state.sreg_input = initial.sreg_input;
@@ -3135,11 +3050,14 @@ bool emit_cfg_state_machine(
                 (!entry_b32 || !entry_b32->contains(kv.first)))
                 continue;
             if (filters_wave64_b64 &&
-                (!entry_wave64_b64 || !entry_wave64_b64->contains(kv.first)))
+                (!entry_wave64_b64 || !entry_wave64_b64->contains(kv.first)) &&
+                !(entry_block != UINT32_MAX &&
+                  portable_mask_half_at_entry(b, starts[entry_block], kv.first)))
                 continue;
             state.sreg_bool[kv.first] = b.load_function(b.t_bool, kv.second);
             state.sreg_bool_narrowed[kv.first] = true;
         }
+        if (entry_block != UINT32_MAX) load_portable_mask_half_types(b, state, starts[entry_block]);
         if (entry_wave64_mask_halves)
             for (const auto& kv : mhv)
                 if (const auto half = entry_wave64_mask_halves->find(kv.first);
@@ -3283,6 +3201,8 @@ bool emit_cfg_state_machine(
             }
         }
         state.exec_narrowed = true; // state-machine joins may carry a narrowed EXEC edge
+        if (track_active_vectors && dispatch != UINT32_MAX && entry_wave64_b64)
+            restore_active_vector_words(halves_in.active_vectors.current, state);
         state.mubuf_pcrel_tables = initial.mubuf_pcrel_tables;
         state.smem_pcrel_tables = initial.smem_pcrel_tables;
         state.mtbuf_pcrel_tables = initial.mtbuf_pcrel_tables;
@@ -3547,6 +3467,9 @@ bool emit_cfg_state_machine(
             const Rdna2Inst* block_b64_mask_scc_vote = nullptr;
             for (const auto& in : ins) {
                 if (in.pc < lo || in.pc >= hi) continue;
+                if (const char* gap = prepare_portable_mask_common_sources(
+                        b, state, in, b.portable_mask_common_partial_entry))
+                    return reject_cfg(in.pc, gap);
                 if (packet_definedness) packet_definedness->instruction(b, state, in);
                 if (cfg_terminator(in)) {
                     block_terminator = &in;
@@ -3770,6 +3693,8 @@ bool emit_cfg_state_machine(
                         state, in,
                         allows_compute_scalar_vcc_bridge(b), saved_masks);
                 if (handled && ok) retain_saved_mask_words(b, state, in);
+                if (handled && ok && track_active_vectors)
+                    restore_active_vector_instruction(active_vectors_after, in, state);
                 if (handled && ok) {
                     packet_raw_masks.expire(state, in);
                     packet_raw_masks.stage(b, state, in);
@@ -3953,25 +3878,15 @@ bool emit_cfg_state_machine(
             if (dst == 106 || dst == 107) state.vcc = 0;
         }
         if (mask_ffbh) {
-            const int source = mask_ffbh->src[0].value;
-            int mask_base = source;
-            auto mask = state.sreg_bool.find(mask_base);
-            if (mask == state.sreg_bool.end() || state.sreg_bool_b32.contains(mask_base)) {
-                mask_base = source - 1;
-                mask = state.sreg_bool.find(mask_base);
-            }
+            const auto [mask, half] = portable_mask_common_ffbh_source(b, state, *mask_ffbh);
             const auto event = portable_mask_ffbh_event_for_pc.find(mask_ffbh->pc);
-            if (source < 0 || mask_base < 0 || source - mask_base < 0 ||
-                source - mask_base > 1 || mask == state.sreg_bool.end() ||
-                state.sreg_bool_b32.contains(mask_base) ||
-                event == portable_mask_ffbh_event_for_pc.end())
+            if (!mask || event == portable_mask_ffbh_event_for_pc.end())
                 return reject_cfg(mask_ffbh->pc, "mask-ffbh-source");
             b.store_function(mask_ffbh_pending_var, yes);
-            b.store_function(mask_ffbh_mask_var, mask->second);
+            b.store_function(mask_ffbh_mask_var, mask);
             b.store_function(mask_ffbh_write_var, state.exec);
             b.store_function(mask_ffbh_event_var, b.uconst(event->second));
-            b.store_function(mask_ffbh_half_var,
-                b.uconst(static_cast<uint32_t>(source - mask_base)));
+            b.store_function(mask_ffbh_half_var, b.uconst(half));
             b.store_function(mask_ffbh_dst_var,
                 b.uconst(static_cast<uint32_t>(mask_ffbh->dst.value)));
         }
@@ -4033,12 +3948,10 @@ bool emit_cfg_state_machine(
                 // false, so map membership is not a lifetime proof. Admit a saved SGPR mask only
                 // at the exact consumer where the Wave64 MUST analysis proves its pair root live.
                 const auto proof = proven_wave64_mbcnt_mask_root_for_pc.find(mbcnt->pc);
-                if (proof == proven_wave64_mbcnt_mask_root_for_pc.end())
-                    return reject_cfg(mbcnt->pc, "mbcnt-unproven-saved-mask");
-                const auto live = state.sreg_bool.find(proof->second);
-                if (live == state.sreg_bool.end())
-                    return reject_cfg(mbcnt->pc, "mbcnt-proven-mask-missing-state");
-                mask = live->second;
+                mask = portable_mask_common_mbcnt_source(
+                    b, state, *mbcnt,
+                    proof == proven_wave64_mbcnt_mask_root_for_pc.end() ? -1 : proof->second);
+                if (!mask) return reject_cfg(mbcnt->pc, "mbcnt-unproven-saved-mask");
             } else {
                 mask = mbcnt_source_bit(
                     b, state, mbcnt->src[0], mbcnt->opcode == 0x366);
@@ -5649,6 +5562,13 @@ bool emit_cfg_state_machine(
     }
     initial.invalidated_vgpr_lane_slots =
         std::move(terminal_invalidated_vgpr_lane_slots);
+    if (barrier_half_phase) {
+        const auto terminal = block_for_pc.find(end_pc);
+        if (terminal != block_for_pc.end() && wave64_b64_reachable[terminal->second])
+            barrier_halves->finish_phase(ins, terminal_mask_half_slots,
+                                         wave64_spilled_halves_in[terminal->second],
+                                         wave64_slot_domain_in[terminal->second]);
+    }
     // sreg_srt and lds_addtid are path-sensitive SSA provenance without dispatcher function
     // variables. Not reconstructing them across a phase is intentional and fail-closed: a later
     // descriptor/LDS consumer rejects instead of reviving provenance from an arbitrary path.
@@ -5685,6 +5605,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
     // whole-shader liveness valid when a barrier-separated body is compiled in phases.
     prepare_ngg_row_source_proof(b, rs, ins);
     SavedMaskCopyBodyScope copy_scope(b, rs, ins, code, dwords, initial_dispatch_active);
+    PortableMaskHalfBodyScope half_scope(b, rs, ins);
     rs.max_vgpr = std::max(rs.max_vgpr, shader_max_vgpr(ins));
     if (!b.cselect_b64_low_only_analysis_done) {
         b.cselect_b64_low_only_pcs = proven_cselect_b64_low_only_pcs(ins);
@@ -5779,6 +5700,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             (phased.guarded || initial_dispatch_active || force_barrier_phases ||
              portable_compute_mask_reduction || portable_compute_readfirstlane ||
              portable_compute_bpermute || compute_cfg_row_integer || compute_cfg_row_fadd)) {
+            NativeBarrierHalfProof barrier_halves(b, ins, code, dwords, phased.guarded,
+                                                  initial_dispatch_active);
             // Every phase shares one immutable Workgroup OpTypeArray. Size it from the complete
             // phased stream before the first dispatcher: a later portable DPP operation needs a
             // second per-lane plane even when the earlier phase needed only votes/liveness.
@@ -5831,16 +5754,15 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 b.emit_label(body_label);
             }
 
-            auto emit_phase = [&](std::vector<Rdna2Inst>& phase) {
+            auto emit_phase = [&](std::vector<Rdna2Inst>& phase, size_t begin, size_t end) {
                 // Unguarded phases are admitted specifically because the whole-stream exact-wave
                 // dispatcher was blocked by a guest barrier. Use that dispatcher directly for each
                 // now barrier-free region; re-entering the narrow structurizer could reject the same
                 // backward-else/complex shape before it ever reaches the fallback.
                 if (!phased.guarded || initial_dispatch_active)
-                    return emit_cfg_state_machine(
-                        b, rs, phase, safe, rt, allow_exec_update, allow_smem,
-                        exp_fn, code, dwords, initial_dispatch_active,
-                        force_lds_fminmax_dispatcher);
+                    return copy_scope.emit_barrier_phase(
+                        begin, end, safe, rt, allow_exec_update, allow_smem, exp_fn,
+                        initial_dispatch_active, force_lds_fminmax_dispatcher, &barrier_halves);
                 return emit_body(b, rs, phase, safe, rt, allow_exec_update, allow_smem,
                                  exp_fn, code, dwords, &dead_masks, true, 0, false,
                                  force_lds_fminmax_dispatcher);
@@ -5862,7 +5784,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                         std::fprintf(stderr, "[compute-phase] begin=%u end=%u barrier=%u\n",
                                      phase.front().pc, phase[phase.size() - 2].pc,
                                      ins[barrier_index].pc);
-                    if (!emit_phase(phase)) {
+                    if (!emit_phase(phase, phase_begin, barrier_index)) {
                         log_recompile_diagnostic(
                             b.diagnostic, "compute-phase-reject", "consequent",
                             "begin=%u end=%u", phase.front().pc, phase[phase.size() - 2].pc);
@@ -5877,7 +5799,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 if (getenv("PROSPER_DBG"))
                     std::fprintf(stderr, "[compute-phase] begin=%u end=%u tail=1\n",
                                  tail.front().pc, tail.back().pc);
-                if (!emit_phase(tail)) {
+                if (!emit_phase(tail, phase_begin, ins.size())) {
                     log_recompile_diagnostic(b.diagnostic, "compute-phase-reject", "consequent",
                                              "begin=%u end=%u tail=1",
                                              tail.front().pc, tail.back().pc);
@@ -6421,7 +6343,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             // exit-iteration refinement is intentionally omitted for it.
             else if (pr.dom == 2) {
                 rs.scc = pr.phi;
-                if (b.wave_size == 32) {
+                if (b.wave_size == 32 || rs.track_scc_definition) {
                     // This path publishes the header phi, not the fresh check predicate.
                     rs.scc_merge_placeholder = true;
                     rs.scc_loop_blanket.clear();
@@ -7114,7 +7036,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     rs.sreg[pr.reg] = merged;
                 } else if (pr.dom == 2) {
                     rs.scc = merged;
-                    if (b.wave_size == 32) {
+                    if (b.wave_size == 32 || rs.track_scc_definition) {
                         rs.scc_merge_placeholder = check_marks.scc;
                         rs.scc_loop_blanket = check_marks.scc_blanket;
                         if (L.direct_exec_breaks || L.direct_wave_breaks) {
@@ -7424,4 +7346,4 @@ namespace {
 
 } // namespace
 
-} // namespace prosper::gpu
+}   // namespace prosper::gpu

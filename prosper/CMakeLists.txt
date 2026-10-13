@@ -265,6 +265,17 @@ prosper_add_gtest(test_compute_buffer_diff_span
   INCLUDES frontends src
   LIBRARIES Threads::Threads)
 
+# Fresh processes pin a ragged five-worker split and an aligned eight-worker control. The
+# conversion-thread setting is cached on first use, so changing it within a test is insufficient.
+foreach(worker_count IN ITEMS 5 8)
+  gtest_discover_tests(test_compute_buffer_diff_span
+    TEST_PREFIX "ComputeWorkers${worker_count}/"
+    TEST_FILTER "ComputeBuffer*"
+    TEST_LIST "test_compute_buffer_diff_span_${worker_count}_TESTS"
+    DISCOVERY_MODE PRE_TEST DISCOVERY_TIMEOUT 60
+    PROPERTIES LABELS unit ENVIRONMENT "PROSPER_COMPUTE_CONVERSION_THREADS=${worker_count}")
+endforeach()
+
 # Standard-library-only host lifetime guard: no core/GPU/game and no scratch/export opt-out.
 add_executable(test_native_tls_lifetime tests/host/platform/test_native_tls_lifetime.cpp)
 target_link_libraries(test_native_tls_lifetime PRIVATE Threads::Threads)
@@ -2377,6 +2388,9 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_tile
     SOURCES tests/gpu/texture/test_tile.cpp
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_volume_chain_upload
+    SOURCES tests/gpu/texture/test_volume_chain_upload.cpp
+    LIBRARIES prosper_core)
   add_test(NAME gpu_surface_detile_gather COMMAND test_tile)
   set_tests_properties(gpu_surface_detile_gather PROPERTIES
                        ENVIRONMENT "PROSPER_NO_PAIRED_AVX2_DETILE=1")
@@ -2472,6 +2486,18 @@ if(TARGET prosper_core)
   # privacy reads a deterministic default.
   prosper_add_gtest(test_syssvc_usersvc
     SOURCES tests/hle/service/test_syssvc_usersvc.cpp
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_loadexec
+    SOURCES tests/hle/service/test_loadexec.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_process_replace
+    SOURCES tests/host/platform/test_process_replace.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_loadexec_options
+    SOURCES tests/host/platform/test_loadexec_frontend.cpp frontends/prosper-app/loadexec.cpp
+    INCLUDES tests frontends/prosper-app
     LIBRARIES prosper_core)
 
   # Includes a shared fixture, which resolves from the `tests` root.
@@ -2585,8 +2611,45 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_compute_scalar_pair_mask.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_vertex_vcc_scalar_lifetime
+    SOURCES tests/gpu/recompiler/test_vertex_vcc_scalar_lifetime.cpp
+    INCLUDES src tests/gpu/recompiler
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_fragment_scalar_vcc_pair
+    SOURCES tests/gpu/recompiler/test_fragment_scalar_vcc_pair.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_vector_scalar_provenance
     SOURCES tests/gpu/recompiler/test_vector_scalar_provenance.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_fresh_mask_exec_confinement
+    SOURCES tests/gpu/recompiler/test_fresh_mask_exec_confinement.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_wave32_mask_scc
+    SOURCES tests/gpu/recompiler/test_wave32_mask_scc.cpp
+    LIBRARIES prosper_core
+    INCLUDES tests
+  )
+  prosper_add_gtest(test_saved_exec_data
+    SOURCES tests/gpu/recompiler/test_saved_exec_data.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_flat_active_word
+    SOURCES tests/gpu/recompiler/test_flat_active_word.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_active_image_word_definedness
+    SOURCES tests/gpu/recompiler/test_active_image_word_definedness.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_complementary_exec_data
+    SOURCES tests/gpu/recompiler/test_complementary_exec_data.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_saved_complement_data
+    SOURCES tests/gpu/recompiler/test_saved_complement_data.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
   prosper_add_gtest(test_wave32_word_provenance
@@ -2627,6 +2690,14 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_module_entry_abi
     SOURCES tests/host/image/test_module_entry_abi.cpp
     INCLUDES src
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_process_arguments
+    SOURCES tests/hle/kernel/test_process_arguments.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_process_entry
+    SOURCES tests/host/image/test_process_entry.cpp
+    INCLUDES src tests
     LIBRARIES prosper_core)
   prosper_add_gtest(test_support_modules
     SOURCES tests/loader/test_support_modules.cpp
@@ -3086,6 +3157,10 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_wait_barrier
     SOURCES tests/gpu/pm4/test_wait_barrier.cpp
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_acb_wait_regmem
+    SOURCES tests/gpu/pm4/test_acb_wait_regmem.cpp
+    LIBRARIES prosper_core
+    ENVIRONMENT PROSPER_WAIT_DEFER=0 PROSPER_EOP_WRITE_SYNC=0)
   add_executable(test_wait_regmem_observation tests/diagnostics/test_wait_regmem_observation.cpp)
   target_link_libraries(test_wait_regmem_observation PRIVATE prosper_core)
   add_test(NAME wait_regmem_observation COMMAND test_wait_regmem_observation
@@ -3213,6 +3288,9 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_shader_source_window
     SOURCES tests/gpu/execute/test_shader_source_window.cpp
     INCLUDES tests
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_terminal_tail_retention
+    SOURCES tests/gpu/execute/test_terminal_tail_retention.cpp
     LIBRARIES prosper_core)
   # Cache switches are process-cached. These distinct processes exercise the actual bypass paths.
   foreach(source_policy IN ITEMS analysis_off decode_off both_off)
@@ -3436,6 +3514,11 @@ if(TARGET prosper_core)
       INCLUDES tests
       LIBRARIES prosper_core Vulkan::Vulkan
       PROPERTIES TIMEOUT 60)
+    prosper_add_gtest(test_rdna2_synthetic_values
+      SOURCES tests/gpu/execute/test_rdna2_synthetic_values.cpp
+      INCLUDES tests
+      LIBRARIES prosper_core Vulkan::Vulkan
+      PROPERTIES TIMEOUT 60)
     prosper_add_gtest(test_wave64_exchange_execution
       SOURCES tests/gpu/execute/test_wave64_exchange.cpp
       INCLUDES tests
@@ -3518,6 +3601,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_native_saved_vcc_copy_demand.cpp
     INCLUDES src tests/gpu/recompiler
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_ngg_saved_vcc_copy_demand
+    SOURCES tests/gpu/recompiler/test_ngg_saved_vcc_copy_demand.cpp
+    INCLUDES src tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_fragment_saved_vcc_copy_demand
     SOURCES tests/gpu/recompiler/test_fragment_saved_vcc_copy_demand.cpp
     INCLUDES src tests tests/gpu/recompiler
@@ -3557,6 +3644,14 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_recompile_diagnostic_attempt
     SOURCES tests/gpu/recompiler/test_recompile_diagnostic_attempt.cpp
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_native_barrier_mask_halves
+    SOURCES tests/gpu/recompiler/test_native_barrier_mask_halves.cpp
+    INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_fragment_fixture_inputs
+    SOURCES tests/gpu/recompiler/test_fragment_fixture_inputs.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_saved_mask_words
     SOURCES tests/gpu/recompiler/test_saved_mask_words.cpp
     INCLUDES tests
@@ -3567,6 +3662,18 @@ if(TARGET prosper_core)
     LIBRARIES prosper_core)
   prosper_add_gtest(test_portable_mask_half
     SOURCES tests/gpu/recompiler/test_portable_mask_half.cpp
+    INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_portable_mask_slots
+    SOURCES tests/gpu/recompiler/test_portable_mask_slots.cpp
+    INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_portable_mask_common
+    SOURCES tests/gpu/recompiler/test_portable_mask_common.cpp
+    INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_portable_mask_dispatch
+    SOURCES tests/gpu/recompiler/test_portable_mask_dispatch.cpp
     INCLUDES tests tests/gpu/recompiler
     LIBRARIES prosper_core)
   prosper_add_gtest(test_native_mask_participation
@@ -3605,6 +3712,9 @@ if(TARGET prosper_core)
     LIBRARIES prosper_core)
 
   # Scalar const-fold interpreter behind bindless-dynamic vertex-fetch resolution (no Vulkan needed).
+  prosper_add_gtest(test_integer_format_store
+    SOURCES tests/gpu/recompiler/test_integer_format_store.cpp
+    LIBRARIES prosper_core)
   add_executable(test_dynfetch_fold tests/gpu/recompiler/test_dynfetch_fold.cpp)
   # Includes a shared fixture, which resolves from the `tests` root.
   target_include_directories(test_dynfetch_fold PRIVATE tests)
@@ -3752,6 +3862,15 @@ endif()
   prosper_add_gtest(test_scc_branch_uniformity
     SOURCES tests/gpu/recompiler/test_scc_branch_uniformity.cpp
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_compute_coverage_inputs
+    SOURCES tests/gpu/recompiler/test_compute_coverage_inputs.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+
+  prosper_add_gtest(test_scalar_condition_preservation
+    SOURCES tests/gpu/recompiler/test_scalar_condition_preservation.cpp
+    LIBRARIES prosper_core)
+
   prosper_add_gtest(test_s_movrels_read_range
     SOURCES tests/gpu/recompiler/test_s_movrels_read_range.cpp
     LIBRARIES prosper_core)
@@ -7084,6 +7203,7 @@ if(PROSPER_APP AND TARGET SDL3::SDL3)
     endif()
 
     add_executable(prosper-app frontends/prosper-app/main.cpp frontends/prosper-app/library_ui.cpp
+                               frontends/prosper-app/loadexec.cpp
                                frontends/prosper-app/library_media.cpp
                                frontends/prosper-app/fps_overlay.cpp)
     prosper_hosts_a_guest(prosper-app)

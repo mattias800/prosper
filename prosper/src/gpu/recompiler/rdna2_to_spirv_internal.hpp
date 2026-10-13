@@ -5,6 +5,7 @@
 #include "gpu/recompiler/compiler_resource_access.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include "gpu/recompiler/rdna2_diagnostic_attempt.hpp"
+#include "gpu/recompiler/rdna2_portable_mask_slots.hpp"
 
 // Lifted out of rdna2_to_spirv.cpp's anonymous namespaces so the emit functions that
 // operate on them can live in their own translation units. These are INTERNAL to the
@@ -410,6 +411,10 @@ enum class PhysicalExecutionDomain { Invocation, Workgroup };
 enum class GuestWaveEventDomain { None, Owned64 };
 
 struct SpirvCompute {
+    std::shared_ptr<const PortableMaskHalfProgram> portable_mask_half_program;
+    // Producing exact-extent configuration may pad a workgroup with absent guest invocations.
+    // A common symbolic-half read cannot derive their scalar bits from physical workers.
+    bool portable_mask_common_partial_entry = false;
     // Guest semantics and physical synchronization ownership are separate. The legacy is_*
     // booleans select the existing physical stage shells; a packet is guest Fragment while its
     // physical shell is GLCompute. Never set both legacy compute and fragment flags.
@@ -678,9 +683,9 @@ struct SpirvCompute {
     std::set<uint32_t> saved_mask_reconverged_entry_pcs;
     // Separate routing-uniform/genuine-DATA proof for original complete native single-wave loops.
     std::set<uint32_t> native_participating_mask_pcs;
-    // Current numeric MOV-to-VCC sources are uniform on every original incoming path.
+    // Current numeric MOV-to-VCC/EXEC sources are uniform on every original incoming path.
     // This is independent of physical word availability and never re-seeded by a reload.
-    std::set<uint32_t> native_uniform_numeric_vcc_move_pcs;
+    std::set<uint32_t> native_uniform_numeric_mask_move_pcs;
     std::vector<uint64_t> native_participation_entry_state;
     uint32_t native_mask_runtime_write_pc = UINT32_MAX;
     bool saved_mask_in_dispatcher = false;
@@ -694,6 +699,8 @@ struct SpirvCompute {
     // Original invocation-domain fragment mask generations with no physical DATA live-out.
     // Register-wide demand from another generation cannot require these producers' words.
     std::set<uint32_t> fragment_bool_only_saved_mask_pcs;
+    // Native NGG copies preserve only the same current whole-mask predicate generation.
+    std::set<uint32_t> ngg_bool_only_vcc_copy_pcs;
     std::array<uint32_t, 10> native_vcc_copy_entry_domain{};
     std::shared_ptr<SavedMaskCopyFrame> saved_mask_copy_frame;
     uint64_t saved_mask_copy_revocation_epoch = 0;
@@ -2978,8 +2985,10 @@ struct RegState;
 void seed_smem_pointer_provenance(RegState& rs, const std::vector<Rdna2Inst>& ins);
 
 struct RegState {
+    PortableMaskHalfTypes portable_mask_half_types;
     std::unordered_map<int, uint32_t> vreg, sreg;
     VectorWordMarks vreg_source_marks;
+    MimgSourceProof mimg_sources;
     bool vector_full_exec =
         false;   // provenance fact; dispatcher runtime predication stays enabled
     bool vector_native_interpolation = false;
@@ -3056,6 +3065,9 @@ struct RegState {
     // s_cselect/s_cmov/s_addc/s_subb carries the mark into its destination even with clean
     // explicit sources.
     bool scc_merge_placeholder = false;
+    // Scoped Wave64 fragment scalar-VCC admission needs an actual SCC producer, just as Wave32
+    // does. Other Wave64 paths retain their established entry/condition policy.
+    bool track_scc_definition = false;
     std::set<uint64_t> scc_loop_blanket;
     int max_vgpr = 0;          // highest statically referenced VGPR in this shader
     // Immutable raw user-data words for DIRECT descriptors. They stay absent from `sreg` so
@@ -3155,6 +3167,10 @@ struct RegState {
     bool reads_scc = false;
     uint32_t exec = 0;         // per-lane execution mask (bool); v_cmpx narrows it, output store honors it
     bool exec_narrowed = false; // true once EXEC is narrowed below all-lanes-on (so VGPR writes predicate)
+    // Lane-set facts about EXEC SSA values: child -> superset it was derived from (v_cmpx computes
+    // EXEC = EXEC & cmp). Each entry is a fact about one immutable SSA value, so it holds on every
+    // path that reaches that value.
+    std::map<uint32_t, uint32_t> exec_subset_of;
     // PC-relative EMBEDDED TABLES (#273): load pc -> the table's dwords, resolved by
     // detect_pcrel_tables (an s_getpc_b64-derived V# whose num_records is a known constant). The
     // shader BLOB carries the table; the recompiler folds it into a compile-time constant lookup.
@@ -3502,6 +3518,9 @@ struct LoopBlanketCheck {
     // The carried words defined on the preheader edge, each with the enclosing assumptions its
     // preheader value already depends on (empty when it is plainly defined).
     std::map<int, std::set<uint64_t>> carried;
+    // Hard vector words whose missing lanes lie outside this preheader EXEC domain. Their header
+    // reads remain conditional on each back edge defining the same domain, not just the same ID.
+    std::map<int, uint32_t> confined;
     uint32_t header_pc = 0;
     template <class Registers>
     LoopBlanketCheck(const RegState& rs, const Registers& registers, uint32_t header)
@@ -3528,8 +3547,12 @@ struct LoopBlanketCheck {
                 const uint64_t root = blanket_root(header_pc, entry.first);
                 const auto back = carried_word_marks(rs, entry.first);
                 if (violated.contains(root) || !back.placeholder) continue;
-                const bool held =
-                    !back.hard && std::none_of(back.blanket_roots.begin(), back.blanket_roots.end(),
+                const auto owner = confined.find(entry.first);
+                const bool domain_held =
+                    !back.hard || (owner != confined.end() &&
+                                   vector_word_defined_in_exec(rs, back, owner->second));
+                const bool held = domain_held &&
+                                  std::none_of(back.blanket_roots.begin(), back.blanket_roots.end(),
                                                [&](uint64_t r) { return violated.contains(r); });
                 if (!held) grew = violated.insert(root).second || grew;
             }
@@ -3551,6 +3574,7 @@ struct LoopBlanketCheck {
                 if (invalid(source.blanket_roots)) {
                     source.blanket_roots.clear();
                     source.hard = true;
+                    source.outside_exec = 0;
                 }
         };
         sanitize(exits.blanket, exits.vectors);
@@ -3577,7 +3601,7 @@ struct LoopBlanketCheck {
 template <class Registers>
 void mark_loop_carried(RegState& rs, const Registers& carried, const std::vector<Rdna2Inst>& ins,
                        uint32_t lo, uint32_t hi, LoopBlanketCheck& blanket) {
-    mark_vector_loop_carried(rs, ins, lo, hi, blanket.carried);
+    mark_vector_loop_carried(rs, ins, lo, hi, blanket.carried, blanket.confined);
     // A full preheader does not prove a full backedge. Clear the independent proof; ordinary
     // entry-iteration full writes still follow exec_narrowed and initialize their old generation.
     for (const auto& in : ins)
@@ -3681,7 +3705,9 @@ inline void expire_saved_b64_mask(RegState& rs, const SavedB64MaskSnapshot& befo
         if (root != reg && !rs.native_saved_mask_words &&
             (!before.portable_numeric_replacement || mask_slot_reload))
             continue;
-        if (root < 0 || root > 105 || root == preserved_pair) continue;
+        if (root < 0 || root > 105 || root == preserved_pair ||
+            (root != reg && rs.portable_mask_half_types.words.contains(root)))
+            continue;
         const auto mask = rs.sreg_bool.find(root);
         if (mask == rs.sreg_bool.end() || rs.sreg_bool_b32.contains(root)) continue;
         bool stale = false;
@@ -4017,7 +4043,7 @@ inline void propagate_merge_placeholder(RegState& rs, const Rdna2Inst& in,
     const bool move_preserves_scc =
         in.fmt == Rdna2Format::SOP1 &&
         (in.opcode == kSop1OpcodeMovB32 || in.opcode == kSop1OpcodeMovB64);
-    if (rs.vector_wave_size == 32) {
+    if (rs.vector_wave_size == 32 || rs.track_scc_definition) {
         record_wave32_scalar_condition(rs, in, marks);
         return;
     }
@@ -4142,6 +4168,10 @@ inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,
         // it, so a Bool there now is this instruction's. See expire_saved_b64_mask.
         const bool publishes_reloaded_mask = in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360 &&
                                              base == in.dst.value && rs.sreg_bool.contains(base);
+        const bool publishes_portable_half =
+            rs.portable_mask_half_types.words.contains(base) &&
+            (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360 ||
+             in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB32);
         // Wave32 compute (the only stage the VCC bridge flag admits): every mask is one word, so a
         // mask reloaded into a register that held a B32 mask stays one. Dropping the marker here
         // also dropped the Bool, and a data read then took the untracked SGPR's silent 0 (#4607).
@@ -4152,9 +4182,11 @@ inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,
             const int reg = base + static_cast<int>(word);
             if (!publishes_wave64_mask_half || reg != base) {
                 expire_wave64_mask_half(rs, reg, writes_b64_mask ? base : -1);
-                expire_saved_b64_mask(rs, saved_b64_masks_before, reg,
-                                      writes_b64_mask || publishes_reloaded_mask ? base : -1,
-                                      publishes_reloaded_mask);
+                expire_saved_b64_mask(
+                    rs, saved_b64_masks_before, reg,
+                    writes_b64_mask || publishes_reloaded_mask || publishes_portable_half ? base
+                                                                                          : -1,
+                    publishes_reloaded_mask);
             }
             if (!rs.sreg_bool_b32.contains(reg) ||
                 ((writes_b32_mask || keeps_b32_reload) && reg == base))
@@ -4206,6 +4238,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
 // default arguments are stated here and nowhere else.
 struct PacketVgprDefinedness;
 struct FragmentPacketMaskRequirements;
+class NativeBarrierHalfProof;
 bool emit_cfg_state_machine(
     SpirvCompute& b, RegState& initial, const std::vector<Rdna2Inst>& ins,
     const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt, bool allow_exec_update,
@@ -4214,7 +4247,8 @@ bool emit_cfg_state_machine(
     bool synchronize_lds_fminmax = false,
     const std::function<int(RegState&, const Rdna2Inst&)>& packet_instruction = {},
     PacketVgprDefinedness* packet_definedness = nullptr,
-    const FragmentPacketMaskRequirements* packet_masks = nullptr);
+    const FragmentPacketMaskRequirements* packet_masks = nullptr,
+    NativeBarrierHalfProof* barrier_halves = nullptr);
 
 bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                const std::unordered_set<uint32_t>& safe, const ShaderResourceTable* rt,

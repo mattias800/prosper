@@ -1102,6 +1102,7 @@ void register_builtin_hle() {
     #undef R
     register_file_hle();     // file I/O (stdio + POSIX, /app0 translation)
     register_service_hle();  // PS5 system services (user/NP/mouse/appcontent/dialog)
+    register_loadexec_hle();   // real process replacement; frontend backend required
     register_avplayer_hle();  // libSceAvPlayer, split out of hle_service.cpp (#3735)
     register_videodec_hle();  // libSceVideodec2 / libSceVdecsw / libScePsml (#3735)
     register_ime_hle();       // libSceIme + libSceImeDialog (#3735)
@@ -1124,6 +1125,7 @@ void register_builtin_hle() {
     register_agc_hle();      // real AGC Dcb functions (override the glog stubs for Dcb NIDs)
     register_agc_getsize_hle();   // fixed-size sceAgc*GetSize answers measured on a console
     register_kernel_hle();   // libkernel primitives (pthread/sync/...)
+    register_process_arguments_hle();   // cached process entry argc/argv
 }
 
 } // namespace prosper

@@ -5,6 +5,7 @@
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include "gpu/recompiler/storage_dst_sel.hpp"
 #include "gpu/recompiler/rdna2_dot.hpp"
 #include "gpu/recompiler/rdna2_dpp_row_shr.hpp"
@@ -38,6 +39,7 @@
 #include <unordered_set>
 #include <vector>
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include "gpu/recompiler/rdna2_portable_mask_slots.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
 #include "gpu/recompiler/rdna2_native_launch.hpp"
@@ -251,6 +253,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
     };
     // SDWA/DPP forms carry a sub-dword select or cross-lane control word we don't model. The decoder
     // flags them (and gets their length right); reject here rather than compute with a wrong operand.
+    PortableMaskHalfInstruction portable_halves(b, rs, in, ok);
+    if (!ok || portable_halves.handled()) return true;
     VccMaskViewDrop drop(rs);   // takes VCC's lane view away at exit when armed
     if (refuse_mask_write(b, rs, in, drop, ok) || emit_exec_cmov(b, rs, in, ok)) return true;
     switch (in.fmt) {
@@ -1013,7 +1017,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (is_exec(in.dst)) {   // set/restore EXEC
                         ok = emit_s_mov_b64_exec(b, rs, in);
                     } else {   // s_mov_b64 sDST, <mask-or-data> : save a mask / copy a pair
-                        uint32_t m = s_mov_b64_numeric_vcc_bit(b, rs, in);
+                        uint32_t m = s_mov_b64_numeric_mask_bit(b, rs, in);
                         if (!m) m = src_mask(in.src[0]);
                         if (m && !validate_saved_mask_copy_words(b, rs, in)) {
                             ok = false;
@@ -1095,6 +1099,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                             : in.opcode == 0x2b ? b.logical_not(xor_em)     // XNOR
                             : in.opcode == 0x37 ? b.land(old_exec, nm)      // GFX10 ANDN1_SAVEEXEC
                                                 : b.lor(old_exec, nm);      // GFX10 ORN1_SAVEEXEC
+                    if (in.opcode == 0x24 || in.opcode == 0x25 || in.opcode == 0x27 ||
+                        in.opcode == 0x37)
+                        record_exec_mask_subset(rs, rs.exec, in.opcode == 0x27 ? m : old_exec,
+                                                in.opcode == 0x27 ? old_exec : m,
+                                                in.opcode == 0x24   ? 0x0f
+                                                : in.opcode == 0x25 ? 0x11
+                                                                    : 0x15,
+                                                old_exec);
                     // Every non-trivial mask expression may be narrower than full EXEC. Two self
                     // identities are exactly all-on and must clear the flag or a later forward
                     // EXECZ guard is conservatively (and incorrectly) rejected.
@@ -1490,8 +1502,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             const bool gtav_wave32_vcchi_scalar_packet =
                 allows_compute_scalar_vcc_bridge(b) && b.native_subgroup_size == 32 &&
                 is_gtav_wave32_vcchi_scalar_packet(in);
-            if (b.is_compute && b.wave_size == 64 && in.opcode == 0x0a &&
-                in.dst.kind == OperandKind::SGPR && in.dst.value == 106) {
+            if ((b.is_compute || (b.is_fragment && !b.vcc_b32_low_only_pcs.contains(in.pc) &&
+                                  (is_wave64_vcc_lo_scalar_cselect(in) ||
+                                   is_wave64_vcc_lo_cselect_reading_vcc_hi(in)))) &&
+                b.wave_size == 64 && in.opcode == 0x0a && in.dst.kind == OperandKind::SGPR &&
+                in.dst.value == 106) {
                 // A B32 write leaves Wave64 VCC_HI untouched, so the resulting mixed physical pair
                 // can remain in the architectural mask domain only when the dispatcher proves that
                 // sibling is scalar data at this exact PC. Otherwise admit only a whole-stream
@@ -1499,11 +1514,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const bool path_local_scalar_pair =
                     rs.scalar_presence_has_no_placeholders && rs.sreg.contains(107);
                 const bool complete_scalar_pair =
-                    path_local_scalar_pair || b.vcc_b32_scalar_pair_pcs.contains(in.pc);
+                    b.is_fragment
+                        ? vcc_b32_scalar_pair_defined(b, rs, in)
+                        : path_local_scalar_pair || b.vcc_b32_scalar_pair_pcs.contains(in.pc);
                 if ((!is_wave64_vcc_lo_scalar_cselect(in) &&
                      !(complete_scalar_pair && rs.sreg.contains(107) &&
                        is_wave64_vcc_lo_cselect_reading_vcc_hi(in))) ||
-                    (!complete_scalar_pair && !b.vcc_b32_low_only_pcs.contains(in.pc)) || !rs.scc) {
+                    (!complete_scalar_pair && !b.vcc_b32_low_only_pcs.contains(in.pc)) || !rs.scc ||
+                    (b.is_fragment && !scalar_condition_source_defined(b, rs))) {
                     ok = false; return true;
                 }
                 const uint32_t selected = b.sel(
@@ -2099,11 +2117,19 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     ok = false;
                     return true;
                 }
-                if (is_exec(in.dst)) { rs.exec = r; rs.exec_narrowed = true; }
-                else if (in.dst.value == 106 || in.dst.value == 107) { rs.vcc = r; rs.sreg_bool_narrowed[in.dst.value] = true;
-                                                                       mask_write_clobbers_pair(rs, in.dst.value); }
-                else { rs.sreg_bool[in.dst.value] = r; rs.sreg_bool_narrowed[in.dst.value] = true;
-                       mask_write_clobbers_pair(rs, in.dst.value); }
+                if (is_exec(in.dst)) {
+                    record_exec_mask_subset(rs, r, m0, m1, in.opcode, rs.exec);
+                    rs.exec = r;
+                    rs.exec_narrowed = true;
+                } else if (in.dst.value == 106 || in.dst.value == 107) {
+                    rs.vcc = r;
+                    rs.sreg_bool_narrowed[in.dst.value] = true;
+                    mask_write_clobbers_pair(rs, in.dst.value);
+                } else {
+                    rs.sreg_bool[in.dst.value] = r;
+                    rs.sreg_bool_narrowed[in.dst.value] = true;
+                    mask_write_clobbers_pair(rs, in.dst.value);
+                }
                 if (words[0] && words[1]) {
                     rs.sreg[in.dst.value] = words[0];
                     rs.sreg[in.dst.value + 1] = words[1];
@@ -2301,6 +2327,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     }
                 };
                 const bool complete_scalar_pair = vcc_b32_scalar_pair_defined(b, rs, in);
+                // Snapshot source authority before an in-place write replaces VCC or SCC. The
+                // shared Special-word check omits physical words unavailable in this domain.
+                const auto unavailable = [&](const Operand& source) {
+                    return (source.kind == OperandKind::SGPR ||
+                            source.kind == OperandKind::Special) &&
+                           rs.unavailable_saved_mask_words.contains(source.value);
+                };
+                const bool current_data_sources = b32_sources_defined(rs, in) &&
+                                                  !unavailable(in.src[0]) &&
+                                                  !unavailable(in.src[1]);
                 const bool has_proven_scalar_sources = has_scalar_data(in.src[0]) &&
                                                        has_scalar_data(in.src[1]) &&
                                                        vcc_b32_scalar_write_proven(b, rs, in);
@@ -2322,14 +2358,20 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     rs.sreg[in.dst.value] = result;
                     rs.sreg_srt.erase(in.dst.value);
                     rs.scc = b.ucmp(Op_INotEqual, result, b.uconst(0));
+                    // Current vertex DATA need not recreate a retired wave predicate. Preserve
+                    // genuine scalar arithmetic; later mask consumers still need their own proof.
+                    if (b.is_vertex && !b.ngg_one_lane && !rs.vcc && !complete_scalar_pair &&
+                        current_data_sources) {
+                        drop_vcc_mask_view(rs);
+                        return true;
+                    }
                     const bool writes_hi = in.dst.value == 107;
                     // A whole-CFG proof can establish that this physical VCC word is scalar data
                     // only: the untouched sibling dies before any mask-domain read. Do not ask for
                     // a guest lane merely to manufacture a predicate that no later instruction can
-                    // observe. Vertex emission has a separate one-lane virtual-wave contract, so
-                    // this applies only to fragment and compute stages.
-                    const bool scalar_low_only = (b.is_fragment || b.is_compute) &&
-                        b.vcc_b32_low_only_pcs.contains(in.pc);
+                    // observe. This also covers vertex scalar scratch after an ordinary DATA
+                    // write has retired the old predicate; no lane-mask value is manufactured.
+                    const bool scalar_low_only = b.vcc_b32_low_only_pcs.contains(in.pc);
                     if (b.wave_size != 32 && scalar_low_only) {
                         rs.vcc = 0;
                         rs.sreg_bool.erase(106);
@@ -2446,6 +2488,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // 32-bit scalar DATA writes into EXEC halves are rejected (see the SOP1 uint path).
             if (in.dst.value == 126 || in.dst.value == 127) { ok = false; return true; }
             uint32_t a = val(in.src[0]), c = val(in.src[1]); uint32_t& d = rs.sreg[in.dst.value];
+            // Capture both operands before ending the old physical-word mask lifetime. These
+            // ordinary DATA writers are separate from the dedicated mask producers above.
+            retire_scalar_data_word_mask(rs, in.dst.value);
             auto scc_nz = [&](uint32_t v){ rs.scc = b.ucmp(Op_INotEqual, v, b.uconst(0)); };  // SCC = (result != 0)
             switch (in.opcode) {
                 case 0x00: d = b.ibin(Op_IAdd, a, c); rs.scc = b.ucmp(Op_ULessThan, d, a); break;  // s_add_u32 (SCC=carry)
@@ -4142,7 +4187,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // v_add_co_ci reading VCC got the compare mask instead of the real predicate (#464).
                     // EXEC suppresses inactive vector comparisons. Select masks an unselected
                     // comparison's poison; strict OpLogicalAnd would propagate it into EXEC.
+                    const uint32_t exec_before = rs.exec;
                     rs.exec = b.bsel(rs.exec, cmp, b.bfalse()); rs.exec_narrowed = true;
+                    rs.exec_subset_of[rs.exec] = exec_before;   // EXEC' = EXEC & cmp
                 } else {
                     // ISA 3.9: "VCC[n] = EXEC[n] & (test passed for thread n)" — a lane inactive in
                     // EXEC gets its mask bit forced to 0, never the raw test result. Masking at the
@@ -7023,10 +7070,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // share a dword), but atomicAnd(clear field)+atomicOr(set field) COMMUTE across lanes
                 // writing DISJOINT fields, so the store is race-free. Requires the field to lie within
                 // a single dword: address comp_bytes-aligned, no runtime per-lane byte offset.
-                bool soff_zero = (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
-                                 (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
+                bool soff_zero =
+                    (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
+                    (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
                 if (is_store && int_subword && !offen && !dyn_vfetch &&
-                    (offset % comp_bytes) == 0 && (!idxen || (stride % comp_bytes) == 0) && soff_zero)
+                    (offset % comp_bytes) == 0 && (!idxen || (stride % comp_bytes) == 0) &&
+                    soff_zero)
                     dyn_int_store = true;
                 if (!base_aligned) {
                     // Float16 format loads use the complete runtime byte address for every requested
@@ -7508,7 +7557,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             const uint32_t SQ_DIM_2D = 1u;
             const uint32_t SQ_DIM_3D = 2u;
             const uint32_t SQ_DIM_2D_ARRAY = 5u;   // (x, y, layer) -- #2265
-            auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
+            begin_mimg_source_proof(rs, in.pc);
+            auto vread = [&](int r) { return read_mimg_source_word(b, rs, r); };
 
             // IMAGE_BVH_INTERSECT_RAY (GFX10 opcode 0xe6) has an image encoding but consumes a
             // four-dword BVH descriptor and eleven NSA VGPR operands. Vulkan ray-query support is
@@ -7542,11 +7592,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     return true;
                 }
 
-                auto addr_vgpr = [&](uint32_t k) -> int {
-                    if (k == 0u) return in.src[0].value;
-                    const uint32_t j = k - 1u;
-                    return static_cast<int>((in.words[2u + j / 4u] >> (8u * (j % 4u))) & 0xffu);
-                };
+                auto addr_vgpr = [&](uint32_t k) { return mimg_address_vgpr(rs, in, k); };
                 uint32_t a[11]{};
                 for (uint32_t k = 0; k < 11; ++k) a[k] = vread(addr_vgpr(k));
 
@@ -8168,13 +8214,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 // Non-NSA coords follow VADDR; NSA coord0=VADDR, coord k>=1 is byte (k-1) of
                 // words[2..3] (dword2=addr1..4, dword3=addr5..8), verified via llvm-mc gfx1010.
-                const bool nsa = in.len_dwords > 2;
-                int va = in.src[0].value;
-                auto coord_vgpr = [&](uint32_t k) -> int {
-                    if (!nsa || k == 0) return va + (nsa ? 0 : (int)k);
-                    uint32_t j = k - 1;
-                    return (int)((in.words[2 + j / 4] >> (8 * (j % 4))) & 0xFFu);
-                };
+                auto coord_vgpr = [&](uint32_t k) { return mimg_address_vgpr(rs, in, k); };
                 uint32_t coords[3] = {0, 0, 0};
                 for (uint32_t k = 0; k < ncoord; k++) coords[k] = vread(coord_vgpr(k));
                 uint32_t sample = ms ? vread(coord_vgpr(ncoord)) : 0;   // MSAA sample index = coord after the spatial ones
@@ -8593,9 +8633,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 ok = false;
                 return true;
             }
-            int va = in.src[0].value;
-            auto cvg = [&](uint32_t k) -> int { if (!nsa || k == 0) return va + (nsa ? 0 : (int)k);
-                uint32_t j = k - 1; return (int)((in.words[2 + j / 4] >> (8 * (j % 4))) & 0xFFu); };
+            auto cvg = [&](uint32_t k) { return mimg_address_vgpr(rs, in, k); };
             uint32_t out[4];
             if (dimcube) {
                 // Cube-processed coordinates encode face selection and a normalized in-face pair;
@@ -8645,8 +8683,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             } else if (dim3d) {
                 // 3D: implicit-LOD / explicit-LOD / LOD-0 sample, or an integer texel FETCH
                 // (image_load — DOLL's color-grade 3D LUT, #273). Explicit LOD lowers with the
-                // guest level, as the 2D path does: a single-level view's image has one mip, so
-                // a nonzero LOD can only address what the view selected (#4814).
+                // guest level, as the 2D path does: a single-level view's image holds one mip,
+                // so a nonzero LOD clamps to the selected level, while a materialized chain
+                // addresses each declared level (#4842). Integer FETCH out-of-range semantics
+                // stay distinct from sampling clamps.
                 if (!is_sample && !is_sample_l && !is_sample_lz && !is_load) {
                     ok = false;
                     return true;

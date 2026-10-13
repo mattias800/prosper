@@ -195,7 +195,12 @@ class FakeGh:
 
 GREEN_CHECKS = '[{"name": "Windows App", "bucket": "pass", "state": "S"}]'
 RED_CHECKS = '[{"name": "Windows MinGW", "bucket": "fail", "state": "F"}]'
-VIEW = '{"headRefOid": "aaaa1111", "headRefName": "topic"}'
+HEAD_REPOSITORY = "https://github.com/review-fixture/prosper.git"
+VIEW = json.dumps({
+    "headRefOid": "aaaa1111", "headRefName": "topic",
+    "headRepository": {"name": "prosper"},
+    "headRepositoryOwner": {"login": "review-fixture"},
+})
 
 
 def run_main(fake, argv=("1",)):
@@ -252,6 +257,79 @@ def run_main_capture(fake, argv):
     finally:
         pr_merge_gate._run = real
     return rc, buf.getvalue()
+
+
+class RepositoryGh(FakeGh):
+    """Model distinct target and head repositories, including an origin decoy."""
+
+    def __init__(self, head_output=LS_ONE, origin_output="", view=VIEW):
+        super().__init__(GREEN_CHECKS, view, head_output)
+        self.origin_output = origin_output
+        self.commands = []
+
+    def __call__(self, cmd, cwd):
+        self.commands.append(cmd)
+        if cmd[0] == "git":
+            return self.ls_out if cmd[2] == HEAD_REPOSITORY else self.origin_output
+        return super().__call__(cmd, cwd)
+
+
+print("\n-- a fork head is resolved in its actual repository, never target origin (#5018)")
+fake = RepositoryGh()
+rc, out = run_main_capture(fake, ["1", "--json"])
+case("a real fork head absent from origin can pass", rc, 0)
+payload = json.loads(out) if out else {}
+case("...with the exact fork SHA compared", payload.get("branch_tip"), "aaaa1111")
+case("...queries both repository identity fields",
+     any(cmd[:3] == ["gh", "pr", "view"] and
+         {"headRepository", "headRepositoryOwner"}.issubset(cmd[-1].split(","))
+         for cmd in fake.commands), True)
+case("...uses the exact head repository and ref without changing remotes",
+     [cmd for cmd in fake.commands if cmd[0] == "git"],
+     [["git", "ls-remote", HEAD_REPOSITORY, "refs/heads/topic"]])
+
+fake = RepositoryGh(head_output="cccc3333\trefs/heads/topic\n", origin_output=LS_ONE)
+rc, out = run_main_capture(fake, ["1", "--json"])
+case("a matching origin decoy cannot hide a changed fork head", rc, 1)
+payload = json.loads(out) if out else {}
+case("...refuses specifically for the actual fork SHA mismatch",
+     any("nothing verified what would merge" in r for r in payload.get("reasons", [])), True)
+
+for label, output, reason in [
+    ("missing head branch despite a matching origin decoy", "", "has no remote tip"),
+    ("suffix-only head ref", "bbbb2222\trefs/heads/x/refs/heads/topic\n", "has no remote tip"),
+    ("duplicate exact head refs", LS_ONE + LS_ONE, "resolved to 2 tips"),
+]:
+    fake = RepositoryGh(head_output=output, origin_output=LS_ONE)
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        rc, _ = run_main_capture(fake, ["1"])
+    case(label + " -> exit 2", rc, 2)
+    case("...names the actual resolution failure", reason in err.getvalue(), True)
+
+for label, field, value in [
+    ("missing repository", "headRepository", None),
+    ("non-object repository", "headRepository", "prosper"),
+    ("missing repository name", "headRepository", {}),
+    ("non-string repository name", "headRepository", {"name": 7}),
+    ("repository path injection", "headRepository", {"name": "../prosper"}),
+    ("dot repository", "headRepository", {"name": ".."}),
+    ("missing owner", "headRepositoryOwner", None),
+    ("non-object owner", "headRepositoryOwner", "review-fixture"),
+    ("missing owner login", "headRepositoryOwner", {}),
+    ("non-string owner login", "headRepositoryOwner", {"login": 7}),
+    ("owner authority injection", "headRepositoryOwner", {"login": "host.invalid/user"}),
+]:
+    view = json.loads(VIEW)
+    view[field] = value
+    fake = RepositoryGh(origin_output=LS_ONE, view=json.dumps(view))
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        rc, _ = run_main_capture(fake, ["1"])
+    case(label + " -> exit 2, never origin fallback", rc, 2)
+    case("...identifies unavailable head repository authority", "head repository" in err.getvalue(), True)
+    case("...launches no git process on invalid authority",
+         any(cmd[0] == "git" for cmd in fake.commands), False)
 
 
 rc, out = run_main_capture(FakeGh(RED_CHECKS, VIEW, LS_ONE), ["1", "--json"])

@@ -5,6 +5,7 @@
 // and pipeline consume. Pure/headless; validates the decode against hand-built descriptors.
 #include "gpu/agc/agc_shader_layout.hpp"
 #include "gpu/texture/tile.hpp"
+#include "gpu/resources/mip_chain_plan.hpp"
 #include <gtest/gtest.h>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include <algorithm>
@@ -1331,6 +1332,105 @@ TEST(BuildShaderResources, VolumeTailLayout) {
         << "a volume deeper than the tail block does not place";
 }
 
+// #5019: geometry-only chain admission exposed unsupported formats as one-level images,
+// so explicit LOD sampled the wrong guest level. These descriptors exercise both view
+// admission and the resource table consumed by the backend, rather than only the planner.
+static ShaderResourceTable build_volume_test_resources(const uint32_t descriptor[8]) {
+    AgcShaderSharp sharp{};
+    AgcShaderUserData user_data{};
+    user_data.sharp_resource_offset[0] = &sharp;
+    user_data.sharp_resource_count[0] = 1;
+    AgcShaderHeader shader{};
+    shader.file_header = 0x34333231u;
+    shader.version = 0x18;
+    shader.type = 1;
+    shader.user_data = &user_data;
+    return build_shader_resources(shader, descriptor, 8);
+}
+
+TEST(BuildShaderResources, VolumeTailChainRejectsUnmaterializedFormats) {
+    for (const uint32_t format : {13u, 29u, 71u}) {
+        SCOPED_TRACE(format);
+        Gen5ImageFormatInfo fi;
+        ASSERT_TRUE(gen5_image_format(format, &fi)) << "Float16 fixture format maps";
+        ASSERT_EQ(fi.format, DataFormat::Float16);
+        uint32_t descriptor[8];
+        make_tsharp(descriptor, 0x12000000ull, 16, 16, format, 9, 10, 16);
+        descriptor[3] |= 0xFACu | (4u << 16);
+        descriptor[5] |= 4u << 4;
+        const DecodedImageDescriptor decoded = decode_image_descriptor(descriptor);
+        ASSERT_EQ(decoded.base_level, 0u);
+        ASSERT_EQ(decoded.last_level, 4u);
+        ASSERT_EQ(decoded.max_mip, 4u);
+        ASSERT_EQ(image_descriptor_reject_reason(decoded), nullptr)
+            << "the mapped five-level descriptor is valid before view admission";
+        for (uint32_t level = 0; level <= decoded.last_level; ++level)
+            ASSERT_TRUE(
+                tiled_volume_tail_layout(16, 16, 16, fi.bytes_per_block, 9, 4, level).supported)
+                << "tail geometry alone admits every level, including " << level;
+        EXPECT_FALSE(image_base_level_view(decoded, fi).supported)
+            << "an unmaterialized Float16 chain must not become a one-level sampled view";
+        EXPECT_EQ(build_volume_test_resources(descriptor).by_sgpr_base(0), nullptr)
+            << "unsupported chain must not reach the backend as a texture resource";
+    }
+}
+
+TEST(BuildShaderResources, VolumeTailChainPreservesSampledFormats) {
+    for (const uint32_t format : {1u, 5u, 7u, 11u, 14u, 22u}) {
+        SCOPED_TRACE(format);
+        Gen5ImageFormatInfo fi;
+        ASSERT_TRUE(gen5_image_format(format, &fi)) << "R8 or native fixture format maps";
+        uint32_t descriptor[8];
+        make_tsharp(descriptor, 0x12000000ull, 16, 16, format, 9, 10, 16);
+        descriptor[3] |= 0xFACu | (4u << 16);
+        descriptor[5] |= 4u << 4;
+        const DecodedImageView view =
+            image_base_level_view(decode_image_descriptor(descriptor), fi);
+        ASSERT_TRUE(view.supported) << "materializable chain keeps its level-zero view";
+        ASSERT_TRUE(view.in_mip_tail);
+        const ShaderResourceTable resources = build_volume_test_resources(descriptor);
+        const ShaderResource* resource = resources.by_sgpr_base(0);
+        ASSERT_NE(resource, nullptr) << "supported descriptor publishes a real resource";
+        EXPECT_EQ(resource->format, fi.format);
+        EXPECT_EQ(resource->num_components, fi.num_components);
+        EXPECT_EQ(resource->declared_mip_levels, 5u);
+        EXPECT_EQ(resource->img_dim, 2u);
+        EXPECT_EQ(resource->depth, 16u);
+        EXPECT_EQ(shader_resource_compute_mip_chain_levels(*resource), 5u)
+            << "every admitted level is materializable, including R8 broadcast";
+        const MipChainPlan plan = shader_resource_mip_chain_plan(*resource);
+        ASSERT_TRUE(plan.valid);
+        EXPECT_EQ(plan.allocation_bytes, 65536u);
+    }
+}
+
+TEST(BuildShaderResources, VolumeTailPreservesFloat16SingleLevelViews) {
+    for (const uint32_t format : {13u, 29u, 71u}) {
+        for (const uint32_t level : {0u, 2u}) {
+            SCOPED_TRACE(format);
+            SCOPED_TRACE(level);
+            Gen5ImageFormatInfo fi;
+            ASSERT_TRUE(gen5_image_format(format, &fi));
+            uint32_t descriptor[8];
+            make_tsharp(descriptor, 0x12000000ull, 16, 16, format, 9, 10, 16);
+            descriptor[3] |= 0xFACu | (level << 12) | (level << 16);
+            descriptor[5] |= 4u << 4;
+            const DecodedImageView view =
+                image_base_level_view(decode_image_descriptor(descriptor), fi);
+            ASSERT_TRUE(view.supported) << "single-level Float16 placement remains supported";
+            const ShaderResourceTable resources = build_volume_test_resources(descriptor);
+            const ShaderResource* resource = resources.by_sgpr_base(0);
+            ASSERT_NE(resource, nullptr);
+            EXPECT_EQ(resource->format, DataFormat::Float16);
+            EXPECT_EQ(resource->declared_mip_levels, 1u);
+            EXPECT_EQ(resource->width, 16u >> level);
+            EXPECT_EQ(resource->height, 16u >> level);
+            EXPECT_EQ(resource->depth, 16u >> level);
+            EXPECT_EQ(shader_resource_compute_mip_chain_levels(*resource), 1u);
+        }
+    }
+}
+
 // The six single-level views over that pyramid decode to supported views at the proven
 // coordinates, with the allocation base unshifted and the level extent selected.
 TEST(BuildShaderResources, VolumeTailView) {
@@ -1359,8 +1459,7 @@ TEST(BuildShaderResources, VolumeTailView) {
         EXPECT_EQ(v.mip_tail_x, kTailX[level]) << "proven tail_x";
         EXPECT_EQ(v.mip_tail_y, kTailY[level]) << "proven tail_y";
     }
-    // A multi-level chain view stays refused: per-level materialization needs volume
-    // support in mip_chain_plan, which does not exist yet.
+    // Mid-chain windows stay refused: the volume plan materializes only base-zero chains.
     {
         uint32_t t[8];
         make_tsharp(t, 0x4066a90000ull, 32, 32, /*fmt*/ 1, /*tile*/ 9, /*type 3D*/ 10,
@@ -1369,6 +1468,70 @@ TEST(BuildShaderResources, VolumeTailView) {
         t[5] |= 5u << 4;
         EXPECT_FALSE(image_base_level_view(decode_image_descriptor(t), fi).supported)
             << "BASE_LEVEL=1 LAST_LEVEL=5 chain stays refused";
+    }
+    // A base-zero full chain over the proven pyramid admits with the level-zero
+    // placement and the allocation-wide provenance the volume chain plan reads.
+    {
+        uint32_t t[8];
+        make_tsharp(t, 0x4066a90000ull, 32, 32, /*fmt*/ 1, /*tile*/ 9, /*type 3D*/ 10,
+                    /*depth*/ 32);
+        t[3] |= (5u << 16);
+        t[5] |= 5u << 4;
+        const DecodedImageDescriptor chain0 = decode_image_descriptor(t);
+        ASSERT_TRUE(chain0.base_level == 0 && chain0.last_level == 5 && chain0.max_mip == 5)
+            << "fixture is a base-zero six-level chain, not a single level";
+        const DecodedImageView v0 = image_base_level_view(chain0, fi);
+        EXPECT_TRUE(v0.supported) << "BASE_LEVEL=0 LAST_LEVEL=5 chain admits (planned)";
+        EXPECT_EQ(v0.base, 0x4066a90000ull) << "chain view keeps the allocation base";
+        EXPECT_EQ(v0.width, 32u) << "chain view selects the level-zero extent";
+        EXPECT_EQ(v0.height, 32u) << "chain view selects the level-zero extent";
+        EXPECT_EQ(v0.depth, 32u) << "chain view selects the level-zero depth";
+        EXPECT_TRUE(v0.in_mip_tail) << "chain view lives in the shared block";
+        EXPECT_EQ(v0.mip_tail_x, 32u) << "chain view carries the level-zero tail origin";
+        EXPECT_EQ(v0.mip_tail_y, 0u) << "chain view carries the level-zero tail origin";
+        EXPECT_EQ(v0.chain_element_width, 32u) << "chain provenance names the allocation";
+        EXPECT_EQ(v0.chain_element_height, 32u) << "chain provenance names the allocation";
+        EXPECT_EQ(v0.chain_bytes_per_block, 1u) << "chain provenance names the texel width";
+        EXPECT_EQ(v0.chain_max_mip, 5u) << "chain provenance names the allocation length";
+        EXPECT_EQ(v0.chain_base_level, 0u) << "chain provenance names the selected base";
+    }
+    // A base-zero partial chain (fewer declared levels than the allocation holds) admits
+    // the same way: the plan materializes the declared window.
+    {
+        uint32_t t[8];
+        make_tsharp(t, 0x4066a90000ull, 32, 32, /*fmt*/ 1, /*tile*/ 9, /*type 3D*/ 10,
+                    /*depth*/ 32);
+        t[3] |= (2u << 16);
+        t[5] |= 5u << 4;
+        const DecodedImageDescriptor partial = decode_image_descriptor(t);
+        ASSERT_TRUE(partial.base_level == 0 && partial.last_level == 2 && partial.max_mip == 5)
+            << "fixture is a base-zero three-level window";
+        EXPECT_TRUE(image_base_level_view(partial, fi).supported)
+            << "BASE_LEVEL=0 LAST_LEVEL=2 window admits (planned)";
+    }
+    // A base-zero chain the tail derivation cannot place stays refused: level zero of a
+    // 512^3 pyramid owns disjoint blocks no in-block coordinate can name.
+    {
+        uint32_t t[8];
+        make_tsharp(t, 0x4066a90000ull, 512, 512, /*fmt*/ 1, /*tile*/ 9, /*type 3D*/ 10,
+                    /*depth*/ 512);
+        t[3] |= (2u << 16);
+        t[5] |= 9u << 4;
+        EXPECT_FALSE(image_base_level_view(decode_image_descriptor(t), fi).supported)
+            << "non-tail BASE_LEVEL=0 chain stays refused";
+    }
+    // A chain running past MAX_MIP is a contradictory range, not a window: refuse.
+    {
+        uint32_t t[8];
+        make_tsharp(t, 0x4066a90000ull, 32, 32, /*fmt*/ 1, /*tile*/ 9, /*type 3D*/ 10,
+                    /*depth*/ 32);
+        t[3] |= (6u << 16);
+        t[5] |= 5u << 4;
+        const DecodedImageDescriptor over = decode_image_descriptor(t);
+        ASSERT_TRUE(over.base_level == 0 && over.last_level == 6 && over.max_mip == 5)
+            << "fixture really runs past the allocation end";
+        EXPECT_FALSE(image_base_level_view(over, fi).supported)
+            << "LAST_LEVEL past MAX_MIP stays refused";
     }
     // Block-compressed 3D keeps the base-level-only rule: the tail math is element-based
     // and the upload has no BCn volume-tail reader. Level 0 stays admitted unshifted.
@@ -1468,4 +1631,101 @@ TEST(BuildShaderResources, VolumeTailStorageRefused) {
                     r->mip_tail_y == 16)
             << "control binds the level-1 tail view with proven coordinates";
     }
+}
+
+// The thick-3D tail rule across element sizes (#4842 R5: AddrLib reference placements).
+// The per-level (mip_x, mip_y) origin sequence is element-size independent --
+// L0..L5: (4,0) (0,4) (2,0) (1,2) (0,3) (0,2) -- evaluated here by hand from the
+// alternating-bit mipOffset walk, NOT by running the implementation: the 1BPE row
+// reproduces the carve-proven Black Flag table above, and each wider row scales it by
+// its own 256-byte-block geometry (kBlock256S3). A transcription slip in the test's
+// table breaks these exactly as loudly as one in tile.cpp; the carve breaks a shared
+// misreading of AddrLib, which is why the 1BPE table stays the anchor.
+TEST(BuildShaderResources, VolumeTailLayoutMultiBpe) {
+    // 2BPE: 16^3 all-in-tail pyramid (tail 16x32, block depth 32), five levels.
+    constexpr uint32_t k16X[5] = {16, 0, 8, 4, 0};
+    constexpr uint32_t k16Y[5] = {0, 16, 0, 8, 12};
+    for (uint32_t level = 0; level < 5; ++level) {
+        const TiledVolumeTailLayout layout = tiled_volume_tail_layout(16, 16, 16, 2, 9, 4, level);
+        EXPECT_TRUE(layout.supported) << "2BPE pyramid level " << level << " places";
+        EXPECT_EQ(layout.tail_x, k16X[level]) << "2BPE level " << level << " tail_x";
+        EXPECT_EQ(layout.tail_y, k16Y[level]) << "2BPE level " << level << " tail_y";
+        EXPECT_EQ(layout.tail_block_bytes, 65536u) << "2BPE level shares block zero";
+    }
+    // 4BPE: same 16^3 shape (tail 16x32, block depth 16) places identically in x/y.
+    for (uint32_t level = 0; level < 5; ++level) {
+        const TiledVolumeTailLayout layout = tiled_volume_tail_layout(16, 16, 16, 4, 9, 4, level);
+        EXPECT_TRUE(layout.supported) << "4BPE pyramid level " << level << " places";
+        EXPECT_EQ(layout.tail_x, k16X[level]) << "4BPE level " << level << " tail_x";
+        EXPECT_EQ(layout.tail_y, k16Y[level]) << "4BPE level " << level << " tail_y";
+    }
+    // 8BPE: 16^3 all-in-tail pyramid (tail 16x16, block depth 16). The y origins halve
+    // with the 4-texel microblock rows; x keeps the 4-texel columns.
+    constexpr uint32_t k8X[5] = {16, 0, 8, 4, 0};
+    constexpr uint32_t k8Y[5] = {0, 8, 0, 4, 6};
+    for (uint32_t level = 0; level < 5; ++level) {
+        const TiledVolumeTailLayout layout = tiled_volume_tail_layout(16, 16, 16, 8, 9, 4, level);
+        EXPECT_TRUE(layout.supported) << "8BPE pyramid level " << level << " places";
+        EXPECT_EQ(layout.tail_x, k8X[level]) << "8BPE level " << level << " tail_x";
+        EXPECT_EQ(layout.tail_y, k8Y[level]) << "8BPE level " << level << " tail_y";
+    }
+    // 16BPE: 8^3 all-in-tail pyramid (tail 8x16, block depth 16), four levels.
+    constexpr uint32_t k16BX[4] = {8, 0, 4, 2};
+    constexpr uint32_t k16BY[4] = {0, 8, 0, 4};
+    for (uint32_t level = 0; level < 4; ++level) {
+        const TiledVolumeTailLayout layout = tiled_volume_tail_layout(8, 8, 8, 16, 9, 3, level);
+        EXPECT_TRUE(layout.supported) << "16BPE pyramid level " << level << " places";
+        EXPECT_EQ(layout.tail_x, k16BX[level]) << "16BPE level " << level << " tail_x";
+        EXPECT_EQ(layout.tail_y, k16BY[level]) << "16BPE level " << level << " tail_y";
+    }
+    // Outside the proof at wider element sizes: The Plucky Squire's 32^3 RGBA16F lighting
+    // volume (8BPE) is NOT all-in-tail -- level zero spans 32 texels against a 16-texel
+    // tail width -- so it stays refused until a carve proves its non-tail block layout.
+    EXPECT_FALSE(tiled_volume_tail_layout(32, 32, 32, 8, 9, 5, 0).supported)
+        << "Plucky-shaped 32^3 RGBA16F level zero stays refused";
+    // A 64^3 4BPE chain is disjoint-block packed the same way 512^3 R8 is: no in-block
+    // coordinate can name it.
+    EXPECT_FALSE(tiled_volume_tail_layout(64, 64, 64, 4, 9, 6, 0).supported)
+        << "non-tail 4BPE level zero stays refused";
+    // A level past MAX_MIP has no placement at 8BPE either.
+    EXPECT_FALSE(tiled_volume_tail_layout(16, 16, 16, 8, 9, 4, 5).supported)
+        << "8BPE level past MAX_MIP stays refused";
+}
+
+// The 8BPE tail detile is the same translated S3 equation the 1BPE carve validated:
+// zero translation is byte-identical to the whole-block detile, and hand-read equation
+// spots (kSw64kbS3[3] by hand: (1,0,0)->byte 8, (0,1,0)->byte 32, (0,0,1)->byte 16,
+// translated origin (16,0,0)->byte 32768) pin the wider row independently.
+TEST(BuildShaderResources, VolumeTailDetileMechanism8Bpe) {
+    uint64_t lcg = 0x9e3779b97f4a7c15ull;
+    std::vector<uint8_t> block(65536);
+    for (auto& b : block) {
+        lcg = lcg * 6364136223846793005ull + 1442695040888963407ull;
+        b = static_cast<uint8_t>(lcg >> 33);
+    }
+    constexpr size_t kTexels = 16 * 16 * 16;
+    std::vector<uint8_t> whole(kTexels * 8), tail(kTexels * 8);
+    ASSERT_TRUE(detile_volume(whole.data(), block.data(), block.size(), 16, 16, 16, 9, 8))
+        << "whole-block 8BPE detile admits the synthetic block";
+    ASSERT_TRUE(
+        detile_volume_tail_level(tail.data(), block.data(), block.size(), 16, 16, 16, 9, 8, 0, 0))
+        << "8BPE tail detile admits the zero translation";
+    EXPECT_EQ(tail, whole) << "zero-translation 8BPE tail detile is the block detile";
+    std::vector<uint8_t> spot(65536, 0);
+    spot[8] = 0xA1;
+    spot[32] = 0xB2;
+    spot[16] = 0xC4;
+    spot[32768] = 0xD3;
+    std::vector<uint8_t> cube(2 * 2 * 2 * 8, 0);
+    ASSERT_TRUE(
+        detile_volume_tail_level(cube.data(), spot.data(), spot.size(), 2, 2, 2, 9, 8, 0, 0))
+        << "8BPE tail detile admits the spot block";
+    EXPECT_EQ(cube[8], 0xA1) << "8BPE texel (1,0,0) reads byte 8";
+    EXPECT_EQ(cube[16], 0xB2) << "8BPE texel (0,1,0) reads byte 32";
+    EXPECT_EQ(cube[32], 0xC4) << "8BPE texel (0,0,1) reads byte 16";
+    std::vector<uint8_t> one(8, 0);
+    ASSERT_TRUE(
+        detile_volume_tail_level(one.data(), spot.data(), spot.size(), 1, 1, 1, 9, 8, 16, 0))
+        << "8BPE tail detile admits the translated origin";
+    EXPECT_EQ(one[0], 0xD3) << "translated origin (16,0,0) reads byte 32768";
 }

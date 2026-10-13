@@ -4,6 +4,7 @@
 #include "host/image/boot_program.hpp"
 #include "host/image/module_path_policy.hpp"
 #include "host/image/module_start_params.hpp"
+#include "host/image/guest_executable.hpp"
 #include "host/memory/host_address_layout.hpp"
 #include "host/symbols/il2cpp_symbols.hpp"
 
@@ -214,7 +215,8 @@ void veto_init_on_load_for_imported(std::vector<LinkInput>& in, const Say& say) 
         if (e.init_on_load) say("init DEFERRED until the guest loads it: %s\n", e.path.c_str());
 }
 
-std::vector<LinkInput> boot_link_inputs(const std::string& d, bool verbose) {
+std::vector<LinkInput> boot_link_inputs(const std::string& d, bool verbose,
+                                        const std::string& executable) {
     // `verbose` exists only so a TOOL can call this without corrupting its own stdout: the
     // four prints below are the loader's, and nid_census --tsv writes machine-readable rows to
     // the same stream. boot_program passes true, so loader output is byte-identical (#2199).
@@ -311,6 +313,17 @@ std::vector<LinkInput> boot_link_inputs(const std::string& d, bool verbose) {
     // than left as an emergent property of the discovery code, and why it is not switchable.
     for (const auto& r : enforce_module_path_policy(d, in))
         say("module REFUSED by path policy: %s -- %s\n", r.path.c_str(), r.reason.c_str());
+    if (executable != "/app0/eboot.bin") {
+        // An explicit main ELF selected by LoadExec is not a discovered PRX. Check its separate
+        // containment/platform-name policy without widening any dependent-module directory.
+        std::string error;
+        const std::string selected = resolve_guest_executable(d, executable, &error);
+        if (selected.empty()) {
+            say("main executable REFUSED: %s -- %s\n", executable.c_str(), error.c_str());
+            return {};
+        }
+        in[0].path = selected;
+    }
     if (getenv("PROSPER_NO_PSN"))
         for (size_t i = in.size(); i-- > 0; )
             if (in[i].path.find("PSN.prx") != std::string::npos ||
@@ -344,7 +357,8 @@ std::vector<LinkInput> boot_link_inputs(const std::string& d, bool verbose) {
 }
 
 bool boot_program(const std::string& d, Program& p, std::string* err,
-                  const std::function<void()>& after_hle_registered) {
+                  const std::function<void()>& after_hle_registered,
+                  const std::string& executable) {
     il2cpp::clear_symbol_table();
     auto fail = [&](const std::string& m) {
         il2cpp::publish_loaded_module_bounds(std::nullopt);
@@ -360,7 +374,8 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
     host::confine_host_allocations_above_4gib();
 
     // libc.prx loaded last => its init_array runs first (deepest dependency), before eboot's entry.
-    std::vector<LinkInput> in = boot_link_inputs(d);
+    std::vector<LinkInput> in = boot_link_inputs(d, true, executable);
+    if (in.empty()) return fail("main executable selection refused");
 
     std::string e;
     if (!link_program(in, BOOT_STUB, BOOT_IMPORT_DATA, p, &e)) return fail("link failed: " + e);
@@ -486,7 +501,8 @@ bool boot_program(const std::string& d, Program& p, std::string* err,
 
 #else  // no guest-execution substrate for this platform.
 namespace prosper {
-bool boot_program(const std::string&, Program&, std::string* err, const std::function<void()>&) {
+bool boot_program(const std::string&, Program&, std::string* err, const std::function<void()>&,
+                  const std::string&) {
     il2cpp::clear_symbol_table();
     il2cpp::publish_loaded_module_bounds(std::nullopt);
     if (err) *err = "boot_program: no guest-execution substrate for this platform"; return false;

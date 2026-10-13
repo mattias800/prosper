@@ -6,6 +6,7 @@
 
 namespace prosper::gpu {
 struct AgcShaderHeader;
+struct ShaderCodeAnalysis;
 
 // Bounds for raw host-side shader walkers, not shader/entry/resource authority. Callers retain
 // the normal submitted-input stability contract; this observation does not exclude CPU writers
@@ -27,4 +28,9 @@ size_t native_shader_source_dwords(uint64_t address, size_t maximum_dwords);
 // The caller must first bound dwords with shader_source_dwords; these do not authorize guest VA.
 size_t shader_source_code_span(const uint32_t* code, size_t dwords);
 std::vector<uint32_t> shader_source_snapshot(const uint32_t* code, size_t dwords);
+
+// Cold code-span derivation also owns any failed terminal-tail probe's validation bytes. Warm
+// matching checks those separately; they never grant shader or executable-code authority.
+size_t shader_analysis_source_span(ShaderCodeAnalysis&, const uint32_t* code, size_t dwords);
+bool shader_analysis_source_matches(const ShaderCodeAnalysis&, const uint32_t* code, size_t dwords);
 } // namespace prosper::gpu

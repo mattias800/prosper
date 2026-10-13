@@ -65,6 +65,7 @@ void meet_spilled_mask_halves(SpilledMaskHalves& into, const SpilledMaskHalves& 
     into.memory_vectors.insert(incoming.memory_vectors.begin(), incoming.memory_vectors.end());
     into.memory_words.insert(incoming.memory_words.begin(), incoming.memory_words.end());
     into.memory_slots.insert(incoming.memory_slots.begin(), incoming.memory_slots.end());
+    meet_active_vector_words(into.active_vectors, incoming.active_vectors);
     into.exec_known_full = into.exec_known_full && incoming.exec_known_full;
     into.native_interpolation = into.native_interpolation && incoming.native_interpolation;
 }
@@ -171,7 +172,11 @@ SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& st
                   : vector_any(state.relayed_vectors));
     if (readlane && constant_lane(in) && state.lane_written_vgprs.contains(in.src[0].value))
         memory = state.memory_slots.contains({in.src[0].value, in.src[1].value});
-    return {vector_relay, relays, memory};
+    const bool active_defined =
+        state.active_vectors.enabled &&
+        active_vector_sources_defined(state.active_vectors, in, state.relayed_vectors, masks,
+                                      scalar_words, relayed, definite_scc);
+    return {vector_relay, relays, memory, active_defined};
 }
 
 void advance_defined_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
@@ -204,25 +209,16 @@ void advance_defined_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
         }
     const bool scalar_alu = in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2 ||
                             in.fmt == Rdna2Format::SOPK || in.fmt == Rdna2Format::SOPC;
-    // S_MOV propagates its source marks to the destination without changing the old SCC.
-    // Preserve an existing SCC mark too; copying data cannot repair a fabricated condition.
-    const bool move_preserves_scc =
-        in.fmt == Rdna2Format::SOP1 &&
-        (in.opcode == kSop1OpcodeMovB32 || in.opcode == kSop1OpcodeMovB64);
-    if (wave_size == 32) {
-        if (scalar_instruction_writes_scc(in)) {
-            if (relays)
-                relayed.insert(kRelayedScc);
-            else
-                relayed.erase(kRelayedScc);
-        } else if (!scalar_instruction_preserves_scc(in) && relays) {
+    // CONFIDENCE: HIGH -- an instruction which leaves SCC unchanged cannot transfer its data
+    // dependency into that condition. A genuine SCC writer instead replaces an earlier taint;
+    // preserving instructions never repair it. Both wave widths use the same ISA effect inventory.
+    if (scalar_instruction_writes_scc(in)) {
+        if (relays)
             relayed.insert(kRelayedScc);
-        }
-    } else {
-        if (scalar_alu && relays && !move_preserves_scc)
-            relayed.insert(kRelayedScc);
-        else if (in.fmt == Rdna2Format::SOPC)
+        else
             relayed.erase(kRelayedScc);
+    } else if (!scalar_instruction_preserves_scc(in) && relays && (wave_size == 32 || scalar_alu)) {
+        relayed.insert(kRelayedScc);
     }
     const bool preserve = vector_write_depends_on_old_word(in, state.exec_known_full);
     for (int vgpr : vector_writes) {

@@ -24,7 +24,8 @@ bool analyze_wave32_dispatch_words(
     const std::vector<uint32_t>& starts, const std::vector<std::vector<uint32_t>>& successors,
     const std::set<int>& direct_descriptor_sregs, Wave32DispatchWords& words,
     std::set<int>& static_mask_keys, std::unordered_set<uint32_t>& proven_pair_compares,
-    const std::function<std::array<int, 2>(const Rdna2Inst&)>& pair_compare_sources);
+    const std::function<std::array<int, 2>(const Rdna2Inst&)>& pair_compare_sources,
+    const std::unordered_set<uint32_t>& native_mask_scc_vote_pcs);
 void restore_wave32_dispatch_words(const Wave32DispatchWords& words, uint32_t block,
                                    RegState& state);
 } // namespace prosper::gpu

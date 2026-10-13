@@ -37,7 +37,6 @@
 
 namespace prosper::gpu {
 
-
 inline bool sopp_is_noop(const Rdna2Inst& in) {
     if (in.fmt != Rdna2Format::SOPP) return false;
     switch (in.opcode) {
@@ -49,8 +48,7 @@ inline bool sopp_is_noop(const Rdna2Inst& in) {
             // NOTE: s_waitcnt_vscnt is NOT SOPP on gfx10 — it is SOPK opcode 0x17
             // (round-trip: llvm-mc gfx1010 encodes it 0xBBFD0000). Handled in the SOPK case.
             return true;
-        default:
-            return false;
+        default: return false;
     }
 }
 uint32_t scalar_implicit_destination_read_width(const Rdna2Inst& in);
@@ -98,13 +96,15 @@ sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R,
                    // Match physical mask writes to the caller's actual emitter mode.
                    ScalarMergeMaskWriteWidths mask_widths = {}) {
     const auto block = [&](const Rdna2Inst& at, const char* kind) {
-        if (blocker && blocker->pc == UINT32_MAX) { blocker->pc = at.pc; blocker->kind = kind; }
+        if (blocker && blocker->pc == UINT32_MAX) {
+            blocker->pc = at.pc;
+            blocker->kind = kind;
+        }
         return false;
     };
     // MaskDomainOnly is a VCC-half question by construction: an ordinary SGPR has no mask domain,
     // so the relaxation would silently become "reads are fine", which is not a proof of anything.
-    if (proof == ScalarMergeProof::MaskDomainOnly && R != 106 && R != 107)
-        return false;
+    if (proof == ScalarMergeProof::MaskDomainOnly && R != 106 && R != 107) return false;
     // M0 has readers that never name it: the relative moves, v_movrels_b32, the LDS and
     // append/consume forms, s_sendmsg. The operand scan below sees none of them, and a walk
     // that reached s_endpgm used to answer "dead" for it.
@@ -127,7 +127,7 @@ sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R,
         if (index >= ins.size() || visited[index]) continue;
         visited[index] = 1;
         const auto& in = ins[index];
-        if (in.is_end) continue;                           // this path ends without a read
+        if (in.is_end) continue;   // this path ends without a read
         // VCC (R = 106/107) has IMPLICIT readers the operand scan can't see: the e32 VOP2 carry /
         // cndmask ops (0x01, 0x28-0x2A) and the vccz/vccnz branches. Flag those as reads up front so
         // the redef checks below are sound for VCC too (which the s_mov carve-out excludes, but the
@@ -149,8 +149,8 @@ sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R,
             // pure one-word definition and WAITCNT_VSCNT is register-transparent; GTA's low-only
             // VCC lifetime crosses both before the actual pair replacement.
             case Rdna2Format::SOPK:
-                if (in.opcode == kSopkOpcodeWaitcntVscnt &&
-                    in.dst.kind == OperandKind::SGPR && in.dst.value == 125)
+                if (in.opcode == kSopkOpcodeWaitcntVscnt && in.dst.kind == OperandKind::SGPR &&
+                    in.dst.value == 125)
                     break;
                 if (in.opcode == kSopkOpcodeMovkI32 && in.dst.kind == OperandKind::SGPR) {
                     if (in.dst.value == R) continue;
@@ -174,12 +174,12 @@ sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R,
                 // workgroup execution order. For branches, enqueue every possible successor. Unknown
                 // scalar control flow remains fail-closed.
                 if (sopp_is_noop(in) || in.opcode == 0x0a) break;
-                if (in.opcode == 0x02 ||
-                    (in.opcode >= 0x04 && in.opcode <= 0x09)) {
-                    const int64_t branch_pc = static_cast<int64_t>(in.pc) +
-                        in.len_dwords + in.simm16;
+                if (in.opcode == 0x02 || (in.opcode >= 0x04 && in.opcode <= 0x09)) {
+                    const int64_t branch_pc =
+                        static_cast<int64_t>(in.pc) + in.len_dwords + in.simm16;
                     const auto branch = branch_pc >= 0
-                        ? pc_to_index.find(static_cast<uint32_t>(branch_pc)) : pc_to_index.end();
+                                            ? pc_to_index.find(static_cast<uint32_t>(branch_pc))
+                                            : pc_to_index.end();
                     if (branch == pc_to_index.end()) return false;
                     pending.push_back(branch->second);
                     if (in.opcode != 0x02) {
@@ -194,43 +194,57 @@ sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R,
                 // redefines N consecutive dst SGPRs. Anything not a plain load -> bail.
                 uint32_t n = 0;
                 switch (in.opcode) {
-                    case 0x0: case 0x8: n = 1;  break;   case 0x1: case 0x9: n = 2;  break;
-                    case 0x2: case 0xA: n = 4;  break;   case 0x3: case 0xB: n = 8;  break;
-                    case 0x4: case 0xC: n = 16; break;
+                    case 0x0:
+                    case 0x8: n = 1; break;
+                    case 0x1:
+                    case 0x9: n = 2; break;
+                    case 0x2:
+                    case 0xA: n = 4; break;
+                    case 0x3:
+                    case 0xB: n = 8; break;
+                    case 0x4:
+                    case 0xC: n = 16; break;
                     default: return block(in, "unmodelled-smem");
                 }
                 if (in.src[0].value == R || in.src[0].value + 1 == R)
-                    return block(in, "smem-sbase");                                          // SBASE read
+                    return block(in, "smem-sbase");   // SBASE read
                 // SOFFSET is one dword and is consumed as an address, never as a lane mask.
-                if ((in.src[1].kind == OperandKind::SGPR || in.src[1].kind == OperandKind::Special) &&
+                if ((in.src[1].kind == OperandKind::SGPR ||
+                     in.src[1].kind == OperandKind::Special) &&
                     in.src[1].value == R && !data_read_ok)
-                    return block(in, "smem-soffset");                                        // SOFFSET read
-                if (R >= in.dst.value && R < in.dst.value + (int)n) continue;  // redefined: this path is dead
+                    return block(in, "smem-soffset");   // SOFFSET read
+                if (R >= in.dst.value && R < in.dst.value + (int)n)
+                    continue;   // redefined: this path is dead
                 break;
             }
-            case Rdna2Format::SOP1: case Rdna2Format::SOP2: case Rdna2Format::SOPC:
-            case Rdna2Format::VOP1: case Rdna2Format::VOP2: case Rdna2Format::VOP3: case Rdna2Format::VOPC:
-            case Rdna2Format::DS:    // DS operands are VGPR/M0 only; it cannot read an ordinary SGPR/VCC
-            case Rdna2Format::EXP: { // EXP data sources are all VGPRs — it can never read an SGPR
+            case Rdna2Format::SOP1:
+            case Rdna2Format::SOP2:
+            case Rdna2Format::SOPC:
+            case Rdna2Format::VOP1:
+            case Rdna2Format::VOP2:
+            case Rdna2Format::VOP3:
+            case Rdna2Format::VOPC:
+            case Rdna2Format::
+                DS:   // DS operands are VGPR/M0 only; it cannot read an ordinary SGPR/VCC
+            case Rdna2Format::EXP: {   // EXP data sources are all VGPRs — it can never read an SGPR
                 // Conditional moves, SOPK immediate operations, and SOP1 bitsets may read their
                 // encoded destination before replacing it. Their decoded source list does not
                 // contain that old value, so consult the shared implicit-read inventory first.
-                const uint32_t implicit_read_width =
-                    scalar_implicit_destination_read_width(in);
+                const uint32_t implicit_read_width = scalar_implicit_destination_read_width(in);
                 if (implicit_read_width && R >= in.dst.value &&
                     R < in.dst.value + static_cast<int>(implicit_read_width) &&
                     !(data_read_ok && implicit_read_width == 1))
                     return block(in, "implicit-dst-rmw");
                 for (int k = 0; k < in.n_src; k++) {
                     if (in.src[k].kind != OperandKind::SGPR &&
-                        in.src[k].kind != OperandKind::Special) continue;
+                        in.src[k].kind != OperandKind::Special)
+                        continue;
                     // Operand does not carry B32/B64 width. Use the shared opcode inventory so a
                     // physical low-half read (notably GTA's CSELECT_B32 -> V_ADD3 chain) cannot
                     // falsely keep the sibling live, while unlisted VOP3 sources remain pairs.
                     const uint32_t words = scalar_alu_source_words(in, k);
                     if (words == UINT32_MAX) continue;
-                    if (R >= in.src[k].value &&
-                        R < in.src[k].value + static_cast<int>(words)) {
+                    if (R >= in.src[k].value && R < in.src[k].value + static_cast<int>(words)) {
                         // A one-dword source is a scalar-data read. Anything wider reads the pair,
                         // which is exactly the set of lane-mask consumers.
                         if (data_read_ok && words == 1) continue;
@@ -286,8 +300,8 @@ sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R,
                 // at src[1] and the four-dword S# at src[2]. Some opcodes do not consume the sampler,
                 // but accounting for both ranges is deliberately conservative and lets the proof scan
                 // through every MIMG without needing a second opcode inventory.
-                if (in.src[1].kind != OperandKind::SGPR ||
-                    in.src[2].kind != OperandKind::SGPR) return false;
+                if (in.src[1].kind != OperandKind::SGPR || in.src[2].kind != OperandKind::SGPR)
+                    return false;
                 if (R >= in.src[1].value && R < in.src[1].value + 8) return false;
                 if (R >= in.src[2].value && R < in.src[2].value + 4) return false;
                 break;
@@ -301,7 +315,8 @@ sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R,
                 if (in.src[1].kind != OperandKind::SGPR) return false;
                 if (R >= in.src[1].value && R < in.src[1].value + 4) return false;
                 if ((in.src[2].kind == OperandKind::SGPR ||
-                     in.src[2].kind == OperandKind::Special) && in.src[2].value == R)
+                     in.src[2].kind == OperandKind::Special) &&
+                    in.src[2].value == R)
                     return false;
                 break;
             case Rdna2Format::FLAT:
@@ -313,8 +328,7 @@ sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R,
                 if (in.flat_lds) return false;
                 if ((in.src[1].kind == OperandKind::SGPR ||
                      in.src[1].kind == OperandKind::Special) &&
-                    in.src[1].value != 125 &&
-                    (in.src[1].value == R || in.src[1].value + 1 == R))
+                    in.src[1].value != 125 && (in.src[1].value == R || in.src[1].value + 1 == R))
                     return false;
                 break;
             default:
@@ -325,8 +339,8 @@ sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R,
     return true;   // every reachable path hit a redefinition/end without a read
 }
 
-inline std::unordered_set<uint32_t> proven_cselect_b64_low_only_pcs(
-        const std::vector<Rdna2Inst>& ins) {
+inline std::unordered_set<uint32_t>
+proven_cselect_b64_low_only_pcs(const std::vector<Rdna2Inst>& ins) {
     std::unordered_set<uint32_t> result;
     for (const Rdna2Inst& in : ins) {
         if (in.is_end) break;
@@ -337,9 +351,8 @@ inline std::unordered_set<uint32_t> proven_cselect_b64_low_only_pcs(
         // when the shared CFG liveness walk proves VCC_HI dead from the following instruction.
         // An implicit VCC consumer counts as a high-half read in that walk, so no per-lane mask
         // can observe the unavailable selected word.
-        if (in.fmt == Rdna2Format::SOP2 && in.opcode == 0x0bu &&
-            in.dst.kind == OperandKind::SGPR && in.dst.value == 106 &&
-            in.src[0].kind == OperandKind::SGPR &&
+        if (in.fmt == Rdna2Format::SOP2 && in.opcode == 0x0bu && in.dst.kind == OperandKind::SGPR &&
+            in.dst.value == 106 && in.src[0].kind == OperandKind::SGPR &&
             in.src[1].kind == OperandKind::SGPR &&
             sgpr_dead_at_merge(ins, in.pc + in.len_dwords, 107))
             result.insert(in.pc);
@@ -354,35 +367,34 @@ inline std::unordered_set<uint32_t> proven_cselect_b64_low_only_pcs(
 // B32 packets for which a dead-high proof can make that scalar path discard the old predicate.
 inline bool is_wave64_vcc_lo_scalar_b32_candidate(const Rdna2Inst& in) {
     const auto scalar_constant = [](const Operand& operand) {
-        return operand.kind == OperandKind::InlineInt ||
-               operand.kind == OperandKind::InlineFloat ||
+        return operand.kind == OperandKind::InlineInt || operand.kind == OperandKind::InlineFloat ||
                operand.kind == OperandKind::Literal;
     };
-    const bool scalar_cselect_hi =
-        in.fmt == Rdna2Format::SOP2 && in.opcode == kSop2OpcodeCselectB32 &&
-        in.dst.kind == OperandKind::SGPR && in.dst.value == 107 &&
-        scalar_constant(in.src[0]) && scalar_constant(in.src[1]);
+    const bool scalar_cselect_hi = in.fmt == Rdna2Format::SOP2 &&
+                                   in.opcode == kSop2OpcodeCselectB32 &&
+                                   in.dst.kind == OperandKind::SGPR && in.dst.value == 107 &&
+                                   scalar_constant(in.src[0]) && scalar_constant(in.src[1]);
     return is_wave64_vcc_lo_scalar_cselect(in) || scalar_cselect_hi ||
-        (in.fmt == Rdna2Format::SOP2 && sop2_is_b32_logical(in.opcode) &&
-         in.dst.kind == OperandKind::SGPR &&
-         (in.dst.value == 106 || in.dst.value == 107));
+           (in.fmt == Rdna2Format::SOP2 && sop2_is_b32_logical(in.opcode) &&
+            in.dst.kind == OperandKind::SGPR && (in.dst.value == 106 || in.dst.value == 107));
 }
 
-inline std::unordered_set<uint32_t> proven_wave64_vcc_b32_low_only_pcs(
-        const std::vector<Rdna2Inst>& ins, bool include_logical = true) {
+inline std::unordered_set<uint32_t>
+proven_wave64_vcc_b32_low_only_pcs(const std::vector<Rdna2Inst>& ins, bool include_logical = true,
+                                   bool include_high_cselect = false) {
     std::unordered_set<uint32_t> result;
     for (const Rdna2Inst& in : ins) {
         if (in.is_end) break;
-        const bool candidate = include_logical
-            ? is_wave64_vcc_lo_scalar_b32_candidate(in)
-            : is_wave64_vcc_lo_scalar_cselect(in);
+        const bool candidate =
+            (include_high_cselect && is_wave64_vcc_lo_cselect_reading_vcc_hi(in)) ||
+            (include_logical ? is_wave64_vcc_lo_scalar_b32_candidate(in)
+                             : is_wave64_vcc_lo_scalar_cselect(in));
         // Scalar scratch may use either physical VCC word and combine the two as ordinary dwords.
         // The sibling may be read as scalar data, but it must be dead before any pair/mask-domain
         // observation. MaskDomainOnly is exactly that whole-CFG proof.
         const int sibling = in.dst.value == 107 ? 106 : 107;
-        if (candidate &&
-            sgpr_dead_at_merge(ins, in.pc + in.len_dwords, sibling,
-                               ScalarMergeProof::MaskDomainOnly))
+        if (candidate && sgpr_dead_at_merge(ins, in.pc + in.len_dwords, sibling,
+                                            ScalarMergeProof::MaskDomainOnly))
             result.insert(in.pc);
     }
     return result;
@@ -408,19 +420,20 @@ inline std::unordered_set<uint32_t> waterfall_branches(const std::vector<Rdna2In
     for (size_t i = 0; i < ins.size(); i++) {
         const Rdna2Inst& in = ins[i];
         if (in.is_end) break;
-        if (in.fmt != Rdna2Format::SOPP || (in.opcode != 0x04 && in.opcode != 0x05) || in.simm16 >= 0)
+        if (in.fmt != Rdna2Format::SOPP || (in.opcode != 0x04 && in.opcode != 0x05) ||
+            in.simm16 >= 0)
             continue;
         // Walk back to the most recent SCC-writing instruction, skipping ops known not to touch SCC
         // (scalar moves, all vector ALU incl. VOPC — it writes VCC/EXEC, not SCC — memory, hints).
         for (size_t j = i; j-- > 0;) {
             const Rdna2Inst& p = ins[j];
-            bool skip_ok =
-                (p.fmt == Rdna2Format::SOP1 && (p.opcode == 0x03 || p.opcode == 0x04)) ||   // s_mov_b32/b64
-                p.fmt == Rdna2Format::VOP1 || p.fmt == Rdna2Format::VOP2 || p.fmt == Rdna2Format::VOP3 ||
-                p.fmt == Rdna2Format::VOPC || p.fmt == Rdna2Format::MIMG ||
-                p.fmt == Rdna2Format::MUBUF || p.fmt == Rdna2Format::MTBUF ||
-                p.fmt == Rdna2Format::FLAT ||
-                sopp_is_noop(p);
+            bool skip_ok = (p.fmt == Rdna2Format::SOP1 &&
+                            (p.opcode == 0x03 || p.opcode == 0x04)) ||   // s_mov_b32/b64
+                           p.fmt == Rdna2Format::VOP1 ||
+                           p.fmt == Rdna2Format::VOP2 || p.fmt == Rdna2Format::VOP3 ||
+                           p.fmt == Rdna2Format::VOPC || p.fmt == Rdna2Format::MIMG ||
+                           p.fmt == Rdna2Format::MUBUF || p.fmt == Rdna2Format::MTBUF ||
+                           p.fmt == Rdna2Format::FLAT || sopp_is_noop(p);
             if (skip_ok) continue;
             // The SCC producer: a 64-bit wave-mask logical op (s_and/or/xor/andn2_b64, SCC = result!=0).
             if (p.fmt == Rdna2Format::SOP2 &&
@@ -448,13 +461,18 @@ inline std::unordered_set<uint32_t> waterfall_branches(const std::vector<Rdna2In
 // s_branch) is rejected — the recompiler then falls back to the straight-line path (as before).
 struct CountedLoop {
     bool found = false;
-    uint32_t header_pc = 0;       // loop header (target of the back-edge; condition eval starts here)
-    uint32_t exit_branch_pc = 0;  // the s_cbranch_scc0/scc1 exit test (== backedge_pc for a do-while)
-    uint32_t backedge_pc = 0;     // the backward branch (unconditional s_branch, or the scc back-edge)
-    uint32_t exit_pc = 0;         // first pc after the loop (== backedge_pc + its length)
-    bool exit_on_scc0 = true;     // exit-test polarity: true ⇔ the loop continues while SCC==1 (exits on SCC==0)
+    uint32_t header_pc = 0;   // loop header (target of the back-edge; condition eval starts here)
+    uint32_t exit_branch_pc =
+        0;   // the s_cbranch_scc0/scc1 exit test (== backedge_pc for a do-while)
+    uint32_t backedge_pc =
+        0;   // the backward branch (unconditional s_branch, or the scc back-edge)
+    uint32_t exit_pc = 0;   // first pc after the loop (== backedge_pc + its length)
+    bool exit_on_scc0 =
+        true;   // exit-test polarity: true ⇔ the loop continues while SCC==1 (exits on SCC==0)
 };
-inline uint32_t branch_target(const Rdna2Inst& in) { return in.pc + in.len_dwords + (uint32_t)(int32_t)in.simm16; }
+inline uint32_t branch_target(const Rdna2Inst& in) {
+    return in.pc + in.len_dwords + (uint32_t)(int32_t)in.simm16;
+}
 
 // The compare that decides a bottom-tested SCC loop (`do { ... s_cmp ... } while (SCC)`), or
 // UINT32_MAX when it cannot be named. The back-edge reads SCC, so the loop's continue predicate is
@@ -465,29 +483,35 @@ inline uint32_t branch_target(const Rdna2Inst& in) { return in.pc + in.len_dword
 // side effect (carry, nonzero result) and is refused rather than modeled.
 // Kena's (PPSA01802) blur fragment programs put `s_cmp_lt_u32 vcc_lo, 5` twenty dwords above the
 // back-edge, with vector ALU, a waitcnt and an image sample in between (#4518).
-inline uint32_t scc_do_while_condition_pc(const std::vector<Rdna2Inst>& ins,
-                                          uint32_t header_pc, uint32_t backedge_pc) {
+inline uint32_t scc_do_while_condition_pc(const std::vector<Rdna2Inst>& ins, uint32_t header_pc,
+                                          uint32_t backedge_pc) {
     auto is_branch = [](const Rdna2Inst& in) {
         return in.fmt == Rdna2Format::SOPP && in.opcode >= 0x02 && in.opcode <= 0x09 &&
                in.opcode != 0x03;
     };
     size_t back = ins.size();
     for (size_t i = 0; i < ins.size(); ++i)
-        if (ins[i].pc == backedge_pc) { back = i; break; }
+        if (ins[i].pc == backedge_pc) {
+            back = i;
+            break;
+        }
     if (back == ins.size()) return UINT32_MAX;
     uint32_t writer = UINT32_MAX;
     for (size_t j = back; j-- > 0;) {
         const Rdna2Inst& p = ins[j];
         if (p.pc < header_pc) return UINT32_MAX;
-        if (p.fmt == Rdna2Format::SOPC) { writer = p.pc; break; }
+        if (p.fmt == Rdna2Format::SOPC) {
+            writer = p.pc;
+            break;
+        }
         const bool cannot_write_scc =
             (p.fmt == Rdna2Format::SOP1 && (p.opcode == 0x03 || p.opcode == 0x04)) ||
             p.fmt == Rdna2Format::VOP1 || p.fmt == Rdna2Format::VOP2 ||
             p.fmt == Rdna2Format::VOP3 || p.fmt == Rdna2Format::VOP3P ||
             p.fmt == Rdna2Format::VOPC || p.fmt == Rdna2Format::VINTRP ||
-            p.fmt == Rdna2Format::SMEM || p.fmt == Rdna2Format::DS ||
-            p.fmt == Rdna2Format::MUBUF || p.fmt == Rdna2Format::MTBUF ||
-            p.fmt == Rdna2Format::MIMG || p.fmt == Rdna2Format::FLAT || sopp_is_noop(p);
+            p.fmt == Rdna2Format::SMEM || p.fmt == Rdna2Format::DS || p.fmt == Rdna2Format::MUBUF ||
+            p.fmt == Rdna2Format::MTBUF || p.fmt == Rdna2Format::MIMG ||
+            p.fmt == Rdna2Format::FLAT || sopp_is_noop(p);
         if (!cannot_write_scc) return UINT32_MAX;   // a branch, or a possible SCC side effect
     }
     if (writer == UINT32_MAX) return UINT32_MAX;
@@ -512,33 +536,47 @@ inline CountedLoop detect_counted_loop(const std::vector<Rdna2Inst>& ins) {
     // would reject a counted loop that legitimately coexists with a waterfall elsewhere in the same
     // shader — a previously-recompilable combination (kernel 44d locks it).
     const std::unordered_set<uint32_t> wf = waterfall_branches(ins);
-    const Rdna2Inst* back = nullptr; int nback = 0;
+    const Rdna2Inst* back = nullptr;
+    int nback = 0;
     for (const auto& in : ins) {
         if (in.is_end) break;
         if (in.fmt != Rdna2Format::SOPP || in.simm16 >= 0) continue;
-        if (in.opcode == 0x02 ||
-            ((in.opcode == 0x04 || in.opcode == 0x05) && !wf.count(in.pc))) { back = &in; nback++; }
+        if (in.opcode == 0x02 || ((in.opcode == 0x04 || in.opcode == 0x05) && !wf.count(in.pc))) {
+            back = &in;
+            nback++;
+        }
     }
-    if (nback != 1) return L;                       // 0 -> no loop; >1 -> nested/multiple (unhandled)
+    if (nback != 1) return L;   // 0 -> no loop; >1 -> nested/multiple (unhandled)
     const bool do_while = (back->opcode != 0x02);   // conditional back-edge => bottom-tested
     const uint32_t header = branch_target(*back);
     bool header_ok = false;
-    for (const auto& in : ins) if (in.pc == header && in.pc < back->pc) { header_ok = true; break; }
+    for (const auto& in : ins)
+        if (in.pc == header && in.pc < back->pc) {
+            header_ok = true;
+            break;
+        }
     if (!header_ok) return L;
     const uint32_t exit_pc = back->pc + back->len_dwords;
-    const Rdna2Inst* exitbr = nullptr; int nexit = 0;
-    for (const auto& in : ins) {                    // scan the loop body [header, back-edge]
+    const Rdna2Inst* exitbr = nullptr;
+    int nexit = 0;
+    for (const auto& in : ins) {   // scan the loop body [header, back-edge]
         if (in.pc < header || in.pc > back->pc || in.fmt != Rdna2Format::SOPP) continue;
-        if (&in == back) continue;                  // the back-edge is classified above, not here
+        if (&in == back) continue;   // the back-edge is classified above, not here
         switch (in.opcode) {
-            case 0x04: case 0x05:                   // s_cbranch_scc0 / scc1 — must be the single exit
+            case 0x04:
+            case 0x05:   // s_cbranch_scc0 / scc1 — must be the single exit
                 if (branch_target(in) != exit_pc) return L;
-                exitbr = &in; nexit++; break;
-            case 0x02:                              // any other s_branch -> reject
+                exitbr = &in;
+                nexit++;
+                break;
+            case 0x02:   // any other s_branch -> reject
                 return L;
-            case 0x06: case 0x07: case 0x09:        // vcc / execnz branches -> reject
+            case 0x06:
+            case 0x07:
+            case 0x09:   // vcc / execnz branches -> reject
                 return L;
-            case 0x08: default: break;              // execz (forward, predication-handled) / hints ok
+            case 0x08:
+            default: break;   // execz (forward, predication-handled) / hints ok
         }
     }
     if (do_while) {
@@ -549,13 +587,21 @@ inline CountedLoop detect_counted_loop(const std::vector<Rdna2Inst>& ins) {
         // s_cbranch_scc1 back-edge continues while SCC==1 (exit_on_scc0=true); scc0 continues while
         // SCC==0 (exit_on_scc0=false).
         if (nexit != 0) return L;
-        L.found = true; L.header_pc = header; L.exit_branch_pc = back->pc; L.backedge_pc = back->pc;
-        L.exit_pc = exit_pc; L.exit_on_scc0 = (back->opcode == 0x05);
+        L.found = true;
+        L.header_pc = header;
+        L.exit_branch_pc = back->pc;
+        L.backedge_pc = back->pc;
+        L.exit_pc = exit_pc;
+        L.exit_on_scc0 = (back->opcode == 0x05);
         return L;
     }
     if (nexit != 1) return L;
-    L.found = true; L.header_pc = header; L.exit_branch_pc = exitbr->pc; L.backedge_pc = back->pc;
-    L.exit_pc = exit_pc; L.exit_on_scc0 = (exitbr->opcode == 0x04);
+    L.found = true;
+    L.header_pc = header;
+    L.exit_branch_pc = exitbr->pc;
+    L.backedge_pc = back->pc;
+    L.exit_pc = exit_pc;
+    L.exit_on_scc0 = (exitbr->opcode == 0x04);
     return L;
 }
 
@@ -580,14 +626,15 @@ inline CountedLoop detect_counted_loop(const std::vector<Rdna2Inst>& ins) {
 // loop latch and branching the complete wave directly to the loop merge.
 struct DivLoop {
     enum class Condition : uint8_t { Exec, Vcc, Scc };
-    uint32_t header_pc = 0;        // back-edge target; condition region = [header_pc, exit_branch_pc)
-    uint32_t exit_branch_pc = 0;   // canonical forward execz/vccz/scc branch whose target is exit_pc
-    uint32_t backedge_pc = 0;      // backward s_branch, s_cbranch_execnz or s_cbranch_scc0/scc1
-    uint32_t exit_pc = 0;          // backedge_pc + its length (first pc after the loop)
+    uint32_t header_pc = 0;   // back-edge target; condition region = [header_pc, exit_branch_pc)
+    uint32_t exit_branch_pc =
+        0;   // canonical forward execz/vccz/scc branch whose target is exit_pc
+    uint32_t backedge_pc = 0;   // backward s_branch, s_cbranch_execnz or s_cbranch_scc0/scc1
+    uint32_t exit_pc = 0;   // backedge_pc + its length (first pc after the loop)
     std::vector<uint32_t> break_pcs;   // extra forward vccz/execz -> exit_pc (lowered as body ifs)
     bool direct_exec_breaks = false;   // unconditional back-edge: an interior execz exits directly
     bool direct_wave_breaks = false;   // fragment wave64: an interior vccz exits the complete wave
-    bool bottom_tested = false;        // the execnz/scc back-edge is the condition (do-while)
+    bool bottom_tested = false;   // the execnz/scc back-edge is the condition (do-while)
     Condition condition = Condition::Exec;
     // EXECZ/VCCZ and SCC0 all continue while their represented predicate is set. SCC1 is the one
     // admitted opposite-polarity canonical exit: it leaves the loop while SCC is set. A bottom-tested
@@ -625,13 +672,16 @@ inline bool cannot_write_vcc(const Rdna2Inst& in) {
             if (in.opcode == 0x02) return lane_read_misses_vcc();   // v_readfirstlane_b32
             return true;
         case Rdna2Format::VINTRP:
-        case Rdna2Format::MUBUF: case Rdna2Format::MTBUF: case Rdna2Format::MIMG:
-        case Rdna2Format::DS:    case Rdna2Format::FLAT:
-        case Rdna2Format::EXP:                                     // VGPR/memory dsts only
-        case Rdna2Format::SOPP:                                    // branches/hints/waitcnt: no dst
-        case Rdna2Format::SOPC:  return true;                      // writes SCC only
-        case Rdna2Format::VOP2:  return in.opcode < 0x28 || in.opcode > 0x2a;
-        case Rdna2Format::VOP3P: return true;                      // packed VALU: VGPR dst, no carry
+        case Rdna2Format::MUBUF:
+        case Rdna2Format::MTBUF:
+        case Rdna2Format::MIMG:
+        case Rdna2Format::DS:
+        case Rdna2Format::FLAT:
+        case Rdna2Format::EXP:   // VGPR/memory dsts only
+        case Rdna2Format::SOPP:   // branches/hints/waitcnt: no dst
+        case Rdna2Format::SOPC: return true;   // writes SCC only
+        case Rdna2Format::VOP2: return in.opcode < 0x28 || in.opcode > 0x2a;
+        case Rdna2Format::VOP3P: return true;   // packed VALU: VGPR dst, no carry
         case Rdna2Format::VOP3:
             // gfx10 v_writelane_b32 writes only its VGPR lane slot. v_readlane_b32 writes the
             // scalar destination encoded in the decoder's dst field, so it is VCC-preserving as
@@ -642,18 +692,24 @@ inline bool cannot_write_vcc(const Rdna2Inst& in) {
             // Decoder storage has an SDST-shaped field for every VOP3 packet, but only VOP3B
             // operations architecturally write it. Treat ordinary VOP3A VALU as VCC-transparent;
             // otherwise a MAC between a uniform compare and VCCZ creates a false Wave64 vote.
-            if (vop3_writes_mask_sdst(in))
-                return in.sdst.value != 106 && in.sdst.value != 107;
+            if (vop3_writes_mask_sdst(in)) return in.sdst.value != 106 && in.sdst.value != 107;
             return in.dst.kind == OperandKind::VGPR;
-        case Rdna2Format::SOP1: case Rdna2Format::SOP2: case Rdna2Format::SOPK:
-            return sgpr_dst_misses_vcc(2);                         // conservative 64-bit pair
+        case Rdna2Format::SOP1:
+        case Rdna2Format::SOP2:
+        case Rdna2Format::SOPK: return sgpr_dst_misses_vcc(2);   // conservative 64-bit pair
         case Rdna2Format::SMEM: {
             uint32_t n = 0;
-            switch (in.opcode & 7) { case 0: n = 1; break; case 1: n = 2; break; case 2: n = 4; break;
-                                     case 3: n = 8; break; case 4: n = 16; break; default: return false; }
+            switch (in.opcode & 7) {
+                case 0: n = 1; break;
+                case 1: n = 2; break;
+                case 2: n = 4; break;
+                case 3: n = 8; break;
+                case 4: n = 16; break;
+                default: return false;
+            }
             return sgpr_dst_misses_vcc(n);
         }
-        default: return false;                                     // VOPC / unknown: stops the walk
+        default: return false;   // VOPC / unknown: stops the walk
     }
 }
 
@@ -662,12 +718,16 @@ inline bool vcc_exit_is_wave_uniform(const std::vector<Rdna2Inst>& ins, uint32_t
     for (auto it = ins.rbegin(); it != ins.rend(); ++it) {
         if (it->pc >= branch_pc) continue;
         if (sopp_is_noop(*it)) continue;
-        if (it->fmt == Rdna2Format::VOPC) { compare = &*it; break; }
+        if (it->fmt == Rdna2Format::VOPC) {
+            compare = &*it;
+            break;
+        }
         if (cannot_write_vcc(*it)) continue;   // (#590) look past provably-VCC-preserving instrs —
-        break;                                 // VCC's value is frozen at the compare; only a real
-                                               // rewrite between compare and branch invalidates it
+        break;   // VCC's value is frozen at the compare; only a real
+        // rewrite between compare and branch invalidates it
     }
-    if (!compare || compare->fmt != Rdna2Format::VOPC || vopc_is_cmpx(compare->opcode)) return false;
+    if (!compare || compare->fmt != Rdna2Format::VOPC || vopc_is_cmpx(compare->opcode))
+        return false;
 
     std::function<bool(const Operand&, uint32_t)> uniform_operand_at;
     uniform_operand_at = [&](const Operand& operand, uint32_t use_pc) -> bool {
@@ -721,13 +781,15 @@ inline bool vcc_exit_is_wave_uniform(const std::vector<Rdna2Inst>& ins, uint32_t
             if (operand.value == rdna2_tfe_status_vgpr(*it)) return false;
             const uint32_t writes = rdna2_vgpr_write_count(*it);
             if (!writes || operand.value < it->dst.value ||
-                operand.value >= it->dst.value + (int32_t)writes) continue;
+                operand.value >= it->dst.value + (int32_t)writes)
+                continue;
             if (it->dst.value != operand.value || it->has_dpp) return false;
             // The write makes every currently active lane uniform. Keep the original conservative
             // EXEC rule: any later mask change could expose a lane that retained an older value.
             for (const auto& between : ins)
                 if (between.pc > it->pc && between.pc < compare->pc &&
-                    rdna2_instruction_may_change_exec(between)) return false;
+                    rdna2_instruction_may_change_exec(between))
+                    return false;
 
             bool pure_lane_alu = false;
             if (it->fmt == Rdna2Format::VOP1) {
@@ -736,7 +798,7 @@ inline bool vcc_exit_is_wave_uniform(const std::vector<Rdna2Inst>& ins, uint32_t
                 // v_cndmask consumes VCC; the carry family consumes/produces VCC. Neither preserves
                 // scalar-source uniformity as a simple lane-local expression.
                 pure_lane_alu = it->n_src == 2 && it->opcode != 0x01 &&
-                    (it->opcode < 0x28 || it->opcode > 0x2a);
+                                (it->opcode < 0x28 || it->opcode > 0x2a);
             }
             if (!pure_lane_alu) return false;
             for (uint32_t i = 0; i < it->n_src; ++i)
@@ -758,11 +820,11 @@ inline bool vcc_exit_is_wave_uniform(const std::vector<Rdna2Inst>& ins, uint32_t
 // none of the reject sites), or a shape check refused. Callers conflate them deliberately --
 // `(cf_rejected || Ls.empty())` -- so this distinction matters only to a reader of the diagnostic,
 // which is why the reject reporter below prints on exactly one of those two paths.
-inline std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>& ins,
-                                            const std::unordered_set<uint32_t>& safe,
-                                            bool exact_fragment_wave_breaks = false,
-                                            const RecompileDiagnosticContext& diagnostic = {},
-                                            const char* caller_role = "emit") {
+inline std::vector<DivLoop>
+detect_divergent_loops(const std::vector<Rdna2Inst>& ins, const std::unordered_set<uint32_t>& safe,
+                       bool exact_fragment_wave_breaks = false,
+                       const RecompileDiagnosticContext& diagnostic = {},
+                       const char* caller_role = "emit") {
     std::vector<DivLoop> out;
     // PROSPER_DBG: name WHICH rejection discards the loops. Every `return {}` here throws away
     // EVERY loop in the shader, not just the one that failed. What the caller then does with an
@@ -845,8 +907,7 @@ inline std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>&
             // 14 tuples on a full routed GTA V run, so the cap is not expected to be reached.
             if (seen.size() >= 4096u) seen.clear();
             if (seen.emplace(diagnostic.program_address, why, pc, caller_role).second)
-                std::fprintf(stderr,
-                             "[divloop-reject] program=0x%llx role=%s %s at pc=%u (%s)\n",
+                std::fprintf(stderr, "[divloop-reject] program=0x%llx role=%s %s at pc=%u (%s)\n",
                              (unsigned long long)diagnostic.program_address, caller_role, why, pc,
                              std::strcmp(caller_role, "emit") == 0
                                  ? "all loops discarded; what the stream does next is the caller's"
@@ -855,7 +916,11 @@ inline std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>&
         return {};
     };
     uint32_t end_pc = UINT32_MAX;
-    for (const auto& in : ins) if (in.is_end) { end_pc = in.pc; break; }
+    for (const auto& in : ins)
+        if (in.is_end) {
+            end_pc = in.pc;
+            break;
+        }
     // Pass 1: each backward s_branch / s_cbranch_execnz / s_cbranch_scc0/scc1 is a candidate
     // back-edge. A backward SCC branch closes a bottom-tested do-while unless it is a waterfall's
     // once-through branch, which the linearizer consumes (waterfall_branches).
@@ -872,10 +937,17 @@ inline std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>&
         L.header_pc = branch_target(in);
         L.backedge_pc = in.pc;
         L.exit_pc = in.pc + in.len_dwords;
-        if (L.header_pc >= L.backedge_pc) return divloop_reject("degenerate-loop-bounds", L.header_pc);
+        if (L.header_pc >= L.backedge_pc)
+            return divloop_reject("degenerate-loop-bounds", L.header_pc);
         if (L.exit_pc > end_pc) return divloop_reject("exit-past-end-of-program", L.header_pc);
         bool hdr_ok = false;
-        for (const auto& h : ins) { if (h.pc == L.header_pc) { hdr_ok = true; break; } if (h.pc > L.header_pc) break; }
+        for (const auto& h : ins) {
+            if (h.pc == L.header_pc) {
+                hdr_ok = true;
+                break;
+            }
+            if (h.pc > L.header_pc) break;
+        }
         if (!hdr_ok) return divloop_reject("header-pc-is-not-an-instruction", L.header_pc);
         out.push_back(L);
         backedge_op.push_back(in.opcode);
@@ -893,18 +965,28 @@ inline std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>&
         for (size_t i = 0; i < order.size(); i++) order[i] = i;
         std::sort(order.begin(), order.end(),
                   [&](size_t a, size_t c) { return out[a].header_pc < out[c].header_pc; });
-        std::vector<DivLoop> sorted_loops; std::vector<uint32_t> sorted_op;
-        sorted_loops.reserve(out.size()); sorted_op.reserve(out.size());
-        for (size_t i : order) { sorted_loops.push_back(out[i]); sorted_op.push_back(backedge_op[i]); }
-        out.swap(sorted_loops); backedge_op.swap(sorted_op);
+        std::vector<DivLoop> sorted_loops;
+        std::vector<uint32_t> sorted_op;
+        sorted_loops.reserve(out.size());
+        sorted_op.reserve(out.size());
+        for (size_t i : order) {
+            sorted_loops.push_back(out[i]);
+            sorted_op.push_back(backedge_op[i]);
+        }
+        out.swap(sorted_loops);
+        backedge_op.swap(sorted_op);
     }
     for (size_t i = 0; i < out.size(); i++)
         for (size_t j = i + 1; j < out.size(); j++) {
-            const DivLoop& A = out[i]; const DivLoop& B = out[j];   // A.header_pc <= B.header_pc
-            if (A.header_pc == B.header_pc) return divloop_reject("shared-header", A.header_pc); // shared header: not modeled
+            const DivLoop& A = out[i];
+            const DivLoop& B = out[j];   // A.header_pc <= B.header_pc
+            if (A.header_pc == B.header_pc)
+                return divloop_reject("shared-header", A.header_pc);   // shared header: not modeled
             const bool disjoint = B.header_pc >= A.exit_pc;
-            const bool nested   = B.exit_pc <= A.backedge_pc;       // B entirely inside A's body
-            if (!disjoint && !nested) return divloop_reject("partial-overlap", B.header_pc);    // partial overlap: unstructured
+            const bool nested = B.exit_pc <= A.backedge_pc;   // B entirely inside A's body
+            if (!disjoint && !nested)
+                return divloop_reject("partial-overlap",
+                                      B.header_pc);   // partial overlap: unstructured
         }
     // Pass 2: validate each loop's interior branches and find the canonical exit + breaks. A branch
     // inside a NESTED child loop belongs to the child (which validates itself in its own pass-2
@@ -912,8 +994,9 @@ inline std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>&
     // "second back-edge inside" that used to reject nesting outright.
     auto inside_nested_child = [&out](const DivLoop& L, uint32_t pc) {
         for (const auto& C : out)
-            if (C.header_pc > L.header_pc && C.exit_pc <= L.backedge_pc &&
-                pc >= C.header_pc && pc <= C.backedge_pc) return true;
+            if (C.header_pc > L.header_pc && C.exit_pc <= L.backedge_pc && pc >= C.header_pc &&
+                pc <= C.backedge_pc)
+                return true;
         return false;
     };
     for (size_t li = 0; li < out.size(); li++) {
@@ -925,23 +1008,36 @@ inline std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>&
             if (in.pc < L.header_pc || in.fmt != Rdna2Format::SOPP) continue;
             if (inside_nested_child(L, in.pc)) continue;
             switch (in.opcode) {
-                case 0x02: case 0x04: case 0x05: case 0x06: case 0x07: case 0x08: case 0x09: break;
+                case 0x02:
+                case 0x04:
+                case 0x05:
+                case 0x06:
+                case 0x07:
+                case 0x08:
+                case 0x09: break;
                 default: continue;   // hints
             }
-            if (in.simm16 < 0) return divloop_reject("nested-backedge-in-body", in.pc);         // second back-edge inside -> nested loop
-            if (safe.count(in.pc)) continue;                    // linearized (kill-mask / safe-execz)
+            if (in.simm16 < 0)
+                return divloop_reject("nested-backedge-in-body",
+                                      in.pc);   // second back-edge inside -> nested loop
+            if (safe.count(in.pc)) continue;   // linearized (kill-mask / safe-execz)
             uint32_t tgt = branch_target(in);
-            if (in.opcode == 0x02) {                            // forward s_branch: an else-arm terminator
-                if (tgt > L.backedge_pc) return divloop_reject("else-arm-branch-leaves-body", in.pc); // may not leave the body
-                continue;                                       // (validated by detect_forward_ifs)
+            if (in.opcode == 0x02) {   // forward s_branch: an else-arm terminator
+                if (tgt > L.backedge_pc)
+                    return divloop_reject("else-arm-branch-leaves-body",
+                                          in.pc);   // may not leave the body
+                continue;   // (validated by detect_forward_ifs)
             }
-            if (tgt > L.exit_pc) return divloop_reject("conditional-branch-past-loop", in.pc);      // conditional jumping past the loop
+            if (tgt > L.exit_pc)
+                return divloop_reject("conditional-branch-past-loop",
+                                      in.pc);   // conditional jumping past the loop
             // An SCC do-while's only exit is falling through its back-edge. A second, interior
             // exit is a break this lowering does not model (CountedLoop refuses it the same way).
-            if (scc_do_while && tgt == L.exit_pc) return divloop_reject("scc-do-while-interior-exit", in.pc);
-            if (tgt == L.exit_pc) {                             // an exit test
-                if (!L.exit_branch_pc) {                        // first one = the canonical exit
-                    if (in.opcode == 0x08) {                    // execz -> EXIT
+            if (scc_do_while && tgt == L.exit_pc)
+                return divloop_reject("scc-do-while-interior-exit", in.pc);
+            if (tgt == L.exit_pc) {   // an exit test
+                if (!L.exit_branch_pc) {   // first one = the canonical exit
+                    if (in.opcode == 0x08) {   // execz -> EXIT
                         L.condition = DivLoop::Condition::Exec;
                     } else if (in.opcode == 0x06 && !execnz &&
                                (exact_fragment_wave_breaks ||
@@ -967,8 +1063,10 @@ inline std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>&
                         return divloop_reject("exit-branch-opcode-not-modeled", in.pc);
                     }
                     L.exit_branch_pc = in.pc;
-                } else {                                        // later ones = breaks
-                    if (in.opcode != 0x06 && in.opcode != 0x08) return divloop_reject("break-not-vccz-or-execz", in.pc); // vccz/execz only
+                } else {   // later ones = breaks
+                    if (in.opcode != 0x06 && in.opcode != 0x08)
+                        return divloop_reject("break-not-vccz-or-execz",
+                                              in.pc);   // vccz/execz only
                     // With an execnz back-edge, a cleared lane skips to the next header check. With
                     // an unconditional back-edge that could re-enable EXEC, only an EXECZ branch is
                     // exact: the emitter sends the cleared lane directly to the loop merge instead.
@@ -978,7 +1076,8 @@ inline std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>&
                         // approximation could not carry it to the merge. The fragment shell now
                         // reduces VCC over an enforced wave64 subgroup and can branch the complete
                         // guest wave directly at the loop latch. Other stages remain conservative.
-                        if (!exact_fragment_wave_breaks || in.opcode != 0x06) return divloop_reject("vccz-break-unsupported-stage", in.pc);
+                        if (!exact_fragment_wave_breaks || in.opcode != 0x06)
+                            return divloop_reject("vccz-break-unsupported-stage", in.pc);
                         L.direct_wave_breaks = true;
                     } else if (!execnz) {
                         L.direct_exec_breaks = true;
@@ -993,7 +1092,8 @@ inline std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>&
             // while it is clear. The whole body runs before the first test, so it is emitted as
             // the condition region, and the test must read one compare on every path.
             if (scc_do_while_condition_pc(ins, L.header_pc, L.backedge_pc) == UINT32_MAX)
-                return divloop_reject("scc-do-while-condition-not-a-straight-line-compare", L.backedge_pc);
+                return divloop_reject("scc-do-while-condition-not-a-straight-line-compare",
+                                      L.backedge_pc);
             L.exit_branch_pc = L.backedge_pc;
             L.condition = DivLoop::Condition::Scc;
             L.continue_on_set = backedge_op[li] == 0x05;
@@ -1006,15 +1106,16 @@ inline std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>&
             // would turn an arbitrary backward branch into a do-while (and commonly an infinite
             // one). GTA V's nested lighting loop ends in V_CMPX; the regression uses S_MOV_B64
             // EXEC,0. Nested child branches were already validated and skipped above.
-            if (!execnz) return divloop_reject("bottom-tested-needs-execnz-backedge", L.backedge_pc);
+            if (!execnz)
+                return divloop_reject("bottom-tested-needs-execnz-backedge", L.backedge_pc);
             const Rdna2Inst* condition_writer = nullptr;
             for (const auto& in : ins) {
                 if (in.pc < L.header_pc) continue;
                 if (in.pc >= L.backedge_pc) break;
                 condition_writer = &in;
             }
-            if (!condition_writer ||
-                !rdna2_instruction_may_change_exec(*condition_writer)) return divloop_reject("bottom-tested-no-exec-writer", L.backedge_pc);
+            if (!condition_writer || !rdna2_instruction_may_change_exec(*condition_writer))
+                return divloop_reject("bottom-tested-no-exec-writer", L.backedge_pc);
             L.exit_branch_pc = L.backedge_pc;
             L.condition = DivLoop::Condition::Exec;
             L.continue_on_set = true;
@@ -1028,20 +1129,23 @@ inline std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>&
                 if (in.pc >= L.exit_branch_pc) break;
                 if (in.pc < L.header_pc || in.fmt != Rdna2Format::SOPP) continue;
                 if (in.opcode >= 0x02 && in.opcode <= 0x09 && in.opcode != 0x03 &&
-                    !safe.count(in.pc)) return divloop_reject("condition-region-not-branch-free", in.pc);
+                    !safe.count(in.pc))
+                    return divloop_reject("condition-region-not-branch-free", in.pc);
             }
         }
         // The execnz flavor's unconditional-continue lowering requires the header check to
         // immediately re-test EXEC (empty condition region) — see the shape comment.
-        if (execnz && !L.bottom_tested && L.exit_branch_pc != L.header_pc) return divloop_reject("execnz-nonempty-condition-region", L.header_pc);
+        if (execnz && !L.bottom_tested && L.exit_branch_pc != L.header_pc)
+            return divloop_reject("execnz-nonempty-condition-region", L.header_pc);
     }
     // A nested child must lie entirely within its parent's BODY: after the parent's canonical exit
     // test (the condition region [header, exit_branch) stays branch-free) and before its back-edge.
     for (size_t i = 0; i < out.size(); i++)
         for (size_t j = i + 1; j < out.size(); j++)
-            if (out[j].exit_pc <= out[i].backedge_pc &&        // nested per the classification above
-                !out[i].bottom_tested &&
-                out[j].header_pc <= out[i].exit_branch_pc) return divloop_reject("child-header-inside-parent-condition-region", out[j].header_pc);
+            if (out[j].exit_pc <= out[i].backedge_pc &&   // nested per the classification above
+                !out[i].bottom_tested && out[j].header_pc <= out[i].exit_branch_pc)
+                return divloop_reject("child-header-inside-parent-condition-region",
+                                      out[j].header_pc);
     // Pass 3: no branch from OUTSIDE a loop may target its interior (an unstructured entry edge).
     for (const auto& in : ins) {
         if (in.is_end) break;
@@ -1051,7 +1155,8 @@ inline std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>&
         for (const auto& L : out) {
             const bool inside_br = in.pc >= L.header_pc && in.pc <= L.backedge_pc;
             const bool inside_tgt = tgt > L.header_pc && tgt < L.exit_pc;
-            if (!inside_br && inside_tgt) return divloop_reject("entry-edge-from-outside-loop", in.pc);
+            if (!inside_br && inside_tgt)
+                return divloop_reject("entry-edge-from-outside-loop", in.pc);
         }
     }
     return out;
@@ -1066,9 +1171,12 @@ inline std::vector<DivLoop> detect_divergent_loops(const std::vector<Rdna2Inst>&
 struct ForwardIf {
     bool found = false;
     uint32_t branch_pc = 0, target_pc = 0;
-    bool on_scc0 = true;   // s_cbranch_scc0/vccz/execz (branch taken == skip block when flag==0) vs scc1/vccnz
-    bool on_vcc  = false;  // condition register: false = SCC, true = VCC (both are wave-uniform branches)
-    bool early_out = false;// branch target was clamped to end_pc: the conditional block ENDS the shader
+    bool on_scc0 =
+        true;   // s_cbranch_scc0/vccz/execz (branch taken == skip block when flag==0) vs scc1/vccnz
+    bool on_vcc =
+        false;   // condition register: false = SCC, true = VCC (both are wave-uniform branches)
+    bool early_out =
+        false;   // branch target was clamped to end_pc: the conditional block ENDS the shader
     // Divergent-region if (#273): the branch is a forward s_cbranch_execz over an EXEC-narrowed block
     // (v_cmpx … s_cbranch_execz — DOLL's FXAA PS). Fragment reduces EXEC across an enforced wave64;
     // other structured stages use the guarded per-invocation model. EXEC is phi'd at the merge.
@@ -1096,25 +1204,42 @@ struct ForwardIf {
 // no/unsupported control flow (the caller falls back to straight-line, which rejects loudly at the
 // branch). Compute execz uses a subgroup vote; execnz and unclaimed s_branch still reject wholesale.
 // CONFIDENCE: HIGH on the structure (guarded by the phi machinery shared with the single-if path).
-inline std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& ins, bool allow_vcc,
-                                          const uint32_t* code, size_t dwords,
-                                          const std::unordered_set<uint32_t>* skip = nullptr,
-                                          const std::vector<DivLoop>* loops = nullptr,
-                                          bool* rejected = nullptr,
-                                          bool compute_wave_branches = false,
-                                          RecompileDiagnosticContext diagnostic = {}) {
+inline std::vector<ForwardIf>
+detect_forward_ifs(const std::vector<Rdna2Inst>& ins, bool allow_vcc, const uint32_t* code,
+                   size_t dwords, const std::unordered_set<uint32_t>* skip = nullptr,
+                   const std::vector<DivLoop>* loops = nullptr, bool* rejected = nullptr,
+                   bool compute_wave_branches = false, RecompileDiagnosticContext diagnostic = {}) {
     std::vector<ForwardIf> out;
     if (rejected) *rejected = false;
-    auto reject = [&]() -> std::vector<ForwardIf> { if (rejected) *rejected = true; return {}; };
+    auto reject = [&]() -> std::vector<ForwardIf> {
+        if (rejected) *rejected = true;
+        return {};
+    };
     uint32_t end_pc = UINT32_MAX;
-    for (const auto& in : ins) if (in.is_end) { end_pc = in.pc; break; }
+    for (const auto& in : ins)
+        if (in.is_end) {
+            end_pc = in.pc;
+            break;
+        }
     // Loop-claimed pcs (#273): back-edges + canonical exits are consumed by the loop emitter; a break
     // lowers as a forward if over the remainder of its loop's body (target clamped to the back-edge).
-    auto loop_backedge = [&](uint32_t pc) { if (loops) for (const auto& L : *loops) if (L.backedge_pc == pc) return true; return false; };
-    auto loop_exit     = [&](uint32_t pc) { if (loops) for (const auto& L : *loops) if (L.exit_branch_pc == pc) return true; return false; };
-    auto loop_break    = [&](uint32_t pc) -> const DivLoop* {
-        if (loops) for (const auto& L : *loops)
-            for (uint32_t bp : L.break_pcs) if (bp == pc) return &L;
+    auto loop_backedge = [&](uint32_t pc) {
+        if (loops)
+            for (const auto& L : *loops)
+                if (L.backedge_pc == pc) return true;
+        return false;
+    };
+    auto loop_exit = [&](uint32_t pc) {
+        if (loops)
+            for (const auto& L : *loops)
+                if (L.exit_branch_pc == pc) return true;
+        return false;
+    };
+    auto loop_break = [&](uint32_t pc) -> const DivLoop* {
+        if (loops)
+            for (const auto& L : *loops)
+                for (uint32_t bp : L.break_pcs)
+                    if (bp == pc) return &L;
         return nullptr;
     };
     // Pass 1: collect the conditional branches (else-arm s_branch terminators are claimed in pass 2).
@@ -1126,41 +1251,45 @@ inline std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& i
         // synchronized phase (checked after the target/merge is known).
         bool compute_uniform_vcc = false;
         switch (in.opcode) {
-            case 0x02: continue;                                     // s_branch: validated in pass 2
-            case 0x09:                                               // execnz: only as a loop back-edge
+            case 0x02: continue;   // s_branch: validated in pass 2
+            case 0x09:   // execnz: only as a loop back-edge
                 if (loop_backedge(in.pc)) continue;
                 log_recompile_diagnostic(diagnostic, "compute-struct-reject", "route-decline",
                                          "unclaimed execnz pc=%u", in.pc);
                 return reject();
-            case 0x08:                                               // execz: safe-linearized predication
-                if (skip && skip->count(in.pc)) continue;            // branch -> emit_alu no-ops it; else a
-                if (loop_exit(in.pc)) continue;                      // loop exit test: the loop emitter's
+            case 0x08:   // execz: safe-linearized predication
+                if (skip && skip->count(in.pc)) continue;   // branch -> emit_alu no-ops it; else a
+                if (loop_exit(in.pc)) continue;   // loop exit test: the loop emitter's
                 if (!allow_vcc && !compute_wave_branches) {
                     log_recompile_diagnostic(diagnostic, "compute-struct-reject", "route-decline",
                                              "unsupported execz pc=%u", in.pc);
                     return reject();
                 }
-                break;                                               // compute lowers the wave-empty test with
-                                                                     // OpGroupNonUniformAny(EXEC)
-            case 0x06: case 0x07:                                    // vccz / vccnz
-                if (loop_exit(in.pc)) continue;                      // canonical loop condition: loop emitter owns it
+                break;   // compute lowers the wave-empty test with
+                // OpGroupNonUniformAny(EXEC)
+            case 0x06:
+            case 0x07:   // vccz / vccnz
+                if (loop_exit(in.pc)) continue;   // canonical loop condition: loop emitter owns it
                 if (!allow_vcc) {
                     // Compute VCC is a per-lane bool in the SPIR-V shell. The scalar branch consumes
                     // the architectural whole-wave VCCZ/VCCNZ flag. Accept it for the exact guest-wave
                     // CFG dispatcher; emit_body must never lower it through a native subgroup vote.
                     if (!compute_wave_branches) {
-                        log_recompile_diagnostic(diagnostic, "compute-struct-reject", "route-decline",
-                                                 "unsupported vcc branch pc=%u", in.pc);
+                        log_recompile_diagnostic(diagnostic, "compute-struct-reject",
+                                                 "route-decline", "unsupported vcc branch pc=%u",
+                                                 in.pc);
                         return reject();
                     }
                     compute_uniform_vcc = true;
                 }
                 break;
-            case 0x04: case 0x05:                                    // scc0 / scc1
-                if (loop_exit(in.pc)) continue;                      // scalar loop condition: loop emitter owns it
-                if (skip && skip->count(in.pc)) continue;            // kill-mask branch: linearized, not an if
+            case 0x04:
+            case 0x05:   // scc0 / scc1
+                if (loop_exit(in.pc)) continue;   // scalar loop condition: loop emitter owns it
+                if (skip && skip->count(in.pc))
+                    continue;   // kill-mask branch: linearized, not an if
                 break;
-            default: continue;                                       // hints
+            default: continue;   // hints
         }
         // A loop BREAK (validated vccz/execz -> exit_pc inside an execnz-back-edge loop): a plain
         // forward if skipping the REST of the body — the exec-governed continue then exits the lane.
@@ -1173,26 +1302,31 @@ inline std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& i
         }
         if (const DivLoop* L = loop_break(in.pc)) {
             ForwardIf F;
-            F.found = true; F.branch_pc = in.pc; F.target_pc = L->backedge_pc;
-            F.on_scc0 = true;                                        // vccz/execz: skip block when flag==0
-            F.on_vcc  = (in.opcode == 0x06);
+            F.found = true;
+            F.branch_pc = in.pc;
+            F.target_pc = L->backedge_pc;
+            F.on_scc0 = true;   // vccz/execz: skip block when flag==0
+            F.on_vcc = (in.opcode == 0x06);
             F.on_exec = (in.opcode == 0x08);
             out.push_back(F);
             continue;
         }
         uint32_t tgt = branch_target(in);
         bool early = false;
-        if (tgt > end_pc && tgt != UINT32_MAX) {                     // possible early-out past s_endpgm:
+        if (tgt > end_pc && tgt != UINT32_MAX) {   // possible early-out past s_endpgm:
             if (!code || tgt >= dwords) {
                 log_recompile_diagnostic(diagnostic, "compute-struct-reject", "route-decline",
                                          "target out of range pc=%u target=%u", in.pc, tgt);
-                return reject();                                     // verify the target terminates (see
+                return reject();   // verify the target terminates (see
             }
-            std::vector<Rdna2Inst> tail;                             // detect_forward_if for the rationale)
+            std::vector<Rdna2Inst> tail;   // detect_forward_if for the rationale)
             rdna2_walk(code + tgt, dwords - tgt, tail);
             bool ends_immediately = false;
             for (const auto& ti : tail) {
-                if (ti.is_end) { ends_immediately = true; break; }
+                if (ti.is_end) {
+                    ends_immediately = true;
+                    break;
+                }
                 if (ti.fmt == Rdna2Format::SOPP && ti.opcode == 0x00) continue;
                 break;
             }
@@ -1201,17 +1335,21 @@ inline std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& i
                                          "nonterminal early target pc=%u target=%u", in.pc, tgt);
                 return reject();
             }
-            tgt = end_pc; early = true;
+            tgt = end_pc;
+            early = true;
         }
         if (tgt <= in.pc || tgt > end_pc) {
             log_recompile_diagnostic(diagnostic, "compute-struct-reject", "route-decline",
                                      "nonforward target pc=%u target=%u", in.pc, tgt);
-            return reject();                                         // must be forward, within the stream
+            return reject();   // must be forward, within the stream
         }
         ForwardIf F;
-        F.found = true; F.branch_pc = in.pc; F.target_pc = tgt; F.early_out = (early || tgt == end_pc);
+        F.found = true;
+        F.branch_pc = in.pc;
+        F.target_pc = tgt;
+        F.early_out = (early || tgt == end_pc);
         F.on_scc0 = (in.opcode == 0x04 || in.opcode == 0x06 || in.opcode == 0x08);
-        F.on_vcc  = (in.opcode == 0x06 || in.opcode == 0x07);
+        F.on_vcc = (in.opcode == 0x06 || in.opcode == 0x07);
         F.on_exec = (in.opcode == 0x08);
         // IF/ELSE detection: the instruction immediately preceding target_pc is a FORWARD s_branch —
         // the then-arm's terminator jumping to the merge; the else-arm is [target_pc, merge). (Skip
@@ -1220,22 +1358,25 @@ inline std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& i
             for (const auto& sb : ins) {
                 if (sb.pc <= in.pc || sb.pc >= tgt) continue;
                 if (sb.fmt != Rdna2Format::SOPP || sb.opcode != 0x02) continue;
-                if (sb.pc + sb.len_dwords != tgt) continue;          // must be the arm's LAST instruction
-                if (loop_backedge(sb.pc)) continue;                  // a loop's back-edge, not an else-jump
+                if (sb.pc + sb.len_dwords != tgt) continue;   // must be the arm's LAST instruction
+                if (loop_backedge(sb.pc)) continue;   // a loop's back-edge, not an else-jump
                 if (sb.simm16 <= 0) {
                     log_recompile_diagnostic(diagnostic, "compute-struct-reject", "route-decline",
-                                             "backward else pc=%u branch=%u target=%u",
-                                             in.pc, sb.pc, tgt);
-                    return reject();                                 // backward else-jump: a loop, not an if
+                                             "backward else pc=%u branch=%u target=%u", in.pc,
+                                             sb.pc, tgt);
+                    return reject();   // backward else-jump: a loop, not an if
                 }
                 uint32_t lm = branch_target(sb);
                 if (lm <= tgt || lm > end_pc) {
-                    log_recompile_diagnostic(diagnostic, "compute-struct-reject", "route-decline",
-                                             "invalid else merge pc=%u branch=%u target=%u merge=%u",
-                                             in.pc, sb.pc, tgt, lm);
-                    return reject();                                 // merge must be forward, in-stream
+                    log_recompile_diagnostic(
+                        diagnostic, "compute-struct-reject", "route-decline",
+                        "invalid else merge pc=%u branch=%u target=%u merge=%u", in.pc, sb.pc, tgt,
+                        lm);
+                    return reject();   // merge must be forward, in-stream
                 }
-                F.has_else = true; F.sb_pc = sb.pc; F.merge_pc = lm;
+                F.has_else = true;
+                F.sb_pc = sb.pc;
+                F.merge_pc = lm;
                 break;
             }
         }
@@ -1258,23 +1399,33 @@ inline std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& i
                 }
 
                 uint32_t scalar_width = 0;
-                if (r.fmt == Rdna2Format::SOP1) scalar_width = r.opcode == 0x04 ? 2u : 1u;
-                else if (r.fmt == Rdna2Format::SOP2) scalar_width = 1;
-                else if (r.fmt == Rdna2Format::SOPK && sopk_writes_scalar_data(r.opcode)) scalar_width = 1;
+                if (r.fmt == Rdna2Format::SOP1)
+                    scalar_width = r.opcode == 0x04 ? 2u : 1u;
+                else if (r.fmt == Rdna2Format::SOP2)
+                    scalar_width = 1;
+                else if (r.fmt == Rdna2Format::SOPK && sopk_writes_scalar_data(r.opcode))
+                    scalar_width = 1;
                 else if (r.fmt == Rdna2Format::SMEM) {
                     switch (r.opcode) {
-                        case 0x0: case 0x8: scalar_width = 1; break;
-                        case 0x1: case 0x9: scalar_width = 2; break;
-                        case 0x2: case 0xA: scalar_width = 4; break;
-                        case 0x3: case 0xB: scalar_width = 8; break;
-                        case 0x4: case 0xC: scalar_width = 16; break;
+                        case 0x0:
+                        case 0x8: scalar_width = 1; break;
+                        case 0x1:
+                        case 0x9: scalar_width = 2; break;
+                        case 0x2:
+                        case 0xA: scalar_width = 4; break;
+                        case 0x3:
+                        case 0xB: scalar_width = 8; break;
+                        case 0x4:
+                        case 0xC: scalar_width = 16; break;
                         default: break;
                     }
                 }
                 if (!scalar_width ||
-                    (r.dst.kind != OperandKind::SGPR && r.dst.kind != OperandKind::Special)) continue;
+                    (r.dst.kind != OperandKind::SGPR && r.dst.kind != OperandKind::Special))
+                    continue;
                 for (int vcc_half = 106; vcc_half <= 107; ++vcc_half) {
-                    if (vcc_half < r.dst.value || vcc_half >= r.dst.value + (int)scalar_width) continue;
+                    if (vcc_half < r.dst.value || vcc_half >= r.dst.value + (int)scalar_width)
+                        continue;
                     // PROSPER_VCC_SCALAR_DATA_MERGE=1 widens the proof from "not read" to "not read
                     // as a lane mask". The guard this loop implements is about the MASK domain --
                     // its own comment says so -- but the test it applies is total liveness, so a
@@ -1286,19 +1437,21 @@ inline std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& i
                     // rejects that join deliberately. Keeping it behind a switch also makes the A/B
                     // have a lever that can be shown to have moved, which a byte-identical module
                     // has already cost this investigation once.
-                    const bool relax_vcc_scalar_data = compiler_choice(
-                        CompilerChoice::VccScalarMerge, [] {
+                    const bool relax_vcc_scalar_data =
+                        compiler_choice(CompilerChoice::VccScalarMerge, [] {
                             static const bool value =
                                 std::getenv("PROSPER_VCC_SCALAR_DATA_MERGE") != nullptr;
                             return value;
                         });
                     const ScalarMergeProof proof = relax_vcc_scalar_data
-                        ? ScalarMergeProof::MaskDomainOnly : ScalarMergeProof::AnyRead;
+                                                       ? ScalarMergeProof::MaskDomainOnly
+                                                       : ScalarMergeProof::AnyRead;
                     ScalarMergeBlocker blocker;
                     if (!sgpr_dead_at_merge(ins, region_end, vcc_half, proof, &blocker)) {
                         log_recompile_diagnostic(
                             diagnostic, "compute-struct-reject", "route-decline",
-                            "execz pc=%u scalar write pc=%u leaves vcc-half s%d live at merge pc=%u "
+                            "execz pc=%u scalar write pc=%u leaves vcc-half s%d live at merge "
+                            "pc=%u "
                             "blocked-by pc=%u kind=%s",
                             in.pc, r.pc, vcc_half, region_end, blocker.pc, blocker.kind);
                         return reject();
@@ -1343,17 +1496,16 @@ inline std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& i
             for (const auto& r : ins) {
                 if (r.is_end || r.pc >= region_end) break;
                 if (r.pc <= in.pc) continue;
-                const bool ds_wave_collective = r.fmt == Rdna2Format::DS &&
+                const bool ds_wave_collective =
+                    r.fmt == Rdna2Format::DS &&
                     (r.opcode == 0x35 || r.opcode == 0x3d || r.opcode == 0x3e ||
                      r.opcode == kDsOpcodeBpermuteB32);
-                if ((r.fmt == Rdna2Format::SOPP && r.opcode == 0x0a) ||
-                    ds_wave_collective ||
-                    (r.fmt == Rdna2Format::VOP3 &&
-                     (r.opcode == 0x365 || r.opcode == 0x366))) {
+                if ((r.fmt == Rdna2Format::SOPP && r.opcode == 0x0a) || ds_wave_collective ||
+                    (r.fmt == Rdna2Format::VOP3 && (r.opcode == 0x365 || r.opcode == 0x366))) {
                     log_recompile_diagnostic(
                         diagnostic, "compute-struct-reject", "route-decline",
-                        "vcc branch pc=%u contains synchronized op pc=%u fmt=%d op=0x%x",
-                        in.pc, r.pc, static_cast<int>(r.fmt), r.opcode);
+                        "vcc branch pc=%u contains synchronized op pc=%u fmt=%d op=0x%x", in.pc,
+                        r.pc, static_cast<int>(r.fmt), r.opcode);
                     return reject();
                 }
             }
@@ -1367,11 +1519,15 @@ inline std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& i
         if (in.fmt != Rdna2Format::SOPP || in.opcode != 0x02) continue;
         if (loop_backedge(in.pc)) continue;
         bool claimed = false;
-        for (const auto& F : out) if (F.has_else && F.sb_pc == in.pc) { claimed = true; break; }
+        for (const auto& F : out)
+            if (F.has_else && F.sb_pc == in.pc) {
+                claimed = true;
+                break;
+            }
         if (!claimed) {
             log_recompile_diagnostic(diagnostic, "compute-struct-reject", "route-decline",
-                                     "unclaimed s_branch pc=%u target=%u",
-                                     in.pc, branch_target(in));
+                                     "unclaimed s_branch pc=%u target=%u", in.pc,
+                                     branch_target(in));
             return reject();
         }
     }
@@ -1387,25 +1543,28 @@ inline std::vector<ForwardIf> detect_forward_ifs(const std::vector<Rdna2Inst>& i
         size_t fi = 0, li = 0;
         const size_t nl = loops ? loops->size() : 0;
         while (fi < out.size() || li < nl) {
-            const bool take_loop = li < nl &&
-                (fi >= out.size() || (*loops)[li].header_pc < out[fi].branch_pc);
+            const bool take_loop =
+                li < nl && (fi >= out.size() || (*loops)[li].header_pc < out[fi].branch_pc);
             const uint32_t start = take_loop ? (*loops)[li].header_pc : out[fi].branch_pc;
-            uint32_t span_end    = take_loop ? (*loops)[li].exit_pc
-                                 : (out[fi].has_else ? out[fi].merge_pc : out[fi].target_pc);
+            uint32_t span_end = take_loop
+                                    ? (*loops)[li].exit_pc
+                                    : (out[fi].has_else ? out[fi].merge_pc : out[fi].target_pc);
             const bool clampable = !take_loop && out[fi].has_else;
             while (!open.empty() && open.back() <= start) open.pop_back();
             if (!open.empty() && span_end > open.back()) {
                 if (!clampable) {
-                    log_recompile_diagnostic(
-                        diagnostic, "compute-struct-reject", "route-decline",
-                        "overlapping region start=%u end=%u parent-end=%u",
-                        start, span_end, open.back());
-                    return reject();                     // plain if / loop escaping its region: not a tree
+                    log_recompile_diagnostic(diagnostic, "compute-struct-reject", "route-decline",
+                                             "overlapping region start=%u end=%u parent-end=%u",
+                                             start, span_end, open.back());
+                    return reject();   // plain if / loop escaping its region: not a tree
                 }
-                span_end = open.back();                  // cascade if/else: clamped to the enclosing
-            }                                            // region for nesting purposes (see above)
+                span_end = open.back();   // cascade if/else: clamped to the enclosing
+            }   // region for nesting purposes (see above)
             open.push_back(span_end);
-            if (take_loop) li++; else fi++;
+            if (take_loop)
+                li++;
+            else
+                fi++;
         }
     }
     return out;
@@ -1431,7 +1590,7 @@ inline bool s_movrels_b32_result_is_scalar_data(const Rdna2Inst& in) {
 inline uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
     switch (in.fmt) {
         case Rdna2Format::SOP1:
-            if (in.opcode == kSop1OpcodeGetpcB64) return UINT32_MAX; // s_getpc has no source
+            if (in.opcode == kSop1OpcodeGetpcB64) return UINT32_MAX;   // s_getpc has no source
             // S_MOVRELS reads SGPR[src + M0], not SGPR[src] (#4538). The b32 form is lowered as a
             // select over every register from the encoded source up to s105 (rdna2_movrels.cpp),
             // so that whole range is what the instruction may read. Every consumer takes the
@@ -1445,31 +1604,26 @@ inline uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
                 source == 0 && in.src[0].kind == OperandKind::SGPR && in.src[0].value >= 0 &&
                 in.src[0].value <= 105)
                 return static_cast<uint32_t>(106 - in.src[0].value);
-            if (in.opcode == kSop1OpcodeBitreplicateB64B32) return 1u; // 32-bit source replicated to 64-bit dst
-            if (in.opcode == kSop1OpcodeBcnt1I32B64 ||
-                in.opcode == kSop1OpcodeFf1I32B64 ||
-                in.opcode == kSop1OpcodeFlbitI32B64 ||
-                in.opcode == 0x18 || in.opcode == kSop1OpcodeQuadmaskB64)
-                return 2;                    // bcnt/ff1/flbit consume a B64 pair
+            if (in.opcode == kSop1OpcodeBitreplicateB64B32)
+                return 1u;   // 32-bit source replicated to 64-bit dst
+            if (in.opcode == kSop1OpcodeBcnt1I32B64 || in.opcode == kSop1OpcodeFf1I32B64 ||
+                in.opcode == kSop1OpcodeFlbitI32B64 || in.opcode == 0x18 ||
+                in.opcode == kSop1OpcodeQuadmaskB64)
+                return 2;   // bcnt/ff1/flbit consume a B64 pair
             return scalar_write_width(in) == 1 ? 1u : 2u;
         case Rdna2Format::SOP2:
             if (in.opcode == 0x1f || in.opcode == 0x21)
-                return source == 1 ? 1u : 2u; // B64 shifts use a B32 shift count
-            if (in.opcode == kSop2OpcodeBfmB64) return 1;  // BFM width and offset are B32
-            if (in.opcode == kSop2OpcodeBfeU64)
-                return source == 1 ? 1u : 2u;
+                return source == 1 ? 1u : 2u;   // B64 shifts use a B32 shift count
+            if (in.opcode == kSop2OpcodeBfmB64) return 1;   // BFM width and offset are B32
+            if (in.opcode == kSop2OpcodeBfeU64) return source == 1 ? 1u : 2u;
             return scalar_write_width(in) == 1 ? 1u : 2u;
-        case Rdna2Format::SOPC:
-            return in.opcode == 0x12 || in.opcode == 0x13 ? 2u : 1u;
+        case Rdna2Format::SOPC: return in.opcode == 0x12 || in.opcode == 0x13 ? 2u : 1u;
         case Rdna2Format::VOP1:
-        case Rdna2Format::VOP2:
-            return 1;
+        case Rdna2Format::VOP2: return 1;
         case Rdna2Format::VOPC: {
-            const uint32_t effective = vopc_is_cmpx(in.opcode)
-                ? in.opcode - 0x10u : in.opcode;
-            const bool integer64 =
-                (effective >= 0xa1u && effective <= 0xa6u) ||
-                (effective >= 0xe1u && effective <= 0xe6u);
+            const uint32_t effective = vopc_is_cmpx(in.opcode) ? in.opcode - 0x10u : in.opcode;
+            const bool integer64 = (effective >= 0xa1u && effective <= 0xa6u) ||
+                                   (effective >= 0xe1u && effective <= 0xe6u);
             return integer64 ? 2u : 1u;
         }
         case Rdna2Format::VOP3:
@@ -1478,14 +1632,13 @@ inline uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
             // These add/subtract forms read two B32 operands; the fresh SDST carry is an output,
             // not a paired source. MAD_U64/I64 remain separate paired-source consumers.
             if (vop3b_fresh_carry_output(in)) return source < 2 ? 1u : UINT32_MAX;
-            if (in.opcode == 0x360 || in.opcode == 0x361 ||
-                in.opcode == 0x365 || in.opcode == 0x366 || in.opcode == 0x11f)
+            if (in.opcode == 0x360 || in.opcode == 0x361 || in.opcode == 0x365 ||
+                in.opcode == 0x366 || in.opcode == 0x11f)
                 return source < 2 ? 1u : UINT32_MAX;
-            if (in.opcode == kVop3OpcodeLshlrevB64 ||
-                in.opcode == kVop3OpcodeLshrrevB64)
+            if (in.opcode == kVop3OpcodeLshlrevB64 || in.opcode == kVop3OpcodeLshrrevB64)
                 return source == 0 ? 1u : (source == 1 ? 2u : UINT32_MAX);
             if (in.opcode == 0x101)
-                return source < 2 ? 1u : 2u; // cndmask data is B32; condition is a pair
+                return source < 2 ? 1u : 2u;   // cndmask data is B32; condition is a pair
             // B32 VOP3 forms, each of whose sources is ONE dword. The list is an allowlist over a
             // deliberately fail-closed `return 2` default: every consumer of this width treats a
             // wider answer as "prove more" (a pair read blocks `sgpr_dead_at_merge`'s
@@ -1564,8 +1717,7 @@ inline uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
                 in.opcode == kVop3OpcodeMulHiU32)
                 return 1;
             return 2;
-        default:
-            return 0;
+        default: return 0;
     }
 }
 
@@ -1580,8 +1732,8 @@ inline uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
 inline uint32_t scalar_implicit_destination_read_width(const Rdna2Inst& in) {
     if (in.dst.kind != OperandKind::SGPR) return 0;
     if (in.fmt == Rdna2Format::SOPK) {
-        if (in.opcode == 0x02 ||                         // s_cmovk_i32
-            (in.opcode >= 0x03 && in.opcode <= 0x10) ||  // s_cmpk_*, s_addk, s_mulk
+        if (in.opcode == 0x02 ||   // s_cmovk_i32
+            (in.opcode >= 0x03 && in.opcode <= 0x10) ||   // s_cmpk_*, s_addk, s_mulk
             // s_setreg_b32: the encoded SDST field is the SOURCE SGPR, which rdna2_emit_alu.cpp's
             // own handler says in as many words. It reads the register and writes none.
             in.opcode == 0x13 ||
@@ -1595,9 +1747,9 @@ inline uint32_t scalar_implicit_destination_read_width(const Rdna2Inst& in) {
         case kSop1OpcodeCmovB32: return 1;
         case kSop1OpcodeCmovB64: return 2;
         case kSop1OpcodeBitset0B32: return 1;
-        case 0x1c: return 2; // s_bitset0_b64
+        case 0x1c: return 2;   // s_bitset0_b64
         case kSop1OpcodeBitset1B32: return 1;
-        case 0x1e: return 2; // s_bitset1_b64
+        case 0x1e: return 2;   // s_bitset1_b64
         default: return 0;
     }
 }
@@ -1610,6 +1762,8 @@ inline ScalarSourceMarks scalar_source_marks(const RegState& rs, const Rdna2Inst
     const auto word = [&](int r) {
         const bool fabricated = sreg_word_may_be_fabricated(rs, r);
         marks.placeholder = marks.placeholder || fabricated;
+        // A scalar word is unconfined: it may be absent in every lane, so no EXEC confinement survives it.
+        if (fabricated) marks.outside_exec = 0;
         const auto blanket = rs.sreg_loop_blanket.find(r);
         if (fabricated && blanket == rs.sreg_loop_blanket.end())
             marks.hard = true;
@@ -1653,6 +1807,22 @@ inline ScalarSourceMarks scalar_source_marks(const RegState& rs, const Rdna2Inst
         const bool scalar = o.kind == OperandKind::SGPR ||
                             (o.kind == OperandKind::Special && o.value >= 106 && o.value <= 124);
         if (!scalar) continue;
+        // CNDMASK's third operand consumes the current Bool domain, not the saved mask's
+        // physical scalar halves. A fresh predicate can be genuine while those halves cannot
+        // be reconstructed. Retain actual merge poison and DATA roles; map membership alone
+        // must not authenticate an absent, relayed or numerically overwritten mask.
+        if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x101 && k == 2 &&
+            o.kind == OperandKind::SGPR && o.value >= 0 && o.value <= 105) {
+            const auto mask = rs.sreg_bool.find(o.value);
+            const uint32_t mask_words = rs.sreg_bool_b32.contains(o.value) ? 1u : 2u;
+            bool genuine = mask != rs.sreg_bool.end() && mask->second;
+            for (uint32_t w = 0; w < mask_words; ++w) {
+                const int reg = o.value + static_cast<int>(w);
+                genuine = genuine && !rs.sreg_merge_placeholder.contains(reg);
+                marks.memory = marks.memory || rs.sreg_memory_pattern.contains(reg);
+            }
+            if (genuine) continue;
+        }
         uint32_t width = scalar_alu_source_words(in, k);
         if (width == 0 || width == UINT32_MAX) width = 2;   // unknown: both words of a pair
         if (width > 2) width = static_cast<uint32_t>(std::max(0, 125 - o.value));   // a range
@@ -1762,12 +1932,15 @@ std::vector<uint8_t> must_fact_at(const std::vector<Rdna2Inst>& ins, Gen&& gen, 
         if (is_branch(in)) {
             const uint32_t target = branch_target(in);
             auto found = index_of.find(target);
-            if (found != index_of.end()) succ[i].push_back(found->second);
-            else if (target <= ins.back().pc) return {};   // an edge this walk cannot resolve
+            if (found != index_of.end())
+                succ[i].push_back(found->second);
+            else if (target <= ins.back().pc)
+                return {};   // an edge this walk cannot resolve
             // A target past the decoded stream is an early-out that terminates the wave; it
             // contributes no successor inside this function.
         }
-        if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x02) continue;   // s_branch: no fallthrough
+        if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x02)
+            continue;   // s_branch: no fallthrough
         if (i + 1 < ins.size()) succ[i].push_back(i + 1);
     }
 
@@ -1779,8 +1952,10 @@ std::vector<uint8_t> must_fact_at(const std::vector<Rdna2Inst>& ins, Gen&& gen, 
         if (!entry_holds) next[0] = 0;
         for (size_t i = 0; i < ins.size(); ++i) {
             uint8_t out = fact[i];
-            if (gen(ins[i])) out = 1;
-            else if (kill(ins[i])) out = 0;
+            if (gen(ins[i]))
+                out = 1;
+            else if (kill(ins[i]))
+                out = 0;
             if (out) continue;
             for (size_t s : succ[i]) next[s] = 0;
         }
@@ -1810,7 +1985,10 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
                                         UniformBranchCondition condition) {
     size_t branch_index = ins.size();
     for (size_t i = 0; i < ins.size(); ++i)
-        if (ins[i].pc == branch_pc) { branch_index = i; break; }
+        if (ins[i].pc == branch_pc) {
+            branch_index = i;
+            break;
+        }
     if (branch_index == ins.size() || branch_index == 0) return false;
 
     // Obligation (1): EXEC is full at the branch along every path. Required for VCC branches
@@ -1836,7 +2014,7 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
     // unique reaching definition, which is what lets the backwards slice below be a textual walk.
     size_t block_start = branch_index;
     while (block_start > 0) {
-        if (targets.count(ins[block_start].pc)) break;      // another edge enters here
+        if (targets.count(ins[block_start].pc)) break;   // another edge enters here
         const Rdna2Inst& prev = ins[block_start - 1];
         if (prev.is_end || is_branch(prev)) break;
         --block_start;
@@ -1851,8 +2029,8 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
         // A VOPC without an explicit scalar destination writes architectural VCC implicitly; the
         // writer inventory only reports the explicit SGPR form.
         if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
-            in.dst.kind == OperandKind::Special && in.dst.value == 106 &&
-            reg < 108 && 106 < reg + static_cast<int>(words))
+            in.dst.kind == OperandKind::Special && in.dst.value == 106 && reg < 108 &&
+            106 < reg + static_cast<int>(words))
             hit = true;
         return hit;
     };
@@ -1886,20 +2064,18 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
         switch (op.kind) {
             case OperandKind::InlineInt:
             case OperandKind::InlineFloat:
-            case OperandKind::Literal:
-                return true;
+            case OperandKind::Literal: return true;
             case OperandKind::Special:
-                if (op.value == 125) return true;                       // SGPR_NULL
+                if (op.value == 125) return true;   // SGPR_NULL
                 if (op.value == 126 || op.value == 127 || op.value == 253)
-                    return false;                                       // EXEC and SCC are not data
+                    return false;   // EXEC and SCC are not data
                 [[fallthrough]];
             case OperandKind::SGPR:
                 for (uint32_t word = 0; word < words; ++word)
                     if (!uniform_scalar(op.value + static_cast<int>(word), before, depth + 1))
                         return false;
                 return true;
-            default:
-                return false;                                           // VGPR and everything else
+            default: return false;   // VGPR and everything else
         }
     };
 
@@ -1924,16 +2100,19 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
             }
         }
         if (w == ins.size())
-            return true; // No writer in [0, before); holds wave-entry launch data.
+            return true;   // No writer in [0, before); holds wave-entry launch data.
         const Rdna2Inst& in = ins[w];
         switch (in.fmt) {
             case Rdna2Format::SMEM: {
                 if (!scalar_write_width(in) || in.n_src < 1) return false;
                 const uint32_t base_words = in.opcode >= 0x8 ? 4u : 2u;
                 auto op_uniform = [&](const Operand& op, uint32_t words) {
-                    if (op.kind == OperandKind::Special && op.value == 125) return true; // SGPR_NULL
-                    if (op.kind == OperandKind::InlineInt || op.kind == OperandKind::Literal) return true;
-                    if (op.kind != OperandKind::SGPR && op.kind != OperandKind::Special) return false;
+                    if (op.kind == OperandKind::Special && op.value == 125)
+                        return true;   // SGPR_NULL
+                    if (op.kind == OperandKind::InlineInt || op.kind == OperandKind::Literal)
+                        return true;
+                    if (op.kind != OperandKind::SGPR && op.kind != OperandKind::Special)
+                        return false;
                     for (uint32_t word = 0; word < words; ++word) {
                         const int r = op.value + static_cast<int>(word);
                         if (!entry_uniform_scalar(r, w, depth + 1)) return false;
@@ -1944,18 +2123,20 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
                 return in.n_src < 2 || op_uniform(in.src[1], 1);
             }
             case Rdna2Format::SOP1: {
-                if (in.opcode == 0x1f) return true; // s_getpc_b64
+                if (in.opcode == 0x1f) return true;   // s_getpc_b64
                 // Bitset and conditional-move forms read the old destination (and cmov also
                 // reads SCC). The explicit operand alone cannot prove their result uniform.
                 if (rdna2_instruction_may_change_exec(in) || in.n_src != 1 ||
-                    scalar_implicit_destination_read_width(in)) return false;
+                    scalar_implicit_destination_read_width(in))
+                    return false;
                 // Which register a relative move reads depends on M0, which no operand names.
                 if (in.opcode == kSop1OpcodeMovrelsB32 || in.opcode == kSop1OpcodeMovrelsB64)
                     return false;
                 const Operand& op = in.src[0];
                 const uint32_t words = scalar_alu_source_words(in, 0);
                 if (op.kind == OperandKind::Special && op.value == 125) return true;
-                if (op.kind == OperandKind::InlineInt || op.kind == OperandKind::Literal) return true;
+                if (op.kind == OperandKind::InlineInt || op.kind == OperandKind::Literal)
+                    return true;
                 if (op.kind != OperandKind::SGPR && op.kind != OperandKind::Special) return false;
                 for (uint32_t word = 0; word < words; ++word) {
                     const int r = op.value + static_cast<int>(word);
@@ -1964,14 +2145,17 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
                 return true;
             }
             case Rdna2Format::SOP2: {
-                if (in.opcode == 0x04 || in.opcode == 0x05 || in.opcode == 0x0a || in.opcode == 0x0b)
+                if (in.opcode == 0x04 || in.opcode == 0x05 || in.opcode == 0x0a ||
+                    in.opcode == 0x0b)
                     return false;
                 if (in.n_src != 2) return false;
                 const uint32_t words = scalar_write_width(in) == 2 ? 2u : 1u;
                 auto op_uniform = [&](const Operand& op) {
                     if (op.kind == OperandKind::Special && op.value == 125) return true;
-                    if (op.kind == OperandKind::InlineInt || op.kind == OperandKind::Literal) return true;
-                    if (op.kind != OperandKind::SGPR && op.kind != OperandKind::Special) return false;
+                    if (op.kind == OperandKind::InlineInt || op.kind == OperandKind::Literal)
+                        return true;
+                    if (op.kind != OperandKind::SGPR && op.kind != OperandKind::Special)
+                        return false;
                     for (uint32_t word = 0; word < words; ++word) {
                         const int r = op.value + static_cast<int>(word);
                         if (!entry_uniform_scalar(r, w, depth + 1)) return false;
@@ -1980,19 +2164,17 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
                 };
                 return op_uniform(in.src[0]) && op_uniform(in.src[1]);
             }
-            case Rdna2Format::SOPK:
-                return in.opcode == 0x00; // s_movk_i32 is a literal
-            default:
-                return false;
+            case Rdna2Format::SOPK: return in.opcode == 0x00;   // s_movk_i32 is a literal
+            default: return false;
         }
     };
 
     auto sole_launch_derived_definition = [&](int reg) -> bool {
-        if (reg < 0 || reg > 105) return false;            // EXEC/VCC/SCC are not launch data
+        if (reg < 0 || reg > 105) return false;   // EXEC/VCC/SCC are not launch data
         size_t only = ins.size();
         for (size_t i = 0; i < ins.size(); ++i) {
             if (!writes_reg(ins[i], reg, 1)) continue;
-            if (only != ins.size()) return false;          // more than one definition: not this shape
+            if (only != ins.size()) return false;   // more than one definition: not this shape
             only = i;
         }
         if (only == ins.size()) return false;
@@ -2001,14 +2183,14 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
         if (!targets.empty() && *targets.begin() <= ins[only].pc) return false;
         for (const Rdna2Inst& in : ins)
             if (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20u && in.opcode <= 0x22u)
-                return false; // indirect PC change could enter anywhere in the prefix
+                return false;   // indirect PC change could enter anywhere in the prefix
         for (size_t i = 0; i < only; ++i) {
             const Rdna2Inst& before_def = ins[i];
             if (before_def.is_end) return false;
             if (before_def.fmt == Rdna2Format::SOPP && !sopp_is_noop(before_def)) return false;
             if (before_def.fmt == Rdna2Format::SOP1 && before_def.opcode >= 0x20u &&
                 before_def.opcode <= 0x22u)
-                return false;                              // indirect PC change
+                return false;   // indirect PC change
         }
         const Rdna2Inst& def = ins[only];
         if (def.fmt != Rdna2Format::SMEM || !scalar_write_width(def) || def.n_src < 1) return false;
@@ -2037,11 +2219,12 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
         const Rdna2Inst& in = ins[w];
         switch (in.fmt) {
             case Rdna2Format::SOP1:
-                if (in.opcode == 0x1f) return true;                     // s_getpc_b64
+                if (in.opcode == 0x1f) return true;   // s_getpc_b64
                 // Bitset and conditional-move forms read the old destination (and cmov also
                 // reads SCC). The explicit operand alone cannot prove their result uniform.
                 if (rdna2_instruction_may_change_exec(in) || in.n_src != 1 ||
-                    scalar_implicit_destination_read_width(in)) return false;
+                    scalar_implicit_destination_read_width(in))
+                    return false;
                 // Which register a relative move reads depends on M0, which no operand names.
                 if (in.opcode == kSop1OpcodeMovrelsB32 || in.opcode == kSop1OpcodeMovrelsB64)
                     return false;
@@ -2063,10 +2246,8 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
                 if (!uniform_operand(in.src[0], base_words, w, depth)) return false;
                 return in.n_src < 2 || uniform_operand(in.src[1], 1, w, depth);
             }
-            case Rdna2Format::SOPK:
-                return in.opcode == 0x00;                               // s_movk_i32 is a literal
-            default:
-                return false;         // VOPC masks, v_readfirstlane, v_readlane, everything else
+            case Rdna2Format::SOPK: return in.opcode == 0x00;   // s_movk_i32 is a literal
+            default: return false;   // VOPC masks, v_readfirstlane, v_readlane, everything else
         }
     };
 
@@ -2099,7 +2280,8 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
             // older compare through an unmodeled writer would prove uniformity of a condition the
             // branch never saw. Vector, memory, export and SOPP instructions do not write SCC
             // (VOPC writes VCC/EXEC, not SCC) and fall through, as before.
-            if (in.fmt == Rdna2Format::SOP1 && sop1_opcode_leaves_scc_unmodified(in.opcode)) continue;
+            if (in.fmt == Rdna2Format::SOP1 && sop1_opcode_leaves_scc_unmodified(in.opcode))
+                continue;
             if (in.fmt == Rdna2Format::SOPK && in.opcode >= kSopkOpcodeWaitcntVscnt &&
                 in.opcode <= kSopkOpcodeWaitcntLgkmcnt)
                 continue;
@@ -2107,13 +2289,13 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
                 in.fmt == Rdna2Format::SOPK)
                 return false;
         }
-        return false;                 // SCC entering the region from outside is not proved
+        return false;   // SCC entering the region from outside is not proved
     };
 
     uniform_mask = [&](int reg, size_t before, uint32_t depth) -> bool {
         if (depth > 64) return false;
         const size_t w = last_writer(reg, 2, before);
-        if (w == ins.size()) return false;      // a mask entering from outside is not proved
+        if (w == ins.size()) return false;   // a mask entering from outside is not proved
         const Rdna2Inst& in = ins[w];
         if (in.fmt != Rdna2Format::SOP2 || in.dst.value != reg || scalar_write_width(in) != 2 ||
             in.n_src != 2)
@@ -2125,12 +2307,12 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
         auto is_zero = [](const Operand& op) {
             return op.kind == OperandKind::InlineInt && op.value == 0;
         };
-        if (in.opcode == 0x0b) {                // s_cselect_b64 dst, EXEC, 0  (either polarity)
+        if (in.opcode == 0x0b) {   // s_cselect_b64 dst, EXEC, 0  (either polarity)
             const bool shape = (is_exec(in.src[0]) && is_zero(in.src[1])) ||
                                (is_zero(in.src[0]) && is_exec(in.src[1]));
             return shape && uniform_scc(w, depth + 1);
         }
-        if (in.opcode == 0x0f || in.opcode == 0x11) {          // s_and_b64 / s_or_b64
+        if (in.opcode == 0x0f || in.opcode == 0x11) {   // s_and_b64 / s_or_b64
             for (uint32_t s = 0; s < 2; ++s) {
                 const Operand& op = in.src[s];
                 if (op.kind != OperandKind::SGPR && op.kind != OperandKind::Special) return false;
@@ -2194,10 +2376,18 @@ struct PcrelTables {
 // introduces no divergence of its own.
 inline bool rdna2_buffer_format_is_raw_dwords(uint32_t format, uint32_t components) {
     switch (format) {
-        case 20: case 21: case 22: return components == 1;
-        case 62: case 63: case 64: return components == 2;
-        case 72: case 73: case 74: return components == 3;
-        case 75: case 76: case 77: return components == 4;
+        case 20:
+        case 21:
+        case 22: return components == 1;
+        case 62:
+        case 63:
+        case 64: return components == 2;
+        case 72:
+        case 73:
+        case 74: return components == 3;
+        case 75:
+        case 76:
+        case 77: return components == 4;
         default: return false;
     }
 }
@@ -2221,27 +2411,44 @@ inline bool rdna2_buffer_dst_sel_is_identity(uint32_t descriptor_word3, uint32_t
     return true;
 }
 
-inline PcrelTables detect_pcrel_tables(
-        const std::vector<Rdna2Inst>& ins, const uint32_t* code, size_t dwords,
-        size_t* required_dwords = nullptr) {
+inline PcrelTables detect_pcrel_tables(const std::vector<Rdna2Inst>& ins, const uint32_t* code,
+                                       size_t dwords, size_t* required_dwords = nullptr) {
     PcrelTables out;
-    std::unordered_map<int, uint64_t> pcoff;   // reg -> byte offset into the code blob (pair LO half)
-    std::unordered_set<int> pchi;              // regs holding the matching HI half
-    std::unordered_map<int, uint32_t> kconst;  // reg -> compile-time constant (s_mov_b32 literal/inline)
-    std::unordered_map<int, uint32_t> fact_pc; // reg -> pc where its current fact was established
-    std::vector<uint32_t> br_targets;          // all branch targets (for the entry-soundness check)
+    std::unordered_map<int, uint64_t>
+        pcoff;   // reg -> byte offset into the code blob (pair LO half)
+    std::unordered_set<int> pchi;   // regs holding the matching HI half
+    std::unordered_map<int, uint32_t>
+        kconst;   // reg -> compile-time constant (s_mov_b32 literal/inline)
+    std::unordered_map<int, uint32_t> fact_pc;   // reg -> pc where its current fact was established
+    std::vector<uint32_t> br_targets;   // all branch targets (for the entry-soundness check)
     for (const auto& in : ins) {
         if (in.is_end) break;
-        if (in.fmt == Rdna2Format::SOPP && !sopp_is_noop(in) &&
-            in.opcode >= 0x02 && in.opcode <= 0x09 && in.opcode != 0x03)
+        if (in.fmt == Rdna2Format::SOPP && !sopp_is_noop(in) && in.opcode >= 0x02 &&
+            in.opcode <= 0x09 && in.opcode != 0x03)
             br_targets.push_back(in.pc + in.len_dwords + (uint32_t)(int32_t)in.simm16);
     }
-    auto kill = [&](int r) { pcoff.erase(r); pchi.erase(r); kconst.erase(r); fact_pc.erase(r); };
+    auto kill = [&](int r) {
+        pcoff.erase(r);
+        pchi.erase(r);
+        kconst.erase(r);
+        fact_pc.erase(r);
+    };
     auto imm_of = [&](const Operand& o, const Rdna2Inst& in, uint32_t* v) -> bool {
-        if (o.kind == OperandKind::Literal)   { *v = in.literal; return true; }
-        if (o.kind == OperandKind::InlineInt) { *v = (uint32_t)o.value; return true; }
-        if (o.kind == OperandKind::SGPR)      { auto it = kconst.find(o.value);
-                                                if (it != kconst.end()) { *v = it->second; return true; } }
+        if (o.kind == OperandKind::Literal) {
+            *v = in.literal;
+            return true;
+        }
+        if (o.kind == OperandKind::InlineInt) {
+            *v = (uint32_t)o.value;
+            return true;
+        }
+        if (o.kind == OperandKind::SGPR) {
+            auto it = kconst.find(o.value);
+            if (it != kconst.end()) {
+                *v = it->second;
+                return true;
+            }
+        }
         return false;
     };
     for (const auto& in : ins) {
@@ -2249,40 +2456,58 @@ inline PcrelTables detect_pcrel_tables(
         switch (in.fmt) {
             case Rdna2Format::SOP1:
                 kill(in.dst.value);
-                if (in.opcode == 0x1f) {                     // s_getpc_b64: pair = address of NEXT inst
+                if (in.opcode == 0x1f) {   // s_getpc_b64: pair = address of NEXT inst
                     kill(in.dst.value + 1);
                     pcoff[in.dst.value] = (uint64_t)(in.pc + in.len_dwords) * 4u;
                     pchi.insert(in.dst.value + 1);
-                    fact_pc[in.dst.value] = in.pc; fact_pc[in.dst.value + 1] = in.pc;
-                } else if (in.opcode == 0x03) {              // s_mov_b32 <const>
+                    fact_pc[in.dst.value] = in.pc;
+                    fact_pc[in.dst.value + 1] = in.pc;
+                } else if (in.opcode == 0x03) {   // s_mov_b32 <const>
                     uint32_t v;
-                    if (imm_of(in.src[0], in, &v)) { kconst[in.dst.value] = v; fact_pc[in.dst.value] = in.pc; }
-                } else if (in.opcode == 0x04) {              // s_mov_b64 (pair write)
+                    if (imm_of(in.src[0], in, &v)) {
+                        kconst[in.dst.value] = v;
+                        fact_pc[in.dst.value] = in.pc;
+                    }
+                } else if (in.opcode == 0x04) {   // s_mov_b64 (pair write)
                     kill(in.dst.value + 1);
                 }
                 break;
             case Rdna2Format::SOP2: {
                 int d = in.dst.value;
-                if (in.opcode == 0x00) {                     // s_add_u32: pcrel-lo + immediate
-                    uint32_t imm; uint64_t base; bool got = false;
+                if (in.opcode == 0x00) {   // s_add_u32: pcrel-lo + immediate
+                    uint32_t imm;
+                    uint64_t base;
+                    bool got = false;
                     if (in.src[0].kind == OperandKind::SGPR && pcoff.count(in.src[0].value) &&
-                        imm_of(in.src[1], in, &imm)) { base = pcoff[in.src[0].value]; got = true; }
-                    else if (in.src[1].kind == OperandKind::SGPR && pcoff.count(in.src[1].value) &&
-                             imm_of(in.src[0], in, &imm)) { base = pcoff[in.src[1].value]; got = true; }
+                        imm_of(in.src[1], in, &imm)) {
+                        base = pcoff[in.src[0].value];
+                        got = true;
+                    } else if (in.src[1].kind == OperandKind::SGPR &&
+                               pcoff.count(in.src[1].value) && imm_of(in.src[0], in, &imm)) {
+                        base = pcoff[in.src[1].value];
+                        got = true;
+                    }
                     kill(d);
-                    if (got) { pcoff[d] = base + imm; fact_pc[d] = in.pc; }
-                } else if (in.opcode == 0x04) {              // s_addc_u32: pcrel-hi + 0 (+carry; a real
+                    if (got) {
+                        pcoff[d] = base + imm;
+                        fact_pc[d] = in.pc;
+                    }
+                } else if (in.opcode == 0x04) {   // s_addc_u32: pcrel-hi + 0 (+carry; a real
                     // carry needs the lo word to wrap over a <4 KB offset — not a shader-blob shape)
                     uint32_t imm;
-                    bool hi_ok = (in.src[0].kind == OperandKind::SGPR && pchi.count(in.src[0].value) &&
-                                  imm_of(in.src[1], in, &imm) && imm == 0) ||
-                                 (in.src[1].kind == OperandKind::SGPR && pchi.count(in.src[1].value) &&
-                                  imm_of(in.src[0], in, &imm) && imm == 0);
+                    bool hi_ok =
+                        (in.src[0].kind == OperandKind::SGPR && pchi.count(in.src[0].value) &&
+                         imm_of(in.src[1], in, &imm) && imm == 0) ||
+                        (in.src[1].kind == OperandKind::SGPR && pchi.count(in.src[1].value) &&
+                         imm_of(in.src[0], in, &imm) && imm == 0);
                     kill(d);
-                    if (hi_ok) { pchi.insert(d); fact_pc[d] = in.pc; }
+                    if (hi_ok) {
+                        pchi.insert(d);
+                        fact_pc[d] = in.pc;
+                    }
                 } else {
                     kill(d);
-                    if (in.opcode == 0x29) kill(d + 1);      // s_bfe_u64 writes a pair
+                    if (in.opcode == 0x29) kill(d + 1);   // s_bfe_u64 writes a pair
                 }
                 break;
             }
@@ -2299,13 +2524,22 @@ inline PcrelTables detect_pcrel_tables(
                 break;
             case Rdna2Format::SMEM: {
                 uint32_t n = 1;
-                switch (in.opcode) { case 0x1: case 0x9: n=2; break; case 0x2: case 0xA: n=4; break;
-                    case 0x3: case 0xB: n=8; break; case 0x4: case 0xC: n=16; break; default: break; }
+                switch (in.opcode) {
+                    case 0x1:
+                    case 0x9: n = 2; break;
+                    case 0x2:
+                    case 0xA: n = 4; break;
+                    case 0x3:
+                    case 0xB: n = 8; break;
+                    case 0x4:
+                    case 0xC: n = 16; break;
+                    default: break;
+                }
                 // Scalar-buffer form of the same compiler idiom: SBASE is the getpc-built V#, while
                 // SOFFSET selects a row from the embedded table. Inspect it before killing SDATA facts.
                 const int sb = in.src[0].value;
-                if (in.opcode >= 0x8 && in.opcode <= 0xC && pcoff.count(sb) &&
-                    pchi.count(sb + 1) && kconst.count(sb + 2) && kconst.count(sb + 3)) {
+                if (in.opcode >= 0x8 && in.opcode <= 0xC && pcoff.count(sb) && pchi.count(sb + 1) &&
+                    kconst.count(sb + 2) && kconst.count(sb + 3)) {
                     const uint32_t nrec = kconst[sb + 2];
                     const uint64_t off = pcoff[sb];
                     uint32_t newest = 0;
@@ -2315,7 +2549,10 @@ inline PcrelTables detect_pcrel_tables(
                     }
                     bool entered = false;
                     for (uint32_t target : br_targets)
-                        if (target > newest && target <= in.pc) { entered = true; break; }
+                        if (target > newest && target <= in.pc) {
+                            entered = true;
+                            break;
+                        }
                     const bool supported_soffset =
                         (in.src[1].kind == OperandKind::Special && in.src[1].value == 125) ||
                         in.src[1].kind == OperandKind::SGPR ||
@@ -2326,10 +2563,10 @@ inline PcrelTables detect_pcrel_tables(
                         !(off & 3u) && !(nrec & 3u) && nrec && nrec <= 1024 &&
                         off / 4 + nrec / 4 <= dwords) {
                         if (required_dwords)
-                            *required_dwords = std::max(*required_dwords,
-                                static_cast<size_t>(off / 4 + nrec / 4));
-                        out.smem[in.pc] = std::vector<uint32_t>(
-                            code + off / 4, code + off / 4 + nrec / 4);
+                            *required_dwords =
+                                std::max(*required_dwords, static_cast<size_t>(off / 4 + nrec / 4));
+                        out.smem[in.pc] =
+                            std::vector<uint32_t>(code + off / 4, code + off / 4 + nrec / 4);
                     }
                 }
                 for (uint32_t k = 0; k < n; k++) kill(in.dst.value + (int)k);
@@ -2339,11 +2576,16 @@ inline PcrelTables detect_pcrel_tables(
                 if (in.opcode == 0x02) kill(in.dst.value);   // v_readfirstlane -> SGPR
                 break;
             case Rdna2Format::VOPC:
-                if (in.dst.kind == OperandKind::SGPR && in.dst.value <= 105)
-                    { kill(in.dst.value); kill(in.dst.value + 1); }   // e64 compare -> SGPR pair
+                if (in.dst.kind == OperandKind::SGPR && in.dst.value <= 105) {
+                    kill(in.dst.value);
+                    kill(in.dst.value + 1);
+                }   // e64 compare -> SGPR pair
                 break;
             case Rdna2Format::VOP3:
-                if (in.sdst.kind == OperandKind::SGPR) { kill(in.sdst.value); kill(in.sdst.value + 1); }
+                if (in.sdst.kind == OperandKind::SGPR) {
+                    kill(in.sdst.value);
+                    kill(in.sdst.value + 1);
+                }
                 break;
             case Rdna2Format::MTBUF: {
                 // Same proof as the MUBUF case below, with two extra obligations: the typed format
@@ -2351,15 +2593,16 @@ inline PcrelTables detect_pcrel_tables(
                 // converted texels), and TFE must be off (its trailing status word is not modelled).
                 // Per RDNA2 ISA Table 31, TBUFFER_LOAD_FORMAT_* always uses DST SEL = identity,
                 // ignoring the descriptor's DST_SEL field entirely (see test_rdna2_to_spirv.cpp:4261).
-                if (in.opcode > 0x03u || in.mtbuf_tfe) break;      // typed LOADS only, no status
+                if (in.opcode > 0x03u || in.mtbuf_tfe) break;   // typed LOADS only, no status
                 const uint32_t components = in.opcode + 1u;
                 if (!rdna2_buffer_format_is_raw_dwords(in.mtbuf_format, components)) break;
                 const int sb = in.src[1].value;
                 if (!pcoff.count(sb) || !pchi.count(sb + 1) || !kconst.count(sb + 2)) break;
                 const uint32_t nrec = kconst[sb + 2];
                 const bool idxen = (in.literal >> 13) & 1u;
-                const bool soff0 = (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
-                                   (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
+                const bool soff0 =
+                    (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
+                    (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
                 const uint64_t off = pcoff[sb];
                 // Entry soundness. A fact established at pc F is invalid at the load if control can
                 // ENTER the stream at a branch target T with F < T <= load_pc, because on that path
@@ -2373,42 +2616,59 @@ inline PcrelTables detect_pcrel_tables(
                 bool entered = false;
                 for (int r : {sb, sb + 1, sb + 2}) {
                     auto it = fact_pc.find(r);
-                    if (it == fact_pc.end()) { entered = true; break; }   // no proven fact at all
+                    if (it == fact_pc.end()) {
+                        entered = true;
+                        break;
+                    }   // no proven fact at all
                     if (it->second < oldest) oldest = it->second;
                 }
                 if (!entered)
-                    for (uint32_t t : br_targets) if (t > oldest && t <= in.pc) { entered = true; break; }
+                    for (uint32_t t : br_targets)
+                        if (t > oldest && t <= in.pc) {
+                            entered = true;
+                            break;
+                        }
                 if (entered) break;
                 if (idxen || !soff0 || (off & 3u) || (nrec & 3u) || nrec == 0 || nrec > 1024 ||
-                    off / 4 + nrec / 4 > dwords) break;
+                    off / 4 + nrec / 4 > dwords)
+                    break;
                 if (required_dwords)
-                    *required_dwords = std::max(*required_dwords,
-                                                static_cast<size_t>(off / 4 + nrec / 4));
+                    *required_dwords =
+                        std::max(*required_dwords, static_cast<size_t>(off / 4 + nrec / 4));
                 out.mtbuf[in.pc] = std::vector<uint32_t>(code + off / 4, code + off / 4 + nrec / 4);
                 break;
             }
             case Rdna2Format::MUBUF: {
                 if (in.opcode < 0xCu || in.opcode > 0xFu) break;   // raw loads only
-                const int sb = in.src[1].value;                    // SRSRC base SGPR of the V# quad
+                const int sb = in.src[1].value;   // SRSRC base SGPR of the V# quad
                 if (!pcoff.count(sb) || !pchi.count(sb + 1) || !kconst.count(sb + 2)) break;
-                const uint32_t nrec = kconst[sb + 2];              // V# word2 = num_records (bytes here)
+                const uint32_t nrec = kconst[sb + 2];   // V# word2 = num_records (bytes here)
                 const bool offen = (in.literal >> 12) & 1u, idxen = (in.literal >> 13) & 1u;
-                const bool soff0 = (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
-                                   (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
+                const bool soff0 =
+                    (in.src[2].kind == OperandKind::Special && in.src[2].value == 125) ||
+                    (in.src[2].kind == OperandKind::InlineInt && in.src[2].value == 0);
                 const uint64_t off = pcoff[sb];
                 // Entry soundness: no branch may enter between the newest contributing fact and here.
                 uint32_t newest = 0;
-                for (int r : {sb, sb + 1, sb + 2}) { auto it = fact_pc.find(r); if (it != fact_pc.end() && it->second > newest) newest = it->second; }
+                for (int r : {sb, sb + 1, sb + 2}) {
+                    auto it = fact_pc.find(r);
+                    if (it != fact_pc.end() && it->second > newest) newest = it->second;
+                }
                 bool entered = false;
-                for (uint32_t t : br_targets) if (t > newest && t <= in.pc) { entered = true; break; }
+                for (uint32_t t : br_targets)
+                    if (t > newest && t <= in.pc) {
+                        entered = true;
+                        break;
+                    }
                 if (entered) break;
                 if (idxen || !soff0 || (off & 3u) || (nrec & 3u) || nrec == 0 || nrec > 1024 ||
-                    off / 4 + nrec / 4 > dwords) break;            // unprovable / out of window -> reject
+                    off / 4 + nrec / 4 > dwords)
+                    break;   // unprovable / out of window -> reject
                 if (required_dwords)
-                    *required_dwords = std::max(*required_dwords,
-                                                static_cast<size_t>(off / 4 + nrec / 4));
+                    *required_dwords =
+                        std::max(*required_dwords, static_cast<size_t>(off / 4 + nrec / 4));
                 out.mubuf[in.pc] = std::vector<uint32_t>(code + off / 4, code + off / 4 + nrec / 4);
-                (void)offen;                                       // offen just adds the runtime index
+                (void)offen;   // offen just adds the runtime index
                 break;
             }
             default: break;   // formats that don't write SGPRs
@@ -2580,7 +2840,7 @@ struct BarrierPhasedCompute {
 // V_READFIRSTLANE/V_READLANE, vector mask writes, EXEC, and unresolved special registers terminate
 // the proof. Existing all-scalar prefixes retain their established admission path below.
 inline bool terminal_guard_scc_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins,
-                                             size_t guard_index) {
+                                                    size_t guard_index) {
     // This is a textual backwards slice, not a reaching-definition analysis. Keep the prefix
     // branch-free so every scalar definition it finds dominates the terminal guard. In particular,
     // a VCC/EXEC branch may vary between guest waves even when the literal or SMEM value written in
@@ -2588,8 +2848,7 @@ inline bool terminal_guard_scc_is_workgroup_uniform(const std::vector<Rdna2Inst>
     for (size_t i = 0; i < guard_index; ++i) {
         const Rdna2Inst& prefix = ins[i];
         if ((prefix.fmt == Rdna2Format::SOPP && !sopp_is_noop(prefix)) ||
-            (prefix.fmt == Rdna2Format::SOP1 && prefix.opcode >= 0x20u &&
-             prefix.opcode <= 0x22u))
+            (prefix.fmt == Rdna2Format::SOP1 && prefix.opcode >= 0x20u && prefix.opcode <= 0x22u))
             return false;
     }
 
@@ -2599,19 +2858,17 @@ inline bool terminal_guard_scc_is_workgroup_uniform(const std::vector<Rdna2Inst>
         switch (operand.kind) {
             case OperandKind::InlineInt:
             case OperandKind::InlineFloat:
-            case OperandKind::Literal:
-                return true;
+            case OperandKind::Literal: return true;
             case OperandKind::Special:
-                if (operand.value == 125) return true; // SGPR_NULL
+                if (operand.value == 125) return true;   // SGPR_NULL
                 if (operand.value == 126 || operand.value == 127 || operand.value == 253)
-                    return false; // EXEC and SCC are not scalar launch data.
+                    return false;   // EXEC and SCC are not scalar launch data.
                 [[fallthrough]];
             case OperandKind::SGPR:
                 for (uint32_t word = 0; word < words; ++word)
                     if (!self(operand.value + static_cast<int>(word), use_pc, 0)) return false;
                 return true;
-            default:
-                return false;
+            default: return false;
         }
     };
 
@@ -2635,8 +2892,7 @@ inline bool terminal_guard_scc_is_workgroup_uniform(const std::vector<Rdna2Inst>
                 switch (operand.kind) {
                     case OperandKind::InlineInt:
                     case OperandKind::InlineFloat:
-                    case OperandKind::Literal:
-                        return true;
+                    case OperandKind::Literal: return true;
                     case OperandKind::Special:
                         if (operand.value == 125) return true;
                         if (operand.value == 126 || operand.value == 127 || operand.value == 253)
@@ -2644,12 +2900,11 @@ inline bool terminal_guard_scc_is_workgroup_uniform(const std::vector<Rdna2Inst>
                         [[fallthrough]];
                     case OperandKind::SGPR:
                         for (uint32_t word = 0; word < words; ++word)
-                            if (!uniform_reg_at(operand.value + static_cast<int>(word),
-                                                writer.pc, depth + 1))
+                            if (!uniform_reg_at(operand.value + static_cast<int>(word), writer.pc,
+                                                depth + 1))
                                 return false;
                         return true;
-                    default:
-                        return false;
+                    default: return false;
                 }
             };
 
@@ -2659,14 +2914,16 @@ inline bool terminal_guard_scc_is_workgroup_uniform(const std::vector<Rdna2Inst>
                     // are rejected by rdna2_instruction_may_change_exec; ordinary scalar operations trace
                     // their source at the destination's architectural width.
                     if (writer.opcode == 0x1f) return true;
-                    if (rdna2_instruction_may_change_exec(writer) || writer.n_src != 1) return false;
-                    return uniform_operand(writer.src[0], scalar_write_width(writer) == 2 ? 2u : 1u);
+                    if (rdna2_instruction_may_change_exec(writer) || writer.n_src != 1)
+                        return false;
+                    return uniform_operand(writer.src[0],
+                                           scalar_write_width(writer) == 2 ? 2u : 1u);
                 }
                 case Rdna2Format::SOP2: {
                     // Carry/cselect forms consume SCC in addition to their decoded operands. They are
                     // outside this narrow slice until SCC itself is represented as a recursive value.
-                    if (writer.opcode == 0x04 || writer.opcode == 0x05 ||
-                        writer.opcode == 0x0a || writer.opcode == 0x0b)
+                    if (writer.opcode == 0x04 || writer.opcode == 0x05 || writer.opcode == 0x0a ||
+                        writer.opcode == 0x0b)
                         return false;
                     const uint32_t words = scalar_write_width(writer) == 2 ? 2u : 1u;
                     return writer.n_src == 2 && uniform_operand(writer.src[0], words) &&
@@ -2684,8 +2941,7 @@ inline bool terminal_guard_scc_is_workgroup_uniform(const std::vector<Rdna2Inst>
                     // S_MOVK is a literal definition. Other SOPK data writers are read/modify/write
                     // or hardware-register reads and stay outside this proof.
                     return writer.opcode == 0x00;
-                default:
-                    return false;
+                default: return false;
             }
         }
         // Ordinary compute launch SGPRs (user data and enabled system SGPRs) are uniform within one
@@ -2699,8 +2955,7 @@ inline bool terminal_guard_scc_is_workgroup_uniform(const std::vector<Rdna2Inst>
         if (candidate.fmt == Rdna2Format::SOPC) {
             const uint32_t words = candidate.opcode == 0x12 || candidate.opcode == 0x13 ? 2u : 1u;
             for (uint32_t source = 0; source < candidate.n_src; ++source)
-                if (!operand_uniform_at(candidate.src[source], words, candidate.pc,
-                                        uniform_reg_at))
+                if (!operand_uniform_at(candidate.src[source], words, candidate.pc, uniform_reg_at))
                     return false;
             return candidate.n_src != 0;
         }
@@ -2735,14 +2990,14 @@ inline BarrierPhasedCompute analyze_barrier_phased_compute(const std::vector<Rdn
     size_t branch_count = 0;
     for (size_t i = 0; i < result.end_index; ++i) {
         const Rdna2Inst& in = ins[i];
-        if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x0a &&
-            first_barrier == ins.size())
+        if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x0a && first_barrier == ins.size())
             first_barrier = i;
         if (in.fmt != Rdna2Format::SOPP || in.opcode < 0x02 || in.opcode > 0x09 ||
-            in.opcode == 0x03) continue;
+            in.opcode == 0x03)
+            continue;
         ++branch_count;
-        if (result.guard_index == ins.size() &&
-            (in.opcode == 0x04 || in.opcode == 0x05) && branch_target(in) == end_pc)
+        if (result.guard_index == ins.size() && (in.opcode == 0x04 || in.opcode == 0x05) &&
+            branch_target(in) == end_pc)
             result.guard_index = i;
     }
 
@@ -2753,17 +3008,16 @@ inline BarrierPhasedCompute analyze_barrier_phased_compute(const std::vector<Rdn
         // Scalar ALU/loads retain workgroup-uniform values when entered from compute user data and
         // TGIDs. EXEC is lane state, so any explicit access to either half invalidates this proof.
         // VCC physical words may be scalar scratch provided no vector instruction enters the prefix.
-        const bool scalar = in.fmt == Rdna2Format::SOP1 ||
-            in.fmt == Rdna2Format::SOP2 || in.fmt == Rdna2Format::SOPK ||
-            in.fmt == Rdna2Format::SOPC || in.fmt == Rdna2Format::SMEM ||
-            (in.fmt == Rdna2Format::SOPP && sopp_is_noop(in));
+        const bool scalar = in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2 ||
+                            in.fmt == Rdna2Format::SOPK || in.fmt == Rdna2Format::SOPC ||
+                            in.fmt == Rdna2Format::SMEM ||
+                            (in.fmt == Rdna2Format::SOPP && sopp_is_noop(in));
         if (!scalar) {
             scalar_prefix = false;
             break;
         }
         auto is_exec = [](const Operand& operand) {
-            return (operand.kind == OperandKind::SGPR ||
-                    operand.kind == OperandKind::Special) &&
+            return (operand.kind == OperandKind::SGPR || operand.kind == OperandKind::Special) &&
                    (operand.value == 126 || operand.value == 127);
         };
         if (is_exec(in.dst)) scalar_prefix = false;
@@ -2784,8 +3038,7 @@ inline BarrierPhasedCompute analyze_barrier_phased_compute(const std::vector<Rdn
     bool valid = result.end_index < ins.size();
 
     for (size_t i = body_begin; valid && i < result.end_index; ++i)
-        if (ins[i].fmt == Rdna2Format::SOPP && ins[i].opcode == 0x0a)
-            result.barriers.push_back(i);
+        if (ins[i].fmt == Rdna2Format::SOPP && ins[i].opcode == 0x0a) result.barriers.push_back(i);
     valid = valid && !result.barriers.empty();
 
     for (size_t i = body_begin; valid && i < result.end_index; ++i) {
@@ -2793,11 +3046,9 @@ inline BarrierPhasedCompute analyze_barrier_phased_compute(const std::vector<Rdn
         // A trap deactivates its guest wave in the dispatcher. Emitting a host workgroup barrier
         // afterward would then require an invocation that has left the phase to participate.
         // Final-phase traps are fine because no outer barrier follows them.
-        if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x12 &&
-            i < result.barriers.back())
+        if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x12 && i < result.barriers.back())
             valid = false;
-        if (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20u && in.opcode <= 0x22u)
-            valid = false;
+        if (in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x20u && in.opcode <= 0x22u) valid = false;
     }
     // A phase boundary is valid only when no guest branch jumps across it in either direction.
     for (size_t barrier_index : result.barriers) {
@@ -2805,7 +3056,8 @@ inline BarrierPhasedCompute analyze_barrier_phased_compute(const std::vector<Rdn
         for (size_t i = body_begin; valid && i < result.end_index; ++i) {
             const Rdna2Inst& in = ins[i];
             if (in.fmt != Rdna2Format::SOPP || in.opcode < 0x02 || in.opcode > 0x09 ||
-                in.opcode == 0x03 || in.opcode == 0x0a) continue;
+                in.opcode == 0x03 || in.opcode == 0x0a)
+                continue;
             const uint32_t target = branch_target(in);
             if ((in.pc < barrier_pc && target >= barrier_pc) ||
                 (in.pc > barrier_pc && target <= barrier_pc))
@@ -2816,4 +3068,4 @@ inline BarrierPhasedCompute analyze_barrier_phased_compute(const std::vector<Rdn
     return result;
 }
 
-}  // namespace prosper::gpu
+}   // namespace prosper::gpu

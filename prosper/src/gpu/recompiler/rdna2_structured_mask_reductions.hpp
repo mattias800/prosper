@@ -1,58 +1,18 @@
 #pragma once
 
 // Structured Wave64 mask-reduction inventory; promoted mechanically from the CFG emitter.
-
-// rdna2_emit_cfg.cpp — the divergent-control-flow state machine and emit_body, split out of
-// rdna2_to_spirv.cpp. Shared state lives in gpu/recompiler/rdna2_to_spirv_internal.hpp.
-#include <atomic>
-#include "gpu/recompiler/rdna2_to_spirv.hpp"
-#include "gpu/recompiler/smem_x16_descriptor_proof.hpp"
-#include "gpu/recompiler/fragment_packet_definedness.hpp"
-#include "gpu/recompiler/rdna2_packet_raw_masks.hpp"
-#include "gpu/diagnostics/diagnostic_selectors.hpp"
-#include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
-#include "gpu/recompiler/rdna2_cfg_registers.hpp"
-#include "gpu/recompiler/rdna2_counted_loop_guard.hpp"
-#include "gpu/recompiler/rdna2_dead_wave_masks.hpp"
-#include "gpu/recompiler/rdna2_exec_skip_region.hpp"
-#include "gpu/recompiler/rdna2_lane_slot_carry.hpp"
-#include "gpu/recompiler/rdna2_loop_vcc_carry.hpp"
-#include "gpu/recompiler/rdna2_mask_half_alias.hpp"
-#include "gpu/recompiler/rdna2_spill_slot_domain.hpp"
-#include "gpu/recompiler/rdna2_spilled_mask_halves.hpp"
-#include "gpu/recompiler/rdna2_native_logical_words.hpp"
-#include "gpu/recompiler/rdna2_copy_continuation.hpp"
-#include "gpu/recompiler/rdna2_local_vcc_data.hpp"
-#include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
-#include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
-#include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
-#include "gpu/recompiler/indirect/rdna2_indirect_buffer_shadow.hpp"
-#include "gpu/recompiler/indirect/rdna2_indirect_pointer_analysis.hpp"
-#include "gpu/resources/shader_resources.hpp"
+#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include <algorithm>
-#include <bit>
-#include <cstdarg>
-#include <cstring>
-#include <cstdio>
-#include <cstdlib>
-#include <functional>
-#include <map>
-#include <mutex>
+#include <cstddef>
+#include <cstdint>
+#include <iterator>
 #include <set>
-#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
-#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
-#include "gpu/recompiler/rdna2_alu_support.hpp"
-#include "gpu/recompiler/rdna2_cfg_support.hpp"
-#include "gpu/recompiler/rdna2_dpp_row_shr.hpp"
-#include "gpu/recompiler/rdna2_dpp_row_ror8.hpp"
-#include "gpu/recompiler/fragment_loop_mask.hpp"
-#include "gpu/recompiler/rdna2_entry_vcc.hpp"
-#include "gpu/recompiler/rdna2_readlane_route.hpp"
-#include "gpu/recompiler/fragment_packet_mask_requirements.hpp"
 
 namespace prosper::gpu {
 

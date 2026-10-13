@@ -5,6 +5,7 @@
 // actual graphics-stage shader wired into a real pipeline.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include <gtest/gtest.h>
+#include "fixtures/fragment_control_flow_inputs.hpp"
 #include "fixtures/render_runner.h"
 #include "fixtures/spirv_triangle.h"     // kTriVertSpv: placeholder vertex shader (positions)
 #include <algorithm>
@@ -429,7 +430,8 @@ TEST(RecompiledFragment, Contract) {
         0x7d840080u, 0x8aea6a7eu, 0xbf840004u, 0xbefe046au,
         0xf8001890u, 0x00000000u, 0xbf810000u,
     };
-    std::vector<uint32_t> null_frag = recompile_fragment(null_only_ps, std::size(null_only_ps));
+    std::vector<uint32_t> null_frag =
+        prosper::test::compile_fragment_control_flow_fixture(null_only_ps);
     CHECK(!null_frag.empty() && null_frag[0] == 0x07230203u,
           "#825: recompiled Astro Bot's NULL-export depth/stencil fragment shader");
     if (!null_frag.empty()) {
@@ -723,14 +725,16 @@ TEST(RecompiledFragment, Contract) {
               "a scalar-fed VOP chain is accepted as a uniform VCC-loop bound");
         uint32_t varying_chain_ps[std::size(scalar_chain_ps)];
         std::copy(std::begin(scalar_chain_ps), std::end(scalar_chain_ps), varying_chain_ps);
-        varying_chain_ps[1] = 0x7E020302u;  // v1 = unresolved lane-varying v2 before the same chain
-        CHECK(!recompile_fragment(varying_chain_ps, std::size(varying_chain_ps)).empty(),
+        varying_chain_ps[1] =
+            0x7E020302u;   // v1 = declared varying depth input v2 before the chain
+        CHECK(!prosper::test::compile_fragment_control_flow_fixture(varying_chain_ps, {}, true)
+                   .empty(),
               "fragment wave64 vote accepts a lane-varying VCC loop bound exactly");
 
         uint32_t varying_ps[sizeof(ps)/sizeof(ps[0])];
         std::copy(std::begin(ps), std::end(ps), varying_ps);
-        varying_ps[2] = 0x7E020302u;  // v_mov_b32 v1,v2: a lane-varying/unproven loop bound
-        CHECK(!recompile_fragment(varying_ps, sizeof(varying_ps)/sizeof(varying_ps[0])).empty(),
+        varying_ps[2] = 0x7E020302u;   // v_mov_b32 v1,v2: a declared varying depth input
+        CHECK(!prosper::test::compile_fragment_control_flow_fixture(varying_ps, {}, true).empty(),
               "fragment wave64 vote keeps a varying-VCC loop wave-uniform");
 
         uint32_t exec_mutating_ps[sizeof(ps)/sizeof(ps[0])];

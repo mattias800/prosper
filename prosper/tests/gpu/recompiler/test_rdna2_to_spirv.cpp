@@ -4896,6 +4896,32 @@ int main() {
     CHECK(!spv_store16.empty() && store16_out.size() == N / 2 && bad_store16 == 0,
           "#590: stride-2 Uint16 buffer_store_format_x lands disjoint fields race-free (dword k = 2k|(2k+1)<<16)");
 
+    // Dword-aligned sub-dword integer store: a stride-4 Uint16 store is dword-aligned (stride & 3 == 0)
+    // and must lower via the atomic sub-dword store path without rejection.
+    ShaderResourceTable rt_store16_aligned;
+    {
+        ShaderResource sb{};
+        sb.cls = ResourceClass::ConstantBuffer;
+        sb.format = DataFormat::Uint16;
+        sb.num_components = 1;
+        sb.binding = 3;
+        sb.stride = 4;
+        sb.sgpr_base = 8;
+        sb.fetch_pc = 2;
+        rt_store16_aligned.resources.push_back(sb);
+    }
+    const uint32_t code_store16_aligned[] = {
+        0x7e000f00u,   // v_cvt_u32_f32 v0, v0
+        0x7e020300u,   // v_mov_b32 v1, v0
+        0xe0102000u,
+        0x80020100u,   // buffer_store_format_x v1, v0, s[8:11], idxen (Uint16, stride 4)
+        0xbf810000u,
+    };
+    std::vector<uint32_t> spv_store16_aligned = recompile_valu(
+        code_store16_aligned, std::size(code_store16_aligned), 1, 0, &rt_store16_aligned);
+    CHECK(!spv_store16_aligned.empty(),
+          "dword-aligned (stride-4) Uint16 buffer_store_format_x recompiles without rejection");
+
     // Kernel 24b: the SAME unorm8x4 fetch at a NON-dword-aligned inst offset (offset:2). The runtime
     // normalized-component path must begin at byte 2 of each record and join the following dword for
     // the later components. Reading v1 back proves the first component is B rather than the old R.

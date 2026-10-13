@@ -50,7 +50,7 @@ bool emit_exec_cmov(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok
 void record_s_bfm_b64_scalar_data(SpirvCompute& b, RegState& rs, const Rdna2Inst& in,
                                   uint32_t width, uint32_t offset, bool ok);
 bool numeric_vcc_move_has_lane_context(const SpirvCompute& b);
-uint32_t s_mov_b64_numeric_vcc_bit(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in);
+uint32_t s_mov_b64_numeric_mask_bit(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in);
 void retire_data_only_b64_mask(RegState& rs, int destination);
 void retire_scalar_data_word_mask(RegState& rs, int destination);
 bool copy_s_mov_b64_scalar_pair(RegState& rs, int source, int destination, bool source_mask);
@@ -631,7 +631,8 @@ inline bool refuse_mask_write(SpirvCompute& b, const RegState& rs, const Rdna2In
 inline bool vcc_b32_scalar_pair_defined(const SpirvCompute& b, const RegState& rs,
                                         const Rdna2Inst& in) {
     if (b.vcc_b32_scalar_pair_pcs.contains(in.pc)) return true;
-    if (!b.is_compute || b.wave_size != 64 || !b32_sources_defined(rs, in)) return false;
+    if ((!b.is_compute && !b.is_fragment) || b.wave_size != 64 || !b32_sources_defined(rs, in))
+        return false;
     Operand sibling;
     sibling.kind = OperandKind::Special;
     sibling.value = in.dst.value == 106 ? 107 : 106;

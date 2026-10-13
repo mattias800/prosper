@@ -26,6 +26,10 @@ namespace prosper::gpu {
 struct MipChainLevel {
     uint32_t width = 0;
     uint32_t height = 0;
+    // Per-LEVEL depth. Thin-2D levels leave this zero (their upload and copy regions are
+    // depth-1 by construction); volume-tail levels carry their shifted depth, which the
+    // volume uploader and the per-level copy extents read.
+    uint32_t depth = 0;
     uint64_t byte_offset = 0;
     uint64_t byte_size = 0;
     uint32_t tail_x = 0;
@@ -54,6 +58,12 @@ MipChainPlan shader_resource_mip_chain_plan(const ShaderResource& resource);
 // RGBA8 decoder path instead generates levels from level 0.
 MipChainPlan shader_resource_block_mip_chain_plan(const ShaderResource& resource,
                                                   uint32_t block_bytes);
+
+// Format eligibility shared by 3D chain view admission and compute materialization. Native
+// sampled texels are copied at every level; Unorm8 x1 additionally broadcasts for a proven
+// volume tail. Callers must still establish geometry, provenance and binding shape. Zero
+// components uses the resource's single-component default.
+bool sampled_mip_chain_format_supported(DataFormat format, uint32_t components, bool volume_tail);
 
 // The number of mip levels the COMPUTE backend materializes for this resource. 1 means the
 // historical single-level image. Called by `live_compute`'s image creation and by the recompiler's
@@ -85,5 +95,9 @@ bool shader_resource_host_data_covers_mip_chain(const ShaderResource& resource,
 
 // The complete chain implied by a level-zero extent (floor(log2(max(w,h))) + 1).
 uint32_t full_mip_chain_levels(uint32_t width, uint32_t height);
+
+// The complete chain implied by a level-zero volume extent (floor(log2(max(w,h,d))) + 1).
+// Separate from the 2D form so widening one cannot silently change the other.
+uint32_t full_volume_mip_chain_levels(uint32_t width, uint32_t height, uint32_t depth);
 
 } // namespace prosper::gpu

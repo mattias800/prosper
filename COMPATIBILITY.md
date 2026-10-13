@@ -19,7 +19,7 @@ see [`PROGRESS_TRACKER.md`](PROGRESS_TRACKER.md), which is **generated from the 
 and kept in step with them by CI. Neither file is authoritative over a tracker; when this page and
 a tracker disagree, the tracker wins.
 
-Last updated: 2026-10-09
+Last updated: 2026-10-12
 
 ## Summary
 
@@ -93,6 +93,14 @@ Last updated: 2026-10-09
 | *Afterdream* | `PPSA18391` | Clickteam Fusion | 🔬 Rung 1 — the first-boot language menu, the warning card and the in-engine opening dialogue scene render at 60 fps on `scripts/afterdream-PPSA18391/reach-opening-scene.pad`; no title screen seen yet | [#4793](https://github.com/mattias800/prosper/issues/4793) |
 | *The Blood of Dawnwalker* | `PPSA28000` | Unreal Engine (inferred) | 🚧 Rung 2 — content warning, brightness setup, intro cinematic and the 3D title menu at 4K, which the owner checked by eye; about 8 fps, and compute dispatches are still being skipped | [#4792](https://github.com/mattias800/prosper/issues/4792) |
 | *Super Meat Boy 3D* | `PPSA31162` | Unreal Engine | 🔬 Rung 0 — aborts 2 s into a default launch on its first command-buffer submit ([#4790](https://github.com/mattias800/prosper/issues/4790)) | [#4791](https://github.com/mattias800/prosper/issues/4791) |
+| *Resident Evil Village* | `PPSA01557` | RE Engine | 🔬 Rung 0 — runs at 45 flips/s and runs compute, but presents no frame in 270 s; fragment draws and compute dispatches are being dropped | [#5029](https://github.com/mattias800/prosper/issues/5029) |
+| *Resident Evil 4* | `PPSA07412` | RE Engine | 🔬 Rung 0 — the `GameThread` faults on a null structure pointer (`eboot+0x4b41519`) 2 s into a default launch | [#5030](https://github.com/mattias800/prosper/issues/5030) |
+| *METAL GEAR SOLID Δ: SNAKE EATER* | `PPSA15304` | Unreal Engine (inferred) | 🔬 Rung 0 — the boot stalls about 8 s in, after the pak archives open, with nothing presented | [#5031](https://github.com/mattias800/prosper/issues/5031) |
+| *METAL GEAR SOLID 4 (Master Collection)* | `PPSA18194` | — | 🔬 Rung 1 — the 4K content-warning card renders; every later frame is black because `sceSystemServiceLoadExec` is unimplemented ([#5025](https://github.com/mattias800/prosper/issues/5025)) | [#5032](https://github.com/mattias800/prosper/issues/5032) |
+| *METAL GEAR SOLID: Peace Walker (Master Collection)* | `PPSA18216` | — | 🔬 Rung 1 — content warning, matchmaking notice and the language-selection menu render at 4K, then the screen goes black (`sceSystemServiceLoadExec` unimplemented, [#5025](https://github.com/mattias800/prosper/issues/5025)) | [#5033](https://github.com/mattias800/prosper/issues/5033) |
+| *STAR WARS: Galactic Racer* | `PPSA28416` | — | 🔬 Rung 0 — the guest entry thread dies on a null dereference (`eboot+0x26a5149`) during boot; no frame is presented | [#5034](https://github.com/mattias800/prosper/issues/5034) |
+| *RESIDENT EVIL requiem* | `PPSA31246` | RE Engine | 🔬 Rung 0 — 60 flips/s but only about 40 frames ever reach the screen; 28k fragment draws and 170k compute dispatches are dropped in 80 s | [#5035](https://github.com/mattias800/prosper/issues/5035) |
+| *Luna Abyss* | `PPSA36257` | Unreal Engine 4 | 🔬 Rung 1 — the FMOD logo splash renders, then black; 23,453 draws dropped and 15,510 dispatches skipped in 86 s, and one of two runs hit a guest null-page fault about 50 s in | [#5038](https://github.com/mattias800/prosper/issues/5038) |
 
 ## At a glance
 
@@ -108,10 +116,10 @@ unmeasured title is never mistaken for a failing one; newly tracked titles start
 | --- | --- |
 | **Gameplay reached**, with the scene rendering (rung 3 or better) | 31 |
 | **Title screen or menu** reached, or gameplay reached without a rendered world (rung 2) | 22 |
-| **Below a title screen** — logo or splash only (rung 1) | 4 |
-| **Boots, but no frame with content** (rung 0) | 10 |
+| **Below a title screen** — logo or splash only (rung 1) | 7 |
+| **Boots, but no frame with content** (rung 0) | 15 |
 | **Not yet booted** — tracked, no run attempted yet | 0 |
-| Total tracked | 67 |
+| Total tracked | 75 |
 
 **2026-10-09 status sweep, applied as deltas to the counts above.** Three new titles: *Super Meat
 Boy 3D* (rung 0), *Afterdream* (rung 1) and *The Blood of Dawnwalker* (rung 2). *PGA TOUR 2K25*
@@ -121,6 +129,8 @@ are left in their recorded bucket even though they regressed on current `main`: 
 *The Oregon Trail* (#4803) and *BALAN WONDERWORLD* (#4805). The table has 68 rows against a total of
 67, and that one-row gap was already there before this edit; the engine breakdown below was not
 re-derived.
+
+**2026-10-12 status sweep, applied as deltas to the counts above.** Seven new titles, one default launch each on current `main`: *MGS4* and *MGS: Peace Walker* (rung 1) and *Resident Evil Village*, *Resident Evil 4*, *MGS Δ: Snake Eater*, *STAR WARS: Galactic Racer* and *RESIDENT EVIL requiem* (rung 0). On 2026-10-13 *Luna Abyss* was added at rung 1, two runs on the same `main`. The engine breakdown and the pre-existing one-row gap noted above were not re-derived.
 
 Every figure above is re-derived from the rows each time this table is touched, and the buckets now
 sum to the total. They did not before: **rung 0 had no row at all**, so the titles that boot and
@@ -913,6 +923,17 @@ On its first run the title plays its content warning, brightness setup and intro
 its 3D title menu at 4K, which the owner checked by eye. It runs at about 8 fps. Route:
 `prosper/scripts/blood-of-dawnwalker-PPSA28000/reach-title-screen.pad`. See the
 [tracker](https://github.com/mattias800/prosper/issues/4792).
+
+## Luna Abyss — `PPSA36257`
+
+An Unreal Engine 4 title. It renders the FMOD splash and then goes black while many of its shaders are refused, and the owner saw keyboard ("Esc") button prompts. See the
+[tracker](https://github.com/mattias800/prosper/issues/5038).
+
+## METAL GEAR SOLID 4 and METAL GEAR SOLID: Peace Walker (Master Collection) — `PPSA18194`, `PPSA18216`
+
+<p align="center"><img src="assets/screenshots/mgs-peace-walker-language-select.webp" alt="Metal Gear Solid: Peace Walker language selection menu with the cover art and the 1974 Peace Walker Incident panel; Linux prosper-app, default launch, snapshot at pad flip 1800"></p>
+
+Both Master Collection titles render their 4K content-warning card at 60 fps on a default launch, and *Peace Walker* goes on to a matchmaking notice and its language-selection menu. After that the screen is black: the title relaunches itself through `sceSystemServiceLoadExec`, which is not implemented yet ([#5025](https://github.com/mattias800/prosper/issues/5025)). Trackers: [*MGS4* #5032](https://github.com/mattias800/prosper/issues/5032), [*Peace Walker* #5033](https://github.com/mattias800/prosper/issues/5033).
 
 ## Afterdream — `PPSA18391`
 

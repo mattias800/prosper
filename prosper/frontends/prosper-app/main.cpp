@@ -15,6 +15,7 @@
 // the swapchain. Test-pattern boots, an explicit override, or failed adoption retain the original
 // two-device path, where frames cross as shared immutable CPU pixels.
 #include "guest_end_status.hpp"         // exit status + fault banner for a dead guest (#4140)
+#include "loadexec.hpp"
 #include "diagnostics/exit_reports.hpp"         // flush_exit_reports before std::_Exit (#3353)
 #include "gpu/present/videoout_present.hpp"   // present_acquire_rendered_frame / present_write_frame
 #include "gpu/execute/gpu_execute.hpp"         // shared_vulkan_context / gpu-present activation (#1270)
@@ -1440,7 +1441,9 @@ static bool start_guest(const std::string& app0_root, std::string* err) {
 #else
     fprintf(stderr, "[app] built without the live renderer; the window will stay blank.\n");
 #endif
-    if (!boot_program(app0_root, g_prog, err, install_host_backends)) return false;
+    if (!boot_program(app0_root, g_prog, err, install_host_backends,
+                      prosper::frontend::selected_guest_executable()))
+        return false;
     g_guest_started = true;
     g_guest_thread = std::thread([]{
         const BootResult result = run_entry(g_prog.imgs[0]);
@@ -1675,7 +1678,8 @@ static bool relaunch_with_dump(int argc, char** argv, const std::string& app0_ro
     if (exe.empty()) return false;
     std::vector<std::string> args;
     args.push_back(exe);
-    for (int i = 1; i < argc; i++) args.emplace_back(argv[i]);
+    const auto original = prosper::frontend::loadexec_host_arguments(argc, argv);
+    args.insert(args.end(), original.begin(), original.end());
     args.emplace_back("--dump");
     args.push_back(app0_root);
     // The child carries a --dump, so without this marker it would read as a scripted launch and
@@ -1765,15 +1769,21 @@ int main(int argc, char** argv) {
         // relaunch_with_dump() depends on that: it appends "--dump <new title>" to this run's own
         // arguments and needs the appended one to override whatever selected the current game.
         else if (a == "--dump" && i + 1 < argc) dump = argv[++i];                // boot the game at this app0 dir
-        else if (a == "--volume" && i + 1 < argc) {
+        else if (a == "--guest-executable" || a == "--guest-argv") {
+            std::string error;
+            if (!prosper::frontend::parse_loadexec_option(i, argc, argv, &error)) {
+                fprintf(stderr, "prosper-app: %s\n", error.c_str());
+                return 2;
+            }
+        } else if (a == "--volume" && i + 1 < argc) {
             // Percent, 0-100. Clamped rather than rejected so a typo cannot deafen. It attenuates
             // everything prosper-app plays: the title's audio-out ports and the launcher music (#3499).
             g_volume_percent = atoi(argv[++i]);
             if (g_volume_percent < 0) g_volume_percent = 0;
             if (g_volume_percent > 100) g_volume_percent = 100;
             volumeSeen = true;
-        }
-        else if (a == "--from-library") fromLibrary = true;   // relaunch marker, not user input
+        } else if (a == "--from-library")
+            fromLibrary = true;   // relaunch marker, not user input
         else if (a == "--pick") pick.forced = true;         // open the folder picker at startup
         else if (a == "--no-pick") pick.suppressed = true;  // never open it (scripts, CI, kiosk runs)
         else if (a == "--games-dir") {                       // where the titles are, this run only
@@ -2042,6 +2052,8 @@ int main(int argc, char** argv) {
     // This is the argv path and it keeps its original position: the guest is up before the window
     // exists. A title opened later (drop / picker, #1469) boots from inside the event loop instead,
     // through this same start_guest().
+    prosper::frontend::install_loadexec_frontend(argc, argv,
+                                                 this_executable(argc ? argv[0] : nullptr));
     if (!testPattern && !dump.empty()) {
         std::string err;
         if (!start_guest(dump, &err)) { fprintf(stderr, "[app] boot failed: %s\n", err.c_str()); return 1; }
@@ -4338,6 +4350,7 @@ int main(int argc, char** argv) {
         // Everything registered through diagnostics/exit_reports.hpp: std::_Exit skips atexit.
         prosper::diagnostics::flush_exit_reports();
         fflush(nullptr);
+        prosper::frontend::finish_loadexec_replacement();
         std::_Exit(exitCode);
     }
 

@@ -19,6 +19,16 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-10-12
+
+### Two Metal Gear Solid collection titles reach their first screens
+
+*Metal Gear Solid: Peace Walker* now renders its content warning, matchmaking notice and language-selection menu at 4K, and *MGS4* its content-warning card, before both go black ([Peace Walker tracker #5033](https://github.com/mattias800/prosper/issues/5033), [MGS4 tracker #5032](https://github.com/mattias800/prosper/issues/5032), [black screen #5025](https://github.com/mattias800/prosper/issues/5025)).
+
+<p align="center"><img src="assets/screenshots/mgs-peace-walker-language-select.webp" alt="Metal Gear Solid: Peace Walker language selection with the cover art and the 1974 Peace Walker Incident panel; Linux RADV prosper-app, default launch, pad flip 1800"></p>
+
+Five more new titles were measured the same day without a verified game image: *Resident Evil Village*, *Resident Evil 4*, *MGS Δ: Snake Eater* and *STAR WARS: Galactic Racer* presented no picture, and *RESIDENT EVIL requiem* presented about 40 frames whose contents were not captured (trackers #5029 to #5035).
+
 ## 2026-10-10
 
 ### Metaphor reaches its name prompt, with hard-to-read text
