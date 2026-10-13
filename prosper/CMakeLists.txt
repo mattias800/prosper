@@ -2691,6 +2691,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_saved_exec_data.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_narrowing_loop_exec
+    SOURCES tests/gpu/recompiler/test_narrowing_loop_exec.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_flat_active_word
     SOURCES tests/gpu/recompiler/test_flat_active_word.cpp
     INCLUDES tests

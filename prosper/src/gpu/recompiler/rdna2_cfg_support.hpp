@@ -20,6 +20,7 @@
 #include "gpu/resources/shader_resources.hpp"
 #include <algorithm>
 #include <bit>
+#include <cstddef>
 #include <cstdarg>
 #include <cstring>
 #include <cstdio>
@@ -657,6 +658,21 @@ struct DivLoop {
     // SCC loop reads its back-edge instead: scc1 continues while SCC is set, scc0 while it is clear.
     bool continue_on_set = true;
 };
+
+// The header EXEC is a subset of its preheader only when every possible iteration preserves or
+// narrows EXEC. This code-only certificate does not authenticate any carried register's data.
+bool structured_loop_only_narrows_exec(const std::vector<Rdna2Inst>& ins, const DivLoop& loop);
+bool narrowing_loop_exec_admission(const std::vector<Rdna2Inst>& ins, const DivLoop& loop,
+                                   const RegState& entry);
+uint32_t make_narrowing_loop_exec_phi(SpirvCompute& b, RegState& rs, uint32_t preheader,
+                                      std::size_t& patch, bool admitted);
+template <class PhiRecords>
+void open_narrowing_loop_exec_phi(SpirvCompute& b, RegState& rs, uint32_t preheader,
+                                  PhiRecords& phis, bool admitted) {
+    std::size_t patch;
+    const uint32_t phi = make_narrowing_loop_exec_phi(b, rs, preheader, patch, admitted);
+    phis.push_back({0, 4, phi, patch});
+}
 
 // A scalar VCCZ branch tests whether ANY active lane set VCC, not this lane's bit. Stages without
 // fragment's forced wave64 vote may lower it as structured control only when the VCC producer is
