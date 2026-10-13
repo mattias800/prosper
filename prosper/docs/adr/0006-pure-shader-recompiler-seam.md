@@ -1,6 +1,6 @@
 ---
 kind: adr
-status: proposed
+status: accepted
 date: 2026-10-05
 ---
 
@@ -54,5 +54,5 @@ build enforces. Switches that today change recompiler output are guest-behaviour
 
 ## Approval
 
-Requires the project owner's acceptance; the migration touches the recompiler's public header,
+Accepted by the project owner on 2026-10-13. The migration touches the recompiler's public header,
 which every graphics lane includes.

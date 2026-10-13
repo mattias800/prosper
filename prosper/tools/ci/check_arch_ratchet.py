@@ -52,6 +52,11 @@ The rules (every count is per file, over tracked files only, with comments strip
                  or tests/. Files directly in prosper/src (build_revision.hpp) belong to no layer
                  and may be included from anywhere. `"a/b.hpp"` resolves against prosper/src (the
                  include root); `"../x"` resolves against the including file's directory.
+  recompiler-include  an `#include` from src/gpu/recompiler into code that calls or configures it
+                 (gpu/execute, gpu/state, gpu/diagnostics, or the top-level diagnostics layer), one
+                 row per (file, target), valued by the number of include lines. ADR 0006 / spec
+                 GPU-1: the recompiler is a pure function of its request, so it reaches up into
+                 nothing; a switch that changes its output becomes a request field instead.
   fixture-include  `#include "fixtures/..."` (prosper/tests/fixtures) from code under
                  prosper/frontends -- the shipping renderer built out of the test tree
                  (render_runner.h is the live Vulkan backend today).
@@ -236,6 +241,14 @@ PLATFORM_IF_RE = re.compile(
 )
 INCLUDE_RE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*[<"]([^>"\n]+)[>"]', re.MULTILINE)
 FIXTURE_INCLUDE_RE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*[<"]fixtures/', re.MULTILINE)
+RECOMPILER_ROOT = f"{SRC}gpu/recompiler/"
+# Include targets forbidden from the recompiler (spec GPU-1). Order matters: first prefix match wins.
+RECOMPILER_FORBIDDEN = (
+    ("gpu/execute", f"{SRC}gpu/execute/"),
+    ("gpu/state", f"{SRC}gpu/state/"),
+    ("gpu/diagnostics", f"{SRC}gpu/diagnostics/"),
+    ("diagnostics", f"{SRC}diagnostics/"),
+)
 VK_OBJECT_TOKENS = ("vkCreateDescriptorPool", "vkAllocateMemory", "vkCreateFence")
 VK_OBJECT_RES = {token: re.compile(rf"\b{token}\s*\(") for token in VK_OBJECT_TOKENS}
 
@@ -250,6 +263,7 @@ RULES = (
     "platform-stub",
     "host-throw",
     "layer-include",
+    "recompiler-include",
     "fixture-include",
     "vk-object",
 )
@@ -315,6 +329,11 @@ FIX_HINT = {
         "An include against the layer order (LAYER_ORDER in check_arch_ratchet.py; "
         "prosper/docs/architecture/ARCHITECTURE_TARGET_TREE.md). Move the shared type down to a layer both "
         "sides may include, or invert the call (an interface owned by the lower layer)."
+    ),
+    "recompiler-include": (
+        "The shader recompiler including code that calls or configures it (spec GPU-1, ADR 0006). "
+        "Move the shared type down to a header the recompiler owns or a layer below it, and pass "
+        "any switch that changes the output in as a field of the request instead of reading it."
     ),
     "fixture-include": (
         "Shipping frontend code including prosper/tests/fixtures. The Vulkan backend is moving "
@@ -532,6 +551,18 @@ def layer_violations(path: str, code: str) -> dict[str, list[int]]:
     return out
 
 
+def recompiler_includes(path: str, code: str) -> dict[str, list[int]]:
+    """{forbidden target: include line numbers} for a file under src/gpu/recompiler."""
+    out: dict[str, list[int]] = {}
+    for m in INCLUDE_RE.finditer(code):
+        target = include_target(path, m.group(1))
+        for name, prefix in RECOMPILER_FORBIDDEN:
+            if target.startswith(prefix):
+                out.setdefault(name, []).append(_line_of(code, m.start()))
+                break
+    return out
+
+
 def scan(files: dict[str, str], slugs: set[str]) -> dict[str, Finding]:
     """Every finding for a tree given as {repo-relative posix path: text}."""
     found: dict[str, Finding] = {}
@@ -566,6 +597,9 @@ def scan(files: dict[str, str], slugs: set[str]) -> dict[str, Finding]:
             if path.startswith(SRC):
                 for target, lines in sorted(layer_violations(path, code).items()):
                     add(f"layer-include|{path}|{target}", lines)
+            if path.startswith(RECOMPILER_ROOT):
+                for target, lines in sorted(recompiler_includes(path, code).items()):
+                    add(f"recompiler-include|{path}|{target}", lines)
         if under(path, SIZE_ROOTS):
             lines = line_count(text)
             if lines > FILE_SIZE_THRESHOLD:
@@ -987,6 +1021,7 @@ POSITIVE_TREE = {
     "prosper/src/hle/p.cpp": "#ifdef _WIN32\nint w;\n#elif defined(__linux__)\nint l;\n#endif\n",
     "prosper/src/hle/s.cpp": "HLE(k_demo_stub) {\n    return 0;\n}\n",
     "prosper/src/host/l.cpp": '#include "hle/dispatch/dispatch.hpp"\n#include "self/module.hpp"\n',
+    "prosper/src/gpu/recompiler/rc.cpp": '#include "gpu/execute/sopp_cfg.hpp"\n#include "gpu/recompiler/a.hpp"\n',
     "prosper/src/gpu/v.cpp": "vkCreateFence(d, &i, nullptr, &f);\n",
     "prosper/src/gpu/w.cpp": 'if (bad) throw std::runtime_error("x");\ncatch (...) { throw; }\n',
     "prosper/frontends/k.cpp": '#include "fixtures/render_runner.h"\n',
@@ -1003,6 +1038,7 @@ POSITIVE_KEYS = {
     "platform-ifdef|prosper/src/hle/p.cpp": 2,
     "platform-stub|prosper/src/hle/s.cpp": 1,
     "layer-include|prosper/src/host/l.cpp|hle": 1,
+    "recompiler-include|prosper/src/gpu/recompiler/rc.cpp|gpu/execute": 1,
     "vk-object|prosper/src/gpu/v.cpp|vkCreateFence": 1,
     "host-throw|prosper/src/gpu/w.cpp": 2,
     "fixture-include|prosper/frontends/k.cpp": 1,
@@ -1031,6 +1067,10 @@ NEGATIVE_TREE = {
     "prosper/src/gpu/q.cpp": "#if PROSPER_WIN32_LIKE\n#endif\nPFN_vkCreateFence p;\n",
     "prosper/src/gpu/r.cpp": '// throw x\nlog("throw");\nvoid f() throw ();\nint rethrow_count;\n',
     "prosper/src/host/th.cpp": 'throw std::logic_error("host is exempt");\n',
+    "prosper/src/gpu/recompiler/ok.cpp": (
+        '// #include "gpu/execute/x.hpp"\n#include "gpu/recompiler/a.hpp"\n#include "../pm4/p.hpp"\n'
+    ),
+    "prosper/src/gpu/execute/call.cpp": '#include "gpu/recompiler/rdna2_to_spirv.hpp"\n',
 }
 
 
