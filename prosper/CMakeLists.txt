@@ -2688,6 +2688,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_active_image_word_definedness.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_carry_predicate_role
+    SOURCES tests/gpu/recompiler/test_carry_predicate_role.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_complementary_exec_data
     SOURCES tests/gpu/recompiler/test_complementary_exec_data.cpp
     INCLUDES tests

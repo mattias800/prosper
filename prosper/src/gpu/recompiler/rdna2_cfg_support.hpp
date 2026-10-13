@@ -1827,11 +1827,12 @@ inline ScalarSourceMarks scalar_source_marks(const RegState& rs, const Rdna2Inst
         const bool scalar = o.kind == OperandKind::SGPR ||
                             (o.kind == OperandKind::Special && o.value >= 106 && o.value <= 124);
         if (!scalar) continue;
-        // CNDMASK's third operand consumes the current Bool domain, not the saved mask's
-        // physical scalar halves. A fresh predicate can be genuine while those halves cannot
-        // be reconstructed. Retain actual merge poison and DATA roles; map membership alone
-        // must not authenticate an absent, relayed or numerically overwritten mask.
-        if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x101 && k == 2 &&
+        // CNDMASK and carry-in SRC2 consume the current Bool without reading its physical scalar
+        // halves (RDNA2 70648 sections 6.2.3 and 12.7). A genuine predicate need not supply
+        // reconstructible physical words. Retain actual merge poison and DATA roles; map membership
+        // alone must not authenticate an absent, relayed or numerically overwritten mask.
+        if (in.fmt == Rdna2Format::VOP3 &&
+            (in.opcode == 0x101 || (in.opcode >= 0x128 && in.opcode <= 0x12a)) && k == 2 &&
             o.kind == OperandKind::SGPR && o.value >= 0 && o.value <= 105) {
             const auto mask = rs.sreg_bool.find(o.value);
             const uint32_t mask_words = rs.sreg_bool_b32.contains(o.value) ? 1u : 2u;
