@@ -18,10 +18,13 @@ void set_env(const char* name, const char* value) {
 #ifdef _WIN32
     _putenv_s(name, value ? value : "");
 #else
-    if (value)
+    if (value) {
+        // NOLINTNEXTLINE(concurrency-mt-unsafe): this isolated single-threaded CTest owns the edit.
         setenv(name, value, 1);
-    else
+    } else {
+        // NOLINTNEXTLINE(concurrency-mt-unsafe): this isolated single-threaded CTest owns the edit.
         unsetenv(name);
+    }
 #endif
 }
 
