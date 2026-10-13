@@ -178,7 +178,11 @@ def main(argv=None) -> int:
         if not args.out:
             print("record needs --out", file=sys.stderr)
             return 2
-        args.out.write_text(json.dumps(results, indent=1, sort_keys=True) + "\n")
+        try:
+            args.out.write_text(json.dumps(results, indent=1, sort_keys=True) + "\n")
+        except OSError as err:
+            print(f"could not write baseline: {err}", file=sys.stderr)
+            return 2
         print(f"recorded {len(results)} blobs -> {args.out}")
         return 0
     if not args.baseline or not args.baseline.exists():
