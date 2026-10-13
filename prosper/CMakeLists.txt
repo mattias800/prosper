@@ -599,6 +599,8 @@ if(Python3_Interpreter_FOUND)
   # loudly, when ruff is absent; the python-quality CI job installs it, so there they always run.
   add_test(NAME python_quality_gate
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/test_check_python_quality.py")
+  # Its real ruff control needs the checkout config, also with an external build tree.
+  set_tests_properties(python_quality_gate PROPERTIES WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
   # check_cpp_lint.py gates clang-format/clang-tidy on CHANGED lines only (#4210). The end-to-end
   # arm skips, loudly, without the clang tools; the Linux CI job runs its --selftest directly.
   add_test(NAME cpp_lint_gate
