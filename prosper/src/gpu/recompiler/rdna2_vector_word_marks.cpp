@@ -19,7 +19,8 @@ namespace {
 // True when each result lane depends only on that same lane's sources and old word: no DPP,
 // no cross-lane permute, no lane-selecting write, no relative destination, no LDS exchange.
 // Accumulators (VOP2/VOP3 mac/fmac) qualify: they read the old destination, but only their own
-// lane's. SDWA field-select and per-lane memory loads qualify for the same reason.
+// lane's. SDWA field-select qualifies for the same reason. Memory result marks do not
+// authenticate their addresses; their dedicated source proofs must grant confinement.
 bool lane_mapped_vector_write(const Rdna2Inst& in) {
     if (in.has_dpp) return false;
     switch (in.fmt) {
@@ -29,10 +30,6 @@ bool lane_mapped_vector_write(const Rdna2Inst& in) {
         case Rdna2Format::VOP2: return true;
         case Rdna2Format::VOPC: return true;
         case Rdna2Format::VOP3: return in.opcode < 0x300;
-        case Rdna2Format::MUBUF:
-        case Rdna2Format::MTBUF:
-        case Rdna2Format::MIMG:
-        case Rdna2Format::FLAT: return true;
         default: return false;
     }
 }
