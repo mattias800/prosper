@@ -58,6 +58,7 @@
 #include "../../tests/fixtures/fragment_packet_exports_fixture.hpp"
 #include "../../tests/fixtures/native_uint_3d.hpp"
 #include "../../tests/fixtures/fragment_compare_kill.hpp"
+#include "../../tests/fixtures/fragment_dispatch_bool_copy.hpp"
 #include "../../tests/fixtures/fragment_vintrp_merge.hpp"
 #include "../../tests/fixtures/compute_array_gather.hpp"
 #include "../../tests/fixtures/saveexec_m0.hpp"
@@ -737,6 +738,19 @@ static void dump_wqm_mask_compatibility(const std::string& dir) {
         dump(dir, ("fragment_wqm_exact_mask_" + suffix).c_str(),
              recompile_fragment(graphics.data(), graphics.size()));
     }
+}
+
+// #3984: run the actual fragment selector and retain only Bool-copy lineage.
+static void dump_fragment_dispatch_bool_copy(const std::string& dir) {
+    namespace fixture = prosper::test::fragment_dispatch_bool_copy;
+    const auto code = fixture::program();
+    dump(dir, "fragment_dispatch_bool_copy",
+         recompile_fragment(code.data(), code.size(), nullptr, nullptr, 17),
+         "recompile_fragment_impl");
+    const auto early_out = fixture::program(fixture::Tail::Bool, false, 3, true);
+    dump(dir, "fragment_dispatch_bool_copy_mask_early_out",
+         recompile_fragment(early_out.data(), early_out.size(), nullptr, nullptr, 17),
+         "recompile_fragment_impl");
 }
 
 int main(int argc, char** argv) {
@@ -2376,6 +2390,7 @@ int main(int argc, char** argv) {
                               0x01a91281u, 0xf800080fu, 0x00000000u, 0xbf810000u};
         dump(dir, "fragment_logical_bool_copy", recompile_fragment(c, std::size(c), nullptr));
     }
+    dump_fragment_dispatch_bool_copy(dir);
     // Compute: V_WRITELANE spill slots across structured joins (rdna2_lane_slot_carry). The
     // counted loop keeps its counter in v20[40] (Kena 0x5007ad0000's shape), the nested form takes
     // the structured loop route, and the one-arm if phis a slot written on the taken arm only.

@@ -15,6 +15,13 @@ bool native_logical_data_word(const RegState& rs, int word, uint32_t& value);
 bool is_native_b64_logical(const SpirvCompute& b, const Rdna2Inst& in);
 void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rdna2Inst>& original,
                                            const RegState* initial);
+// Narrow an existing original fragment proof; never establish selected-entry authority.
+void retain_fragment_copy_demand_intersection(SpirvCompute&, const std::vector<Rdna2Inst>& selected,
+                                              const RegState* original_entry);
+// Pure MUST provenance; it grants no emitter permit or physical-word authority.
+std::set<uint32_t> fragment_survivor_mask_producers(const SpirvCompute&,
+                                                    const std::vector<Rdna2Inst>&,
+                                                    const RegState* entry);
 void initialize_native_logical_uniform_entry_proof(SpirvCompute& b,
                                                    const std::vector<Rdna2Inst>& original,
                                                    const RegState* initial);
