@@ -10,6 +10,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -69,7 +70,93 @@ std::vector<Rdna2Inst> program(uint32_t image = kSampleLz, uint32_t reader = kCo
     rdna2_walk(words.data(), words.size(), ins);
     return ins;
 }
+
+std::vector<uint32_t> guarded_loop(uint32_t writer, uint32_t extension, bool clean) {
+    // Save EXEC, narrow it with a genuine comparison, and guard a counted loop whose header
+    // reads v6. The body must define v6 again for every subsequent header iteration. The
+    // CNDMASK/EXP makes the header predicate an actual observable output, not a dead compare.
+    return {0x7e000280u, 0x7e020280u,
+            0x7e040280u, 0xbe94047eu,
+            kCmpx,       0xbf88000au,
+            writer,      extension,
+            0xbe8a0380u, 0x7d040c87u,
+            0x021200f2u, 0xbf0a820au,
+            0xbf840003u, clean ? 0x7e0c0287u : 0x7e0c0307u,
+            0x800a810au, 0xbf82fff9u,
+            0xbefe0414u, 0x7e1002f2u,
+            0xf800180fu, 0x09090909u,
+            kEnd};
+}
 }   // namespace
+
+TEST(ActiveImageWordDefinedness, GuardedLoopAcceptsAnInitializedBackedge) {
+    Harness h;
+    for (const auto [writer, extension] :
+         {std::pair{kSampleLz, kImageWord1}, std::pair{0x7e0c0287u, 0xbf800000u},
+          std::pair{0x7e0c02f9u, 0x00861680u}}) {
+        SCOPED_TRACE(writer);
+        const auto code = guarded_loop(writer, extension, true);
+        const auto module = recompile_fragment(code.data(), code.size(), &h.table);
+        EXPECT_FALSE(module.empty()) << "each iteration replaces v6 with genuine active-lane data";
+    }
+}
+
+TEST(ActiveImageWordDefinedness, GuardedLoopRejectsAnUninitializedBackedge) {
+    Harness h;
+    for (const auto [writer, extension] :
+         {std::pair{kSampleLz, kImageWord1}, std::pair{0x7e0c0287u, 0xbf800000u},
+          std::pair{0x7e0c02f9u, 0x00861680u}}) {
+        SCOPED_TRACE(writer);
+        const auto code = guarded_loop(writer, extension, false);
+        constexpr uint64_t address = 0x10001000u;
+        const auto module =
+            recompile_fragment(code.data(), code.size(), &h.table, nullptr, UINT32_MAX, nullptr,
+                               false, {RecompileDiagnosticStage::Fragment, address});
+        EXPECT_TRUE(module.empty()) << "the preheader's EXEC owner cannot authenticate later v7";
+        EXPECT_NE(last_terminal_reject_reason(address).find("loop-carried v6"), std::string::npos);
+    }
+}
+
+TEST(ActiveImageWordDefinedness, NarrowerCleanBackedgePreservesTheRequiredWiderDomain) {
+    Harness h;
+    const std::vector<uint32_t> words{kCmpx, kSampleLz, kImageWord1, kCompare, 0x7e0c0287u};
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(words.data(), words.size(), ins);
+    seed_vector_word_definedness(h.rs, ins, false, 64);
+    ASSERT_TRUE(h.emit(ins[0]));
+    const uint32_t owner = h.rs.exec;
+    ASSERT_TRUE(h.emit(ins[1]));
+    LoopBlanketCheck check(h.rs, std::set<int>{}, ins[3].pc);
+    mark_vector_loop_carried(h.rs, ins, ins[3].pc, ins[3].pc + 1, check.carried, check.confined);
+    auto exits = loop_check_marks(h.rs);
+    ASSERT_TRUE(fresh_mask_sources_defined(h.b, h.rs, ins[2]));
+    ASSERT_TRUE(h.emit(ins[0]));   // a second genuine CMPX narrows the original owner
+    ASSERT_NE(h.rs.exec, owner);
+    ASSERT_TRUE(h.emit(ins[3]));
+    EXPECT_EQ(h.rs.vreg_source_marks.at(6).outside_exec, owner)
+        << "unwritten lanes inside the wider owner retain their genuine carried value";
+    EXPECT_TRUE(check.holds(h.b, h.rs, exits));
+}
+
+TEST(ActiveImageWordDefinedness, NarrowerPoisonedBackedgeCannotReuseItsPreheaderOwner) {
+    Harness h;
+    const std::vector<uint32_t> words{kCmpx, kSampleLz, kImageWord1, kCompare, 0x7e0c0307u};
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(words.data(), words.size(), ins);
+    seed_vector_word_definedness(h.rs, ins, false, 64);
+    ASSERT_TRUE(h.emit(ins[0]));
+    ASSERT_TRUE(h.emit(ins[1]));
+    LoopBlanketCheck check(h.rs, std::set<int>{}, ins[3].pc);
+    mark_vector_loop_carried(h.rs, ins, ins[3].pc, ins[3].pc + 1, check.carried, check.confined);
+    auto exits = loop_check_marks(h.rs);
+    ASSERT_TRUE(fresh_mask_sources_defined(h.b, h.rs, ins[2]));
+    ASSERT_TRUE(h.emit(ins[0]));
+    ASSERT_TRUE(h.emit(ins[3]));
+    EXPECT_EQ(h.rs.vreg_source_marks.at(6).outside_exec, 0u);
+    EXPECT_FALSE(check.holds(h.b, h.rs, exits));
+    EXPECT_EQ(exits.vectors.at(6).outside_exec, 0u)
+        << "an exit cannot retain a failed loop-header obligation";
+}
 
 TEST(ActiveImageWordDefinedness, CompletedSampleAndCompareUseTheSameActualExec) {
     Harness h;

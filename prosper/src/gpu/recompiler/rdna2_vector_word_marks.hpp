@@ -18,6 +18,8 @@ struct ScalarSourceMarks {
     bool placeholder = false;
     bool memory = false;
     bool hard = false;
+    // Loop-header assumptions, including the per-iteration validity of an EXEC-confined word.
+    // A hard word remains unavailable outside its owner even when these assumptions hold.
     std::set<uint64_t> blanket_roots;
     // Nonzero only for a hard placeholder whose lanes are provably confined to the lanes OUTSIDE
     // this SPIR-V EXEC value: a partial VALU write under that EXEC replaced every other lane with
@@ -44,8 +46,10 @@ ScalarSourceMarks vector_lane_read_marks(const RegState& rs, const Rdna2Inst& in
 bool fresh_mask_sources_defined(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in);
 void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSourceMarks& source);
 void join_vector_word_marks(VectorWordMarks& into, const VectorWordMarks& other);
+bool vector_word_defined_in_exec(const RegState& rs, const ScalarSourceMarks& marks, uint32_t exec);
 void mark_vector_loop_carried(RegState& rs, const std::vector<Rdna2Inst>& ins, uint32_t lo,
-                              uint32_t hi, std::map<int, std::set<uint64_t>>& carried);
+                              uint32_t hi, std::map<int, std::set<uint64_t>>& carried,
+                              std::map<int, uint32_t>& confined);
 // Loop roots use physical scalar numbers 0..253 and disjoint vector numbers 256..511.
 inline constexpr int kVectorBlanketBase = 256;
 ScalarSourceMarks carried_word_marks(const RegState& rs, int word);
