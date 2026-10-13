@@ -157,7 +157,7 @@ The recompiler takes shader bytes, the register state it reads, and a target des
 returns SPIR-V plus a binding layout. It reads no environment switch, owns no cache and no device,
 and includes nothing from `gpu/execute`, `gpu/state`, the backend or a frontend. Caching and
 diagnostics wrap it from outside.
-Status: accepted
+Status: proposed (adr:0006)
 Enforcement: ratchet:getenv, ratchet:recompiler-include, adr:0006
 
 ### VER-1 -- renderer changes are replayed against recorded frames before merge
