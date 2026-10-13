@@ -3,6 +3,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 import recompile_corpus as rc  # noqa: E402
@@ -16,12 +18,14 @@ def test_stage_of_uses_filename_prefix():
 
 
 def test_verdict_lines_keep_only_decisions_in_order():
-    text = "\n".join([
-        "pc=0001 len=1 fmt=SOPP op=0x001",
-        "[recompile-reject] pc=9 mode=unresolved-operand",
-        "generic-coverage total=56",
-        "stage-recompile stage=compute status=ok spirv_dwords=12",
-    ])
+    text = "\n".join(
+        [
+            "pc=0001 len=1 fmt=SOPP op=0x001",
+            "[recompile-reject] pc=9 mode=unresolved-operand",
+            "generic-coverage total=56",
+            "stage-recompile stage=compute status=ok spirv_dwords=12",
+        ]
+    )
     assert rc.verdict_lines(text) == [
         "[recompile-reject] pc=9 mode=unresolved-operand",
         "stage-recompile stage=compute status=ok spirv_dwords=12",
@@ -53,3 +57,43 @@ def test_extra_context_in_after_run_is_not_a_difference():
     before = {("ps", "1000", "r"): {"aaaa"}}
     after = {("ps", "1000", "r"): {"aaaa", "bbbb"}}
     assert rc.compare_dumps(before, after) == ([], 1)
+
+
+class _Done:
+    def __init__(self, stdout="", returncode=0):
+        self.stdout, self.stderr, self.returncode = stdout, "", returncode
+
+
+def test_duplicate_basenames_in_different_directories_are_both_recorded(tmp_path, monkeypatch):
+    for sub, verdict in (("a", "status=one"), ("b", "status=two")):
+        (tmp_path / sub).mkdir()
+        (tmp_path / sub / "cs_same.bin").write_bytes(verdict.encode())
+
+    def fake_run(cmd, **_kw):
+        blob = Path(cmd[1])
+        return _Done(f"stage-recompile stage=compute {blob.read_text()}\n")
+
+    monkeypatch.setattr(rc.subprocess, "run", fake_run)
+    results = rc.collect(tmp_path, "inspector")
+    assert sorted(results) == ["a/cs_same.bin", "b/cs_same.bin"]
+    assert results["a/cs_same.bin"] != results["b/cs_same.bin"]
+
+
+def test_inspector_failure_is_not_recorded_as_a_verdict(tmp_path, monkeypatch):
+    (tmp_path / "cs_x.bin").write_bytes(b"\0")
+    monkeypatch.setattr(rc.subprocess, "run", lambda cmd, **_kw: _Done("", returncode=1))
+    with pytest.raises(rc.InspectorError):
+        rc.collect(tmp_path, "inspector")
+
+
+def test_main_reports_could_not_run_for_a_failing_inspector(tmp_path, monkeypatch, capsys):
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "cs_x.bin").write_bytes(b"\0")
+    inspector = tmp_path / "inspector.exe"
+    inspector.write_bytes(b"")
+    monkeypatch.setattr(rc.subprocess, "run", lambda cmd, **_kw: _Done("", returncode=1))
+    out = tmp_path / "base.json"
+    code = rc.main(["record", str(corpus), "--inspect", str(inspector), "--out", str(out)])
+    assert code == 2
+    assert not out.exists()

@@ -45,23 +45,51 @@ def verdict_lines(text: str) -> list[str]:
     return [ln.strip() for ln in text.splitlines() if ln.startswith(VERDICT_PREFIXES)]
 
 
+class InspectorError(Exception):
+    """shader_inspect could not run, as opposed to running and refusing a shader."""
+
+
 def run(cmd: list[str], env: dict[str, str]) -> str:
-    done = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=300)
-    return done.stdout + done.stderr
+    """Run shader_inspect and return its output. A refusal is an answer (it prints a
+    `stage-recompile` line); an inspector that crashes, times out or prints no such line is not."""
+    try:
+        done = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as err:
+        raise InspectorError(f"{cmd[0]} did not run: {err}") from err
+    text = done.stdout + done.stderr
+    if not any(ln.startswith("stage-recompile stage=") for ln in text.splitlines()):
+        raise InspectorError(
+            f"no stage-recompile verdict from {Path(cmd[1]).name} (exit {done.returncode})"
+        )
+    return text
 
 
 def recompile(inspect: str, blob: Path, stage: str) -> dict:
     # PROSPER_DBG is fixed on so the reject lines exist; it only logs, so it never varies the output.
     env = {**os.environ, "PROSPER_DBG": "1"}
-    entry = {"stage": stage, "verdict": verdict_lines(run([inspect, str(blob), "--stage", stage], env))}
+    entry = {
+        "stage": stage,
+        "verdict": verdict_lines(run([inspect, str(blob), "--stage", stage], env)),
+    }
     if stage in ("vertex", "fragment"):
         with tempfile.TemporaryDirectory() as tmp:
             spv = Path(tmp) / "out.spv"
-            text = run([inspect, str(blob), "--stage", stage, "--synthetic-table",
-                        "--spirv-out", str(spv)], env)
+            text = run(
+                [
+                    inspect,
+                    str(blob),
+                    "--stage",
+                    stage,
+                    "--synthetic-table",
+                    "--spirv-out",
+                    str(spv),
+                ],
+                env,
+            )
             entry["synthetic_verdict"] = verdict_lines(text)
             entry["spirv_sha256"] = (
-                hashlib.sha256(spv.read_bytes()).hexdigest() if spv.exists() else None)
+                hashlib.sha256(spv.read_bytes()).hexdigest() if spv.exists() else None
+            )
     return entry
 
 
@@ -69,7 +97,8 @@ def collect(corpus: Path, inspect: str) -> dict:
     blobs = sorted(p for p in corpus.rglob("*.bin") if stage_of(p))
     if not blobs:
         raise SystemExit(f"no cs_/ps_/vs_ blobs under {corpus}")
-    return {p.name: recompile(inspect, p, stage_of(p)) for p in blobs}
+    # Keyed by the path under the corpus: two subdirectories may hold the same basename.
+    return {p.relative_to(corpus).as_posix(): recompile(inspect, p, stage_of(p)) for p in blobs}
 
 
 def diff(base: dict, now: dict) -> list[str]:
@@ -96,8 +125,11 @@ def compare_dumps(before: dict, after: dict) -> tuple[list[str], int]:
     gone after. A hash only in the after run is a context the run reached and the other did not
     (measured: a second boot of one title reached one extra context), so it is not a difference."""
     shared = before.keys() & after.keys()
-    bad = [f"spirv differs: {k[0]} at {k[1]} raw {k[2]}: {sorted(before[k] - after[k])} gone, after has {sorted(after[k])}"
-           for k in sorted(shared) if before[k] - after[k]]
+    bad = [
+        f"spirv differs: {k[0]} at {k[1]} raw {k[2]}: {sorted(before[k] - after[k])} gone, after has {sorted(after[k])}"
+        for k in sorted(shared)
+        if before[k] - after[k]
+    ]
     return bad, len(shared)
 
 
@@ -118,8 +150,10 @@ def main(argv=None) -> int:
         bad, shared = compare_dumps(before, after)
         for line in bad:
             print(line)
-        print(f"{shared} shared programs, {len(bad)} differ, "
-              f"{len(before.keys() - after.keys())} only before, {len(after.keys() - before.keys())} only after")
+        print(
+            f"{shared} shared programs, {len(bad)} differ, "
+            f"{len(before.keys() - after.keys())} only before, {len(after.keys() - before.keys())} only after"
+        )
         if shared == 0:
             print("no program in common: nothing was compared", file=sys.stderr)
             return 2
@@ -128,7 +162,11 @@ def main(argv=None) -> int:
         print("corpus directory or shader_inspect binary not found", file=sys.stderr)
         return 2
     # Absolute: Windows CreateProcess does not resolve a relative, forward-slashed executable path.
-    results = collect(args.corpus.resolve(), str(Path(args.inspect).resolve()))
+    try:
+        results = collect(args.corpus.resolve(), str(Path(args.inspect).resolve()))
+    except InspectorError as err:
+        print(err, file=sys.stderr)
+        return 2
     if args.mode == "record":
         if not args.out:
             print("record needs --out", file=sys.stderr)
