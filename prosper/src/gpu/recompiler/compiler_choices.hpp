@@ -77,8 +77,8 @@ template<class Read> int64_t compiler_choice(CompilerChoice choice, Read&& live_
     return value;
 }
 
-// The four switch-type choices an emitter reads without a lambda: a request-supplied value, else
-// the replayed value, else the environment adapter (compiler_choice_environment.cpp). Kept to those
+// The four switch-type choices an emitter reads without a lambda: a replayed value, else
+// a request-supplied value, else the environment adapter (compiler_choice_environment.cpp). Kept to those
 // four on purpose; FloatControls and the taps still use the lambda form above.
 int64_t environment_compiler_choice(CompilerChoice choice);
 // Every switch-type choice's value from the environment, for a caller to hand to a request. Reading
