@@ -2210,12 +2210,9 @@ bool emit_cfg_state_machine(
                                               /*record_compare*/ false))
                     return false;
             }
-            // Which SGPR holds a reloaded half is block-local: emit_alu's per-lane mask for a
-            // v_readlane'd half does not survive a dispatcher edge, so a move into VCC after the
-            // edge would copy data words while the analysis called it a mask (#4603 review). The
-            // spill-slot and pair-definition facts describe memory and stay valid across edges.
-            halves.sregs.clear();
             for (uint32_t successor : successors[block]) {
+                const auto edge_halves =
+                    active_vector_edge_state(halves, ins, lo, hi, starts[successor], vregs);
                 if (!wave64_b64_reachable[successor]) {
                     wave64_b64_reachable[successor] = true;
                     wave64_b64_mask_in[successor] = masks;
@@ -2223,7 +2220,7 @@ bool emit_cfg_state_machine(
                     wave64_scalar_word_in[successor] = scalar_words;
                     wave64_m0_token_word_in[successor] = m0_tokens;
                     wave64_readlane_word_in[successor] = readlane_words;
-                    wave64_spilled_halves_in[successor] = halves;
+                    wave64_spilled_halves_in[successor] = edge_halves;
                     wave64_slot_domain_in[successor] = slot_domains;
                     wave64_scalar_scc_valid_in[successor] = scalar_scc;
                     pending.push_back(successor);
@@ -2257,7 +2254,7 @@ bool emit_cfg_state_machine(
                 std::set<int> joined_readlane_words = wave64_readlane_word_in[successor];
                 joined_readlane_words.insert(readlane_words.begin(), readlane_words.end());
                 SpilledMaskHalves joined_halves = wave64_spilled_halves_in[successor];
-                meet_spilled_mask_halves(joined_halves, halves);
+                meet_spilled_mask_halves(joined_halves, edge_halves);
                 SpillSlotDomains joined_slots = wave64_slot_domain_in[successor];
                 meet_spill_slot_domains(joined_slots, slot_domains);
                 const bool joined_scalar_scc = wave64_scalar_scc_valid_in[successor] && scalar_scc;
