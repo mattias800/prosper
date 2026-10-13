@@ -77,7 +77,7 @@ prepare_saved_complement_data(ActiveVectorWords& state, const Rdna2Inst& in,
     auto& values = state.complement.saved;
     const bool copy =
         in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB64 && in.n_src == 1;
-    const bool saveexec = in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x24 && in.opcode <= 0x2b;
+    const bool saveexec = in.fmt == Rdna2Format::SOP1 && sop1_opcode_is_saveexec_b64(in.opcode);
     const bool copy_parent = copy && pair_operand(in.dst) && pair_operand(in.src[0]);
     std::optional<SavedComplementData> source;
     if (saveexec || (copy && exec_operand(in.src[0]))) {

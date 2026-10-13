@@ -355,3 +355,148 @@ TEST(SavedExecData, IndependentSavedCopySurvivesAHighWordReplacement) {
     step(state, {0xbefe0406u}, {{126, 2}});
     EXPECT_TRUE(state.current.contains(2));
 }
+
+namespace {
+// v2 belongs to A before C is saved. ANDN1 selects nonempty A\C, whereas ORN1 may
+// enable lanes outside A. Neither instruction's old-EXEC destination is its result.
+std::vector<uint32_t> andn1_subset(bool genuine = true, bool widening = false) {
+    return {0x7dea0080u, 0xbe84047eu, genuine ? 0x7e040281u : 0x7e040309u,  0x7da40081u,
+            0xbe86047eu, 0xbefe0404u, widening ? 0xbe883806u : 0xbe883706u, 0x7d280480u,
+            0xbf810000u};
+}
+
+ActiveVectorWords andn1_words(bool genuine = true, uint32_t opcode = 0x37) {
+    auto state = saved_mask();
+    step(state, {genuine ? 0x7e040281u : 0x7e040309u}, {}, {2}, -1, true);
+    step(state, {0x7da40081u});
+    step(state, {0xbe86047eu}, {{6, 2}});
+    step(state, {0xbefe0404u}, {{126, 2}});
+    step(state, {0xbe880006u | (opcode << 8)}, {{8, 2}});
+    return state;
+}
+} // namespace
+
+TEST(SavedExecData, Andn1KeepsGenuineDataUnderItsOldExecSubset) {
+    dispatcher(compile(andn1_subset()));
+}
+
+TEST(SavedExecData, Andn1PortableKeepsGenuineDataUnderItsOldExecSubset) {
+    dispatcher(compile(andn1_subset(), 32));
+}
+
+TEST(SavedExecData, Andn1CannotAuthenticateAMissingWriterSource) {
+    missing(compile(andn1_subset(false)), 7);
+}
+
+TEST(SavedExecData, Andn1MatchedOrn1WideningCannotBorrowOldExecData) {
+    missing(compile(andn1_subset(true, true)), 7);
+}
+
+TEST(SavedExecData, Andn1SourceDestinationAliasUsesTheOldSourceValue) {
+    auto code = andn1_subset();
+    code[6] = 0xbe863706u;
+    dispatcher(compile(code));
+}
+
+TEST(SavedExecData, Andn1DestinationRetainsOldExecDataForARestore) {
+    auto code = andn1_subset();
+    code.insert(code.begin() + 7, 0xbefe0408u);
+    dispatcher(compile(code));
+}
+
+TEST(SavedExecData, Andn1OldValueCannotReceiveANewSubsetOnlyWord) {
+    auto code = andn1_subset();
+    code.insert(code.begin() + 7, {0x7e060281u, 0xbefe0408u});
+    code[9] = 0x7d280680u;
+    missing(compile(code), 9);
+}
+
+TEST(SavedExecData, Andn1BothPredecessorsRetainCurrentData) {
+    auto left = andn1_words(), right = andn1_words();
+    meet_active_vector_words(left, right);
+    EXPECT_TRUE(left.current.contains(2));
+}
+
+TEST(SavedExecData, Andn1OneMissingPredecessorCannotBorrowCurrentData) {
+    auto left = andn1_words(), right = andn1_words(false);
+    meet_active_vector_words(left, right);
+    EXPECT_FALSE(left.current.contains(2));
+}
+
+TEST(SavedExecData, Andn1BothMissingPredecessorsKeepCurrentDataMissing) {
+    auto left = andn1_words(false), right = andn1_words(false);
+    meet_active_vector_words(left, right);
+    EXPECT_FALSE(left.current.contains(2));
+}
+
+TEST(SavedExecData, Andn1OldValueEqualitySurvivesIndependentCopy) {
+    auto state = andn1_words();
+    step(state, {0xbe8a0408u}, {{10, 2}});
+    step(state, {0xbefe040au}, {{126, 2}});
+    EXPECT_TRUE(state.saved_exec.current_equal.contains(4));
+    EXPECT_TRUE(state.current.contains(2));
+}
+
+TEST(SavedExecData, Andn1HighWordReplacementRetiresOldValueEquality) {
+    auto state = andn1_words();
+    step(state, {0xbe8903c1u}, {{9, 1}});
+    step(state, {0xbe8a0408u}, {{10, 2}});
+    step(state, {0xbefe040au}, {{126, 2}});
+    EXPECT_FALSE(state.saved_exec.current_equal.contains(4));
+    EXPECT_FALSE(state.current.contains(2));
+}
+
+TEST(SavedExecData, Andn1CannotRefreshItsWiderOldValueFromASubset) {
+    auto state = andn1_words();
+    step(state, {0x7e060281u}, {}, {3}, -1, true);
+    step(state, {0xbefe0408u}, {{126, 2}});
+    EXPECT_TRUE(state.current.contains(2));
+    EXPECT_FALSE(state.current.contains(3));
+}
+
+TEST(SavedExecData, Andn1DirtyGenerationCannotBeRevivedByOldExecRestore) {
+    auto state = andn1_words();
+    step(state, {0x7e040309u}, {}, {2});
+    step(state, {0xbefe0408u}, {{126, 2}});
+    EXPECT_FALSE(state.current.contains(2));
+}
+
+TEST(SavedExecData, Andn1MatchedOrn1StillSavesTheGenuineOldValue) {
+    auto state = andn1_words(true, 0x38);
+    EXPECT_FALSE(state.current.contains(2));
+    step(state, {0xbefe0408u}, {{126, 2}});
+    EXPECT_TRUE(state.current.contains(2));
+}
+
+TEST(SavedExecData, Andn1SubsetRetainsOldExecParentsWithoutBorrowingExcludedOperand) {
+    auto state = andn1_words();
+    EXPECT_TRUE(state.complement.current_parents.contains(4));
+    EXPECT_TRUE(state.complement.current_parents.contains(8));
+    EXPECT_FALSE(state.complement.current_parents.contains(6));
+}
+
+TEST(SavedExecData, Andn1AliasingDestinationRetainsOldExecInsteadOfTheExcludedSource) {
+    auto state = saved_mask();
+    step(state, {0x7e040281u}, {}, {2}, -1, true);
+    step(state, {0x7da40081u});
+    step(state, {0xbe86047eu}, {{6, 2}});
+    step(state, {0xbefe0404u}, {{126, 2}});
+    step(state, {0xbe863706u}, {{6, 2}});
+    EXPECT_TRUE(state.current.contains(2));
+    EXPECT_TRUE(state.saved_exec.aliases.at(6).contains(4));
+    EXPECT_TRUE(state.complement.current_parents.contains(6));
+}
+
+TEST(SavedExecData, Andn1DirtyBackedgeCannotBorrowThePreheaderWordOnRestore) {
+    auto entry = andn1_words(), back = andn1_words();
+    step(back, {0x7e040309u}, {}, {2});
+    meet_active_vector_words(entry, back);
+    step(entry, {0xbefe0408u}, {{126, 2}});
+    EXPECT_FALSE(entry.current.contains(2));
+}
+
+TEST(SavedExecData, Andn1MatchedOrn1DoesNotRetainOldExecSubsetParents) {
+    auto state = andn1_words(true, 0x38);
+    EXPECT_FALSE(state.complement.current_parents.contains(4));
+    EXPECT_FALSE(state.complement.current_parents.contains(8));
+}

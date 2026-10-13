@@ -97,7 +97,7 @@ void advance_saved_exec_data(SavedExecDataEquality& equality, const Rdna2Inst& i
     const Value right = in.n_src > 1 ? value(equality, in.src[1]) : Value{};
     const bool copy =
         in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB64 && in.n_src == 1;
-    const bool saveexec = in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x24 && in.opcode <= 0x2b;
+    const bool saveexec = in.fmt == Rdna2Format::SOP1 && sop1_opcode_is_saveexec_b64(in.opcode);
     const bool compare =
         in.fmt == Rdna2Format::VOPC || (in.fmt == Rdna2Format::VOP3 && mask_write >= 0);
     const bool identity = in.fmt == Rdna2Format::SOP2 && (in.opcode == 0x0f || in.opcode == 0x11) &&
