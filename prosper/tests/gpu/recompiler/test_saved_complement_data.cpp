@@ -371,3 +371,21 @@ TEST(SavedComplementData, LoopBackedgeRetainsTheGenuineCurrentGeneration) {
 TEST(SavedComplementData, LoopBackedgeCannotReviveStoredEarlierFirstHalfData) {
     missing(compile(backedge(false)), 10);
 }
+
+TEST(SavedComplementData, Andn1SnapshotsOldComplementBeforeSelectingItsSubset) {
+    auto state = saved_second_half();
+    step(state, {0xbefe0406u}, {{126, 2}});
+    step(state, {0xbe8a3704u}, {{10, 2}});
+    ASSERT_TRUE(state.complement.saved.contains(10));
+    step(state, {0x7da40081u});
+    complete_parent(state, 10);
+    EXPECT_TRUE(state.current.contains(2));
+}
+
+TEST(SavedComplementData, Andn1CannotSaveAnInnerSubsetAsTheExactComplement) {
+    auto state = saved_second_half();
+    step(state, {0xbe8a3704u}, {{10, 2}});
+    EXPECT_FALSE(state.complement.saved.contains(10));
+    complete_parent(state, 10);
+    EXPECT_FALSE(state.current.contains(2));
+}

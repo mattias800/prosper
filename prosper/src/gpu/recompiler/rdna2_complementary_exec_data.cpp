@@ -124,7 +124,7 @@ void advance_complementary_exec_data(ActiveVectorWords& state, const Rdna2Inst& 
     const Domain right = in.n_src > 1 ? domain(proof, in.src[1]) : Domain{};
     const bool copy =
         in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB64 && in.n_src == 1;
-    const bool saveexec = in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x24 && in.opcode <= 0x2b;
+    const bool saveexec = in.fmt == Rdna2Format::SOP1 && sop1_opcode_is_saveexec_b64(in.opcode);
     const bool compare =
         in.fmt == Rdna2Format::VOPC || (in.fmt == Rdna2Format::VOP3 && mask_write >= 0);
     Domain result;
@@ -171,6 +171,7 @@ void advance_complementary_exec_data(ActiveVectorWords& state, const Rdna2Inst& 
                 case 0x25: next = logical_domain(0x11, left, before); break;
                 case 0x26: next = logical_domain(0x13, left, before); break;
                 case 0x27: next = logical_domain(0x15, left, before); break;
+                case kSop1OpcodeAndn1SaveexecB64: next = before; break;
                 default: break;
             }
         } else if (in.dst.value == 126)
@@ -179,7 +180,8 @@ void advance_complementary_exec_data(ActiveVectorWords& state, const Rdna2Inst& 
     }
     if (saveexec && in.dst.value < 126) {
         proof.parents[in.dst.value] = live(before.parents);
-        if (in.opcode == 0x24) proof.current_parents.insert(in.dst.value);
+        if (in.opcode == 0x24 || in.opcode == kSop1OpcodeAndn1SaveexecB64)
+            proof.current_parents.insert(in.dst.value);
     } else if (mask_write >= 0 && mask_write < 126 && compare) {
         proof.parents[mask_write] = live(before.parents);
         if (in.fmt == Rdna2Format::VOPC && vopc_is_cmpx(in.opcode))

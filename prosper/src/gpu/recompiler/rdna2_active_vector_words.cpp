@@ -257,7 +257,7 @@ void advance_active_vector_words(ActiveVectorWords& state, const Rdna2Inst& in,
         });
     const bool compare =
         in.fmt == Rdna2Format::VOPC || (in.fmt == Rdna2Format::VOP3 && mask_write >= 0);
-    const bool saveexec = in.fmt == Rdna2Format::SOP1 && in.opcode >= 0x24 && in.opcode <= 0x2b;
+    const bool saveexec = in.fmt == Rdna2Format::SOP1 && sop1_opcode_is_saveexec_b64(in.opcode);
     const bool changes_exec = rdna2_instruction_may_change_exec(in);
     EntryDomain exec_domain;
     if (changes_exec) {
@@ -272,6 +272,10 @@ void advance_active_vector_words(ActiveVectorWords& state, const Rdna2Inst& in,
             // RDNA2 ISA 70648 §12.3: S0 & ~EXEC selects a subset of S0, not of old EXEC.
             state.current = left;
             exec_domain = logical_domain(0x15, left_domain, before_domain);
+        } else if (saveexec && in.opcode == kSop1OpcodeAndn1SaveexecB64) {
+            // RDNA2 ISA 70648 §12.3: ~S0 & old EXEC cannot enable an old EXEC-off lane.
+            state.current = before;
+            exec_domain = logical_domain(0x15, before_domain, left_domain);
         } else if (saveexec && (in.opcode == 0x25 || in.opcode == 0x26)) {
             state.current = intersect(before, left);
             exec_domain =
