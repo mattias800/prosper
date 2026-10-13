@@ -635,6 +635,8 @@ std::shared_ptr<const DecodedShader> decode_shader_cached(const uint32_t* code, 
 
 struct ShaderCodeAnalysis {
     std::vector<uint32_t> code;
+    std::vector<uint32_t> terminal_tail_validation;
+    bool terminal_tail_limit_required = false;
     RefusedShaderMemo refused_shader_memo;
     uint64_t code_hash = 0;
     PcrelDispatchInfo pcrel_dispatch;
