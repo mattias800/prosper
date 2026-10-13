@@ -15,6 +15,10 @@
 #include <windows.h>
 #elif defined(__APPLE__)
 #include <crt_externs.h>
+#else
+// Global scope on purpose: a declaration here would name
+// prosper::screenshot::environ, which mislinks (macOS proved it).
+extern char** environ;
 #endif
 
 namespace prosper::screenshot {
@@ -505,7 +509,6 @@ std::map<std::string, std::string> collect_prosper_switches() {
     for (char** entry = *_NSGetEnviron(); entry && *entry; ++entry)
         record_switch(out, *entry);
 #else
-    extern char** environ;
     for (char** entry = environ; entry && *entry; ++entry) record_switch(out, *entry);
 #endif
     return out;
