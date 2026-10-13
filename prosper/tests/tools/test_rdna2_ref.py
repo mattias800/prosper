@@ -7,7 +7,10 @@ field layouts, so the tests do not depend on the decoder's own field extraction 
 construction. All data is synthetic.
 """
 
+import shlex
+import shutil
 import struct
+import subprocess
 import sys
 from pathlib import Path
 
@@ -576,6 +579,121 @@ def test_run_llvm_without_toolchain_raises(monkeypatch):
     assert not L.llvm_available()
     with pytest.raises(L.LlvmUnavailable):
         L.run_llvm(CONTROL)
+
+
+@pytest.mark.parametrize(
+    "failure", [1, OSError("launcher failed"), subprocess.TimeoutExpired("wsl", 10)]
+)
+def test_wsl_launcher_without_usable_tools_is_unavailable(monkeypatch, failure):
+    """An installed WSL launcher alone cannot qualify the optional cross-check."""
+    monkeypatch.setattr(L.shutil, "which", lambda name: "wsl" if name == "wsl" else None)
+
+    def run(cmd, **kwargs):
+        assert cmd[:4] == ["wsl", "-d", "Ubuntu", "--"]
+        assert kwargs["timeout"] <= 10
+        if isinstance(failure, Exception):
+            raise failure
+        return subprocess.CompletedProcess(cmd, failure, "WSL_E_DISTRO_NOT_FOUND", "")
+
+    monkeypatch.setattr(L.subprocess, "run", run)
+    assert not L.llvm_available()
+    with pytest.raises(L.LlvmUnavailable):
+        L.run_llvm(CONTROL)
+
+
+@pytest.mark.parametrize("native,failed_stage", [(True, 0), (True, 1), (False, 1)])
+def test_failed_llvm_process_is_not_a_disassembly(monkeypatch, native, failed_stage):
+    """Even parseable stdout from a failed assembler/disassembler must be refused."""
+    monkeypatch.setattr(L.shutil, "which", lambda name: name if native or name == "wsl" else None)
+    calls = []
+
+    def run(cmd, **kwargs):
+        stage = len(calls)
+        calls.append(cmd)
+        return subprocess.CompletedProcess(
+            cmd,
+            7 if stage == failed_stage else 0,
+            "s_endpgm // 00000000: BF810000\n",
+            "deliberate tool failure",
+        )
+
+    monkeypatch.setattr(L.subprocess, "run", run)
+    with pytest.raises(RuntimeError, match="deliberate tool failure"):
+        L.run_llvm(CONTROL)
+    assert len(calls) == failed_stage + 1
+
+
+def test_usable_wsl_disassembles_with_requested_cpu(monkeypatch):
+    """The fallback positive actually reaches and parses the disassembly process."""
+    monkeypatch.setattr(L.shutil, "which", lambda name: name if name == "wsl" else None)
+    calls = []
+
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        assert "gfx1030" in cmd[-1]
+        assert kwargs["input"].startswith(".text\n.byte ")
+        return subprocess.CompletedProcess(cmd, 0, "s_endpgm // 00000000: BF810000\n", "")
+
+    monkeypatch.setattr(L.subprocess, "run", run)
+    result = L.run_llvm(code(END))
+    assert [(i.offset, i.size, i.mnemonic) for i in result.insns] == [(0, 4, "s_endpgm")]
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("mc_status,dump_status", [(0, 0), (7, 0), (0, 9)])
+def test_wsl_pipeline_preserves_status_and_cleans_object(mc_status, dump_status):
+    """Execute the actual fallback shell composition with synthetic tool functions."""
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("fallback shell composition requires bash")
+    # The production object path is a UUID in /tmp. Use only the same safe name
+    # alphabet here, including when Windows Python drives MSYS bash.
+    proc = subprocess.run(
+        [bash, "-c", "mktemp -d"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    directory = proc.stdout.strip()
+    obj = directory + "/prog.o"
+    definitions = (
+        f"llvm-mc() {{ cat >/dev/null; touch {obj}; return {mc_status}; }}; "
+        f"llvm-objdump() {{ echo disassembled; return {dump_status}; }}; "
+    )
+    try:
+        proc = subprocess.run(
+            [bash, "-c", definitions + L.LLVM_PIPE.format(cpu="gfx1030", obj=obj)],
+            input=".text\n",
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == (mc_status or dump_status)
+        assert ("disassembled" in proc.stdout) == (mc_status == 0)
+        control = subprocess.run([bash, "-c", f"test ! -e {obj}"], check=False)
+        assert control.returncode == 0
+    finally:
+        subprocess.run([bash, "-c", f"rmdir {directory}"], check=True)
+
+
+def test_wsl_cpu_argument_is_quoted(monkeypatch):
+    """A caller-supplied CPU name stays one argument in the fallback shell."""
+    monkeypatch.setattr(L.shutil, "which", lambda name: name if name == "wsl" else None)
+    calls = []
+    cpu = "gfx1030; exit 99"
+
+    def run(cmd, **_kwargs):
+        calls.append(cmd)
+        if len(calls) == 2:
+            assert f"-mcpu={shlex.quote(cpu)}" in cmd[-1]
+            assert f"--mcpu={shlex.quote(cpu)}" in cmd[-1]
+        return subprocess.CompletedProcess(cmd, 0, "s_endpgm // 00000000: BF810000\n", "")
+
+    monkeypatch.setattr(L.subprocess, "run", run)
+    assert len(L.run_llvm(code(END), mcpu=cpu).insns) == 1
+    assert len(calls) == 2
 
 
 @needs_llvm
