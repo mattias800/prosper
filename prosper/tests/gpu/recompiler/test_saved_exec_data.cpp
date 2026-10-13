@@ -256,13 +256,13 @@ ActiveVectorWords saved_mask() {
     ActiveVectorWords state;
     state.enabled = state.current_is_entry = state.current_within_entry = true;
     state.current = state.entry_words = {0};
-    step(state, {0x7dea0080u}, {}, {}, 106); // actual current A, from genuine local-ID
+    step(state, {0x7dea0080u}); // actual current A; CMPX writes EXEC only, preserving VCC
     step(state, {0xbe84047eu}, {{4, 2}}); // unchanged s[4:5] = A before v2 is written
     return state;
 }
 
 void narrow(ActiveVectorWords& state) {
-    step(state, {0x7da40081u}, {}, {}, 106);
+    step(state, {0x7da40081u}); // match the actual dispatcher's mask_write=-1
 }
 
 void write_and_restore_parent(ActiveVectorWords& state) {

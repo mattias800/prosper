@@ -127,10 +127,9 @@ void advance_saved_exec_data(SavedExecDataEquality& equality, const Rdna2Inst& i
         return;
     }
     equality.current_equal.clear();
-    if (in.fmt == Rdna2Format::VOPC && vopc_is_cmpx(in.opcode)) {
-        // CMPX writes the same new comparison bits to VCC and EXEC.
-        equality.current_equal = published;
-    } else if (saveexec && in.opcode == 0x24 && left.current) {
+    // GFX10 CMPX replaces EXEC and preserves VCC. The dispatcher supplies no mask_write for
+    // it; no saved-pair equality follows from the narrowed result alone.
+    if (saveexec && in.opcode == 0x24 && left.current) {
         // S0 equals old EXEC, so S0 & old EXEC is that exact value.
         equality.current_equal = surviving(equality, before.aliases);
         equality.current_equal.insert(published.begin(), published.end());
