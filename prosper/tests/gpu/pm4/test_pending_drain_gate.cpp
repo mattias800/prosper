@@ -106,7 +106,6 @@ struct Rendezvous {
 thread_local Rendezvous* fixture_drainer = nullptr;
 
 void modern_control() {
-    prosper_gpu_enable_post_submit_visibility();
     prosper_gpu_drain_completion_writes();
     const auto before = observe([](const auto& q) {
         return q.queued == 0 && q.inflight_batches == 0 && q.active_submits == 0;
@@ -247,35 +246,6 @@ void modern_control() {
           "cleanup leaves no queued write, inflight apply or unmatched real submit scope");
 }
 
-void legacy_control() {
-    uint64_t label = 0;
-    std::vector<uint64_t> landed;
-    set_guest_gpu_write_observer([&](uint64_t address, uint64_t bytes, const char* origin) {
-        if (address != reinterpret_cast<uint64_t>(&label)) return;
-        if (bytes != 8 || !origin || std::strcmp(origin, "RELEASE_MEM") != 0)
-            apparatus_failure("legacy effect had an unexpected write origin");
-        landed.push_back(label);
-    });
-    prosper_gpu_submit_scope_begin();
-    check(!prosper_gpu_submit_scope_active(), "legacy visibility keeps submit scopes inactive");
-    std::vector<uint32_t> stream;
-    append_release(stream, &label, 0x62000001u);
-    append_release(stream, &label, 0x62000002u);
-    GpuState state;
-    check(run_command_buffer(stream.data(), stream.size(), state) == 2,
-          "legacy arm decodes two real completion packets");
-    prosper_gpu_submit_scope_end();
-    prosper_gpu_drain_completion_writes();
-    set_guest_gpu_write_observer({});
-    check(landed == std::vector<uint64_t>{0x62000001u, 0x62000002u},
-          "legacy completions still land in FIFO order");
-    check(label == 0x62000002u, "legacy completion drain still publishes the final label");
-    const auto final = observe([](const auto& q) {
-        return q.queued == 0 && q.inflight_batches == 0 && q.active_submits == 0;
-    });
-    check(final && final->scope_begins == 0 && final->scope_ends == 0,
-          "legacy drain invents no modern submit token or retained work");
-}
 } // namespace
 
 extern "C" void prosper_pending_drain_inflight_wait_for_test() {
@@ -288,14 +258,10 @@ extern "C" void prosper_pending_drain_active_wait_for_test() {
     if (fixture_drainer) fixture_drainer->signal_fresh_gate();
 }
 
-int main(int argc, char** argv) {
-    const bool legacy = argc == 2 && std::strcmp(argv[1], "--legacy") == 0;
-    if (argc != 1 && !legacy) return 2;
-    set_environment("PROSPER_POST_SUBMIT_VISIBILITY", legacy ? "0" : "1");
+int main() {
     set_environment("PROSPER_EOP_WRITE_SYNC", "0");
-    std::printf("Actual CPU pending-drain control; mode=%s; Vulkan UNRUN\n",
-                legacy ? "legacy" : "modern");
-    if (legacy) legacy_control(); else modern_control();
+    std::printf("Actual CPU pending-drain control; default visibility; Vulkan UNRUN\n");
+    modern_control();
     std::printf("== %s: %d failures ==\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

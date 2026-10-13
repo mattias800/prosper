@@ -17,7 +17,6 @@
 #include <cstdio>
 #include <iterator>
 
-#include "gpu/pm4/command_processor.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 
 namespace prosper { namespace agc {
@@ -554,13 +553,10 @@ extern "C" void* prosper_agc_reg_defaults(unsigned int version) {
     static std::atomic<bool> announced{false};
     if (!announced.exchange(true))
         std::fprintf(stderr, "[agc] register defaults requested for SDK version %u\n", version);
-    // The post-submit visibility contract is a real SDK-13 behavioural difference and
-    // stays version-gated; the register table itself does not, because the keys a
-    // guest searches for are the same on every version it may ask about.
-    if (version >= 13) prosper_gpu_enable_post_submit_visibility();
+    // The table's register keys are independent of this version. Completion ownership is
+    // established at submit entry, including before any table query (#2220), not by the SDK.
     return prosper::agc::public_defaults();
 }
-extern "C" void* prosper_agc_reg_defaults_internal(unsigned int version) {
-    if (version >= 13) prosper_gpu_enable_post_submit_visibility();
+extern "C" void* prosper_agc_reg_defaults_internal(unsigned int /*version*/) {
     return &prosper::agc::g_reg_defaults2;
 }

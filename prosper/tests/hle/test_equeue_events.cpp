@@ -81,9 +81,11 @@ TEST(EqueueEvents, Contract) {
     CHECK(tev.filter == -15, "HR-timer event filter == EVFILT_HRTIMER (-15)");
 
     // --- GPU EOP event (sceGnmAddEqEvent, NID b0xyllnVY-I): register id=0x40 (GfxEop) on the equeue,
-    //     then a completed SubmitDcb must fire it — our fold is synchronous, so submit == pipe drain. ---
+    //     then a completed SubmitDcb must fire it at the registered import return boundary. ---
     auto addeq  = Hle::lookup("b0xyllnVY-I");   // sceGnmAddEqEvent / GraphicsAddEqEvent (raw NID)
     auto submit = Hle::lookup("UglJIZjGssM");   // sceAgcDriverSubmitDcb (raw NID)
+    const auto submit_return = Hle::return_hook_of("UglJIZjGssM");
+    ASSERT_NE(submit_return, nullptr);
     CHECK(addeq && submit, "GnmAddEqEvent + SubmitDcb registered");
     if (addeq && submit) {
         const int64_t kEop = 0x40; const uint64_t kEopUdata = 0x1234BEEF;
@@ -94,6 +96,9 @@ TEST(EqueueEvents, Contract) {
         uint32_t dcbbuf[2] = { 0xC0000000u | (0x10u << 8) | (0x05u << 2), 0 };  // IT_NOP=0x10, R_DRAW_RESET=0x05
         struct Packet { uint32_t* addr; uint32_t dw_num; uint8_t pad[4]; } pkt{ dcbbuf, 2, {0,0,0,0} };
         submit((uint64_t)(uintptr_t)&pkt, 0, 0, 0, 0, 0);
+        CHECK(getcount(eq, 0, 0, 0, 0, 0) == 0,
+              "submit completion remains private until the import returns");
+        submit_return();
 
         KEvent gev{}; int32_t gout = -1; uint32_t gcap = 50000;
         wait(eq, (uint64_t)(uintptr_t)&gev, 1, (uint64_t)(uintptr_t)&gout, (uint64_t)(uintptr_t)&gcap, 0);

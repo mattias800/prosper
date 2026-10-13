@@ -12,6 +12,56 @@
 
 namespace prosper {
 
+template <typename Mapping>
+bool mapped_memory_slices(const std::vector<Mapping>& maps, std::mutex& mapping_mutex,
+                          uint32_t direct_flag, uint64_t address, uint64_t bytes,
+                          std::vector<GuestMemoryMappingSlice>& output,
+                          GuestMemoryMappingCoverage* coverage = nullptr) {
+    output.clear();
+    if (coverage) *coverage = GuestMemoryMappingCoverage::Incomplete;
+    if (!address || !bytes || address > UINT64_MAX - bytes) return false;
+    std::lock_guard<std::mutex> lock(mapping_mutex);
+    const auto after = std::upper_bound(
+        maps.begin(), maps.end(), address,
+        [](uint64_t value, const Mapping& mapping) { return value < mapping.base; });
+    auto mapping = after;
+    if (after != maps.begin()) {
+        const auto previous = std::prev(after);
+        if (previous->size > UINT64_MAX - previous->base ||
+            address - previous->base < previous->size)
+            mapping = previous;
+    }
+    if (mapping == maps.end() || mapping->base >= address + bytes) {
+        if (coverage) *coverage = GuestMemoryMappingCoverage::Untracked;
+        return false;
+    }
+    std::vector<GuestMemoryMappingSlice> slices;
+    uint64_t cursor = address;
+    while (cursor < address + bytes) {
+        if (mapping == maps.end() || !mapping->committed || mapping->base > cursor ||
+            mapping->size > UINT64_MAX - mapping->base || cursor - mapping->base >= mapping->size)
+            return false;
+        const uint64_t count = std::min(address + bytes, mapping->base + mapping->size) - cursor;
+        const bool direct = (mapping->query_flags & direct_flag) != 0;
+        const uint64_t delta = cursor - mapping->base;
+        if (direct &&
+            (mapping->offset > UINT64_MAX - delta || mapping->offset + delta > UINT64_MAX - count))
+            return false;
+        const uint64_t physical = direct ? mapping->offset + delta : 0;
+        if (!slices.empty() && slices.back().direct == direct &&
+            slices.back().offset + slices.back().bytes == cursor - address &&
+            (!direct || slices.back().physical + slices.back().bytes == physical))
+            slices.back().bytes += count;
+        else
+            slices.push_back({cursor - address, count, physical, direct});
+        cursor += count;
+        ++mapping;
+    }
+    output = std::move(slices);
+    if (coverage) *coverage = GuestMemoryMappingCoverage::Complete;
+    return true;
+}
+
 // Renderer reads must stop at the first reserved or unreadable guest byte. Mapping records can
 // split at a 16 KiB guest page, so sampling one address per 64 KiB can silently cross a hole.
 // Adjacent committed records remain one readable prefix even when protection split them.

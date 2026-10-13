@@ -85,6 +85,17 @@ static size_t run_cb(const uint32_t* buf, size_t dwords, GpuState& st) {
     return n;
 }
 
+// A satisfied barrier transfers completion effects into the asynchronous post-submit FIFO.
+// These packet-only fixtures have already retired; drain that FIFO before inspecting labels,
+// then recheck any later deferred stream that consumes a newly published completion.
+static void flush_retired_streams() {
+    int completed = 0;
+    do {
+        completed = flush_deferred_streams();
+        prosper_gpu_drain_completion_writes();
+    } while (completed != 0);
+}
+
 TEST(WaitBarrier, Contract) {
     // Enable the opt-in model. The default one-second release timeout is generous enough that the
     // ordering assertions below do not race it; the two liveness tests deliberately sleep past it.
@@ -110,10 +121,10 @@ TEST(WaitBarrier, Contract) {
         CHECK(last_fold_deferred(), "unsatisfied WaitRegMem paused the stream");
         CHECK(deferred_pending(), "a deferred stream is pending");
         CHECK(pre == 1, "effect UPSTREAM of the barrier flushed promptly");
-        flush_deferred_streams();
+        flush_retired_streams();
         CHECK(post == 0, "effect DOWNSTREAM of the barrier stays gated while the condition is unmet");
         cond = 1;                                    // producer arrives (CPU-visible label write)
-        flush_deferred_streams();
+        flush_retired_streams();
         CHECK(post == 1, "downstream effect released once the condition was satisfied");
         CHECK(!deferred_pending(), "stream completed and left the deferred queue");
     }
@@ -137,13 +148,13 @@ TEST(WaitBarrier, Contract) {
         run_cb(s2, 7, st);
         run_cb(s3, 7, st);
         run_cb(s4, 15, st);
-        flush_deferred_streams();
+        flush_retired_streams();
         CHECK(L == 0, "gated-address writes stay gated (no overtake)");
         CHECK(M == 1, "unrelated-address write flowed immediately");
         CHECK(N == 0, "stream behind a gated-address wait stays gated");
         CHECK(deferred_pending(), "tail pending");
         cond1 = 1;                                   // front producer arrives -> tail drains in order
-        flush_deferred_streams();
+        flush_retired_streams();
         CHECK(L == 2, "same-address writes landed in ring order (final = later write)");
         CHECK(N == 1, "gated-address wait evaluated in ring order and released its stream");
         CHECK(!deferred_pending(), "queue fully drained");
@@ -172,14 +183,14 @@ TEST(WaitBarrier, Contract) {
         GpuState async_state;
         run_cb(async_wait, 15, async_state);
         async_condition = 1;
-        flush_deferred_streams();
+        flush_retired_streams();
         CHECK(async_tail == 1, "ready async-compute tail drained past a blocked graphics front");
         CHECK(label == 0 && graphics_tail == 0 && deferred_pending(),
               "async drain did not disturb the blocked graphics queue");
         run_cb(async_producer, 7, async_state);
         CHECK(label == 1, "async-compute producer flowed around a paused graphics queue");
         CHECK(graphics_tail == 0, "graphics tail remained gated until its wait was re-checked");
-        flush_deferred_streams();
+        flush_retired_streams();
         CHECK(label == 0 && graphics_tail == 1,
               "async producer released the graphics tail in graphics-stream order");
         CHECK(!deferred_pending(), "cross-queue dependency fully drained");
@@ -192,7 +203,7 @@ TEST(WaitBarrier, Contract) {
         run_cb(async_producer, 7, graphics_state);
         CHECK(label == 0, "DcbFinal cannot overtake a paused Dcb at the same address");
         label = 1;                                       // external producer releases the queue
-        flush_deferred_streams();
+        flush_retired_streams();
         CHECK(label == 1 && graphics_tail == 1,
               "Dcb and DcbFinal tails drained in graphics-queue order");
         CHECK(!deferred_pending(), "graphics queue fully drained");
@@ -217,12 +228,12 @@ TEST(WaitBarrier, Contract) {
         emit_release(buf + 13, (uint64_t)(uintptr_t)&post, 1);
         GpuState st;
         run_cb(buf, 20, st);
-        flush_deferred_streams();
+        flush_retired_streams();
         CHECK(in_jump == 0, "jump-target effect gated with the paused parent stream");
         CHECK(post == 0, "parent's post-jump effect STAYS gated (recursion must not reset the pause)");
         CHECK(last_fold_deferred(), "fold still reports deferred after an inner Jump");
         cond = 1;
-        flush_deferred_streams();
+        flush_retired_streams();
         CHECK(in_jump == 1 && post == 1, "both released in order once the condition held");
     }
 
@@ -238,13 +249,13 @@ TEST(WaitBarrier, Contract) {
         emit_release(buf + 8, (uint64_t)(uintptr_t)&label, 1);
         GpuState st;
         run_cb(buf, 15, st);
-        flush_deferred_streams();
+        flush_retired_streams();
         const uint64_t guest_before_host_work = prosper_guest_tsc_ns();
         const uint64_t progress_before_host_work = prosper::host_gpu_progress_ns();
         {
             prosper::HostGpuClockScope host_gpu_work(0);
             std::this_thread::sleep_for(std::chrono::milliseconds(1100));
-            flush_deferred_streams();
+            flush_retired_streams();
         }
         const uint64_t guest_after_host_work = prosper_guest_tsc_ns();
         CHECK(label == 0,
@@ -254,7 +265,7 @@ TEST(WaitBarrier, Contract) {
         CHECK(prosper::host_gpu_progress_ns() - progress_before_host_work < 100000000ull,
               "host GPU work is excluded only from the internal dependency clock");
         cond = 1;
-        flush_deferred_streams();
+        flush_retired_streams();
         CHECK(label == 1 && !deferred_pending(),
               "barrier still releases normally after compensated host GPU work");
         uint64_t timestamp = 0;
@@ -277,14 +288,14 @@ TEST(WaitBarrier, Contract) {
         emit_release(buf + 8, (uint64_t)(uintptr_t)&label, 1);
         GpuState st;
         run_cb(buf, 15, st);
-        flush_deferred_streams();
+        flush_retired_streams();
         CHECK(label == 0, "gated before the timeout");
         const uint64_t guest_before_timeout = prosper_guest_tsc_ns();
         std::this_thread::sleep_for(std::chrono::milliseconds(1100));   // > default timeout
         const uint64_t guest_after_timeout = prosper_guest_tsc_ns();
         CHECK(guest_after_timeout - guest_before_timeout >= 1000000000ull,
               "ordinary guest time advances through the liveness window");
-        flush_deferred_streams();
+        flush_retired_streams();
         CHECK(label == 1, "timeout released the gated write (liveness backstop)");
         CHECK(!deferred_pending(), "timed-out stream completed");
     }
@@ -319,7 +330,7 @@ TEST(WaitBarrier, Contract) {
         CHECK(st.dma_copies.size() == 1 && st.dma_execution_rejected,
               "WAIT_DEFER-gated address DMA remains visible and rejects execution");
         cond = 1;
-        flush_deferred_streams();
+        flush_retired_streams();
         execute_nonrender_submit_work(st);
         CHECK(target == 0 && completion == 0,
               "rejected gated DMA discards its deferred completion suffix without signaling");
@@ -349,7 +360,7 @@ TEST(WaitBarrier, Contract) {
         CHECK(st.dma_copies.size() == 1 && st.dma_execution_rejected,
               "WAIT_DEFER stream gate still rejects a downstream memory-to-GDS copy");
         cond = 1;
-        flush_deferred_streams();
+        flush_retired_streams();
         execute_nonrender_submit_work(st);
         uint32_t copied = 0;
         memcpy(&copied, gds + 0x24, sizeof(copied));
@@ -399,7 +410,7 @@ TEST(WaitBarrier, Contract) {
               "only the disjoint GDS copy executes before the earlier wait releases");
 
         cond = 1;
-        flush_deferred_streams();
+        flush_retired_streams();
         execute_nonrender_submit_work(same_span_state);
         uint32_t final_same_span = 0;
         memcpy(&final_same_span, gds + 0x24, 4);
@@ -427,7 +438,7 @@ TEST(WaitBarrier, Contract) {
               "address DMA rejects a dependency on a previously gated source range");
         CHECK(target == 0, "source-dependent DMA cannot overtake the gated producer");
         cond = 1;
-        flush_deferred_streams();
+        flush_retired_streams();
     }
 
 }
