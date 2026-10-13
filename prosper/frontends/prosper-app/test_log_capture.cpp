@@ -252,20 +252,34 @@ protected:
 TEST_F(ChildOutputCapture, ChildWritesAfterLibraryCaptureTeardown) {
     std::string exe = "/bin/sh";
     std::string flag = "-c";
-    std::string script = "read token || exit 9; printf 'child stdout\\n'; "
+    std::string script = "printf 'child ready\\n'; read token || exit 9; printf 'child stdout\\n'; "
                          "printf 'child stderr\\n' >&2";
     char* args[] = {exe.data(), flag.data(), script.data(), nullptr};
     ASSERT_EQ(capture_.spawn_child(child_, args, environ), 0);
     ASSERT_GT(child_, 0);
     EXPECT_TRUE(capture_.installed()) << "spawning must retain the library's capture";
+    // Spawn completion does not synchronize the test with the shell's startup. Wait for its
+    // actual script before requiring EOF: transient inherited write ends may still be closing.
+    // pread observes readiness without moving the file offset shared with the child's stdout.
+    const auto child_ready = [&] {
+        constexpr char marker[] = "child ready\n";
+        char seen[sizeof(marker) - 1]{};
+        return ::pread(fd_of(out_), seen, sizeof(seen), 0) == static_cast<ssize_t>(sizeof(seen)) &&
+               std::string(seen, sizeof(seen)) == marker;
+    };
+    const auto ready_deadline = Clock::now() + std::chrono::seconds(3);
+    while (!child_ready() && Clock::now() < ready_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    ASSERT_TRUE(child_ready()) << "the child must reach its stdin gate before capture teardown";
     write_all(1, "library stdout\n");
     write_all(2, "library stderr\n");
-    EXPECT_EQ(read_back(fd_of(out_)), "") << "the library still writes through held readers";
+    EXPECT_EQ(read_back(fd_of(out_)), "child ready\n")
+        << "the library still writes through held readers";
     EXPECT_EQ(read_back(fd_of(err_)), "");
 
     EXPECT_TRUE(capture_.uninstall(std::chrono::milliseconds(2000)))
         << "the waiting game must hold no write end of the library's output pipes";
-    EXPECT_EQ(read_back(fd_of(out_)), "library stdout\n");
+    EXPECT_EQ(read_back(fd_of(out_)), "child ready\nlibrary stdout\n");
     EXPECT_EQ(read_back(fd_of(err_)), "library stderr\n");
     write_all(gate_[1], "go\n");
     int status = 0;
@@ -280,7 +294,7 @@ TEST_F(ChildOutputCapture, ChildWritesAfterLibraryCaptureTeardown) {
     child_ = -1;
     ASSERT_TRUE(WIFEXITED(status));
     EXPECT_EQ(WEXITSTATUS(status), 0);
-    EXPECT_EQ(read_back(fd_of(out_)), "library stdout\nchild stdout\n");
+    EXPECT_EQ(read_back(fd_of(out_)), "child ready\nlibrary stdout\nchild stdout\n");
     EXPECT_EQ(read_back(fd_of(err_)), "library stderr\nchild stderr\n");
     EXPECT_EQ(ring_->snapshot().size(), 2u) << "child output must bypass the library's log ring";
 }
