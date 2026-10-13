@@ -74,6 +74,7 @@ uint64_t begin_record(TraceState& state) {
 } // namespace
 
 bool wait_producer_trace_enabled() {
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): boot-pinned, synchronized static; never rearmed.
     return PROSPER_ENV_ON("PROSPER_WAIT_PRODUCER_TRACE");
 }
 
