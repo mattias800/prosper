@@ -592,6 +592,16 @@ struct Interpreter {
           const auto x = value(l, a[2]);
           if (x.type != a[0] || x.words.size() != size(x.type)) fail("Not operand type mismatch");
           set_unsigned(l, a[1], a[0], x.defined ? ~unsigned_value(x) : 0, x.defined);
+      } else if (op ==
+                 177) {   // OpSLessThan: the CFG dispatcher bounds its signed program counter.
+          if (a.size() != 4 || ty(a[0]).op != 20) fail("malformed signed comparison");
+          const auto x = value(l, a[2]), y = value(l, a[3]);
+          if (ty(x.type).op != 21 || ty(x.type).a != std::vector<uint32_t>{32, 1} ||
+              x.type != y.type || x.words.size() != 1 || y.words.size() != 1)
+              fail("signed comparison operand types");
+          set(l, a[1], a[0],
+              {std::bit_cast<int32_t>(x.words[0]) < std::bit_cast<int32_t>(y.words[0])},
+              x.defined && y.defined);
       } else if (op == 170 || op == 171 || op == 172 || op == 174 || op == 176 || op == 178 ||
                  op == 128 || op == 130 || op == 132 || op == 134 || op == 137 || op == 194 ||
                  op == 196 || op == 197 || op == 198 || op == 199) {

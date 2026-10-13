@@ -87,6 +87,7 @@ void seed_active_vector_words(ActiveVectorWords& facts, const RegState& initial,
 void meet_active_vector_words(ActiveVectorWords& into, const ActiveVectorWords& incoming) {
     meet_complementary_exec_data(into.complement, incoming.complement);
     meet_saved_exec_data(into.saved_exec, incoming.saved_exec);
+    meet_exec_spill_equality(into.exec_spill, incoming.exec_spill);
     into.enabled = into.enabled && incoming.enabled;
     into.current = intersect(std::move(into.current), incoming.current);
     into.current_is_entry = into.current_is_entry && incoming.current_is_entry;
@@ -200,6 +201,9 @@ void advance_active_vector_words(ActiveVectorWords& state, const Rdna2Inst& in,
                                  const std::vector<std::pair<int, uint32_t>>& scalar_writes,
                                  const std::vector<int>& vector_writes, int mask_write,
                                  bool genuine_active_sources, bool complete_active_word) {
+    if (state.enabled &&
+        advance_exec_spill_equality(state.exec_spill, in, scalar_writes, vector_writes, mask_write))
+        return;   // A proved full restore of CURRENT EXEC changes none of its DATA domains.
     advance_complementary_exec_data(state, in, scalar_writes, mask_write);
     advance_saved_exec_data(state.saved_exec, in, scalar_writes, mask_write);
     // Snapshot masks before an aliasing SDST or saveexec destination overwrites them.
