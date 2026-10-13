@@ -63,13 +63,21 @@ def toplevel():
     `--stdin-filename` against its cwd only, so both ruff and file reads run from here: from a
     subdirectory (ctest runs in the build tree) ruff would silently fall back to its defaults."""
     out = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
+        ["git", "rev-parse", "--show-cdup"],
         capture_output=True,
         text=True,
         encoding="utf-8",
         check=True,
     )
-    return Path(out.stdout.strip())
+    # Relative ../ components avoid interpreting an MSYS Git absolute path in
+    # native Windows Python. Resolve them through the interpreter's own cwd.
+    climb = out.stdout.rstrip("\r\n")
+    if re.fullmatch(r"(?:\.\./)*", climb) is None:
+        raise RuntimeError("could not determine checkout root: invalid Git relative path")
+    root = (Path.cwd() / climb).resolve()
+    if not root.is_dir():
+        raise RuntimeError("could not determine checkout root: directory is unavailable")
+    return root
 
 
 def ruff(args, stdin=None):

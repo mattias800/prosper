@@ -254,7 +254,12 @@ int main(int argc, char** argv) {
     reject(trap, "unmodelled-control-flow", "unmodelled scalar control remains unproved");
     auto interpolation = loop();
     interpolation[2] = 0xc8000000u;
-    reject(interpolation, "scalar-or-unmodelled-read", "unknown read inventories stay fail-closed");
+    CHECK(analyze(interpolation).admitted,
+          "recognized interpolation reads no ordinary scalar word");
+    auto reserved_interpolation = loop();
+    reserved_interpolation[2] = 0xc8030000u;
+    reject(reserved_interpolation, "scalar-or-unmodelled-read",
+           "reserved interpolation remains unproved");
 
     reject(loop(), "ordinary-aligned-pair-required", "odd SGPR pair roots are outside the contract", 2, 85);
     reject(loop(), "missing-loop-header", "the supplied header must name an instruction", 99);
