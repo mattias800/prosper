@@ -166,6 +166,7 @@ TEST(StructuralFixtureInputs, TwoSourceCarryRequiresTheOriginalComparedWord) {
     ComputeShaderConfig config;
     config.wave_size = 32;
     config.local_x = 64;
+    config.tgid_x_en = true;
     auto code = prosper::test::declared_two_source_cfg_fixture(body);
     const auto compile = [&](uint64_t address) {
         return recompile_compute(code.data(), code.size(), nullptr, config,
@@ -179,5 +180,63 @@ TEST(StructuralFixtureInputs, TwoSourceCarryRequiresTheOriginalComparedWord) {
     EXPECT_TRUE(compile(0x50630301u).empty());
     const auto reason = last_terminal_reject_reason(0x50630301u);
     EXPECT_NE(reason.find("fabricated-fresh-mask-source"), std::string::npos) << reason;
-    EXPECT_NE(reason.find("pc=8 words=7d8a06f9,06868080"), std::string::npos) << reason;
+    EXPECT_NE(reason.find("pc=9 words=7d8a06f9,06868080"), std::string::npos) << reason;
+}
+
+TEST(StructuralFixtureInputs, RuntimeBranchKeepsTheOriginalThreeSourceAmbiguity) {
+    constexpr uint32_t body[] = {
+        0x7d8a06f9u, 0x06868080u, 0xbf068008u, 0xbf840001u, 0xbe800380u, 0xd5690001u,
+        0x00020302u, 0x7e040280u, 0x7c020300u, 0xbf860001u, 0x7e040281u, 0x7d840100u,
+        0xbf870001u, 0xbf82fffdu, 0x7e040d02u, 0xbf810000u,
+    };
+    ComputeShaderConfig config;
+    config.wave_size = 32;
+    config.local_x = 64;
+    config.tgid_x_en = true;
+    auto code = prosper::test::declared_two_source_cfg_fixture(body);
+    const auto compile = [&](uint64_t address) {
+        return recompile_compute(code.data(), code.size(), nullptr, config,
+                                 {RecompileDiagnosticStage::Compute, address});
+    };
+    const auto module = compile(0x50630302u);
+    ASSERT_FALSE(module.empty()) << last_terminal_reject_reason(0x50630302u);
+    EXPECT_TRUE(has_opcode(module, 251));
+    code[prosper::test::two_source_cfg_inputs.size() + 5] = 0xd5430001u;
+    EXPECT_TRUE(compile(0x50630303u).empty())
+        << "the genuine third source reads the original path-dependent s0 lifetime";
+    code[0] = 0xbe880380u; // A constant branch selects only the genuine scalar-data path.
+    EXPECT_FALSE(compile(0x50630304u).empty()) << last_terminal_reject_reason(0x50630304u);
+}
+
+TEST(StructuralFixtureInputs, PhiReductionDeclaresItsActualPredicate) {
+    constexpr uint32_t code[] = {
+        0x93eaff03u, 0x00080008u, 0x876bff03u, 0x000000ffu, 0x8f6a8c6au, 0x887c6a6bu,
+        0xbf900009u, 0x906a8803u, 0x81ea6a80u, 0x90fe6ac1u, 0xf8000941u, 0x00000000u,
+        0x81ea0380u, 0x90fe6ac1u, 0xbe80246au, 0xbf880001u, 0x8afe7e00u, 0xbefe0400u,
+        0x34040a81u, 0x36060ac2u, 0x7e000280u, 0x7e0202f2u, 0x36040482u, 0x4a0606c1u,
+        0x4a0404c1u, 0x7e060b03u, 0x7e040b02u, 0xf80008cfu, 0x01000302u, 0xbf810000u,
+    };
+    const auto module = prosper::test::compile_ngg_phi_fixture_with_declared_predicate(code);
+    ASSERT_FALSE(module.empty());
+    EXPECT_TRUE(has_opcode(module, 245)) << "the original wave-pack/forward-if PHI is exercised";
+    for (size_t i = 5; i < module.size();) {
+        const uint32_t count = module[i] >> 16;
+        ASSERT_GT(count, 0u);
+        ASSERT_LE(count, module.size() - i);
+        if ((module[i] & 0xffffu) == 245) {
+            ASSERT_GE(count, 5u);
+            EXPECT_NE(module[i + 2], 0u);
+            for (size_t word = i + 3; word < i + count; ++word) EXPECT_NE(module[word], 0u);
+        }
+        i += count;
+    }
+    EXPECT_TRUE(recompile_vertex(code, std::size(code), nullptr, nullptr, false, 0,
+                                 {RecompileDiagnosticStage::Vertex, 0x50630305u})
+                    .empty());
+    EXPECT_NE(last_terminal_reject_reason(0x50630305u).find("pc=14 words=be80246a"),
+              std::string::npos)
+        << last_terminal_reject_reason(0x50630305u);
+    EXPECT_TRUE(
+        prosper::test::compile_ngg_phi_fixture_with_declared_predicate(std::span(code).first(14))
+            .empty());
 }
