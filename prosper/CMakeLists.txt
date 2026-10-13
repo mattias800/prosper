@@ -2648,6 +2648,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_complementary_exec_data.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_saved_complement_data
+    SOURCES tests/gpu/recompiler/test_saved_complement_data.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_wave32_word_provenance
     SOURCES tests/gpu/recompiler/test_wave32_word_provenance.cpp
     INCLUDES tests
