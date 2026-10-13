@@ -1235,7 +1235,8 @@ static PROSPER_SYSV_ABI uint64_t agc_acb_wait_reg_mem(uint64_t cb, uint64_t size
     // CONFIDENCE: HIGH. #5037's two independent guest call chains pass address in r8, reference
     // in r9, then mask and poll on the stack. PS5 3.20 names htn36gPnBk4 as sceAgcAcbWaitRegMem.
     // Sharing the nine-argument DCB handler shifted all four operands and discarded this wait.
-    if (PROSPER_ENV_ON("PROSPER_GFXLOG"))
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): tests arm between calls; production only reads.
+    if (getenv("PROSPER_GFXLOG"))
         fprintf(stderr,
                 "[agc] AcbWaitRegMem size=%llu func=%llu cache=%llu addr=0x%llx ref=0x%llx "
                 "mask=0x%llx\n",
