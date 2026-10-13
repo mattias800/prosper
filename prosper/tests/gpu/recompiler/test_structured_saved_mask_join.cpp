@@ -304,6 +304,32 @@ TEST(StructuredSavedMaskJoin, CompletelyDeadOneArmMaskNeedsNoPhi) {
     ASSERT_TRUE(e.run({0xbf068014u, 0xbf840001u, logical(0x13), end}));
     EXPECT_FALSE(e.rs.sreg_bool.contains(24));
 }
+TEST(StructuredSavedMaskJoin, InterpolationDoesNotKeepDeadOneArmMaskLive) {
+    Emitter e;
+    ASSERT_TRUE(e.run({0xbf068014u, 0xbf840001u, logical(0x13), 0xc8100000u, end}));
+    EXPECT_FALSE(e.rs.sreg_bool.contains(24));
+    for (uint32_t storage : {0u, 1u})
+        for (uint32_t lane = 0; lane < 64; ++lane)
+            EXPECT_EQ(value(e, storage, lane), std::bit_cast<uint32_t>(0.5f));
+    retain_module(e, "interpolation-dead-mask.spv");
+}
+TEST(StructuredSavedMaskJoin, InterpolationPreservesGenuinePredicatesOnBothPaths) {
+    Emitter e;
+    e.predicate();
+    auto code = one_arm();
+    code.insert(code.begin() + 3, 0xc8100000u);
+    ASSERT_TRUE(e.run(code));
+    expect_values(e, left ^ right, incoming);
+    retain_module(e, "interpolation-genuine-predicate.spv");
+}
+TEST(StructuredSavedMaskJoin, InterpolationCannotSupplyMissingLiveMaskOrRelay) {
+    for (bool relay : {false, true}) {
+        Emitter e;
+        auto code = one_arm(relay);
+        code.insert(code.begin() + 3, 0xc8100000u);
+        e.refused(code);
+    }
+}
 TEST(StructuredSavedMaskJoin, FullReplacementAfterJoinNeedsNoOldMask) {
     Emitter e;
     std::vector<uint32_t> code{0xbf068014u, 0xbf840001u, logical(0x13), logical(0x11)};

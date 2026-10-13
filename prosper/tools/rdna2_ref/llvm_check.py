@@ -1,7 +1,7 @@
 """Decode cross-check of the independent decoder against LLVM's AMDGPU disassembler.
 
 LLVM runs natively when ``llvm-mc`` and ``llvm-objdump`` are on ``PATH``, otherwise inside WSL
-Ubuntu when ``wsl`` is; with neither, ``run_llvm`` raises ``LlvmUnavailable`` (``llvm_available()``
+Ubuntu when both tools can run there; with neither, ``run_llvm`` raises ``LlvmUnavailable`` (``llvm_available()``
 answers the question up front). The bytes are assembled as ``.byte`` data by ``llvm-mc`` and
 disassembled by ``llvm-objdump -d`` from the same LLVM build, whose output lists each
 instruction with its byte offset and its *original* dwords (``llvm-mc --disassemble
@@ -15,6 +15,7 @@ the expected side.
 from __future__ import annotations
 
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -25,8 +26,9 @@ from pathlib import Path
 from . import decode as D
 
 LLVM_PIPE = (
+    "trap 'rm -f {obj}' EXIT; "
     "llvm-mc -triple=amdgcn-amd-amdhsa -mcpu={cpu} -filetype=obj -o {obj} && "
-    "llvm-objdump -d --mcpu={cpu} {obj}; rm -f {obj}"
+    "llvm-objdump -d --mcpu={cpu} {obj}"
 )
 _LINE = re.compile(r"^\s*(.*?)\s*//\s*([0-9A-Fa-f]+):((?:\s+[0-9A-Fa-f]{8})+)\s*$")
 _SUFFIX = re.compile(r"_(e32|e64|dpp|sdwa|dpp8)$")
@@ -52,16 +54,47 @@ class LlvmResult:
 
 
 class LlvmUnavailable(RuntimeError):
-    """Neither a native LLVM toolchain nor WSL is available for the cross-check."""
+    """Neither native LLVM nor a usable WSL Ubuntu toolchain is available."""
 
 
 def _native_llvm() -> bool:
     return shutil.which("llvm-mc") is not None and shutil.which("llvm-objdump") is not None
 
 
+def _wsl_llvm() -> bool:
+    """A launcher can exist without Ubuntu or working LLVM binaries in that distro."""
+    if shutil.which("wsl") is None:
+        return False
+    try:
+        proc = subprocess.run(
+            [
+                "wsl",
+                "-d",
+                "Ubuntu",
+                "--",
+                "bash",
+                "-c",
+                "llvm-mc --version >/dev/null && llvm-objdump --version >/dev/null",
+            ],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+def _require_success(proc, stage):
+    """Tool failure is not an empty or partially valid disassembly."""
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        raise RuntimeError(f"{stage} failed (exit {proc.returncode}): {detail}")
+
+
 def llvm_available() -> bool:
-    """Whether ``run_llvm`` has a toolchain to run (native LLVM or WSL)."""
-    return _native_llvm() or shutil.which("wsl") is not None
+    """Whether ``run_llvm`` has native tools or a usable WSL Ubuntu toolchain."""
+    return _native_llvm() or _wsl_llvm()
 
 
 def run_llvm(data: bytes, mcpu: str = "gfx1030", timeout: int = 180) -> LlvmResult:
@@ -88,8 +121,7 @@ def run_llvm(data: bytes, mcpu: str = "gfx1030", timeout: int = 180) -> LlvmResu
                 timeout=timeout,
                 check=False,
             )
-            if mc.returncode != 0:
-                return parse_llvm_output("")
+            _require_success(mc, "llvm-mc")
             proc = subprocess.run(
                 ["llvm-objdump", "-d", f"--mcpu={mcpu}", obj],
                 capture_output=True,
@@ -97,14 +129,24 @@ def run_llvm(data: bytes, mcpu: str = "gfx1030", timeout: int = 180) -> LlvmResu
                 timeout=timeout,
                 check=False,
             )
+            _require_success(proc, "llvm-objdump")
         return parse_llvm_output(proc.stdout)
-    if shutil.which("wsl") is None:
-        raise LlvmUnavailable("llvm-mc/llvm-objdump not on PATH and no WSL to run them in")
+    if not _wsl_llvm():
+        raise LlvmUnavailable("llvm-mc/llvm-objdump not on PATH and no usable WSL Ubuntu toolchain")
     obj = f"/tmp/h03_{uuid.uuid4().hex}.o"
-    cmd = ["wsl", "-d", "Ubuntu", "--", "bash", "-c", LLVM_PIPE.format(cpu=mcpu, obj=obj)]
+    cmd = [
+        "wsl",
+        "-d",
+        "Ubuntu",
+        "--",
+        "bash",
+        "-c",
+        LLVM_PIPE.format(cpu=shlex.quote(mcpu), obj=obj),
+    ]
     proc = subprocess.run(
         cmd, input=asm, capture_output=True, text=True, timeout=timeout, check=False
     )
+    _require_success(proc, "WSL LLVM")
     return parse_llvm_output(proc.stdout)
 
 

@@ -331,8 +331,24 @@ sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R,
                     in.src[1].value != 125 && (in.src[1].value == R || in.src[1].value + 1 == R))
                     return false;
                 break;
-            default:
-                return false;   // memory/branch/interp/unknown: can't bound reads of R -> assume live
+            case Rdna2Format::VINTRP:
+                // CONFIDENCE: HIGH -- AMD 70648 10.4.2/Table 53: P1/P2/MOV read VGPRs
+                // and implicit M0, never an ordinary scalar word. EXEC still predicates them;
+                // M0 is excluded above. Reserved opcodes and inconsistent decoded forms prove
+                // nothing. This only extends the ordinary scalar/VCC-word liveness question.
+                if (R < 0 || R > 107 || in.opcode > 2 || in.len_dwords != 1 || in.n_src != 1 ||
+                    in.dst.kind != OperandKind::VGPR || in.dst.value < 0 || in.dst.value > 255 ||
+                    in.src[0].kind != OperandKind::VGPR || in.src[0].value < 0 ||
+                    in.src[0].value > 255 || in.vintrp_attr > 32 || in.vintrp_chan > 3 ||
+                    (in.opcode == 2 && in.src[0].value > 2) || in.has_modifier || in.has_sdwa ||
+                    in.has_dpp || in.has_literal || in.sdst.kind != OperandKind::None ||
+                    in.words[0] !=
+                        (0xc8000000u | (in.opcode << 16u) |
+                         (static_cast<uint32_t>(in.dst.value) << 18u) | (in.vintrp_attr << 10u) |
+                         (in.vintrp_chan << 8u) | static_cast<uint32_t>(in.src[0].value)))
+                    return block(in, "unmodelled-vintrp");
+                break;
+            default: return false;   // memory/branch/unknown: can't bound reads of R -> assume live
         }
         if (index + 1 < ins.size()) pending.push_back(index + 1);
     }
@@ -1637,6 +1653,10 @@ inline uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
                 return source < 2 ? 1u : UINT32_MAX;
             if (in.opcode == kVop3OpcodeLshlrevB64 || in.opcode == kVop3OpcodeLshrrevB64)
                 return source == 0 ? 1u : (source == 1 ? 2u : UINT32_MAX);
+            // CONFIDENCE: HIGH -- carry-in ADD/SUB/SUBREV lower SRC0/SRC1 as B32;
+            // only SRC2 names the actual SGPR-pair predicate (RDNA2 70648, section 12.7).
+            if (in.opcode == 0x128 || in.opcode == 0x129 || in.opcode == 0x12a)
+                return source < 2 ? 1u : (source == 2 ? 2u : UINT32_MAX);
             if (in.opcode == 0x101)
                 return source < 2 ? 1u : 2u;   // cndmask data is B32; condition is a pair
             // B32 VOP3 forms, each of whose sources is ONE dword. The list is an allowlist over a
@@ -1859,9 +1879,17 @@ inline SavedB64MaskSnapshot snapshot_saved_b64_masks(const RegState& rs, const R
 }
 
 // Explicit emission-domain snapshot: host load_state reconstruction is not an architectural write.
-inline SavedB64MaskSnapshot snapshot_saved_b64_masks(const SpirvCompute& b, const RegState& rs,
+inline SavedB64MaskSnapshot snapshot_saved_b64_masks(SpirvCompute& b, const RegState& rs,
                                                      const Rdna2Inst& in) {
     auto snapshot = snapshot_saved_b64_masks(rs, in);
+    if (in.fmt == Rdna2Format::FLAT || in.fmt == Rdna2Format::MUBUF ||
+        in.fmt == Rdna2Format::MTBUF) {
+        // Address assumptions are read by this memory instruction, before an aliasing write.
+        // The genuine loaded value is separate from those address-generation obligations.
+        const auto& roots = snapshot.source_marks.blanket_roots;
+        b.loop_blanket_roots_read.insert(roots.begin(), roots.end());
+        snapshot.source_marks.blanket_roots.clear();
+    }
     if (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x43)
         snapshot.source_marks = vector_relative_source_marks(b, rs, in);
     snapshot.portable_numeric_replacement = ordinary_portable_wave64_masks(b);
