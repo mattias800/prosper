@@ -3,6 +3,7 @@
 #pragma once
 
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_saved_complement_data.hpp"
 
 #include <map>
 #include <set>
@@ -19,6 +20,7 @@ struct ComplementaryExecData {
     std::map<int, std::set<int>> parents;
     int parent = -1;
     std::set<int> first_words;
+    SavedComplementValues saved;
     bool operator==(const ComplementaryExecData&) const = default;
 };
 

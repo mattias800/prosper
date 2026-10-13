@@ -312,6 +312,7 @@ void advance_active_vector_words(ActiveVectorWords& state, const Rdna2Inst& in,
         // later iteration at the same writer PC. Unknown partial/cross-lane writers also retire it.
         if (!genuine_active_sources) {
             state.complement.first_words.erase(word);
+            retire_saved_complement_word(state.complement, word);
             state.current.erase(word);
             state.entry_words.erase(word);
             for (auto& [mask, words] : state.masks) words.erase(word);
