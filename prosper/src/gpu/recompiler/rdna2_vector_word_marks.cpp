@@ -16,29 +16,45 @@
 namespace prosper::gpu {
 namespace {
 
-// True only for plain VOP1/VOP2/VOPC/VOP3 arithmetic whose result for lane L depends on lane L's
-// own sources. A form that reads or writes another lane, or a memory form, is not lane-wise.
-bool lane_wise_vector_op(const Rdna2Inst& in) {
-    if (in.has_dpp || in.has_modifier) return false;
+// True when each result lane depends only on that same lane's sources and old word: no DPP,
+// no cross-lane permute, no lane-selecting write, no relative destination, no LDS exchange.
+// Accumulators (VOP2/VOP3 mac/fmac) qualify: they read the old destination, but only their own
+// lane's. SDWA field-select and per-lane memory loads qualify for the same reason.
+bool lane_mapped_vector_write(const Rdna2Inst& in) {
+    if (in.has_dpp) return false;
     switch (in.fmt) {
         case Rdna2Format::VOP1:
             return in.opcode != 0x02 && in.opcode != kVop1OpcodeMovreldB32 &&
                    !(in.opcode >= 0x40 && in.opcode <= 0x47);
-        case Rdna2Format::VOP2: return in.opcode != 0x1f && in.opcode != 0x2b && in.opcode != 0x3c;
+        case Rdna2Format::VOP2: return true;
         case Rdna2Format::VOPC: return true;
         case Rdna2Format::VOP3: return in.opcode < 0x300;
+        case Rdna2Format::MUBUF:
+        case Rdna2Format::MTBUF:
+        case Rdna2Format::MIMG:
+        case Rdna2Format::FLAT: return true;
         default: return false;
     }
 }
 
-// True when a lane-wise form writes the complete 32-bit word of every lane it executes: no SDWA
+// True only for plain lane-mapped arithmetic without SDWA partial destinations: DPP and
+// unmodeled SDWA/DPP forms (has_modifier) may move a value across lanes or preserve bits.
+bool lane_wise_vector_op(const Rdna2Inst& in) {
+    return !in.has_modifier && lane_mapped_vector_write(in);
+}
+
+// True when a lane-wise form writes the complete 32-bit word of every lane it executes: no
 // partial destination, no preserved old bits (vector_write_depends_on_old_word, with EXEC treated
 // as full so only the form's own dependence counts), and not an indexed relative write.
 bool complete_full_word_write(const Rdna2Inst& in) {
     // A plain buffer load writes each active lane's dwords (out-of-range lanes return zero); a TFE
     // form also writes a status word, which is not modelled here, so it is not complete.
     if (in.fmt == Rdna2Format::MUBUF) return rdna2_tfe_status_vgpr(in) < 0;
-    if (!lane_wise_vector_op(in) || in.has_sdwa) return false;
+    // A modeled SDWA form writes the complete word only for a full-DWORD destination with
+    // zero-fill (UNUSED_PAD). PRESERVE keeps old bits and sub-dword selects write fields, and
+    // unmodeled forms keep has_modifier; none of those is complete.
+    if (in.has_sdwa) return !in.has_modifier && in.sdwa_dst_sel == 6 && in.sdwa_dst_unused == 0;
+    if (!lane_wise_vector_op(in)) return false;
     if (in.fmt == Rdna2Format::VOP1 && (in.opcode == 0x02 || in.opcode == kVop1OpcodeMovreldB32))
         return false;
     return !vector_write_depends_on_old_word(in, /*full_exec=*/true);
@@ -230,13 +246,16 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
         // replaces one selected lane regardless of EXEC. Partial/relative writes retain old bits.
         if (preserve) union_source_marks(result, vector_word(rs, reg));
         // A write defines its word only in the lanes it writes. Confinement is granted only when the
-        // form writes the complete word of every active lane; any other form (preserved bits,
-        // selected lanes, relative destinations, cross-lane forms) leaves the old word unconfined.
+        // form writes the complete word of every active lane. A lane-mapped preserve/accumulator
+        // form computes each lane from that lane's sources and old word, so the union's meet of
+        // their confinements survives (it is already in result.outside_exec). Anything cross-lane
+        // (DPP, permutes, lane-selecting or relative writes, LDS) may move a placeholder anywhere
+        // and drops it.
         const bool complete = complete_full_word_write(in);
         const bool narrowed_write = rs.exec_narrowed && !rdna2_instruction_may_change_exec(in);
-        if (!complete) {
+        if (!complete && !lane_mapped_vector_write(in)) {
             result.outside_exec = 0;
-        } else if (narrowed_write) {
+        } else if (narrowed_write && complete) {
             // Outside EXEC the old word survives; inside it the result is the source relayed.
             const bool defined_inside =
                 !source.placeholder ||

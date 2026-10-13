@@ -31,6 +31,8 @@ const std::vector<uint32_t> kSdwaV6 = {0x7e0c02f9u, 0x00851480u};
 const std::vector<uint32_t> kWritelaneV6 = {0xd7610006u, 0x00010002u};
 // v_movreld_b32 with VDST v6 (indexed through M0), inline-zero source.
 const std::vector<uint32_t> kMovrelV6 = {0x7e0c8480u};
+// v_mac_f32 v6, v1, v2 (VOP2 0x1f): lane-wise accumulator reading its own lane's old word.
+const std::vector<uint32_t> kMacV6 = {0x3e0c0501u};
 // v_fmac_f32_e64 (0x12b) and v_pk_fmac_f16_e64 (0x13c): the VOP3 forms of VOP2 0x2b/0x3c, which
 // accumulate the old destination like 0x11f (the e64 form of 0x1f).
 // SRC2 encodes s2: the decoder exposes a third source field for these opcodes, so the test makes
@@ -143,6 +145,29 @@ bool predicate_defined_after_cmpx(const std::vector<uint32_t>& writes,
 void sgpr_genuine(RegState& rs, SpirvCompute& b, int r) {
     rs.sreg[r] = b.uconst(5);
 }
+
+// v6 holds a placeholder confined to G. A lane-wise accumulator under M combines its own lane's
+// clean sources with its own lane's old word, so the meet stays G: it is accepted under G, and it
+// is NOT rebased to a different writer EXEC M.
+bool accumulator_meet(bool mac_under_writer_exec) {
+    Harness h;
+    h.rs.vreg[1] = h.b.uconst(3);
+    h.rs.vreg[2] = h.b.uconst(4);
+    const uint32_t g = h.b.btrue();
+    h.rs.exec = g;
+    h.rs.exec_narrowed = true;
+    const auto mov = decode(kMovV6);
+    const auto mac = decode(kMacV6);
+    const auto cmp = decode(kCmpV6V6);
+    if (mov.size() != 1 || mac.size() != 1 || cmp.size() != 1) return false;
+    std::vector<Rdna2Inst> all = {mov[0], mac[0], cmp[0]};
+    seed_vector_word_definedness(h.rs, all, false, 64);
+    record_vector_word_marks(h.rs, mov[0], scalar_source_marks(h.rs, mov[0]));
+    h.rs.exec = mac_under_writer_exec ? g : h.b.btrue();
+    h.rs.exec_narrowed = true;
+    record_vector_word_marks(h.rs, mac[0], scalar_source_marks(h.rs, mac[0]));
+    return fresh_mask_sources_defined(h.b, h.rs, cmp[0]);
+}
 }   // namespace
 
 TEST(FreshMaskExecConfinement, CompleteWriteCompareUnderTheWritersExecIsDefined) {
@@ -184,6 +209,11 @@ TEST(FreshMaskExecConfinement, ControlEncodingsDecodeAsTheFormsTheyClaim) {
     }
     EXPECT_EQ(decode(kFmacV6)[0].opcode, 0x12bu);
     EXPECT_EQ(decode(kPkFmacV6)[0].opcode, 0x13cu);
+    const auto mac = decode(kMacV6);
+    ASSERT_EQ(mac.size(), 1u);
+    EXPECT_EQ(mac[0].fmt, Rdna2Format::VOP2);
+    EXPECT_EQ(mac[0].opcode, 0x1fu);
+    EXPECT_EQ(mac[0].dst.value, 6);
 }
 
 TEST(FreshMaskExecConfinement, CompareUnderAnotherExecStillRefuses) {
@@ -229,6 +259,14 @@ TEST(FreshMaskExecConfinement, CompareUnderAnUnrelatedExecRecordStillRefuses) {
 
 void vgpr_genuine(RegState& rs, SpirvCompute& b, int r) {
     rs.vreg[r] = b.uconst(7);
+}
+
+TEST(FreshMaskExecConfinement, AccumulatorKeepsSharedConfinement) {
+    EXPECT_TRUE(accumulator_meet(/*mac_under_writer_exec=*/true));
+}
+
+TEST(FreshMaskExecConfinement, AccumulatorMeetDoesNotRebaseToWriterExec) {
+    EXPECT_FALSE(accumulator_meet(/*mac_under_writer_exec=*/false));
 }
 
 TEST(FreshMaskExecConfinement, FmacAccumulatorReadsStillRefuse) {
