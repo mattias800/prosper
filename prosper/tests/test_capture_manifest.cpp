@@ -1,6 +1,7 @@
 #include "../tools/screenshot/capture_manifest.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <string>
 #include <vector>
