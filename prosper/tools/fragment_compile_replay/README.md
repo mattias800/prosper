@@ -94,3 +94,22 @@ it was removed because it could not detect a new reader, only that some file cha
 
 These files contain private shader bytes. Do not commit or publish them. SOURCE reproduction does
 not establish buffer immutability, Wave64 admission, draw execution, or pixel correctness.
+
+## Comparing two builds over a corpus
+
+`corpus.py` is the before/after check ADR 0006 asks of each recompiler migration step. Record a
+directory of cases once with the build you trust, then replay it on both builds and compare:
+
+```text
+corpus.py run <CASE_DIR> --replay <recording-build>/fragment_compile_replay --mode baseline  --out BASE.json
+corpus.py run <CASE_DIR> --replay <build-under-test>/fragment_compile_replay --mode candidate --out CAND.json
+corpus.py compare BASE.json CAND.json
+```
+
+A case's answer is its SPIR-V sha256 (none for a refusal) and the replay's verdict, which includes
+the refusing pc, so a refusal that moves is a difference. Baseline mode matches only on the build that
+recorded the case; candidate mode replays the same inputs on any build, which is why the two runs use
+different binaries. An exit other than 0 or 3, a missing status line, or a produced-but-unwritten
+module is "could not run" (exit 2), never a recorded answer. Same-build baseline and candidate runs
+agree on every case, which is the control for the tool itself (43 cases from two titles when it was
+added). The cases are local; only result files may be shared.
