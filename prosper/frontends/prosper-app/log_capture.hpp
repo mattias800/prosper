@@ -42,6 +42,7 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <poll.h>
+#include <spawn.h>
 #include <unistd.h>
 #endif
 
@@ -159,6 +160,31 @@ public:
     }
 
     bool installed() const { return installed_; }
+
+#ifndef _WIN32
+    // File actions for a posix_spawned child whose streams must outlive this capture.
+    //
+    // A game the library launches into a separate window may run long after the library is
+    // closed. Without actions it inherits the captured targets — pipes whose readers die with
+    // this process — and its first write afterwards dies of SIGPIPE. For every captured target
+    // this dups the saved (pre-capture) destination onto it in the child, so the game's output
+    // lands on the console no matter how long the game outlives us. Adds nothing (returns
+    // false) when not installed; the caller then spawns with no actions, exactly as before.
+    // The saved descriptors stay open for process life (see uninstall), so the action's fd
+    // numbers remain valid after the call returns; the caller destroys the actions after spawn.
+    bool spawn_console_actions(posix_spawn_file_actions_t* actions) const {
+        if (!installed_ || !actions) return false;
+        if (::posix_spawn_file_actions_init(actions) != 0) return false;
+        for (const Stream& s : streams_) {
+            if (s.saved < 0 || s.saved == s.target ||
+                ::posix_spawn_file_actions_adddup2(actions, s.saved, s.target) != 0) {
+                ::posix_spawn_file_actions_destroy(actions);
+                return false;
+            }
+        }
+        return true;
+    }
+#endif
 
 private:
     struct Shared {

@@ -1730,8 +1730,19 @@ static bool relaunch_with_dump(int argc, char** argv, const std::string& app0_ro
     // the user instead of this process quitting into nothing. POSIX permits an implementation to
     // return 0 and let the child exit 127 instead; there the relaunch would degrade to the old
     // silent behaviour rather than misbehave.
+    //
+    // The library session keeps the Game Log capture installed while a game it launched may
+    // outlive it: without actions the child inherits fds 1/2 pointing at pipes whose readers die
+    // with this process, and its later writes die of SIGPIPE once the library is closed. Hand it
+    // the console instead. After the old path's uninstall there is nothing to rescue, so the same
+    // call covers both: it adds nothing and the spawn below takes no actions, exactly as before.
+    posix_spawn_file_actions_t stream_actions;
+    posix_spawn_file_actions_t* stream_action_ptr = nullptr;
+    if (g_log_capture.spawn_console_actions(&stream_actions)) stream_action_ptr = &stream_actions;
     pid_t child = 0;
-    const int rc = ::posix_spawn(&child, cargv[0], nullptr, nullptr, cargv.data(), environ);
+    const int rc =
+        ::posix_spawn(&child, cargv[0], stream_action_ptr, nullptr, cargv.data(), environ);
+    if (stream_action_ptr) ::posix_spawn_file_actions_destroy(stream_action_ptr);
     if (rc != 0) {
         fprintf(stderr, "[app] could not start %s: %s\n", cargv[0], strerror(rc));
         return false;
@@ -3073,6 +3084,34 @@ int main(int argc, char** argv) {
             libraryStatus = std::to_string(unavailable) + " games folders are unavailable.";
         libraryUi.set_games(found, gamesDirs);
     };
+    // Recent rows show game names, not raw paths: read each root's own param.json the
+    // same way the library scan does (no boot, no guest). Unreadable roots keep their
+    // basename so a removed dump still says which entry died; a drive root has no
+    // basename, so there the root itself is the name. Re-run after a launch as well as
+    // at startup: the library now outlives the game it opened, so the menu would otherwise
+    // miss the new title until a restart.
+    auto refresh_recent = [&](const std::vector<std::string>& roots) {
+        if (!wantLibrary) return;
+        std::vector<prosper::frontend::LibraryUi::RecentGame> recents;
+        for (const std::string& root : roots) {
+            const std::string json = host_library_io().read_file(root + "/sce_sys/param.json");
+            const std::string name = prosper::frontend::parse_param_title_name(json);
+            const std::string id = prosper::frontend::parse_param_title_id(json);
+            std::string label;
+            if (!name.empty() && !id.empty())
+                label = name + "  (" + id + ")";
+            else if (!name.empty())
+                label = name;
+            else if (!id.empty())
+                label = id;
+            else {
+                const std::string folder = prosper::frontend::path_basename(root);
+                label = folder.empty() ? root : folder;
+            }
+            recents.push_back({root, label});
+        }
+        libraryUi.set_recent(std::move(recents));
+    };
     if (wantLibrary) {
         // Game Log capture starts here and only here: a library session is the only run with a
         // panel to feed, so scripted runs, guest execution and crash reports never pass through
@@ -3080,32 +3119,7 @@ int main(int argc, char** argv) {
         libraryUi.set_log_ring(install_log_capture());
         libraryUi.set_music_preference(appConfig.launcher_music);
         libraryUi.set_output_volume(g_volume_percent / 100.0f);   // --volume covers the launcher too (#3499)
-        // Recent rows show game names, not raw paths: read each root's own param.json the
-        // same way the library scan does (no boot, no guest). Unreadable roots keep their
-        // basename so a removed dump still says which entry died; a drive root has no
-        // basename, so there the root itself is the name.
-        {
-            std::vector<prosper::frontend::LibraryUi::RecentGame> recents;
-            for (const std::string& root : appConfig.recent_games) {
-                const std::string json =
-                    host_library_io().read_file(root + "/sce_sys/param.json");
-                const std::string name = prosper::frontend::parse_param_title_name(json);
-                const std::string id = prosper::frontend::parse_param_title_id(json);
-                std::string label;
-                if (!name.empty() && !id.empty())
-                    label = name + "  (" + id + ")";
-                else if (!name.empty())
-                    label = name;
-                else if (!id.empty())
-                    label = id;
-                else {
-                    const std::string folder = prosper::frontend::path_basename(root);
-                    label = folder.empty() ? root : folder;
-                }
-                recents.push_back({root, label});
-            }
-            libraryUi.set_recent(std::move(recents));
-        }
+        refresh_recent(appConfig.recent_games);
         // The panel edits the run's EFFECTIVE policy (the apply block above already folded the
         // file into these), so what it shows is what the next boot gets — never a stale default.
         libraryUi.set_host_settings(
@@ -3148,11 +3162,13 @@ int main(int argc, char** argv) {
         // The library stays up: Play/Open spawns the title in its own process (its own window),
         // so closing the game window ends only the game and this library can open another title.
         // The capture pipes stay installed: on Windows the child gets the console directly
-        // (no handle inheritance), on POSIX its output forwards through our readers.
+        // (no handle inheritance), on POSIX the spawn actions below rescue its streams to the
+        // console, so the game survives the library being closed first.
         if (!root.empty() && libraryUi.ready() && !g_guest_started && !g_boot_attempted) {
             fprintf(stderr, "[app] opening %s in a new window\n", root.c_str());
             if (relaunch_with_dump(argc, argv, root)) {
                 record_recent(root);
+                refresh_recent(load_app_config().recent_games);
                 fprintf(stderr, "[app] game started in a new window; the library stays open\n");
                 return true;
             }
