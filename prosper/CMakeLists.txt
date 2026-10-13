@@ -2670,6 +2670,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_fresh_mask_exec_confinement.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_confined_source_union
+    SOURCES tests/gpu/recompiler/test_confined_source_union.cpp
+    INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_vintrp_scalar_liveness
     SOURCES tests/gpu/recompiler/test_vintrp_scalar_liveness.cpp
     INCLUDES tests
