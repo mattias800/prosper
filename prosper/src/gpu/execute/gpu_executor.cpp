@@ -679,8 +679,8 @@ struct InterpolationCacheKeyHash {
         hash = hash_mix(hash, key.analysis_identity);
         hash = hash_mix(hash, key.has_system_inputs);
         if (key.has_system_inputs) {
-            hash = hash_mix(hash, key.system_inputs.ena);
-            hash = hash_mix(hash, key.system_inputs.addr);
+            hash = hash_mix(hash, key.system_inputs.layout_words());
+            hash = hash_mix(hash, static_cast<uint8_t>(key.system_inputs.front_face_encoding));
         }
         hash = hash_mix(hash, key.passthrough_mask);
         hash = hash_mix(hash, key.flat_mask);

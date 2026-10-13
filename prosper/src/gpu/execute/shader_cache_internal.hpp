@@ -360,8 +360,8 @@ struct ShaderCompileKeyHash {
         }
         hash = hash_mix(hash, key.has_system_inputs);
         if (key.has_system_inputs) {
-            hash = hash_mix(hash, key.system_inputs.ena);
-            hash = hash_mix(hash, key.system_inputs.addr);
+            hash = hash_mix(hash, key.system_inputs.layout_words());
+            hash = hash_mix(hash, static_cast<uint8_t>(key.system_inputs.front_face_encoding));
         }
         hash = hash_mix(hash, key.fragment_wave32);
         hash = hash_mix(hash, key.fragment_float_mode.available);

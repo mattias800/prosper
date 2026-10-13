@@ -582,6 +582,10 @@ static std::vector<uint32_t> recompile_fragment_impl(
                     }
                 } else if (field >= 8 && field <= 11) {
                     rs.vreg[(int)vgpr] = b.guest_pixel_position_component(field - 8);
+                } else if (field == 12) {
+                    const uint32_t value =
+                        b.fragment_front_face_word(system_inputs->front_face_encoding);
+                    if (value) rs.vreg[(int)vgpr] = value;
                 } else if (field == 13) {
                     rs.vreg[(int)vgpr] = b.fragment_ancillary_layer_bits();
                 }
