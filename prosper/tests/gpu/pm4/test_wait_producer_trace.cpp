@@ -158,10 +158,13 @@ TEST_F(WaitProducerTrace, NestedDirectStoreCannotBorrowPendingApplicationIdentit
     std::vector<Pm4Command> decoded;
     ASSERT_EQ(decode_pm4(packet.data(), packet.size(), decoded), packet.size());
     ASSERT_EQ(decoded.size(), 1u);
+    decoded.front().stream_order = 1;
     const auto tag = capture_pending_writer_identity(decoded.front());
     ASSERT_NE(tag, nullptr);
-    GpuState::MemoryEffect unrelated(decoded.front(),
-                                     1); // A distinct command with equal metadata.
+    // A distinct command with the same trace metadata, including packet and stream order.
+    GpuState::MemoryEffect unrelated(decoded.front(), 1);
+    ASSERT_EQ(unrelated.cmd.stream_order, decoded.front().stream_order);
+    ASSERT_EQ(unrelated.cmd.payload, decoded.front().payload);
     {
         PendingWriterTraceApplyScope pending(tag.get(), decoded.front());
         execute_ordered_memory_effect(unrelated);
