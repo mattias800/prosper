@@ -100,6 +100,9 @@
 #include <thread>
 #include <chrono>
 #include <ctime>
+#ifndef _WIN32
+#include <unistd.h>   // _exit: the detached guest must not race static teardown
+#endif
 
 using namespace prosper;
 
