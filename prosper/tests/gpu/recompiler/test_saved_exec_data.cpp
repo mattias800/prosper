@@ -2,11 +2,13 @@
 // the write must not freeze its DATA snapshot forever: restoring the unchanged value reads the
 // written word. A narrower mask, overwritten alias or one-predecessor equality cannot grant it.
 #include "fixtures/checked_compute_launch.hpp"
+#include "gpu/recompiler/rdna2_active_vector_words.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <initializer_list>
 #include <string>
 #include <utility>
 #include <vector>
@@ -138,4 +140,218 @@ TEST(SavedExecData, IndependentEqualCopySurvivesTheOriginalPairReplacement) {
     code.insert(code.begin() + 4, 0xbe840408u); // original pair now holds wider ENTRY
     code[7] = 0xbefe0406u;
     dispatcher(compile(code));
+}
+
+TEST(SavedExecData, AndOfTheSameActualMaskRetainsEquality) {
+    auto code = unchanged_mask();
+    code.insert(code.begin() + 2, 0x87fe047eu); // EXEC = actual A & saved A
+    dispatcher(compile(code));
+}
+
+TEST(SavedExecData, OrOfTheSameActualMaskRetainsEquality) {
+    auto code = unchanged_mask();
+    code.insert(code.begin() + 2, 0x88fe047eu); // EXEC = actual A | saved A
+    dispatcher(compile(code));
+}
+
+TEST(SavedExecData, AndWithANarrowerValueCannotRefreshTheWiderOperand) {
+    auto code = unchanged_mask();
+    code.insert(code.begin() + 2, {0x7da40081u, 0x87fe047eu});
+    missing(compile(code), 7);
+}
+
+TEST(SavedExecData, ReversedAndOperandsCannotAuthenticateTheWiderMask) {
+    auto code = unchanged_mask();
+    code.insert(code.begin() + 2, {0x7da40081u, 0x87fe7e04u});
+    missing(compile(code), 7);
+}
+
+TEST(SavedExecData, AndOfDistinctValuesCannotTreatEitherAsTheResult) {
+    const std::vector<uint32_t> code{
+        0xbe88047eu, 0x7da40080u, 0xbe84047eu, 0xbefe0408u, 0x7da40081u, 0xbe86047eu, 0xbefe0404u,
+        0x87fe7e06u, // B & A is empty, while saved B itself still enables lane 1
+        0x7e040281u, 0xbefe0406u, 0x7d280480u, 0xbf810000u,
+    };
+    missing(compile(code), 10);
+}
+
+TEST(SavedExecData, AndOfIdenticalSavedValuesWritesThroughoutThatActualValue) {
+    const std::vector<uint32_t> code{
+        0xbe88047eu, 0x7da40080u, 0xbe84047eu, 0xbefe0408u, 0x7da40081u, 0xbe86047eu, 0xbefe0404u,
+        0x87fe0606u, // B & B enables every lane of saved B, independently of old current A
+        0x7e040281u, 0xbefe0406u, 0x7d280480u, 0xbf810000u,
+    };
+    dispatcher(compile(code));
+}
+
+TEST(SavedExecData, SaveexecWithAnEqualOperandCapturesTheSameCurrentValue) {
+    auto code = unchanged_mask();
+    code.insert(code.begin() + 2, 0xbe862404u);
+    code[5] = 0xbefe0406u;
+    dispatcher(compile(code));
+}
+
+TEST(SavedExecData, SaveexecWithAWiderOperandCannotRefreshThatOperand) {
+    auto code = unchanged_mask();
+    code.insert(code.begin() + 2, {0x7da40081u, 0xbe862404u});
+    missing(compile(code), 7);
+}
+
+TEST(SavedExecData, OverlappingDestinationCopiesTheOldSourceBeforeRetirement) {
+    auto code = unchanged_mask();
+    code.insert(code.begin() + 2, 0xbe850404u); // s[5:6] = old s[4:5], overlapping by one word
+    code[5] = 0xbefe0405u;
+    dispatcher(compile(code));
+}
+
+TEST(SavedExecData, SelfCopyKeepsTheSameActualPairValue) {
+    auto code = unchanged_mask();
+    code.insert(code.begin() + 2, 0xbe840404u);
+    dispatcher(compile(code));
+}
+
+namespace {
+std::vector<uint32_t> backedge(bool genuine) {
+    return {
+        0x7dea0080u,
+        0xbe84047eu,
+        0x7e040281u,
+        0xbe860380u,
+        0x7d280480u, // header must consume the CURRENT generation, not its preheader writer
+        genuine ? 0x7e040281u : 0x7e040309u,
+        0xbefe0404u,
+        0x80068106u,
+        0xbf0a8206u,
+        0xbf85fffau,
+        0xbf810000u,
+    };
+}
+} // namespace
+
+TEST(SavedExecData, EveryBackedgeRetainsTheGenuineWrittenWord) {
+    dispatcher(compile(backedge(true)));
+}
+
+TEST(SavedExecData, SavedEqualityCannotReviveAnEarlierDataGeneration) {
+    missing(compile(backedge(false)), 4);
+}
+
+// Pin the actual MUST boundary directly, so an independent missing-mask emission guard cannot
+// conceal a broken equality join or pair lifetime. v0 is the sole genuine hand-supplied input;
+// every later word and mask relationship comes from decoded production transfers.
+namespace {
+void step(ActiveVectorWords& state, std::initializer_list<uint32_t> words,
+          const std::vector<std::pair<int, uint32_t>>& scalars = {},
+          const std::vector<int>& vectors = {}, int mask = -1, bool complete = false) {
+    const std::vector<uint32_t> code(words);
+    const auto instruction = rdna2_decode_one(code.data(), code.size());
+    std::set<int> relayed;
+    for (int word = 0; word < 256; ++word) relayed.insert(word);
+    const bool genuine =
+        active_vector_sources_defined(state, instruction, relayed, {}, {}, {}, true);
+    advance_active_vector_words(state, instruction, scalars, vectors, mask, genuine, complete);
+}
+
+ActiveVectorWords saved_mask() {
+    ActiveVectorWords state;
+    state.enabled = state.current_is_entry = state.current_within_entry = true;
+    state.current = state.entry_words = {0};
+    step(state, {0x7dea0080u}, {}, {}, 106); // actual current A, from genuine local-ID
+    step(state, {0xbe84047eu}, {{4, 2}}); // unchanged s[4:5] = A before v2 is written
+    return state;
+}
+
+void narrow(ActiveVectorWords& state) {
+    step(state, {0x7da40081u}, {}, {}, 106);
+}
+
+void write_and_restore_parent(ActiveVectorWords& state) {
+    step(state, {0x7e040281u}, {}, {2}, -1, true);
+    step(state, {0xbefe0404u}, {{126, 2}});
+}
+
+ActiveVectorWords saved_alias(bool equal) {
+    auto state = saved_mask();
+    if (equal) step(state, {0xbe860404u}, {{6, 2}});
+    narrow(state);
+    if (!equal) step(state, {0xbe86047eu}, {{6, 2}});
+    return state;
+}
+
+void write_through_alias(ActiveVectorWords& state) {
+    step(state, {0xbefe0406u}, {{126, 2}});
+    write_and_restore_parent(state);
+}
+
+ActiveVectorWords replace_high_word() {
+    auto state = saved_mask();
+    step(state, {0xbe860404u}, {{6, 2}}); // independent copy retains actual A
+    step(state, {0xbe8503c1u}, {{5, 1}}); // old pair s[4:5] no longer holds actual A
+    step(state, {0xbe880404u}, {{8, 2}}); // a copy cannot reauthenticate that retired value
+    step(state, {0x7e040281u}, {}, {2}, -1, true);
+    return state;
+}
+} // namespace
+
+TEST(SavedExecData, CurrentEqualityMeetBothPredecessorsRefreshTheGenuineWord) {
+    auto left = saved_mask();
+    auto right = saved_mask();
+    meet_active_vector_words(left, right);
+    write_and_restore_parent(left);
+    EXPECT_TRUE(left.current.contains(2));
+}
+
+TEST(SavedExecData, CurrentEqualityMeetOnePredecessorCannotAuthenticateTheOther) {
+    auto left = saved_mask();
+    auto right = saved_mask();
+    narrow(right);
+    meet_active_vector_words(left, right);
+    write_and_restore_parent(left);
+    EXPECT_FALSE(left.current.contains(2));
+}
+
+TEST(SavedExecData, CurrentEqualityMeetBothNarrowerPredecessorsKeepTheWiderWordMissing) {
+    auto left = saved_mask();
+    auto right = saved_mask();
+    narrow(left);
+    narrow(right);
+    meet_active_vector_words(left, right);
+    write_and_restore_parent(left);
+    EXPECT_FALSE(left.current.contains(2));
+}
+
+TEST(SavedExecData, AliasEqualityMeetBothPredecessorsRetainTheSameSavedValue) {
+    auto left = saved_alias(true);
+    auto right = saved_alias(true);
+    meet_active_vector_words(left, right);
+    write_through_alias(left);
+    EXPECT_TRUE(left.current.contains(2));
+}
+
+TEST(SavedExecData, AliasEqualityMeetOneDifferentValueCannotRefreshTheWiderParent) {
+    auto left = saved_alias(true);
+    auto right = saved_alias(false);
+    meet_active_vector_words(left, right);
+    write_through_alias(left);
+    EXPECT_FALSE(left.current.contains(2));
+}
+
+TEST(SavedExecData, AliasEqualityMeetBothDifferentValuesRetainTheMissingParentWord) {
+    auto left = saved_alias(false);
+    auto right = saved_alias(false);
+    meet_active_vector_words(left, right);
+    write_through_alias(left);
+    EXPECT_FALSE(left.current.contains(2));
+}
+
+TEST(SavedExecData, HighWordReplacementCannotAuthenticateACopyOfTheRetiredPair) {
+    auto state = replace_high_word();
+    step(state, {0xbefe0408u}, {{126, 2}});
+    EXPECT_FALSE(state.current.contains(2));
+}
+
+TEST(SavedExecData, IndependentSavedCopySurvivesAHighWordReplacement) {
+    auto state = replace_high_word();
+    step(state, {0xbefe0406u}, {{126, 2}});
+    EXPECT_TRUE(state.current.contains(2));
 }
