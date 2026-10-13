@@ -13,6 +13,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <crt_externs.h>
 #endif
 
 namespace prosper::screenshot {
@@ -497,6 +499,11 @@ std::map<std::string, std::string> collect_prosper_switches() {
     for (char* entry = block; *entry != '\0'; entry += std::strlen(entry) + 1)
         record_switch(out, entry);
     FreeEnvironmentStringsA(block);
+#elif defined(__APPLE__)
+    // environ is not directly addressable on Apple targets; _NSGetEnviron is
+    // the documented accessor (a manual `extern char** environ` mislinks there).
+    for (char** entry = *_NSGetEnviron(); entry && *entry; ++entry)
+        record_switch(out, *entry);
 #else
     extern char** environ;
     for (char** entry = environ; entry && *entry; ++entry) record_switch(out, *entry);
