@@ -5,12 +5,43 @@
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 
 namespace prosper::gpu {
+namespace {
+bool canonical_indirect_local_entry(const ComputeDispatchLaunchProfile& profile) {
+    // CONFIDENCE: HIGH. AMD NUM_THREAD_FULL applies independently of group count when
+    // PARTIAL_TG_EN is disabled. With USE_THREAD_DIMENSIONS clear, unknown counts can launch no
+    // work, but every launched group has this authentic local extent. This grants no global bound.
+    // Require the executor's canonical unresolved profile, not a direct profile with a lost field.
+    const auto& launch = profile.launch;
+    constexpr uint32_t local_words =
+        ComputeDispatchLaunchState::kInitiator | ComputeDispatchLaunchState::kNumThreadX |
+        ComputeDispatchLaunchState::kNumThreadY | ComputeDispatchLaunchState::kNumThreadZ;
+    constexpr std::array<uint32_t, 3> absent{};
+    // Native Wave64 ordinary controls. Partial groups, thread dimensions, tunnel, restore,
+    // Wave32, reserved fields and every upper flag stay excluded.
+    constexpr uint64_t ordinary_controls = 0x0c5du;
+    if (launch.known != local_words || launch.dimensions != absent || profile.threads != absent ||
+        profile.exact_thread_extent || launch.initiator > UINT32_MAX || !(launch.initiator & 1u) ||
+        (launch.initiator & ~ordinary_controls))
+        return false;
+    for (size_t axis = 0; axis < profile.local.size(); ++axis) {
+        const uint32_t full = launch.num_thread[axis] & 0xffffu;
+        if (!full || full != profile.local[axis]) return false;
+    }
+    const uint64_t xy = uint64_t{profile.local[0]} * profile.local[1];
+    return xy <= std::numeric_limits<uint32_t>::max() / profile.local[2];
+}
+}   // namespace
+
 bool native_compute_has_complete_entry(const SpirvCompute& b) {
     // CONFIDENCE: HIGH. A required Vulkan subgroup width does not prove guest entry EXEC.
-    // PARTIAL_TG_EN/raw presence is checked by the shared producing-register contract first.
+    // Authentic local/control words prove complete groups independently of unknown indirect counts.
+    // The native backend additionally requires full subgroups with flattened LocalSize X.
     // Complete local groups (e.g. 65 workers) are not necessarily complete logical Wave64s.
     const auto& launch = b.guest_compute_launch;
     if (!b.is_compute || b.is_fragment || b.is_vertex || b.is_fragment_packet() ||
@@ -18,7 +49,7 @@ bool native_compute_has_complete_entry(const SpirvCompute& b) {
         b.physical_domain != PhysicalExecutionDomain::Workgroup || b.ngg_workgroup_shell ||
         b.ngg_one_lane || b.wave_size != 64 || b.native_subgroup_size != 64 ||
         launch.wave_size != b.wave_size || launch.local != b.guest_local_size ||
-        !compute_dispatch_has_complete_groups(launch))
+        (!compute_dispatch_has_complete_groups(launch) && !canonical_indirect_local_entry(launch)))
         return false;
     const uint64_t count = uint64_t{launch.local[0]} * launch.local[1] * launch.local[2];
     return count >= 64 && count % 64 == 0 && count == b.local_count;
@@ -87,4 +118,4 @@ bool native_uniform_exec_mov_has_full_participation(const SpirvCompute& b, const
     original.pc = in.pc;
     return !in.synthetic_terminator && in == original;
 }
-} // namespace prosper::gpu
+}   // namespace prosper::gpu
