@@ -461,24 +461,28 @@ int main(int argc, char** argv) {
     prosper::frontend::register_live_renderer(".", /*dump_bmps=*/false,
         prosper::gpu::FragmentWavePolicy::ProvenVotes);
     Program prog; std::string err;
-    if (!boot_program(dump, prog, &err, [&]{
+    if (!boot_program(dump, prog, &err, [&] {
 #ifdef PROSPER_AUDIO_FFMPEG
-        if (!prosper::ajm::install_ffmpeg_decoder_backend())
-            fprintf(stderr, "[ajm] FFmpeg audio decoder unavailable\n");
+            if (!prosper::ajm::install_ffmpeg_decoder_backend())
+                fprintf(stderr, "[ajm] FFmpeg audio decoder unavailable\n");
 #endif
 #ifdef PROSPER_VIDEO_MF
-        if (!prosper::video::install_media_foundation_backend())
-            fprintf(stderr, "[avp] Media Foundation backend unavailable\n");
+            if (!prosper::video::install_media_foundation_backend())
+                fprintf(stderr, "[avp] Media Foundation backend unavailable\n");
 #endif
 #ifdef PROSPER_VIDEO_VT
-        if (!prosper::video::install_videotoolbox_backend())
-            fprintf(stderr, "[avp] VideoToolbox backend unavailable\n");
+            if (!prosper::video::install_videotoolbox_backend())
+                fprintf(stderr, "[avp] VideoToolbox backend unavailable\n");
 #endif
 #ifdef PROSPER_VIDEO_VAAPI
-        if (!prosper::video::install_vaapi_backend())
-            fprintf(stderr, "[avp] FFmpeg/VA-API backend unavailable\n");
+            if (!prosper::video::install_vaapi_backend())
+                fprintf(stderr, "[avp] FFmpeg/VA-API backend unavailable\n");
 #endif
-    })) { fprintf(stderr, "screenshot: boot failed: %s\n", err.c_str()); return 1; }
+        })) {
+        fprintf(stderr, "screenshot: boot failed: %s\n", err.c_str());
+        if (manifest) fclose(manifest);
+        return 1;
+    }
     std::thread guest([&prog] {
         const BootResult result = run_entry(prog.imgs[0]);
         // Hand the sampling thread the result FIRST. Without this the thread is detached with the
@@ -820,7 +824,10 @@ int main(int argc, char** argv) {
         fprintf(manifest, "%s\n", screenshot::manifest_conditions_json(conditions).c_str());
         const std::string summary = screenshot::manifest_summary_json(
             saved, count, stop, tracker, verdict, guest_outcome, allow_guest_fault, run_rate);
-        if (fprintf(manifest, "%s\n", summary.c_str()) < 0 || fclose(manifest) != 0) {
+        const bool summary_written = fprintf(manifest, "%s\n", summary.c_str()) >= 0;
+        // Close even when the summary write fails; || would short-circuit this cleanup.
+        const bool manifest_closed = fclose(manifest) == 0;
+        if (!summary_written || !manifest_closed) {
             fprintf(stderr, "[shot] manifest close failed: %s: %s\n",
                     manifest_path.c_str(), strerror(errno));
             // Re-fold rather than poke the exit code, so the printed status cannot drift away from
