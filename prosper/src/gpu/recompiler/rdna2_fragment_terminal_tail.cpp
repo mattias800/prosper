@@ -50,9 +50,12 @@ Rdna2FragmentTerminalTail rdna2_fragment_terminal_tail(const uint32_t* code, siz
             } else if (!cleared_exec && word == 0xbefe0480u) {
                 cleared_exec = true;   // S_MOV_B64 EXEC, inline integer zero; preserves SCC.
             } else if (cleared_exec && !exported && (word & 0xffffe00fu) == 0xf8000000u &&
-                       ((word >> 4) & 0x3fu) < 8u) {
+                       (((word >> 4) & 0x3fu) < 8u ||
+                        (((word >> 4) & 0x3fu) == 8u && !(word & (1u << 10))))) {
                 // EN0 observes no physical VGPR payload, including COMPR. Retain the encoded
-                // payload word nevertheless. No enabled color/depth/NULL export is licensed.
+                // payload word nevertheless. CONFIDENCE: HIGH -- AMD 70648 chapter 11/Table 56
+                // also defines uncompressed target 8 as depth, with the same component enables
+                // and EXEC validity mask. No enabled output or NULL/vertex target is licensed.
                 width = 2;
                 if (width > dwords - pc || width > 256 - (pc - target)) {
                     result.source_limit_required |= width > dwords - pc;

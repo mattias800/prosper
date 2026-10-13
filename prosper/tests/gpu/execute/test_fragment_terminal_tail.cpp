@@ -13,6 +13,7 @@
 #include <array>
 #include <cstring>
 #include <cstdint>
+#include <ios>
 #include <span>
 #include <string>
 #include <vector>
@@ -97,6 +98,110 @@ TEST_F(FragmentTerminalTail, ExecutableInventoryIncludesActualTerminalInstructio
     EXPECT_TRUE(inventory.back().is_end);
     EXPECT_TRUE(sgpr_dead_at_merge(inventory, 4, 2));
     EXPECT_TRUE(sgpr_dead_at_merge(inventory, 4, 3));
+}
+
+TEST_F(FragmentTerminalTail, EmptyUncompressedDepthExportCompletesTheDeadPredicateJoin) {
+    auto code = program();
+    code[12] = 0xf8001880u;   // depth, EN0, uncompressed, DONE and VM
+    const auto tail = proof(code);
+    ASSERT_EQ(tail.retained_dwords, 15u);
+    ASSERT_EQ(tail.instructions.size(), 3u);
+    EXPECT_EQ(tail.instructions[1].exp_target, 8u);
+    EXPECT_EQ(tail.instructions[1].exp_en, 0u);
+    EXPECT_FALSE(tail.instructions[1].exp_compr);
+    EXPECT_NE(tail.instructions[1].words[0] & (1u << 11), 0u);   // DONE
+    EXPECT_NE(tail.instructions[1].words[0] & (1u << 12), 0u);   // VM
+    const auto direct = compile(code, 0x50980001u);
+    ASSERT_FALSE(direct.empty());
+    EXPECT_EQ(
+        recompile_graphics_shader_cached(ShaderProgramStage::Fragment, code.data(), code.size()),
+        direct);
+    const auto owned =
+        shader_analysis_owned_words(acquire_shader_analysis(code.data(), code.size()));
+    ASSERT_TRUE(owned);
+    EXPECT_EQ(*owned, (std::vector<uint32_t>(code.begin(), code.begin() + 15)));
+    EXPECT_EQ(compile(*owned, 0x50980002u), direct);
+}
+
+TEST_F(FragmentTerminalTail, EnabledDepthComponentsAndOtherTargetsDoNotSupplyTheProof) {
+    // All four component bits can carry observable depth/stencil/mask outputs. COMPR, NULL
+    // and vertex exports remain outside the newly established uncompressed depth contract.
+    for (uint32_t export_word : {0xf8001881u, 0xf8001882u, 0xf8001884u, 0xf8001888u, 0xf8001c80u,
+                                 0xf8001890u, 0xf80018c0u}) {
+        auto code = program();
+        code[12] = export_word;
+        EXPECT_TRUE(proof(code).instructions.empty()) << std::hex << export_word;
+        EXPECT_EQ(proof(code).retained_dwords, 11u);
+        const uint64_t address = 0x50981000ull + export_word;
+        EXPECT_TRUE(compile(code, address).empty()) << std::hex << export_word;
+        EXPECT_NE(
+            last_terminal_reject_reason(address).find("structured-saved-mask-domain-missing-edge"),
+            std::string::npos);
+    }
+}
+
+TEST_F(FragmentTerminalTail, DepthTailCannotRetireARealLowOrHighReader) {
+    for (uint32_t source : {2u, 3u}) {
+        auto code = program();
+        code[12] = 0xf8001880u;
+        code.insert(code.begin() + 11, 0xbe800300u | source);
+        EXPECT_TRUE(proof(code).instructions.empty());
+        const uint64_t address = 0x50982000u + source;
+        EXPECT_TRUE(compile(code, address).empty());
+        EXPECT_NE(
+            last_terminal_reject_reason(address).find("structured-saved-mask-domain-missing-edge"),
+            std::string::npos);
+    }
+}
+
+TEST_F(FragmentTerminalTail, DepthTailCannotManufactureALiveMissingEdgeMask) {
+    auto code = program();
+    code[12] = 0xf8001880u;
+    code[6] = 0xbefe0402u;   // EXEC reads the missing s[2:3] after the one-arm join
+    ASSERT_EQ(proof(code).retained_dwords, 15u);
+    EXPECT_TRUE(compile(code, 0x50983000u).empty());
+    EXPECT_NE(
+        last_terminal_reject_reason(0x50983000u).find("structured-saved-mask-domain-missing-edge"),
+        std::string::npos);
+}
+
+TEST_F(FragmentTerminalTail, DepthTailRequiresTheCompleteZeroExecResetAndOriginalEnd) {
+    auto code = program();
+    code[12] = 0xf8001880u;
+    ASSERT_EQ(proof(code).retained_dwords, 15u);
+    for (uint32_t reset : {kNop, 0xbefe0481u, 0xbefe0380u}) {
+        code[11] = reset;   // absent, nonzero or LOW-only EXEC replacement
+        EXPECT_TRUE(proof(code).instructions.empty()) << std::hex << reset;
+        EXPECT_TRUE(compile(code, 0x50984000ull + reset).empty());
+    }
+    code[11] = kClearExec;
+    for (size_t count : {11u, 12u, 13u, 14u}) {
+        const auto partial = std::span(code).first(count);
+        EXPECT_EQ(proof(partial).retained_dwords, 11u);
+        EXPECT_TRUE(proof(partial).source_limit_required);
+        EXPECT_TRUE(compile(partial, 0x50985000u + count).empty());
+    }
+}
+
+TEST_F(FragmentTerminalTail, ChangedDepthTailWordsAndWindowInvalidateTheOwnedSource) {
+    auto code = program();
+    code[12] = 0xf8001880u;
+    const auto valid = acquire_shader_analysis(code.data(), code.size());
+    ASSERT_TRUE(valid);
+    ASSERT_EQ(shader_analysis_owned_words(valid)->size(), 15u);
+    EXPECT_EQ(acquire_shader_analysis(code.data(), code.size()), valid);
+    code[12] |= 1u;
+    const auto enabled = acquire_shader_analysis(code.data(), code.size());
+    EXPECT_NE(enabled, valid);
+    EXPECT_EQ(shader_analysis_owned_words(enabled)->size(), 11u);
+    code[12] &= ~1u;
+    const auto restored = acquire_shader_analysis(code.data(), code.size());
+    EXPECT_NE(restored, enabled);
+    EXPECT_EQ(shader_analysis_owned_words(restored)->size(), 15u);
+    const auto truncated = acquire_shader_analysis(code.data(), 13);
+    EXPECT_NE(truncated, restored);
+    EXPECT_EQ(shader_analysis_owned_words(truncated)->size(), 11u);
+    EXPECT_NE(acquire_shader_analysis(code.data(), 15), truncated);
 }
 
 TEST_F(FragmentTerminalTail, ActualLowAndHighTailReadsCannotRetireAMissingPredicate) {
@@ -254,35 +359,38 @@ TEST_F(FragmentTerminalTail, ConditionalTargetsShareNopsButCannotWrapOrExceedThe
 }
 
 TEST_F(FragmentTerminalTail, RawCaptureRetainsExactlyTheBoundedDiscardTail) {
-    const auto code = program();
-    DrawItem draw;
-    draw.vs = {0x07230203, 1, 2};
-    draw.fs = compile(code);
-    ASSERT_FALSE(draw.fs.empty());
-    constexpr uint64_t address = 0x40000;
-    draw.fs_guest_addr = address;
-    draw.vertex_count = draw.raw_draw_count = 3;
-    draw.ps.topology = 3;
-    draw.ps.color_write_mask = 0xf;
-    draw.color0_base = 0x2000;
-    draw.color0_width = draw.color0_height = 16;
-    draw.command_order = 1;
-    GpuCaptureMetadata metadata;
-    metadata.width = metadata.height = 16;
-    const auto reader = [&](uint64_t at, uint8_t* destination, size_t bytes) -> size_t {
-        if (at < address || at - address >= code.size() * sizeof(uint32_t)) return 0;
-        const size_t offset = static_cast<size_t>(at - address);
-        const size_t count = std::min(bytes, code.size() * sizeof(uint32_t) - offset);
-        std::memcpy(destination, reinterpret_cast<const uint8_t*>(code.data()) + offset, count);
-        return count;
-    };
-    GpuCaptureFile capture;
-    std::string error;
-    ASSERT_TRUE(capture_draw_items({draw}, metadata, reader, capture, error)) << error;
-    ASSERT_EQ(capture.draws.size(), 1u);
-    const auto index = capture.draws[0].fs_raw_shader_index;
-    ASSERT_LT(index, capture.raw_shader_versions.size());
-    EXPECT_EQ(capture.raw_shader_versions[index].words,
-              (std::vector<uint32_t>(code.begin(), code.begin() + 15)));
-    EXPECT_EQ(compile(capture.raw_shader_versions[index].words), draw.fs);
+    for (uint32_t export_word : {kEmptyExport, 0xf8001880u}) {
+        auto code = program();
+        code[12] = export_word;
+        DrawItem draw;
+        draw.vs = {0x07230203, 1, 2};
+        draw.fs = compile(code);
+        ASSERT_FALSE(draw.fs.empty());
+        constexpr uint64_t address = 0x40000;
+        draw.fs_guest_addr = address;
+        draw.vertex_count = draw.raw_draw_count = 3;
+        draw.ps.topology = 3;
+        draw.ps.color_write_mask = 0xf;
+        draw.color0_base = 0x2000;
+        draw.color0_width = draw.color0_height = 16;
+        draw.command_order = 1;
+        GpuCaptureMetadata metadata;
+        metadata.width = metadata.height = 16;
+        const auto reader = [&](uint64_t at, uint8_t* destination, size_t bytes) -> size_t {
+            if (at < address || at - address >= code.size() * sizeof(uint32_t)) return 0;
+            const size_t offset = static_cast<size_t>(at - address);
+            const size_t count = std::min(bytes, code.size() * sizeof(uint32_t) - offset);
+            std::memcpy(destination, reinterpret_cast<const uint8_t*>(code.data()) + offset, count);
+            return count;
+        };
+        GpuCaptureFile capture;
+        std::string error;
+        ASSERT_TRUE(capture_draw_items({draw}, metadata, reader, capture, error)) << error;
+        ASSERT_EQ(capture.draws.size(), 1u);
+        const auto index = capture.draws[0].fs_raw_shader_index;
+        ASSERT_LT(index, capture.raw_shader_versions.size());
+        EXPECT_EQ(capture.raw_shader_versions[index].words,
+                  (std::vector<uint32_t>(code.begin(), code.begin() + 15)));
+        EXPECT_EQ(compile(capture.raw_shader_versions[index].words), draw.fs);
+    }
 }
