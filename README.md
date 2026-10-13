@@ -52,9 +52,6 @@ A game loop running over a black screen is not gameplay, and a build that compil
 
 - [`COMPATIBILITY.md`](COMPATIBILITY.md) — per-title user-visible milestones (authoritative
   user-facing overview, written by hand).
-- [Compatibility page](https://mattias800.github.io/prosper/) — the same titles as a searchable,
-  filterable table with rung-status filters and a no-JS fallback. Generated offline from
-  `COMPATIBILITY.md` and `PROGRESS_TRACKER.md` on every `main` push; the trackers stay authoritative.
 - [`PROGRESS_TRACKER.md`](PROGRESS_TRACKER.md) — machine-readable rung table, generated from the
   tracker issues and kept in step by CI.
 - [`BLOG.md`](BLOG.md) — progress blog, newest first: every checked-in screenshot and the story
