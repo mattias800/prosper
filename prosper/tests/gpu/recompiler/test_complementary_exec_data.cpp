@@ -150,3 +150,212 @@ TEST(ComplementaryExecData, BackedgeRetainsGenuineCurrentReplacement) {
 TEST(ComplementaryExecData, BackedgeCannotReviveAnEarlierPartitionWord) {
     missing(compile(partition_backedge(false)), 9);
 }
+
+TEST(ComplementaryExecData, ZeroDisplacementExeczKeepsBothConditionOutcomes) {
+    auto code = partition();
+    code[2] = 0xbf880000u;
+    dispatcher(compile(code));
+}
+
+TEST(ComplementaryExecData, ZeroDisplacementExeczCannotInventAnEmptyFirstHalf) {
+    auto code = partition(false, true);
+    code[2] = 0xbf880000u;
+    missing(compile(code));
+}
+
+namespace {
+std::vector<uint32_t> execnz_partition(bool first, bool second) {
+    return {
+        0xbe84047eu,
+        0x7dea0080u,
+        0xbf890001u,
+        0xbf820001u,
+        first ? 0x7e040281u : 0x7e040309u,
+        0x8afe7e04u,
+        0xbf890001u,
+        0xbf820001u,
+        second ? 0x7e040282u : 0x7e040309u,
+        0xbefe0404u,
+        0x7d280480u,
+        0xbf810000u,
+    };
+}
+
+std::vector<uint32_t> accumulating_partition(bool first, bool second, bool explicit_source = true,
+                                             bool alias = false, bool e64 = false) {
+    auto code = partition(first, second);
+    code.resize(8);
+    code.push_back(0x7dea0080u); // narrow again to A, with genuine DATA retained in both halves
+    if (e64) {
+        code.push_back(0xd51f0002u); // v_mac_f32_e64 v2, v0/v2, v0/v9 (implicit old v2)
+        code.push_back((alias ? 0x102u : 0x100u) | (explicit_source ? 0x20000u : 0x21200u));
+    } else {
+        code.push_back(0x3e040000u | (alias ? 0x102u : 0x100u) | (explicit_source ? 0u : 0x1200u));
+    }
+    code.insert(code.end(), {0xbefe0404u, 0x7d280480u, 0xbf810000u});
+    return code;
+}
+} // namespace
+
+TEST(ComplementaryExecData, ExecnzFallthroughCoversOnlyItsEmptyCurrentDomain) {
+    dispatcher(compile(execnz_partition(true, true)));
+}
+
+TEST(ComplementaryExecData, ExecnzFallthroughCannotInventFirstHalfData) {
+    missing(compile(execnz_partition(false, true)), 10);
+}
+
+TEST(ComplementaryExecData, ExecnzFallthroughCannotInventSecondHalfData) {
+    missing(compile(execnz_partition(true, false)), 10);
+}
+
+TEST(ComplementaryExecData, MacRetainsGenuinePartitionData) {
+    dispatcher(compile(accumulating_partition(true, true)));
+}
+
+TEST(ComplementaryExecData, MacCannotInventItsOldAccumulator) {
+    missing(compile(accumulating_partition(false, true)), 11);
+}
+
+TEST(ComplementaryExecData, MacCannotRepairTheOtherMissingHalf) {
+    missing(compile(accumulating_partition(true, false)), 11);
+}
+
+TEST(ComplementaryExecData, MacCannotBorrowAMissingExplicitSource) {
+    missing(compile(accumulating_partition(true, true, false)), 11);
+}
+
+TEST(ComplementaryExecData, AliasingMacReadsTheGenuinePriorWord) {
+    dispatcher(compile(accumulating_partition(true, true, true, true)));
+}
+
+TEST(ComplementaryExecData, AliasingMacCannotReadAMissingPriorWord) {
+    missing(compile(accumulating_partition(false, true, true, true)), 11);
+}
+
+TEST(ComplementaryExecData, E64MacRetainsGenuinePartitionData) {
+    dispatcher(compile(accumulating_partition(true, true, true, false, true)));
+}
+
+TEST(ComplementaryExecData, E64MacCannotInventItsOldAccumulator) {
+    missing(compile(accumulating_partition(false, true, true, false, true)), 12);
+}
+
+TEST(ComplementaryExecData, E64MacCannotBorrowAMissingExplicitSource) {
+    missing(compile(accumulating_partition(true, true, false, false, true)), 12);
+}
+
+namespace {
+std::vector<uint32_t> scalar_accumulator(bool genuine) {
+    auto code = scalar_first_half(genuine);
+    code.resize(11);
+    code.insert(code.end(), {0x7dea0080u, 0x3e040100u, 0xbefe0404u, 0x7d280480u, 0xbf810000u});
+    return code;
+}
+
+std::vector<uint32_t> mac_backedge(bool genuine) {
+    auto code = partition();
+    code.resize(8);
+    code.insert(code.end(), {
+                                0xbe860380u,
+                                0x3e040100u,
+                                0x7d280480u,
+                                genuine ? 0x7e040281u : 0x7e040309u,
+                                0x80068106u,
+                                0xbf0a8206u,
+                                0xbf85fffau,
+                                0xbf810000u,
+                            });
+    return code;
+}
+
+std::vector<uint32_t> overwritten_parent(bool restore_copy) {
+    auto code = partition();
+    code.insert(code.begin(), 0x7da40080u);   // actual parent initially enables only local-ID zero
+    code.insert(code.begin() + 2, 0xbe860404u);   // retain that parent in independent s[6:7]
+    code[6] = 0x8afe7e06u;   // use the retained parent to form the exact complement
+    code.insert(code.begin() + 9,
+                0xbe8503c1u);   // overwrite only s5: old s[4:5] now enables high lanes
+    code[10] = restore_copy ? 0xbefe0406u : 0xbefe0404u;
+    return code;
+}
+}   // namespace
+
+TEST(ComplementaryExecData, MacRetainsBothPredecessorsGenuineAccumulator) {
+    dispatcher(compile(scalar_accumulator(true)));
+}
+
+TEST(ComplementaryExecData, MacCannotBorrowOnePredecessorsAccumulator) {
+    missing(compile(scalar_accumulator(false)), 14);
+}
+
+TEST(ComplementaryExecData, MacBackedgeRetainsGenuinePriorGeneration) {
+    dispatcher(compile(mac_backedge(true)));
+}
+
+TEST(ComplementaryExecData, MacBackedgeCannotBorrowAnEarlierGeneration) {
+    missing(compile(mac_backedge(false)), 10);
+}
+
+TEST(ComplementaryExecData, SavedParentCopySurvivesAnUnrelatedHighWordOverwrite) {
+    dispatcher(compile(overwritten_parent(true)));
+}
+
+TEST(ComplementaryExecData, SavedParentHighWordOverwriteCannotReviveCoverage) {
+    missing(compile(overwritten_parent(false)), 11);
+}
+
+TEST(ComplementaryExecData, RepeatingTheFirstMaskCannotCoverTheParent) {
+    auto code = partition();
+    code[4] = 0x87fe7e04u;   // parent & old EXEC repeats A instead of selecting parent & ~A
+    missing(compile(code));
+}
+
+TEST(ComplementaryExecData, SelectedLaneWriterCannotReplaceTheMissingComplement) {
+    auto code = partition();
+    code[5] = 0xbf880002u;
+    code[6] = 0xd7610002u;
+    code.insert(code.begin() + 7, 0x00010200u);   // write lane 1, while B's missing lane is 0
+    missing(compile(code), 9);
+}
+
+namespace {
+std::vector<uint32_t> peer_overwrite_arm(bool poison) {
+    return {
+        0xbe84047eu,
+        0x7dea0080u,
+        0xbf880001u,
+        0x7e040281u,
+        0x8afe7e04u,
+        0xbf060000u,
+        0xbf840003u,
+        poison ? 0xd7610002u : 0xbf800000u,
+        poison ? 0x00010209u
+               : 0xbf800000u,   // absent s9 overwrites active A's lane 1, ignoring EXEC B
+        0xbf820001u,
+        0xbf800000u,
+        0xbf880001u,
+        0x7e040282u,
+        0xbefe0404u,
+        0x7d280480u,
+        0xbf810000u,
+    };
+}
+}   // namespace
+
+TEST(ComplementaryExecData, BothPredecessorsRetainTheActualFirstHalfWord) {
+    dispatcher(compile(peer_overwrite_arm(false)));
+}
+
+TEST(ComplementaryExecData, OnePeerOverwriteCannotBorrowTheOtherPredecessorsFirstHalf) {
+    missing(compile(peer_overwrite_arm(true)), 14);
+}
+
+TEST(ComplementaryExecData, NewParentValueCannotReuseAnEarlierComplement) {
+    auto code = partition();
+    code.insert(code.begin(),
+                {0xbe86047eu, 0x7da40080u});   // preserve ENTRY, then narrow parent to lane 0
+    code.insert(code.begin() + 7,
+                0xbe840406u);   // while old B is active, replace parent by wider ENTRY
+    missing(compile(code), 11);
+}
