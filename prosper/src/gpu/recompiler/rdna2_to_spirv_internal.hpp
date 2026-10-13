@@ -3576,12 +3576,7 @@ struct LoopBlanketCheck {
         };
         const auto sanitize = [&](auto& scalar, auto& vectors) {
             std::erase_if(scalar, [&](const auto& word) { return invalid(word.second); });
-            for (auto& [reg, source] : vectors)
-                if (invalid(source.blanket_roots)) {
-                    source.blanket_roots.clear();
-                    source.hard = true;
-                    source.outside_exec = 0;
-                }
+            for (auto& [reg, source] : vectors) retire_vector_word_roots(source, violated);
         };
         sanitize(exits.blanket, exits.vectors);
         sanitize(rs.sreg_loop_blanket, rs.vreg_source_marks);
