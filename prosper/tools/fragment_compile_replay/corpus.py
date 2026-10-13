@@ -17,12 +17,15 @@ code is not part of it, since a baseline that reproduces a recorded refusal exit
 that still refuses exits 3. The corpus is local (cases hold guest code and are never committed); only
 the result files may be shared. `compare` exits 1 on any difference. Exit 2 means the replay could
 not run: the tool exited with anything but 0 (reproduced) or 3 (a complete candidate still refused),
-printed no status line, or reported a produced module but wrote none.
+printed no valid status/refusal, or disagreed with its module size. Result records include the input
+case's SHA256; changed inputs are differences even when their output is identical. Malformed result
+files are unevaluated, never an equal comparison. Regenerate both files when upgrading the driver.
 """
 
 import argparse
 import hashlib
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -30,44 +33,91 @@ from pathlib import Path
 
 VERDICT_EXITS = frozenset({0, 3})
 MODE_PREFIXES = ("BASELINE MATCH ", "CANDIDATE ")
+STATUS = re.compile(r"(PRODUCED|REFUSED) source_words=(0|[1-9][0-9]*)")
+SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 class ReplayError(Exception):
     """The replay tool could not give an answer for a case, as opposed to answering 'refused'."""
 
 
-def verdict_of(output: str) -> str:
+def checked_verdict(verdict: str) -> tuple[str, int]:
+    """Require the replay CLI's one status and optional actual-refusal diagnostic."""
+    lines = verdict.splitlines()
+    match = STATUS.fullmatch(lines[0]) if lines else None
+    if (
+        match is None
+        or len(lines) > 2
+        or (
+            len(lines) == 2
+            and (not lines[1].startswith("actual_refusal=") or lines[1] == "actual_refusal=")
+        )
+    ):
+        raise ReplayError("invalid or duplicate replay status/refusal line")
+    kind = match[1]
+    try:
+        words = int(match[2])
+    except ValueError as err:
+        raise ReplayError("invalid source word count") from err
+    expected_lines = 1 if kind == "PRODUCED" else 2
+    if (kind == "PRODUCED") != (words > 0) or len(lines) != expected_lines:
+        raise ReplayError("replay status contradicts source count or refusal")
+    return kind, words
+
+
+def verdict_of(output: str, mode: str | None = None) -> str:
     """The replay's answer: its status line with the mode prefix removed, so the two modes compare,
     plus the `actual_refusal=` line a refusal prints (it names the refusing pc, so a refusal that
     moves is a change)."""
-    answer = []
+    statuses, refusals = [], []
     for raw in output.splitlines():
         line = raw.strip()
         for prefix in MODE_PREFIXES:
             if line.startswith(prefix):
-                answer.append(line[len(prefix) :])
+                expected_prefix = "BASELINE MATCH " if mode == "baseline" else "CANDIDATE "
+                if mode is not None and prefix != expected_prefix:
+                    raise ReplayError("replay status has the wrong mode")
+                statuses.append(line[len(prefix) :])
         if line.startswith("actual_refusal="):
-            answer.append(line)
-    if not answer:
-        raise ReplayError("replay printed no BASELINE/CANDIDATE status line")
-    return "\n".join(answer)
+            refusals.append(line)
+    if len(statuses) != 1:
+        raise ReplayError("replay must print exactly one BASELINE/CANDIDATE status line")
+    verdict = "\n".join(statuses + refusals)
+    checked_verdict(verdict)
+    return verdict
+
+
+def case_digest(case: Path) -> str:
+    with case.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def run_case(replay: str, mode: str, case: Path) -> dict:
+    input_sha = case_digest(case)
     with tempfile.TemporaryDirectory() as tmp:
         module = Path(tmp) / "out.spv"
         cmd = [replay, f"--{mode}", str(case), "--output", str(module)]
         try:
             done = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        except (OSError, subprocess.TimeoutExpired) as err:
+        except (OSError, UnicodeError, subprocess.TimeoutExpired) as err:
             raise ReplayError(f"{case.name}: replay did not run: {err}") from err
         if done.returncode not in VERDICT_EXITS:
             raise ReplayError(f"{case.name}: replay exited {done.returncode}, not a verdict")
-        verdict = verdict_of(done.stdout + done.stderr)
-        if "PRODUCED" in verdict.split("\n")[0] and not module.exists():
+        verdict = verdict_of(done.stdout + "\n" + done.stderr, mode)
+        kind, words = checked_verdict(verdict)
+        expected_exit = 3 if mode == "candidate" and kind == "REFUSED" else 0
+        if done.returncode != expected_exit:
+            raise ReplayError(f"{case.name}: replay exit contradicts its status")
+        if kind == "PRODUCED" and not module.exists():
             raise ReplayError(f"{case.name}: replay reported a module but wrote none")
+        if kind == "REFUSED" and module.exists():
+            raise ReplayError(f"{case.name}: refused replay wrote a module")
+        if kind == "PRODUCED" and module.stat().st_size != words * 4:
+            raise ReplayError(f"{case.name}: module size disagrees with source_words")
+        if case_digest(case) != input_sha:
+            raise ReplayError(f"{case.name}: case changed during replay")
         sha = hashlib.sha256(module.read_bytes()).hexdigest() if module.exists() else None
-        return {"spirv_sha256": sha, "verdict": verdict}
+        return {"case_sha256": input_sha, "spirv_sha256": sha, "verdict": verdict}
 
 
 def collect(cases: Path, replay: str, mode: str) -> dict:
@@ -116,6 +166,27 @@ def run_compare(args) -> int:
         return 2
     if not isinstance(base, dict) or not isinstance(cand, dict) or not (base.keys() & cand.keys()):
         print("no case in common: nothing was compared", file=sys.stderr)
+        return 2
+    try:
+        for results in (base, cand):
+            for name, record in results.items():
+                if (
+                    not isinstance(record, dict)
+                    or set(record) != {"case_sha256", "spirv_sha256", "verdict"}
+                    or not isinstance(record["case_sha256"], str)
+                    or SHA256.fullmatch(record["case_sha256"]) is None
+                    or not isinstance(record["verdict"], str)
+                ):
+                    raise ReplayError(f"{name}: invalid result record")
+                kind, _ = checked_verdict(record["verdict"])
+                sha = record["spirv_sha256"]
+                if (kind == "REFUSED" and sha is not None) or (
+                    kind == "PRODUCED"
+                    and (not isinstance(sha, str) or SHA256.fullmatch(sha) is None)
+                ):
+                    raise ReplayError(f"{name}: module hash contradicts status")
+    except ReplayError as err:
+        print(f"could not read results: {err}", file=sys.stderr)
         return 2
     problems = diff(base, cand)
     for line in problems:

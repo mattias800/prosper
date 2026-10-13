@@ -18,8 +18,13 @@ void set_env(const char* name, const char* value) {
 #ifdef _WIN32
     _putenv_s(name, value ? value : "");
 #else
-    if (value) setenv(name, value, 1);
-    else unsetenv(name);
+    if (value) {
+        // NOLINTNEXTLINE(concurrency-mt-unsafe): this isolated single-threaded CTest owns the edit.
+        setenv(name, value, 1);
+    } else {
+        // NOLINTNEXTLINE(concurrency-mt-unsafe): this isolated single-threaded CTest owns the edit.
+        unsetenv(name);
+    }
 #endif
 }
 
@@ -31,13 +36,15 @@ struct MimgSoftEnv {
 
 std::vector<uint32_t> compile_probe(const ComputeShaderConfig& config) {
     static const uint32_t probe[] = {
-        0x7E080300u,               // v_mov_b32 v4, v0 (1D image coordinate)
-        0xF0000F00u, 0x00000004u,  // image_load v[0:3], v4, s[0:7], dmask:0xf dim:1D
-        0xBF810000u,               // s_endpgm
+        0x7E080300u,   // v_mov_b32 v4, v0 (1D image coordinate)
+        0xF0000F00u,
+        0x00000004u,   // image_load v[0:3], v4, s[0:7], dmask:0xf dim:1D
+        0xBF810000u,   // s_endpgm
     };
     ShaderResourceTable empty_rt;   // no resources: s[0:7] resolves to nothing
-    return recompile_compute(probe, std::size(probe), &empty_rt, config,
-                             RecompileDiagnosticContext{RecompileDiagnosticStage::Compute, 0x6a1ull});
+    return recompile_compute(
+        probe, std::size(probe), &empty_rt, config,
+        RecompileDiagnosticContext{RecompileDiagnosticStage::Compute, 0x6a1ull});
 }
 
 ComputeShaderConfig probe_config() {
@@ -51,7 +58,8 @@ ComputeShaderConfig probe_config() {
 TEST(ComputeRequestChoices, RequestValueSelectsTheSoftPathWithTheEnvironmentUnset) {
     MimgSoftEnv env(nullptr);
     auto config = probe_config();
-    EXPECT_TRUE(compile_probe(config).empty()) << "no switch anywhere: the unresolved MIMG is refused";
+    EXPECT_TRUE(compile_probe(config).empty())
+        << "no switch anywhere: the unresolved MIMG is refused";
     config.choices.set(CompilerChoice::MimgSoft, 1);
     EXPECT_FALSE(compile_probe(config).empty()) << "the request alone must soften it";
 }
@@ -140,4 +148,56 @@ TEST(CompilerChoiceScope, ReplayBeatsSuppliedAndSuppliedReadsAreRecorded) {
     CompilerChoiceScope replay(replayed);
     EXPECT_EQ(compiler_choice(CompilerChoice::MimgSoft, []() -> int64_t { return 99; }), 5)
         << "a replayed trace owns the sequence even under a supplied request";
+}
+
+TEST(CompilerChoiceScope, OuterReplaySurvivesRequestAndRecordingScopes) {
+    CompilerChoiceTrace input;
+    input.reads.push_back({CompilerChoice::MimgSoft, 5});
+    const CompilerChoiceTrace replayed = input;
+    CompilerChoiceSet supplied;
+    supplied.set(CompilerChoice::MimgSoft, 1);
+    CompilerChoiceTrace observation;
+    CompilerChoiceScope replay(replayed);
+    {
+        CompilerChoiceScope request(supplied);
+        CompilerChoiceScope recording(observation);
+        EXPECT_EQ(compiler_choice(CompilerChoice::MimgSoft, [] { return int64_t{99}; }), 5);
+    }
+    EXPECT_NO_THROW(replay.finish_replay());
+    EXPECT_TRUE(observation.reads.empty()) << "replayed reads are not a new live invocation";
+}
+
+TEST(CompilerChoiceScope, OuterReplayRefusesMissingReadBeforeRequestOrEnvironment) {
+    const CompilerChoiceTrace empty;
+    CompilerChoiceSet supplied;
+    supplied.set(CompilerChoice::MimgSoft, 1);
+    CompilerChoiceScope replay(empty);
+    CompilerChoiceScope request(supplied);
+    bool live_read = false;
+    EXPECT_THROW(compiler_choice(CompilerChoice::MimgSoft,
+                                 [&] {
+                                     live_read = true;
+                                     return int64_t{99};
+                                 }),
+                 std::runtime_error);
+    EXPECT_FALSE(live_read);
+}
+
+TEST(ComputeRequestChoices, OuterRecordedReplayOwnsTheComputeRequest) {
+    MimgSoftEnv env(nullptr);
+    auto config = probe_config();
+    config.choices.set(CompilerChoice::MimgSoft, 1);
+    CompilerChoiceTrace recorded;
+    std::vector<uint32_t> expected;
+    {
+        CompilerChoiceScope recording(recorded);
+        expected = compile_probe(config);
+    }
+    ASSERT_FALSE(expected.empty());
+    ASSERT_FALSE(recorded.reads.empty());
+    const CompilerChoiceTrace replayed = recorded;
+    config.choices.set(CompilerChoice::MimgSoft, 0);
+    CompilerChoiceScope replay(replayed);
+    EXPECT_EQ(compile_probe(config), expected) << "replay must override the inner request";
+    EXPECT_NO_THROW(replay.finish_replay());
 }
