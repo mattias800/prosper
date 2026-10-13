@@ -79,8 +79,8 @@ public:
     // the UI costs the user a library, not the app.
     //
     // The library owns its own command buffer, semaphores and fence and does its own acquire/present.
-    // That is deliberate rather than sharing the app's: the two never run at the same time (the library
-    // is the idle state and disappears the moment a guest boots), so separate sync objects keep the
+    // That is deliberate rather than sharing the app's: the two never run in the same process (the
+    // library is the idle state, and Play/Open starts a separate game process), so separate sync objects keep the
     // game present path exactly as it was instead of threading a second mode through it.
     bool init(SDL_Window* window, VkInstance instance, VkPhysicalDevice phys, VkDevice device,
               uint32_t queue_family, VkQueue queue, VkSwapchainKHR swapchain,

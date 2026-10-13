@@ -42,6 +42,8 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <poll.h>
+#include <spawn.h>
+#include <sys/types.h>
 #include <unistd.h>
 #endif
 
@@ -159,6 +161,33 @@ public:
     }
 
     bool installed() const { return installed_; }
+
+#ifndef _WIN32
+    // A library-launched game must outlive these readers. Map each captured descriptor to its
+    // original destination in the child only; the library keeps its capture installed. File
+    // actions duplicate even CLOEXEC saved descriptors before exec closes the originals.
+    // Returns a POSIX error number, including file-action setup failures, without spawning on
+    // partial setup. The caller owns the returned child PID and must reap it.
+    int spawn_child(pid_t& child, char* const argv[], char* const envp[]) const {
+        if (!argv || !argv[0]) return EINVAL;
+        posix_spawn_file_actions_t actions;
+        int error = ::posix_spawn_file_actions_init(&actions);
+        if (error != 0) return error;
+        if (installed_) {
+            for (const Stream& s : streams_) {
+                error = ::posix_spawn_file_actions_adddup2(&actions, s.saved, s.target);
+                if (error != 0) break;
+            }
+        }
+        if (error == 0) {
+            pid_t spawned = 0;
+            error = ::posix_spawn(&spawned, argv[0], &actions, nullptr, argv, envp);
+            if (error == 0) child = spawned;
+        }
+        ::posix_spawn_file_actions_destroy(&actions);
+        return error;
+    }
+#endif
 
 private:
     struct Shared {

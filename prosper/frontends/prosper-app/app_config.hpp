@@ -244,6 +244,17 @@ inline void note_recent_game(AppConfig& cfg, const std::string& app0_root) {
     cfg.recent_games = std::move(kept);
 }
 
+// A successful interactive launch updates both the persisted history and the running menu.
+// Publish the launch even if saving fails; the caller reports that failure separately. Injected
+// callbacks keep filesystem and UI ownership in the frontend and let CPU tests pin this boundary.
+template <class Save, class Publish>
+bool record_recent_game(AppConfig cfg, const std::string& app0_root, Save save, Publish publish) {
+    note_recent_game(cfg, app0_root);
+    const bool saved = save(cfg);
+    publish(cfg);
+    return saved;
+}
+
 // Per-title launch arguments for the guest: a `guest_args.<TITLE_ID>` entry wins over the global
 // `guest_args` default; "" when neither is set. The caller decides precedence against the user's
 // own environment (see main.cpp — the environment always wins over this file).

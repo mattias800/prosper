@@ -2252,6 +2252,11 @@ if(TARGET prosper_core)
     SOURCES frontends/prosper-app/test_log_capture.cpp
     INCLUDES frontends/prosper-app)
 
+  # Library launches update persisted history and the live Recent menu without requiring SDL.
+  prosper_add_gtest(test_frontend_recent_games
+    SOURCES tests/frontend/test_recent_games.cpp
+    INCLUDES frontends/prosper-app)
+
   # The optional retained-target selector bounds readback without changing the legacy broad
   # census. Malformed and oversized lists must decline every target rather than read them all.
   prosper_add_gtest(test_persistent_readback_filter

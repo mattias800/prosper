@@ -23,10 +23,14 @@
 #ifdef _WIN32
 #include <io.h>
 #else
-#include <csignal>
+#include <cerrno>
 #include <ctime>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+extern char** environ;
 #endif
 
 using prosper::frontend::LogCapture;
@@ -190,6 +194,112 @@ TEST(LogCapture, TeardownIsBoundedWhileAnotherDescriptorHoldsTheWriteEnd) {
 }
 
 #ifndef _WIN32
+// Redirect only this test's standard streams to synthetic files. A stdin gate holds the shell
+// child until capture teardown has finished; no timing guess or application launch is involved.
+class ChildOutputCapture : public testing::Test {
+protected:
+    void SetUp() override {
+        for (int fd = 0; fd < 3; ++fd) {
+            saved_[fd] = ::fcntl(fd, F_DUPFD_CLOEXEC, 3);
+            ASSERT_GE(saved_[fd], 0);
+        }
+        out_ = std::tmpfile();
+        err_ = std::tmpfile();
+        ASSERT_NE(out_, nullptr);
+        ASSERT_NE(err_, nullptr);
+        ASSERT_EQ(::pipe(gate_), 0);
+        for (int fd : {gate_[0], gate_[1], fd_of(out_), fd_of(err_)})
+            ASSERT_EQ(::fcntl(fd, F_SETFD, FD_CLOEXEC), 0);
+        ASSERT_EQ(::dup2(gate_[0], 0), 0);
+        ASSERT_EQ(::dup2(fd_of(out_), 1), 1);
+        ASSERT_EQ(::dup2(fd_of(err_), 2), 2);
+        LogCapture::Options opts;
+        opts.hold_readers_until_stop = true;
+        ASSERT_TRUE(capture_.install(ring_, {1, 2}, opts));
+    }
+
+    void TearDown() override {
+        if (child_ > 0) {
+            ::kill(child_, SIGKILL);   // only the synthetic child created by this test
+            while (::waitpid(child_, nullptr, 0) < 0 && errno == EINTR) {}
+        }
+        capture_.uninstall(std::chrono::milliseconds(2000));
+        for (int fd = 0; fd < 3; ++fd) {
+            if (saved_[fd] < 0) continue;
+            ::dup2(saved_[fd], fd);
+            ::close(saved_[fd]);
+        }
+        for (int fd : gate_)
+            if (fd >= 0) ::close(fd);
+        if (HasFailure()) {
+            if (out_) std::fprintf(stderr, "captured stdout:\n%s", read_back(fd_of(out_)).c_str());
+            if (err_) std::fprintf(stderr, "captured stderr:\n%s", read_back(fd_of(err_)).c_str());
+        }
+        if (out_) std::fclose(out_);
+        if (err_) std::fclose(err_);
+    }
+
+    LogCapture capture_;
+    LogRing* ring_ = leaked_ring();
+    FILE* out_ = nullptr;
+    FILE* err_ = nullptr;
+    int saved_[3] = {-1, -1, -1};
+    int gate_[2] = {-1, -1};
+    pid_t child_ = -1;
+};
+
+TEST_F(ChildOutputCapture, ChildWritesAfterLibraryCaptureTeardown) {
+    std::string exe = "/bin/sh";
+    std::string flag = "-c";
+    std::string script = "read token || exit 9; printf 'child stdout\\n'; "
+                         "printf 'child stderr\\n' >&2";
+    char* args[] = {exe.data(), flag.data(), script.data(), nullptr};
+    ASSERT_EQ(capture_.spawn_child(child_, args, environ), 0);
+    ASSERT_GT(child_, 0);
+    EXPECT_TRUE(capture_.installed()) << "spawning must retain the library's capture";
+    write_all(1, "library stdout\n");
+    write_all(2, "library stderr\n");
+    EXPECT_EQ(read_back(fd_of(out_)), "") << "the library still writes through held readers";
+    EXPECT_EQ(read_back(fd_of(err_)), "");
+
+    EXPECT_TRUE(capture_.uninstall(std::chrono::milliseconds(2000)))
+        << "the waiting game must hold no write end of the library's output pipes";
+    EXPECT_EQ(read_back(fd_of(out_)), "library stdout\n");
+    EXPECT_EQ(read_back(fd_of(err_)), "library stderr\n");
+    write_all(gate_[1], "go\n");
+    int status = 0;
+    pid_t reaped = 0;
+    const auto deadline = Clock::now() + std::chrono::seconds(3);
+    do {
+        reaped = ::waitpid(child_, &status, WNOHANG);
+        if (reaped != 0) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    } while (Clock::now() < deadline);
+    ASSERT_EQ(reaped, child_) << "the released synthetic child must finish";
+    child_ = -1;
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+    EXPECT_EQ(read_back(fd_of(out_)), "library stdout\nchild stdout\n");
+    EXPECT_EQ(read_back(fd_of(err_)), "library stderr\nchild stderr\n");
+    EXPECT_EQ(ring_->snapshot().size(), 2u) << "child output must bypass the library's log ring";
+}
+
+TEST(LogCapture, SpawnFailureDoesNotStartAChildOrUninstallCapture) {
+    FILE* f = std::tmpfile();
+    ASSERT_NE(f, nullptr);
+    LogCapture capture;
+    ASSERT_TRUE(capture.install(leaked_ring(), {fd_of(f)}));
+    std::string exe = "/prosper-test-nonexistent/executable";
+    char* args[] = {exe.data(), nullptr};
+    pid_t child = -1;
+    EXPECT_EQ(capture.spawn_child(child, args, environ), ENOENT);
+    EXPECT_EQ(child, -1);
+    EXPECT_TRUE(capture.installed());
+    EXPECT_EQ(capture.spawn_child(child, nullptr, environ), EINVAL);
+    capture.uninstall(std::chrono::milliseconds(2000));
+    fclose(f);
+}
+
 // (b), as the app meets it: a child process (xdg-open, a file manager) inherited the captured fd.
 TEST(LogCapture, TeardownIsBoundedWhileAChildProcessHoldsTheWriteEnd) {
     FILE* f = std::tmpfile();
