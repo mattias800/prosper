@@ -1,11 +1,13 @@
 // Complete writes under A and parent&~A cover the saved parent. Neither an absent source in one
 // half nor a register-file placeholder may authenticate that whole-parent DATA at a fresh compare.
 #include "fixtures/checked_compute_launch.hpp"
+#include "gpu/recompiler/rdna2_active_vector_words.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <initializer_list>
 #include <string>
 #include <utility>
 #include <vector>
@@ -358,4 +360,74 @@ TEST(ComplementaryExecData, NewParentValueCannotReuseAnEarlierComplement) {
     code.insert(code.begin() + 7,
                 0xbe840406u);   // while old B is active, replace parent by wider ENTRY
     missing(compile(code), 11);
+}
+
+// Exercise the actual DATA MUST boundary without an independent spill/relay emission refusal
+// hiding a broken first-half meet. The hand-established v0 entry is the genuine producer input;
+// subsequent ownership comes from decoded production transfers, not invented word definitions.
+namespace {
+Rdna2Inst inst(std::initializer_list<uint32_t> words) {
+    const std::vector<uint32_t> encoded(words);
+    return rdna2_decode_one(encoded.data(), encoded.size());
+}
+ActiveVectorWords first_half() {
+    // The one supplied word is genuine under producer ENTRY EXEC.
+    ActiveVectorWords state;
+    state.enabled = state.current_is_entry = state.current_within_entry = true;
+    state.current = state.entry_words = {0};
+    advance_active_vector_words(state, inst({0xbe84047eu}), {{4, 2}}, {}, 4, true, false);
+    advance_active_vector_words(state, inst({0x7dea0080u}), {}, {}, -1, true, false);
+    advance_active_vector_words(state, inst({0x7e040281u}), {}, {2}, -1, true, true);
+    advance_active_vector_words(state, inst({0x8afe7e04u}), {{126, 2}}, {}, -1, true, false);
+    return state;
+}
+void selected_peer_overwrite(ActiveVectorWords& state) {
+    // This exact encoded instruction writes lane 1 irrespective of current B EXEC.
+    // The absent s9 input cannot preserve the genuine first-half word in active A.
+    const auto peer = inst({0xd7610002u, 0x00010209u});
+    EXPECT_EQ(peer.fmt, Rdna2Format::VOP3);
+    EXPECT_EQ(peer.opcode, 0x361u);
+    EXPECT_EQ(peer.dst.value, 2);
+    EXPECT_FALSE(active_vector_sources_defined(state, peer, {2}, {}, {0}, {}, true));
+    advance_active_vector_words(state, peer, {}, {2}, -1, false, false);
+}
+void finish_second_half(ActiveVectorWords& state) {
+    advance_active_vector_words(state, inst({0x7e040282u}), {}, {2}, -1, true, true);
+    advance_active_vector_words(state, inst({0xbefe0404u}), {{126, 2}}, {}, -1, true, false);
+}
+}   // namespace
+TEST(ComplementaryExecData, FirstHalfMeetBothPredecessorsRetainAndPublishTheGenuineWord) {
+    auto left = first_half();
+    auto right = first_half();
+    ASSERT_EQ(left.complement.parent, 4);
+    ASSERT_TRUE(left.complement.first_words.contains(2));
+    ASSERT_FALSE(left.current.contains(2));   // B has no complete writer yet.
+    meet_active_vector_words(left, right);
+    finish_second_half(left);
+    EXPECT_TRUE(left.current.contains(2));
+    EXPECT_TRUE(left.masks[4].contains(2));
+}
+TEST(ComplementaryExecData, FirstHalfMeetOneLostWordCannotBorrowTheOtherPredecessor) {
+    auto left = first_half();
+    auto right = first_half();
+    selected_peer_overwrite(right);
+    ASSERT_TRUE(left.complement.first_words.contains(2));
+    ASSERT_FALSE(right.complement.first_words.contains(2));
+    ASSERT_EQ(left.complement.parent, right.complement.parent);
+    ASSERT_EQ(left.complement.parents, right.complement.parents);
+    ASSERT_EQ(left.complement.current_parents, right.complement.current_parents);
+    meet_active_vector_words(left, right);
+    finish_second_half(left);
+    EXPECT_FALSE(left.current.contains(2));
+    EXPECT_FALSE(left.masks[4].contains(2));
+}
+TEST(ComplementaryExecData, FirstHalfMeetBothLostWordsRemainUncovered) {
+    auto left = first_half();
+    auto right = first_half();
+    selected_peer_overwrite(left);
+    selected_peer_overwrite(right);
+    meet_active_vector_words(left, right);
+    finish_second_half(left);
+    EXPECT_FALSE(left.current.contains(2));
+    EXPECT_FALSE(left.masks[4].contains(2));
 }
