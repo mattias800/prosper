@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -244,6 +245,14 @@ private:
 std::string json_escape(const std::string& value);
 const char* capture_source_name(CaptureSource source);
 std::string manifest_run_json(const CaptureRunConfig& config);
+
+// Manifest slice of ADR 0021/0023 (head, build, switches per run). The run
+// record above carries head (build_revision) and build (build_source_identity);
+// this is the third leg: every PROSPER_* variable present in the run's
+// environment, so a reader can tell from the artifact whether it qualifies as
+// evidence. Sorted by name, so two runs diff cleanly.
+std::map<std::string, std::string> collect_prosper_switches();
+std::string manifest_switches_json(const std::map<std::string, std::string>& switches);
 
 // The conditions a framerate depends on that the `run` line cannot know: it is written before the
 // guest boots and before the renderer has chosen a GPU. Written as its own `conditions` record just

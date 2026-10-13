@@ -7,8 +7,13 @@
 #include <cstdio>
 #include <cstring>
 #include <iomanip>
+#include <map>
 #include <sstream>
 #include <unordered_set>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace prosper::screenshot {
 
@@ -284,7 +289,13 @@ std::string manifest_run_json(const CaptureRunConfig& c) {
          // run succeeds, and the result is a confident measurement of the wrong build (instrument
          // trap 81). Recording it here makes every manifest self-describing, including archived ones
          // nobody can re-run. `tools/revision/check_build_revision.py` is the active check.
-         << ",\"build_revision\":\"" << json_escape(prosper::embedded_build_revision()) << "\""
+          << ",\"build_revision\":\"" << json_escape(prosper::embedded_build_revision()) << "\""
+          // The BUILD beside the HEAD: HEAD alone does not see dirty or untracked
+          // compiled edits, and never samples the toolchain or configuration.
+          // Same-binary A/B arms compare this for equality by reading the run
+          // record, not by trusting the checkout either arm ran from.
+          << ",\"build_source_identity\":\""
+          << json_escape(prosper::embedded_build_source_identity()) << "\""
          << ",\"timestamp\":\"" << json_escape(c.timestamp) << "\""
          << ",\"output_dir\":\"" << json_escape(c.output_dir) << "\""
          << ",\"input_route\":\"" << json_escape(c.input_route) << "\""
@@ -455,6 +466,56 @@ std::string manifest_summary_json(int saved, int requested, SamplingStop stop,
     line << ",\"allow_guest_fault\":" << (allow_guest_fault ? "true" : "false")
          << ",\"status\":\"" << verdict.status << "\""
          << ",\"exit_code\":" << verdict.exit_code << "}";
+    return line.str();
+}
+
+namespace {
+
+// The "PROSPER_" prefix that bounds the switch surface (tools/env/switch_registry.txt).
+bool is_switch_name(const std::string& name) {
+    return name.size() > 8 && name.compare(0, 8, "PROSPER_") == 0;
+}
+
+void record_switch(std::map<std::string, std::string>& out, const std::string& entry) {
+    // Split at the FIRST '=': values legitimately contain '=' (pad routes, dims).
+    const size_t at = entry.find('=');
+    if (at == std::string::npos) return;
+    const std::string name = entry.substr(0, at);
+    if (!is_switch_name(name)) return;
+    out[name] = entry.substr(at + 1);
+}
+
+} // namespace
+
+std::map<std::string, std::string> collect_prosper_switches() {
+    std::map<std::string, std::string> out;
+#ifdef _WIN32
+    // GetEnvironmentStringsA returns NUL-separated "NAME=value" entries behind a
+    // final NUL. environ is not reliably populated under MinGW, so read the block.
+    char* block = GetEnvironmentStringsA();
+    if (!block) return out;
+    for (char* entry = block; *entry != '\0'; entry += std::strlen(entry) + 1)
+        record_switch(out, entry);
+    FreeEnvironmentStringsA(block);
+#else
+    extern char** environ;
+    for (char** entry = environ; entry && *entry; ++entry) record_switch(out, *entry);
+#endif
+    return out;
+}
+
+std::string manifest_switches_json(const std::map<std::string, std::string>& switches) {
+    std::ostringstream line;
+    line << "{\"type\":\"switches\",\"schema\":1,\"switches\":{";
+    bool first = true;
+    // std::map iterates sorted, so two runs diff cleanly without canonicalization.
+    for (const auto& entry : switches) {
+        if (!first) line << ",";
+        first = false;
+        line << "\"" << json_escape(entry.first) << "\":\"" << json_escape(entry.second)
+             << "\"";
+    }
+    line << "}}";
     return line.str();
 }
 

@@ -1,6 +1,7 @@
 #include "../tools/screenshot/capture_manifest.hpp"
 
 #include <cstdio>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -520,6 +521,64 @@ int main() {
                   unknown.find("\"gpu_driver_version\":null") != std::string::npos &&
                   unknown.find("\"gpu_vendor_id\":0") == std::string::npos,
               "an unselected device is null on every GPU field, never a zero id");
+    }
+
+    // Manifest slice of ADR 0021/0023: head, build and switches per run. A reader
+    // cannot tell from the artifact whether it qualifies as evidence unless the
+    // switches that were set travel with it -- the screenshot manifest recorded
+    // the flip pacing but no other PROSPER_* switch, so a diagnostic left set in
+    // a shell silently became part of a snapshot verdict.
+    {
+        // Positive control for the sort discriminator below: insertion order is
+        // reversed, so only a sorted emission passes.
+        const std::map<std::string, std::string> switches{
+            {"PROSPER_Z_LAST", "1"},
+            {"PROSPER_A_FIRST", "x\"y\nz"},
+        };
+        const std::string line = manifest_switches_json(switches);
+        CHECK(line.find("\"type\":\"switches\"") != std::string::npos,
+              "the manifest carries a switches record naming its own type");
+        CHECK(line.find("\"schema\":1") != std::string::npos,
+              "the switches record carries a schema version");
+        const size_t a = line.find("PROSPER_A_FIRST");
+        const size_t z = line.find("PROSPER_Z_LAST");
+        CHECK(a != std::string::npos && z != std::string::npos && a < z,
+              "switches are emitted in sorted order, so two runs diff cleanly");
+        CHECK(line.find("x\\\"y\\nz") != std::string::npos,
+              "switch values are JSON-escaped like every other manifest string");
+        CHECK(manifest_switches_json({}).find("\"switches\":{}") != std::string::npos,
+              "a run with no switches set still writes an (empty) switches record");
+    }
+    // Build identity beside the revision: HEAD alone does not see dirty or
+    // untracked compiled edits, and never samples the toolchain or config.
+    CHECK(run.find("\"build_source_identity\":\"") != std::string::npos &&
+              run.find("\"build_source_identity\":\"\"") == std::string::npos,
+          "run header records the build source identity beside the revision");
+    // The collector sees the PROSPER_* surface only, never the whole environment.
+    {
+#ifdef _WIN32
+        _putenv_s("PROSPER_TEST_MANIFEST_SLICE_PROBE", "probe-value");
+#else
+        setenv("PROSPER_TEST_MANIFEST_SLICE_PROBE", "probe-value", 1);
+#endif
+        const auto collected = collect_prosper_switches();
+#ifdef _WIN32
+        _putenv_s("PROSPER_TEST_MANIFEST_SLICE_PROBE", "");
+#else
+        unsetenv("PROSPER_TEST_MANIFEST_SLICE_PROBE");
+#endif
+        auto probe = collected.find("PROSPER_TEST_MANIFEST_SLICE_PROBE");
+        CHECK(probe != collected.end() && probe->second == "probe-value",
+              "the collector picks up a set PROSPER_* switch with its value");
+        CHECK(collected.find("PATH") == collected.end() &&
+                  collected.find("Path") == collected.end(),
+              "the collector leaves non-PROSPER_* environment out of the record");
+        bool sorted = true;
+        for (auto it = collected.begin(); it != collected.end() && sorted; ++it) {
+            auto nxt = it;
+            if (++nxt != collected.end() && !(it->first < nxt->first)) sorted = false;
+        }
+        CHECK(sorted, "collection order is sorted, matching the emitted record");
     }
 
     if (fails) { std::printf("== FAIL: %d ==\n", fails); return 1; }

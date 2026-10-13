@@ -79,11 +79,22 @@ def summary_record(**over):
     return record
 
 
-def manifest(run=None, conditions=None, summary=None):
+def switches_record(**over):
+    record = {
+        "type": "switches",
+        "schema": 1,
+        "switches": {},
+    }
+    record.update(over)
+    return record
+
+
+def manifest(run=None, conditions=None, summary=None, switches=None):
     records = {
         "run": run_record(**(run or {})),
         "conditions": conditions_record(**(conditions or {})),
         "summary": summary_record(**(summary or {})),
+        "switches": switches_record(**(switches or {})),
     }
     return records
 
@@ -308,6 +319,58 @@ class Cli(unittest.TestCase):
             with open(invalid_utf8, "wb") as handle:
                 handle.write(b"\xff\n")
             self.assertEqual(self.run_main(base, invalid_utf8)[0], 2)
+
+
+class SwitchRefusals(unittest.TestCase):
+    """ADR 0023: a run with behaviour switches is not evidence.
+
+    Each arm matches EVERYWHERE except one switch, so a refusal can only be
+    attributed to that switch. Registry classes are read from the real
+    switch_registry.txt: PROSPER_GFXLOG is diagnostic, PROSPER_WAVE64_EXCHANGE
+    is a selector, PROSPER_FLIP_PACE_FPS is unclassified.
+    """
+
+    def test_identical_switches_are_comparable(self):
+        pair = manifest(switches={"switches": {"PROSPER_GFXLOG": "1"}})
+        self.assertEqual(cr.refusals(pair, manifest(switches={"switches": {"PROSPER_GFXLOG": "1"}})), [])
+
+    def test_build_source_identity_may_differ_like_the_revision(self):
+        candidate = manifest(run={"build_source_identity": "b" * 64})
+        self.assertEqual(cr.refusals(manifest(), candidate), [])
+
+    def test_diagnostic_only_difference_is_comparable(self):
+        base = manifest(switches={"switches": {"PROSPER_GFXLOG": "1"}})
+        candidate = manifest(switches={"switches": {"PROSPER_GFXLOG": "2"}})
+        self.assertEqual(cr.refusals(base, candidate), [])
+
+    def test_selector_difference_refuses(self):
+        base = manifest(switches={"switches": {"PROSPER_WAVE64_EXCHANGE": "0"}})
+        candidate = manifest(switches={"switches": {"PROSPER_WAVE64_EXCHANGE": "1"}})
+        reasons = cr.refusals(base, candidate)
+        self.assertTrue(any("PROSPER_WAVE64_EXCHANGE" in r for r in reasons), reasons)
+
+    def test_unclassified_difference_refuses(self):
+        base = manifest(switches={"switches": {"PROSPER_FLIP_PACE_FPS": ""}})
+        candidate = manifest(switches={"switches": {"PROSPER_FLIP_PACE_FPS": "60"}})
+        reasons = cr.refusals(base, candidate)
+        self.assertTrue(any("PROSPER_FLIP_PACE_FPS" in r for r in reasons), reasons)
+
+    def test_unknown_switch_difference_refuses(self):
+        base = manifest(switches={"switches": {}})
+        candidate = manifest(switches={"switches": {"PROSPER_FUTURE_SWITCH": "1"}})
+        reasons = cr.refusals(base, candidate)
+        self.assertTrue(any("PROSPER_FUTURE_SWITCH" in r for r in reasons), reasons)
+
+    def test_a_manifest_without_switches_is_refused_and_says_why(self):
+        old = manifest()
+        del old["switches"]
+        reasons = cr.refusals(manifest(), old)
+        self.assertTrue(any("predates the `switches` record" in r for r in reasons), reasons)
+
+    def test_a_diagnostic_left_set_on_one_side_only_is_still_comparable(self):
+        base = manifest(switches={"switches": {}})
+        candidate = manifest(switches={"switches": {"PROSPER_GFXLOG": "1"}})
+        self.assertEqual(cr.refusals(base, candidate), [])
 
 
 if __name__ == "__main__":

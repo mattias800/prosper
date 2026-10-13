@@ -605,6 +605,17 @@ int main(int argc, char** argv) {
             fclose(manifest);
             return 1;
         }
+        // ADR 0023: the switches in force travel with the artifact, sampled here --
+        // before the guest boots -- so a diagnostic left set in the shell is part of
+        // the record instead of a silent ingredient of the verdict.
+        const std::string switches_line =
+            screenshot::manifest_switches_json(screenshot::collect_prosper_switches());
+        if (fprintf(manifest, "%s\n", switches_line.c_str()) < 0 || fflush(manifest) != 0) {
+            fprintf(stderr, "screenshot: cannot write manifest switches '%s': %s\n",
+                    manifest_path.c_str(), strerror(errno));
+            fclose(manifest);
+            return 1;
+        }
     }
 
     // Register the shared live renderer (feeds the present layer; no BMP spam), then boot + run the
