@@ -187,10 +187,46 @@ ScalarSourceMarks vector_source_marks(const RegState& rs, const Rdna2Inst& in) {
     if (vector_write_leaves_old_word(in, rs.vector_native_interpolation) ||
         (rs.vector_native_interpolation && in.fmt == Rdna2Format::VINTRP))
         return marks;
-    // Load addresses are not loaded data. A genuine read still carries MEMORY, which only the
-    // fragment lane-bit projection rejects; compute keeps its actual guest-lane identity.
+    // Load addresses are not loaded data, but an unavailable address cannot produce genuine
+    // loaded data. Capture that obligation before an overlapping destination replaces it.
+    // MEMORY remains a separate classification, never proof that the address was supplied.
     if (memory_result(in)) {
         marks.memory = true;
+        const auto missing_address = [&] {
+            marks.placeholder = marks.hard = true;
+            marks.outside_exec = 0;
+            marks.blanket_roots.clear();
+        };
+        const auto address_word = [&](int reg) {
+            const auto value = rs.vreg.find(reg);
+            const auto source = vector_word(rs, reg);
+            if (reg < 0 || reg > 255 || value == rs.vreg.end() || !value->second ||
+                !vector_word_defined_in_exec(rs, source, rs.exec)) {
+                missing_address();
+            } else if (!marks.hard && !source.blanket_roots.empty()) {
+                marks.blanket_roots.insert(source.blanket_roots.begin(),
+                                           source.blanket_roots.end());
+            }
+        };
+        if (in.fmt == Rdna2Format::FLAT && in.src[0].kind == OperandKind::VGPR) {
+            // The architectural FLAT/GLOBAL pointer is a pair even when a resolved window
+            // lowers its offset using only the low word. A binding cannot supply either word.
+            address_word(in.src[0].value);
+            address_word(in.src[0].value + 1);
+        } else if (in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF) {
+            const uint32_t words = ((in.literal >> 12) & 1u) + ((in.literal >> 13) & 1u);
+            for (uint32_t word = 0; word < words; ++word)
+                address_word(in.src[0].value + static_cast<int>(word));
+            const auto& offset = in.src[2];
+            if (offset.kind == OperandKind::SGPR) {
+                if (sreg_word_blanket_only(rs, offset.value)) {
+                    const auto& roots = rs.sreg_loop_blanket.at(offset.value);
+                    if (!marks.hard) marks.blanket_roots.insert(roots.begin(), roots.end());
+                } else if (!b32_source_word_defined(rs, offset)) {
+                    missing_address();
+                }
+            }
+        }
         if (in.fmt != Rdna2Format::DS) return marks;
     }
     for (uint32_t source = 0; source < in.n_src; ++source)

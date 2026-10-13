@@ -1859,9 +1859,17 @@ inline SavedB64MaskSnapshot snapshot_saved_b64_masks(const RegState& rs, const R
 }
 
 // Explicit emission-domain snapshot: host load_state reconstruction is not an architectural write.
-inline SavedB64MaskSnapshot snapshot_saved_b64_masks(const SpirvCompute& b, const RegState& rs,
+inline SavedB64MaskSnapshot snapshot_saved_b64_masks(SpirvCompute& b, const RegState& rs,
                                                      const Rdna2Inst& in) {
     auto snapshot = snapshot_saved_b64_masks(rs, in);
+    if (in.fmt == Rdna2Format::FLAT || in.fmt == Rdna2Format::MUBUF ||
+        in.fmt == Rdna2Format::MTBUF) {
+        // Address assumptions are read by this memory instruction, before an aliasing write.
+        // The genuine loaded value is separate from those address-generation obligations.
+        const auto& roots = snapshot.source_marks.blanket_roots;
+        b.loop_blanket_roots_read.insert(roots.begin(), roots.end());
+        snapshot.source_marks.blanket_roots.clear();
+    }
     if (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x43)
         snapshot.source_marks = vector_relative_source_marks(b, rs, in);
     snapshot.portable_numeric_replacement = ordinary_portable_wave64_masks(b);

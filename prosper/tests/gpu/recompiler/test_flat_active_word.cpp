@@ -58,7 +58,8 @@ Compilation compile(const std::vector<uint32_t>& code, bool dispatcher = false,
     window.flat_base_sgpr = 12;
     // Every control keeps the original packet PC unless it inserts an instruction before it.
     for (std::size_t pc = 0; pc + 1 < code.size(); ++pc) {
-        if ((code[pc] & 0xfc000000u) == 0xdc000000u || (code[pc] & 0xfc000000u) == 0xe0000000u) {
+        if ((code[pc] & 0xfc000000u) == 0xdc000000u || (code[pc] & 0xfc000000u) == 0xe0000000u ||
+            (code[pc] & 0xfc000000u) == 0xe8000000u) {
             window.fetch_pc = static_cast<uint32_t>(pc);
             break;
         }
@@ -353,4 +354,170 @@ TEST(FlatActiveWord, AliasingAndn2SaveexecCannotBorrowTheOldActiveAddressDomain)
     auto code = saveexec_address(0x27, false);
     code[4] = 0xbe842704u; // destination aliases S0; the old parent must be read first
     missing(compile(code, true), 7, true);
+}
+
+namespace {
+std::vector<uint32_t> whole_entry_destination(unsigned destination, unsigned missing_word) {
+    auto code = program();
+    if (missing_word) code[missing_word - 1] = 0xbf800000u;
+    code[5] = (destination << 24u) | 0x007d0001u;
+    code[6] = 0x7d280080u | (destination << 9u);
+    if (destination == 3) code.insert(code.begin(), 0x7e060281u);
+    return code;
+}
+
+void accepted(const Compilation& result, bool dispatcher) {
+    if (dispatcher)
+        dispatcher_module(result);
+    else
+        ASSERT_FALSE(result.module.empty()) << result.reason;
+}
+
+std::vector<uint32_t> whole_entry_buffer(bool typed, bool missing_address) {
+    return {
+        0x7e060281u, // whole-entry genuine old v3
+        missing_address ? 0xbf800000u : 0x7e020280u,
+        0xbe84047eu,
+        0x7dea0080u,
+        typed ? 0xe8b01000u : 0xe0301000u,
+        0x80030301u,
+        0x7d280680u,
+        0xbf810000u,
+    };
+}
+} // namespace
+
+TEST(FlatActiveWord, WholeEntryDestinationStillRequiresTheLowAddressWord) {
+    for (bool dispatcher : {false, true})
+        for (unsigned destination : {3u, 0u}) {
+            const auto code = whole_entry_destination(destination, 1);
+            missing(compile(code, dispatcher), static_cast<uint32_t>(code.size() - 2), dispatcher);
+        }
+}
+
+TEST(FlatActiveWord, WholeEntryDestinationStillRequiresTheHighAddressWord) {
+    for (bool dispatcher : {false, true})
+        for (unsigned destination : {3u, 0u}) {
+            const auto code = whole_entry_destination(destination, 2);
+            missing(compile(code, dispatcher), static_cast<uint32_t>(code.size() - 2), dispatcher);
+        }
+}
+
+TEST(FlatActiveWord, WholeEntryDestinationKeepsARealAddressLoad) {
+    for (bool dispatcher : {false, true})
+        for (unsigned destination : {3u, 0u})
+            accepted(compile(whole_entry_destination(destination, 0), dispatcher), dispatcher);
+}
+
+TEST(FlatActiveWord, OverlappingDestinationReadsTheOldGenuineAddressFirst) {
+    for (bool dispatcher : {false, true})
+        for (unsigned destination : {1u, 2u})
+            accepted(compile(whole_entry_destination(destination, 0), dispatcher), dispatcher);
+}
+
+TEST(FlatActiveWord, OverlappingDestinationCannotCreateTheOtherAddressWord) {
+    for (bool dispatcher : {false, true})
+        for (unsigned destination : {1u, 2u}) {
+            const auto code = whole_entry_destination(destination, destination == 1 ? 2 : 1);
+            missing(compile(code, dispatcher), static_cast<uint32_t>(code.size() - 2), dispatcher);
+        }
+}
+
+TEST(FlatActiveWord, RelayingTheNewLoadResultRetainsItsCurrentSourceValidity) {
+    for (bool dispatcher : {false, true})
+        for (unsigned missing_word : {0u, 1u, 2u}) {
+            auto code = whole_entry_destination(3, missing_word);
+            code.insert(code.end() - 2, 0x7e080303u); // v4 = the new loaded v3
+            code[code.size() - 2] = 0x7d280880u;
+            const auto result = compile(code, dispatcher);
+            if (missing_word)
+                missing(result, static_cast<uint32_t>(code.size() - 2), dispatcher);
+            else
+                accepted(result, dispatcher);
+        }
+}
+
+TEST(FlatActiveWord, RelayedAddressMustHaveACurrentOriginalSource) {
+    for (bool dispatcher : {false, true})
+        for (bool supplied : {false, true}) {
+            auto code = whole_entry_destination(3, 0);
+            code[1] = 0x7e020309u; // address low v1 = v9, before the load writes v3
+            code.insert(code.begin(), supplied ? 0x7e12020cu : 0xbf800000u);
+            const auto result = compile(code, dispatcher);
+            if (supplied)
+                accepted(result, dispatcher);
+            else
+                missing(result, static_cast<uint32_t>(code.size() - 2), dispatcher);
+        }
+}
+
+TEST(FlatActiveWord, DispatcherEdgeKeepsTheNewLoadSourceObligation) {
+    for (unsigned missing_word : {0u, 1u, 2u}) {
+        auto code = whole_entry_destination(3, missing_word);
+        code.insert(code.end() - 2, {0xbf060000u, 0xbf850001u, 0xbf800000u});
+        const auto result = compile(code, true);
+        if (missing_word)
+            missing(result, static_cast<uint32_t>(code.size() - 2), true);
+        else
+            dispatcher_module(result);
+    }
+}
+
+TEST(FlatActiveWord, BufferOverwriteKeepsTheGenuineCurrentAddress) {
+    for (bool dispatcher : {false, true})
+        for (bool typed : {false, true})
+            accepted(compile(whole_entry_buffer(typed, false), dispatcher), dispatcher);
+}
+
+TEST(FlatActiveWord, BufferOverwriteCannotBorrowItsGenuineOldDestination) {
+    for (bool dispatcher : {false, true})
+        for (bool typed : {false, true})
+            missing(compile(whole_entry_buffer(typed, true), dispatcher), 6, dispatcher);
+}
+
+TEST(FlatActiveWord, BufferDispatcherEdgeRetainsTheCurrentAddressObligation) {
+    for (bool typed : {false, true})
+        for (bool missing_address : {false, true}) {
+            auto code = whole_entry_buffer(typed, missing_address);
+            code.insert(code.end() - 2, {0xbf060000u, 0xbf850001u, 0xbf800000u});
+            const auto result = compile(code, true);
+            if (missing_address)
+                missing(result, 9, true);
+            else
+                dispatcher_module(result);
+        }
+}
+
+TEST(FlatActiveWord, BothSelectedBufferAddressWordsMustBeCurrentBeforeOverwrite) {
+    for (bool dispatcher : {false, true})
+        for (bool typed : {false, true})
+            for (unsigned destination : {3u, 0u})
+                for (unsigned missing_word : {0u, 1u, 2u}) {
+                    std::vector<uint32_t> code{
+                        missing_word == 1 ? 0xbf800000u : 0x7e020280u,
+                        missing_word == 2 ? 0xbf800000u : 0x7e040280u,
+                        0xbe84047eu,
+                        0x7dea0080u,
+                        typed ? 0xe8b03000u : 0xe0303000u,
+                        0x80030001u | (destination << 8u),
+                        0x7d280080u | (destination << 9u),
+                        0xbf810000u,
+                    };
+                    if (destination == 3) code.insert(code.begin(), 0x7e060281u);
+                    const auto result = compile(code, dispatcher);
+                    if (missing_word)
+                        missing(result, static_cast<uint32_t>(code.size() - 2), dispatcher);
+                    else
+                        accepted(result, dispatcher);
+                }
+}
+
+TEST(FlatActiveWord, AnUnusedBufferAddressFieldIsNotAMissingInput) {
+    for (bool dispatcher : {false, true})
+        for (bool typed : {false, true}) {
+            auto code = whole_entry_buffer(typed, true);
+            code[4] &= ~0x3000u; // neither OFFEN nor IDXEN consumes VADDR
+            code[5] = 0x80030309u; // an absent v9 in the unused encoded field
+            accepted(compile(code, dispatcher), dispatcher);
+        }
 }

@@ -359,3 +359,26 @@ TEST(FreshMaskExecConfinement, MemoryOverwriteKeepsAGenuineWholeEntryDestination
         }));
     }
 }
+
+TEST(FreshMaskExecConfinement, ALoadReadsItsAddressLoopObligationBeforeWritingTheResult) {
+    for (const auto words : {kFlatV6, kMtbufV6}) {
+        Harness h;
+        h.rs.exec = h.b.btrue();
+        h.rs.exec_narrowed = true;
+        vgpr_genuine(h.rs, h.b, 1);
+        vgpr_genuine(h.rs, h.b, 2);
+        vgpr_genuine(h.rs, h.b, 6);
+        const uint64_t root = blanket_root(19, kVectorBlanketBase + 1);
+        auto& address = h.rs.vreg_source_marks[1];
+        address.placeholder = true;
+        address.blanket_roots.insert(root);
+        const auto ins = decode(words);
+        ASSERT_EQ(ins.size(), 1u);
+        const auto before = snapshot_saved_b64_masks(h.b, h.rs, ins[0]);
+        EXPECT_TRUE(h.b.loop_blanket_roots_read.contains(root));
+        EXPECT_FALSE(before.source_marks.placeholder);
+        EXPECT_TRUE(before.source_marks.blanket_roots.empty());
+        record_vector_word_marks(h.rs, ins[0], before.source_marks);
+        EXPECT_TRUE(fresh_mask_sources_defined(h.b, h.rs, decode(kCmpV6V6)[0]));
+    }
+}

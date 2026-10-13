@@ -126,6 +126,27 @@ SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& st
     bool vector_relay =
         missing_scc || ((!load || in.fmt == Rdna2Format::DS) &&
                         (vector_any(state.relayed_vectors) || reads_relayed_word(relayed, in)));
+    // A load overwrites its old DATA generation. Preserve unavailable current address inputs
+    // across case edges too; neither a clean old destination nor memory storage authenticates it.
+    if (load && (in.fmt == Rdna2Format::FLAT || in.fmt == Rdna2Format::MUBUF ||
+                 in.fmt == Rdna2Format::MTBUF)) {
+        const auto available = [&](int word) {
+            return !state.relayed_vectors.contains(word) ||
+                   (state.active_vectors.enabled && state.active_vectors.current.contains(word));
+        };
+        if (in.fmt == Rdna2Format::FLAT && in.src[0].kind == OperandKind::VGPR) {
+            vector_relay =
+                vector_relay || !available(in.src[0].value) || !available(in.src[0].value + 1);
+        } else if (in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF) {
+            const uint32_t words = ((in.literal >> 12) & 1u) + ((in.literal >> 13) & 1u);
+            for (uint32_t word = 0; word < words; ++word)
+                vector_relay = vector_relay || !available(in.src[0].value + static_cast<int>(word));
+            const auto& offset = in.src[2];
+            if (offset.kind == OperandKind::SGPR)
+                vector_relay = vector_relay || !scalar_words.contains(offset.value) ||
+                               relayed.contains(offset.value);
+        }
+    }
     if (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x43) vector_relay = true;
     bool memory =
         load || vector_any(state.memory_vectors) || reads_relayed_word(state.memory_words, in);
