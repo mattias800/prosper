@@ -1,4 +1,5 @@
 #include "gpu/recompiler/rdna2_wave32_dispatch_words.hpp"
+#include "gpu/recompiler/compute_dispatch_launch.hpp"
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
@@ -16,6 +17,20 @@
 #include <utility>
 #include <vector>
 namespace prosper::gpu {
+namespace {
+bool native_wave32_vote_launch(const SpirvCompute& b) {
+    const auto& launch = b.guest_compute_launch;
+    if (!b.is_compute || b.is_fragment || b.is_vertex || b.is_fragment_packet() ||
+        b.ngg_workgroup_shell || b.ngg_one_lane || b.wave_size != 32 ||
+        b.native_subgroup_size != 32 || b.guest_stage != GuestShaderStage::Compute ||
+        b.physical_domain != PhysicalExecutionDomain::Workgroup ||
+        launch.wave_size != b.wave_size || launch.local != b.guest_local_size ||
+        !compute_dispatch_has_complete_groups(launch))
+        return false;
+    const uint64_t count = uint64_t{launch.local[0]} * launch.local[1] * launch.local[2];
+    return count >= 32 && count % 32 == 0 && count == b.local_count;
+}
+} // namespace
 Wave32DispatchWords::Wave32DispatchWords(std::size_t count)
     : masks(count), ambiguous(count), pairs(count), ambiguous_pairs(count), scalar_words(count),
       marks(count), reachable(count, false), scalar_scc(count, false) {}
@@ -24,7 +39,8 @@ bool analyze_wave32_dispatch_words(
     const std::vector<uint32_t>& starts, const std::vector<std::vector<uint32_t>>& successors,
     const std::set<int>& direct_descriptor_sregs, Wave32DispatchWords& words,
     std::set<int>& static_mask_keys, std::unordered_set<uint32_t>& proven_pair_compares,
-    const std::function<std::array<int, 2>(const Rdna2Inst&)>& pair_compare_sources) {
+    const std::function<std::array<int, 2>(const Rdna2Inst&)>& pair_compare_sources,
+    const std::unordered_set<uint32_t>& native_mask_scc_vote_pcs) {
     auto& b32_mask_in = words.masks;
     auto& b32_mask_ambiguous_in = words.ambiguous;
     auto& b64_mask_in = words.pairs;
@@ -35,6 +51,7 @@ bool analyze_wave32_dispatch_words(
     const bool compute_scalar_vcc_bridge = allows_compute_scalar_vcc_bridge(b);
     const int max_vgpr = shader_max_vgpr(ins);
     const bool track_words = (b.is_compute || b.is_fragment) && b.wave_size == 32;
+    const bool complete_native_vote_launch = native_wave32_vote_launch(b);
     if (b.allow_b32_masks && !starts.empty()) {
         b32_mask_in.front().insert(initial.sreg_bool_b32.begin(), initial.sreg_bool_b32.end());
         for (const auto& mask : initial.sreg_bool) {
@@ -332,7 +349,15 @@ bool analyze_wave32_dispatch_words(
                                in.opcode == kSop1OpcodeAndSaveexecB64)) ||
                              (in.fmt == Rdna2Format::SOP2 && in.opcode >= 0x0e &&
                               in.opcode <= 0x1d));
-                        scalar_scc = !source.scalar_relay && (!mask_result || fragment_vote);
+                        // CONFIDENCE: HIGH -- the dispatcher emits SCC=ANY(result) at these exact
+                        // last B32 logicals before a scalar branch. Admit only a current one-word
+                        // mask with genuine sources and a complete producing Wave32 launch. An
+                        // inverted mask may have set bits outside a partial launch's host cohort.
+                        // The existing MAY marks and CFG MUST meet still reject tainted/one-arm data.
+                        const bool compute_vote = complete_native_vote_launch && writes_b32_mask &&
+                                                  native_mask_scc_vote_pcs.contains(in.pc);
+                        scalar_scc =
+                            !source.scalar_relay && (!mask_result || fragment_vote || compute_vote);
                     } else if (!scalar_instruction_preserves_scc(in)) {
                         scalar_scc = scalar_scc && !source.scalar_relay;
                     }

@@ -1487,7 +1487,8 @@ bool emit_cfg_state_machine(
     std::unordered_set<uint32_t> proven_saved_mask_pair_compare_pcs;
     if (!analyze_wave32_dispatch_words(
             b, ins, initial, starts, successors, direct_descriptor_sregs, wave32_words,
-            static_mask_keys, proven_saved_mask_pair_compare_pcs, saved_mask_pair_compare_sources))
+            static_mask_keys, proven_saved_mask_pair_compare_pcs, saved_mask_pair_compare_sources,
+            native_b32_mask_scc_vote_pcs))
         return false;
 
     // Which Wave64 mask half each spill slot and reloaded SGPR holds (rdna2_mask_half_alias.hpp).
