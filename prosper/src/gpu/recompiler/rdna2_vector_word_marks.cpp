@@ -38,7 +38,16 @@ bool complete_full_word_write(const Rdna2Inst& in) {
     // A plain buffer load writes each active lane's dwords (out-of-range lanes return zero); a TFE
     // form also writes a status word, which is not modelled here, so it is not complete.
     if (in.fmt == Rdna2Format::MUBUF) return rdna2_tfe_status_vgpr(in) < 0;
-    if (!lane_wise_vector_op(in) || in.has_sdwa) return false;
+    // CONFIDENCE: HIGH -- a completed ordinary image reader writes every selected result dword
+    // in every active lane. Its predication preserves only lanes outside EXEC, not destination
+    // bits inside EXEC. Empty DMASK has only a conservative storage inventory and assigns no
+    // result words. Atomics, packed results and status-bearing forms retain their old proof.
+    if (in.fmt == Rdna2Format::MIMG)
+        return in.mimg_dmask != 0 && !rdna2_instruction_may_write_memory(in) && !in.mimg_d16 &&
+               !in.mimg_tfe && !in.mimg_lwe;
+    // A DWORD SDWA destination still replaces all 32 bits. Narrow preserved destinations
+    // remain excluded; source selection/modifiers do not make a complete destination partial.
+    if (!lane_wise_vector_op(in) || (in.has_sdwa && in.sdwa_dst_sel != 6)) return false;
     if (in.fmt == Rdna2Format::VOP1 && (in.opcode == 0x02 || in.opcode == kVop1OpcodeMovreldB32))
         return false;
     return !vector_write_depends_on_old_word(in, /*full_exec=*/true);
@@ -102,6 +111,25 @@ bool vector_write_completes_active_word(const Rdna2Inst& in) {
             in.src[1].kind == OperandKind::Special && in.src[1].value == 125);
 }
 
+void record_exec_mask_subset(RegState& rs, uint32_t result, uint32_t left, uint32_t right,
+                             uint32_t opcode, uint32_t previous_exec) {
+    // CONFIDENCE: HIGH -- A&B is a subset of each operand; A&~B is a subset of A.
+    // A|B is a subset of A only when B was already proved a subset of A (and vice versa).
+    // These relations do not authenticate an operand or invent its missing physical words.
+    uint32_t parent = 0;
+    if (opcode == 0x0f)
+        parent = right == previous_exec ? right : left;
+    else if (opcode == 0x15)
+        parent = left;
+    else if (opcode == 0x11) {
+        if (exec_within(rs, left, right))
+            parent = right;
+        else if (exec_within(rs, right, left))
+            parent = left;
+    }
+    if (parent && result && result != parent) rs.exec_subset_of[result] = parent;
+}
+
 void seed_vector_word_definedness(RegState& rs, const std::vector<Rdna2Inst>& instructions,
                                   bool native_interpolation, uint32_t wave_size) {
     // CONFIDENCE: HIGH -- operand_bits/vreg_old supply zero for absent ordinary VGPRs. That
@@ -139,7 +167,7 @@ void union_source_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other)
     into.placeholder = into.placeholder || other.placeholder;
     into.memory = into.memory || other.memory;
     into.hard = into.hard || other.hard;
-    if (into.hard)
+    if (into.hard && !into.outside_exec)
         into.blanket_roots.clear();
     else
         into.blanket_roots.insert(other.blanket_roots.begin(), other.blanket_roots.end());
@@ -216,8 +244,12 @@ bool fresh_mask_sources_defined(SpirvCompute& b, const RegState& rs, const Rdna2
     // The predicate reads only the lanes its own EXEC enables, and its result is masked by that EXEC,
     // so a placeholder confined to the lanes outside the same EXEC value is never observed.
     if (marks.hard && marks.outside_exec != 0 && rs.exec_narrowed &&
-        exec_within(rs, rs.exec, marks.outside_exec))
+        exec_within(rs, rs.exec, marks.outside_exec)) {
+        // An unchanged SSA EXEC owner does not prove the next iteration's carried value. Record
+        // the header obligation before accepting this scoped read; the back edge checks it.
+        b.loop_blanket_roots_read.insert(marks.blanket_roots.begin(), marks.blanket_roots.end());
         return true;
+    }
     if (marks.hard || marks.blanket_roots.empty()) return false;
     // These roots name defined loop seeds, whose back edges the existing loop proof checks.
     b.loop_blanket_roots_read.insert(marks.blanket_roots.begin(), marks.blanket_roots.end());
@@ -236,10 +268,11 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
     const bool complete = complete_full_word_write(in);
     const int end = relative ? rs.max_vgpr + 1 : in.dst.value + static_cast<int>(width);
     for (int reg = in.dst.value; reg < end; ++reg) {
+        const auto old = vector_word(rs, reg);
         ScalarSourceMarks result = source;
         // CONFIDENCE: HIGH -- RDNA2 70648's ordinary VALU writes retain inactive lanes; WRITELANE
         // replaces one selected lane regardless of EXEC. Partial/relative writes retain old bits.
-        if (preserve) union_source_marks(result, vector_word(rs, reg));
+        if (preserve) union_source_marks(result, old);
         // A write defines its word only in the lanes it writes. Confinement is granted only when the
         // form writes the complete word of every active lane; any other form (preserved bits,
         // selected lanes, relative destinations, cross-lane forms) leaves the old word unconfined.
@@ -248,11 +281,30 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
             result.outside_exec = 0;
         } else if (narrowed_write) {
             // Outside EXEC the old word survives; inside it the result is the source relayed.
+            const bool image_proof = in.fmt == Rdna2Format::MIMG && result.hard;
             const bool defined_inside =
-                !source.placeholder ||
-                (source.hard && exec_within(rs, rs.exec, source.outside_exec));
+                vector_word_defined_in_exec(rs, source, rs.exec) &&
+                (!image_proof || (rs.mimg_sources.pc == in.pc && rs.mimg_sources.enabled &&
+                                  rs.mimg_sources.defined));
             result.outside_exec = defined_inside ? rs.exec : 0u;
+            if (defined_inside && result.hard) {
+                // A narrower write leaves genuine old lanes in the rest of the prior owner. Keep
+                // that wider domain and its carried obligation; an equal-owner complete write
+                // replaces the whole required domain and depends only on its current sources.
+                const bool keep_wider = old.hard && old.outside_exec != 0 &&
+                                        old.outside_exec != rs.exec &&
+                                        exec_within(rs, rs.exec, old.outside_exec);
+                result.blanket_roots = source.blanket_roots;
+                if (image_proof)
+                    result.blanket_roots.insert(rs.mimg_sources.roots.begin(),
+                                                rs.mimg_sources.roots.end());
+                if (keep_wider) {
+                    result.outside_exec = old.outside_exec;
+                    result.blanket_roots.insert(old.blanket_roots.begin(), old.blanket_roots.end());
+                }
+            }
         }
+        if (result.hard && !result.outside_exec) result.blanket_roots.clear();
         set_word(rs.vreg_source_marks, reg, std::move(result));
     }
 }
@@ -261,15 +313,61 @@ void join_vector_word_marks(VectorWordMarks& into, const VectorWordMarks& other)
     for (const auto& [reg, source] : other) union_source_marks(into[reg], source);
 }
 
+bool vector_word_defined_in_exec(const RegState& rs, const ScalarSourceMarks& marks,
+                                 uint32_t exec) {
+    if (!marks.placeholder) return true;
+    if (!marks.hard) return !marks.blanket_roots.empty();
+    return marks.outside_exec != 0 && exec_within(rs, exec, marks.outside_exec);
+}
+
+void begin_mimg_source_proof(RegState& rs, uint32_t pc) {
+    rs.mimg_sources = {pc, rs.exec_narrowed, true, {}, {}};
+}
+
+void record_mimg_source_word(RegState& rs, int reg) {
+    auto& proof = rs.mimg_sources;
+    if (!proof.enabled || !proof.words.insert(reg).second) return;
+    const auto value = rs.vreg.find(reg);
+    const auto marks = vector_word(rs, reg);
+    if (reg < 0 || reg > 255 || value == rs.vreg.end() || !value->second ||
+        !vector_word_defined_in_exec(rs, marks, rs.exec))
+        proof.defined = false;
+    proof.roots.insert(marks.blanket_roots.begin(), marks.blanket_roots.end());
+}
+
+void record_mimg_address_operand(RegState& rs, const Rdna2Inst& in, uint32_t index) {
+    // NSA's first VGPR is VADDR; subsequent register numbers come from the actual extra dwords.
+    // Zero padding beyond the encoded instruction cannot invent an additional v0 operand.
+    if (rs.mimg_sources.enabled && in.len_dwords > 2u && index > 0u &&
+        2u + (index - 1u) / 4u >= in.len_dwords)
+        rs.mimg_sources.defined = false;
+}
+
+uint32_t read_mimg_source_word(SpirvCompute& b, RegState& rs, int reg) {
+    record_mimg_source_word(rs, reg);
+    const auto value = rs.vreg.find(reg);
+    return value == rs.vreg.end() ? b.uconst(0) : value->second;
+}
+
+int mimg_address_vgpr(RegState& rs, const Rdna2Inst& in, uint32_t index) {
+    record_mimg_address_operand(rs, in, index);
+    if (in.len_dwords <= 2u) return in.src[0].value + static_cast<int>(index);
+    if (!index) return in.src[0].value;
+    const uint32_t offset = index - 1u;
+    return static_cast<int>((in.words[2u + offset / 4u] >> (8u * (offset % 4u))) & 0xffu);
+}
+
 void mark_vector_loop_carried(RegState& rs, const std::vector<Rdna2Inst>& ins, uint32_t lo,
-                              uint32_t hi, std::map<int, std::set<uint64_t>>& carried) {
+                              uint32_t hi, std::map<int, std::set<uint64_t>>& carried,
+                              std::map<int, uint32_t>& confined) {
     std::set<int> vectors, scalars;
     loop_written_regs(ins, lo, hi, vectors, scalars);
     for (int reg : vectors) {
         auto source = vector_word(rs, reg);
         const int root_word = kVectorBlanketBase + reg;
-        if (rs.vreg.contains(reg) && !source.hard) {
+        if (rs.vreg.contains(reg) && (!source.hard || source.outside_exec != 0)) {
             carried[root_word] = source.blanket_roots;
+            if (source.hard) confined[root_word] = source.outside_exec;
             source.blanket_roots.insert(blanket_root(lo, root_word));
         } else {
             source.hard = true;

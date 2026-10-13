@@ -1804,6 +1804,22 @@ inline ScalarSourceMarks scalar_source_marks(const RegState& rs, const Rdna2Inst
         const bool scalar = o.kind == OperandKind::SGPR ||
                             (o.kind == OperandKind::Special && o.value >= 106 && o.value <= 124);
         if (!scalar) continue;
+        // CNDMASK's third operand consumes the current Bool domain, not the saved mask's
+        // physical scalar halves. A fresh predicate can be genuine while those halves cannot
+        // be reconstructed. Retain actual merge poison and DATA roles; map membership alone
+        // must not authenticate an absent, relayed or numerically overwritten mask.
+        if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x101 && k == 2 &&
+            o.kind == OperandKind::SGPR && o.value >= 0 && o.value <= 105) {
+            const auto mask = rs.sreg_bool.find(o.value);
+            const uint32_t mask_words = rs.sreg_bool_b32.contains(o.value) ? 1u : 2u;
+            bool genuine = mask != rs.sreg_bool.end() && mask->second;
+            for (uint32_t w = 0; w < mask_words; ++w) {
+                const int reg = o.value + static_cast<int>(w);
+                genuine = genuine && !rs.sreg_merge_placeholder.contains(reg);
+                marks.memory = marks.memory || rs.sreg_memory_pattern.contains(reg);
+            }
+            if (genuine) continue;
+        }
         uint32_t width = scalar_alu_source_words(in, k);
         if (width == 0 || width == UINT32_MAX) width = 2;   // unknown: both words of a pair
         if (width > 2) width = static_cast<uint32_t>(std::max(0, 125 - o.value));   // a range

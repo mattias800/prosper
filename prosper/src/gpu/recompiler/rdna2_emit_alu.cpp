@@ -5,6 +5,7 @@
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include "gpu/recompiler/storage_dst_sel.hpp"
 #include "gpu/recompiler/rdna2_dot.hpp"
 #include "gpu/recompiler/rdna2_dpp_row_shr.hpp"
@@ -1098,6 +1099,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                             : in.opcode == 0x2b ? b.logical_not(xor_em)     // XNOR
                             : in.opcode == 0x37 ? b.land(old_exec, nm)      // GFX10 ANDN1_SAVEEXEC
                                                 : b.lor(old_exec, nm);      // GFX10 ORN1_SAVEEXEC
+                    if (in.opcode == 0x24 || in.opcode == 0x25 || in.opcode == 0x27 ||
+                        in.opcode == 0x37)
+                        record_exec_mask_subset(rs, rs.exec, in.opcode == 0x27 ? m : old_exec,
+                                                in.opcode == 0x27 ? old_exec : m,
+                                                in.opcode == 0x24   ? 0x0f
+                                                : in.opcode == 0x25 ? 0x11
+                                                                    : 0x15,
+                                                old_exec);
                     // Every non-trivial mask expression may be narrower than full EXEC. Two self
                     // identities are exactly all-on and must clear the flag or a later forward
                     // EXECZ guard is conservatively (and incorrectly) rejected.
@@ -2102,11 +2111,19 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     ok = false;
                     return true;
                 }
-                if (is_exec(in.dst)) { rs.exec = r; rs.exec_narrowed = true; }
-                else if (in.dst.value == 106 || in.dst.value == 107) { rs.vcc = r; rs.sreg_bool_narrowed[in.dst.value] = true;
-                                                                       mask_write_clobbers_pair(rs, in.dst.value); }
-                else { rs.sreg_bool[in.dst.value] = r; rs.sreg_bool_narrowed[in.dst.value] = true;
-                       mask_write_clobbers_pair(rs, in.dst.value); }
+                if (is_exec(in.dst)) {
+                    record_exec_mask_subset(rs, r, m0, m1, in.opcode, rs.exec);
+                    rs.exec = r;
+                    rs.exec_narrowed = true;
+                } else if (in.dst.value == 106 || in.dst.value == 107) {
+                    rs.vcc = r;
+                    rs.sreg_bool_narrowed[in.dst.value] = true;
+                    mask_write_clobbers_pair(rs, in.dst.value);
+                } else {
+                    rs.sreg_bool[in.dst.value] = r;
+                    rs.sreg_bool_narrowed[in.dst.value] = true;
+                    mask_write_clobbers_pair(rs, in.dst.value);
+                }
                 if (words[0] && words[1]) {
                     rs.sreg[in.dst.value] = words[0];
                     rs.sreg[in.dst.value + 1] = words[1];
@@ -2304,6 +2321,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     }
                 };
                 const bool complete_scalar_pair = vcc_b32_scalar_pair_defined(b, rs, in);
+                // Snapshot source authority before an in-place write replaces VCC or SCC. The
+                // shared Special-word check omits physical words unavailable in this domain.
+                const auto unavailable = [&](const Operand& source) {
+                    return (source.kind == OperandKind::SGPR ||
+                            source.kind == OperandKind::Special) &&
+                           rs.unavailable_saved_mask_words.contains(source.value);
+                };
+                const bool current_data_sources = b32_sources_defined(rs, in) &&
+                                                  !unavailable(in.src[0]) &&
+                                                  !unavailable(in.src[1]);
                 const bool has_proven_scalar_sources = has_scalar_data(in.src[0]) &&
                                                        has_scalar_data(in.src[1]) &&
                                                        vcc_b32_scalar_write_proven(b, rs, in);
@@ -2325,6 +2352,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     rs.sreg[in.dst.value] = result;
                     rs.sreg_srt.erase(in.dst.value);
                     rs.scc = b.ucmp(Op_INotEqual, result, b.uconst(0));
+                    // Current vertex DATA need not recreate a retired wave predicate. Preserve
+                    // genuine scalar arithmetic; later mask consumers still need their own proof.
+                    if (b.is_vertex && !b.ngg_one_lane && !rs.vcc && !complete_scalar_pair &&
+                        current_data_sources) {
+                        drop_vcc_mask_view(rs);
+                        return true;
+                    }
                     const bool writes_hi = in.dst.value == 107;
                     // A whole-CFG proof can establish that this physical VCC word is scalar data
                     // only: the untouched sibling dies before any mask-domain read. Do not ask for
@@ -7517,7 +7551,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             const uint32_t SQ_DIM_2D = 1u;
             const uint32_t SQ_DIM_3D = 2u;
             const uint32_t SQ_DIM_2D_ARRAY = 5u;   // (x, y, layer) -- #2265
-            auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
+            begin_mimg_source_proof(rs, in.pc);
+            auto vread = [&](int r) { return read_mimg_source_word(b, rs, r); };
 
             // IMAGE_BVH_INTERSECT_RAY (GFX10 opcode 0xe6) has an image encoding but consumes a
             // four-dword BVH descriptor and eleven NSA VGPR operands. Vulkan ray-query support is
@@ -7551,11 +7586,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     return true;
                 }
 
-                auto addr_vgpr = [&](uint32_t k) -> int {
-                    if (k == 0u) return in.src[0].value;
-                    const uint32_t j = k - 1u;
-                    return static_cast<int>((in.words[2u + j / 4u] >> (8u * (j % 4u))) & 0xffu);
-                };
+                auto addr_vgpr = [&](uint32_t k) { return mimg_address_vgpr(rs, in, k); };
                 uint32_t a[11]{};
                 for (uint32_t k = 0; k < 11; ++k) a[k] = vread(addr_vgpr(k));
 
@@ -8177,13 +8208,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 // Non-NSA coords follow VADDR; NSA coord0=VADDR, coord k>=1 is byte (k-1) of
                 // words[2..3] (dword2=addr1..4, dword3=addr5..8), verified via llvm-mc gfx1010.
-                const bool nsa = in.len_dwords > 2;
-                int va = in.src[0].value;
-                auto coord_vgpr = [&](uint32_t k) -> int {
-                    if (!nsa || k == 0) return va + (nsa ? 0 : (int)k);
-                    uint32_t j = k - 1;
-                    return (int)((in.words[2 + j / 4] >> (8 * (j % 4))) & 0xFFu);
-                };
+                auto coord_vgpr = [&](uint32_t k) { return mimg_address_vgpr(rs, in, k); };
                 uint32_t coords[3] = {0, 0, 0};
                 for (uint32_t k = 0; k < ncoord; k++) coords[k] = vread(coord_vgpr(k));
                 uint32_t sample = ms ? vread(coord_vgpr(ncoord)) : 0;   // MSAA sample index = coord after the spatial ones
@@ -8602,9 +8627,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 ok = false;
                 return true;
             }
-            int va = in.src[0].value;
-            auto cvg = [&](uint32_t k) -> int { if (!nsa || k == 0) return va + (nsa ? 0 : (int)k);
-                uint32_t j = k - 1; return (int)((in.words[2 + j / 4] >> (8 * (j % 4))) & 0xFFu); };
+            auto cvg = [&](uint32_t k) { return mimg_address_vgpr(rs, in, k); };
             uint32_t out[4];
             if (dimcube) {
                 // Cube-processed coordinates encode face selection and a normalized in-face pair;

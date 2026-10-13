@@ -2988,6 +2988,7 @@ struct RegState {
     PortableMaskHalfTypes portable_mask_half_types;
     std::unordered_map<int, uint32_t> vreg, sreg;
     VectorWordMarks vreg_source_marks;
+    MimgSourceProof mimg_sources;
     bool vector_full_exec =
         false;   // provenance fact; dispatcher runtime predication stays enabled
     bool vector_native_interpolation = false;
@@ -3514,6 +3515,9 @@ struct LoopBlanketCheck {
     // The carried words defined on the preheader edge, each with the enclosing assumptions its
     // preheader value already depends on (empty when it is plainly defined).
     std::map<int, std::set<uint64_t>> carried;
+    // Hard vector words whose missing lanes lie outside this preheader EXEC domain. Their header
+    // reads remain conditional on each back edge defining the same domain, not just the same ID.
+    std::map<int, uint32_t> confined;
     uint32_t header_pc = 0;
     template <class Registers>
     LoopBlanketCheck(const RegState& rs, const Registers& registers, uint32_t header)
@@ -3540,8 +3544,12 @@ struct LoopBlanketCheck {
                 const uint64_t root = blanket_root(header_pc, entry.first);
                 const auto back = carried_word_marks(rs, entry.first);
                 if (violated.contains(root) || !back.placeholder) continue;
-                const bool held =
-                    !back.hard && std::none_of(back.blanket_roots.begin(), back.blanket_roots.end(),
+                const auto owner = confined.find(entry.first);
+                const bool domain_held =
+                    !back.hard || (owner != confined.end() &&
+                                   vector_word_defined_in_exec(rs, back, owner->second));
+                const bool held = domain_held &&
+                                  std::none_of(back.blanket_roots.begin(), back.blanket_roots.end(),
                                                [&](uint64_t r) { return violated.contains(r); });
                 if (!held) grew = violated.insert(root).second || grew;
             }
@@ -3563,6 +3571,7 @@ struct LoopBlanketCheck {
                 if (invalid(source.blanket_roots)) {
                     source.blanket_roots.clear();
                     source.hard = true;
+                    source.outside_exec = 0;
                 }
         };
         sanitize(exits.blanket, exits.vectors);
@@ -3589,7 +3598,7 @@ struct LoopBlanketCheck {
 template <class Registers>
 void mark_loop_carried(RegState& rs, const Registers& carried, const std::vector<Rdna2Inst>& ins,
                        uint32_t lo, uint32_t hi, LoopBlanketCheck& blanket) {
-    mark_vector_loop_carried(rs, ins, lo, hi, blanket.carried);
+    mark_vector_loop_carried(rs, ins, lo, hi, blanket.carried, blanket.confined);
     // A full preheader does not prove a full backedge. Clear the independent proof; ordinary
     // entry-iteration full writes still follow exec_narrowed and initialize their old generation.
     for (const auto& in : ins)
