@@ -85,8 +85,21 @@ static bool fallback_and_expiry_wired(const std::string& source) {
     const std::string_view fallback(source.data() + begin, end - begin);
     const size_t convert = fallback.find("interactive_grab_on_cpu_fallback(");
     const size_t bmp = fallback.find("flushGrabScreenshot(cf.rgba->data()");
-    const std::string_view loop_entry(source.data() + loop,
-                                      std::min<size_t>(source.size() - loop, 250));
+    const size_t loop_open = source.find('{', loop);
+    const size_t loop_close = matching_brace(source, loop_open);
+    const size_t poll_call = source.find("expirePendingGrabProducer();", loop_open);
+    if (loop_close == std::string::npos || poll_call == std::string::npos ||
+        poll_call >= loop_close)
+        return false;
+    // Startup observers may precede the poll. Follow the actual loop scope instead of a
+    // character budget, while refusing a poll hidden inside a conditional/nested block.
+    for (size_t cursor = loop_open + 1; cursor < poll_call;) {
+        const size_t nested_open = source.find('{', cursor);
+        if (nested_open == std::string::npos || nested_open >= poll_call) break;
+        const size_t nested_close = matching_brace(source, nested_open);
+        if (nested_close == std::string::npos || nested_close >= poll_call) return false;
+        cursor = nested_close + 1;
+    }
     const size_t expiry_open = source.find('{', expiry);
     const size_t expiry_close = matching_brace(source, expiry_open);
     if (expiry_close == std::string::npos) return false;
@@ -96,7 +109,6 @@ static bool fallback_and_expiry_wired(const std::string& source) {
     const size_t expire_call = expiry_body.find("interactive_grab_expire_producer_wait(");
     const size_t early_return = expiry_body.find("return;");
     return convert != std::string::npos && bmp != std::string::npos && convert < bmp &&
-           loop_entry.find("expirePendingGrabProducer();") != std::string::npos &&
            owned_poll != std::string::npos && expire_call > owned_poll &&
            expire_call != std::string::npos &&
            (early_return == std::string::npos || early_return > expire_call);
@@ -149,6 +161,31 @@ int main() {
                                  "omitted_cpu_fallback");
     CHECK(!fallback_and_expiry_wired(omitted_fallback),
           "#3828: removing the live CPU fallback transition makes the wiring gate fail");
+    const size_t loop_start = app_source.find("while (running && !prosper_stop_requested()) {");
+    const size_t poll_call = app_source.find("expirePendingGrabProducer();", loop_start);
+    CHECK(poll_call != std::string::npos,
+          "#3828: the loop polling omission controls have an actual call to remove");
+    if (poll_call != std::string::npos) {
+        const std::string poll_statement = "expirePendingGrabProducer();";
+        std::string omitted_poll = app_source;
+        omitted_poll.erase(poll_call, poll_statement.size());
+        CHECK(!fallback_and_expiry_wired(omitted_poll),
+              "#3828: removing the per-loop expiry poll makes the wiring gate fail");
+        std::string nested_poll = app_source;
+        nested_poll.replace(poll_call, poll_statement.size(),
+                            "if (false) { " + poll_statement + " }");
+        CHECK(!fallback_and_expiry_wired(nested_poll),
+              "#3828: a conditionally unreachable expiry poll fails the wiring gate");
+        const size_t loop_open = omitted_poll.find('{', loop_start);
+        const size_t loop_close = matching_brace(omitted_poll, loop_open);
+        CHECK(loop_close != std::string::npos,
+              "#3828: the outside-loop polling control has an actual loop boundary");
+        if (loop_close != std::string::npos) {
+            omitted_poll.insert(loop_close + 1, "\n" + poll_statement + "\n");
+            CHECK(!fallback_and_expiry_wired(omitted_poll),
+                  "#3828: moving expiry polling outside the loop fails the wiring gate");
+        }
+    }
     std::string bmp_gated_expiry = app_source;
     if (const size_t expiry = bmp_gated_expiry.find("auto expirePendingGrabProducer = [&] {");
             expiry != std::string::npos) {
