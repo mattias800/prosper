@@ -542,12 +542,29 @@ inline PixelInputMapping resolve_pixel_input_mapping(
 // Fixed-function per-pixel VGPR loads selected by SPI_PS_INPUT_ENA / SPI_PS_INPUT_ADDR. ENA says
 // which values hardware computes and loads; ADDR also reserves VGPR slots for disabled values, so it
 // participates in the destination-register mapping. The fragment shell currently materializes the
-// four floating-point position terms through SPIR-V FragCoord; the remaining enabled terms still
-// reserve their documented slots for faithful position placement.
+// four floating-point position terms through SPIR-V FragCoord. FRONT_FACE additionally needs the
+// observed SPI_BARYC_CNTL encoding; ADDR alone never supplies an enabled value.
+enum class FragmentFrontFaceEncoding : uint8_t { Unavailable, SignedFloat, AllBits };
+
 struct PixelSystemInputMapping {
     uint32_t ena = 0;
     uint32_t addr = 0;
+    FragmentFrontFaceEncoding front_face_encoding = FragmentFrontFaceEncoding::Unavailable;
 
+    void retain_front_face_encoding(bool available, uint32_t baryc_cntl) {
+        front_face_encoding =
+            available && (ena & addr & (1u << 12))
+                ? (baryc_cntl & (1u << 24) ? FragmentFrontFaceEncoding::AllBits
+                                           : FragmentFrontFaceEncoding::SignedFloat)
+                : FragmentFrontFaceEncoding::Unavailable;
+    }
+    bool canonical() const {
+        return static_cast<uint8_t>(front_face_encoding) <=
+                   static_cast<uint8_t>(FragmentFrontFaceEncoding::AllBits) &&
+               (front_face_encoding == FragmentFrontFaceEncoding::Unavailable ||
+                (ena & addr & (1u << 12)));
+    }
+    uint64_t layout_words() const { return uint64_t(ena) | (uint64_t(addr) << 32); }
     bool operator==(const PixelSystemInputMapping&) const = default;
 };
 

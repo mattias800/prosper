@@ -27,8 +27,10 @@ bool join_structured_saved_masks(SpirvCompute& b, RegState& current,
     const bool carry_pair =
         !(b.allow_b32_masks && (b.is_fragment || (b.is_compute && b.wave_size == 32)));
     const ScalarMergeMaskWriteWidths widths{carry_pair, b.wave_size != 32, !b.allow_b32_masks};
+    const auto& liveness =
+        b.saved_mask_liveness_instructions.empty() ? ins : b.saved_mask_liveness_instructions;
     const auto dead = [&](int word) {
-        return sgpr_dead_at_merge(ins, merge_pc, word, ScalarMergeProof::AnyRead, nullptr,
+        return sgpr_dead_at_merge(liveness, merge_pc, word, ScalarMergeProof::AnyRead, nullptr,
                                   carry_pair, widths);
     };
     std::set<int> keys;

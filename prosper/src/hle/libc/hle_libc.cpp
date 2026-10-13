@@ -1125,6 +1125,7 @@ void register_builtin_hle() {
     register_agc_hle();      // real AGC Dcb functions (override the glog stubs for Dcb NIDs)
     register_agc_getsize_hle();   // fixed-size sceAgc*GetSize answers measured on a console
     register_kernel_hle();   // libkernel primitives (pthread/sync/...)
+    register_process_arguments_hle();   // cached process entry argc/argv
 }
 
 } // namespace prosper

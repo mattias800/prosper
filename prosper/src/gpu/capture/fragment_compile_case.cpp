@@ -212,6 +212,10 @@ void validate_fragment_compile_case(const FragmentCompileCase& c) {
         require(c.compiler.find("unknown") == std::string::npos && !c.compiler.empty(), "compile-case compiler identity unknown");
         require(c.choices.error.empty(), "compile-case choices unavailable");
     }
+    require(c.system_inputs.canonical() &&
+                (c.has_system_inputs ||
+                 c.system_inputs.front_face_encoding == FragmentFrontFaceEncoding::Unavailable),
+            "compile-case invalid front-face encoding");
     require(c.float_mode.canonical(), "compile-case noncanonical float mode");
     require(c.float_transport.canonical(), "compile-case noncanonical float transport");
     require(c.float_flags.canonical(), "compile-case noncanonical float flags");

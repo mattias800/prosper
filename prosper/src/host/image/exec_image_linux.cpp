@@ -1,6 +1,7 @@
 // exec_image_linux.cpp — Linux host backing + HLE stubs (M2/M3). Compiles to nothing
 // on non-Linux so the shared (mingw) build is unaffected.
 #include "host/image/exec_image.hpp"
+#include "host/image/process_entry.hpp"
 #include "host/image/module_start_params.hpp"
 #include "host/image/guest_executable.hpp"
 #include "host/image/runtime_module_load.hpp"
@@ -4029,7 +4030,22 @@ static void dump_fault_bytes(uint64_t start, int n) {
     }
 }
 
+bool prepare_configured_process_entry(std::string* error) {
+    if (process_entry_context().stack) return true;
+    // Boot-only environment reads precede guest workers; later calls reuse the published context.
+    // NOLINTBEGIN(concurrency-mt-unsafe)
+    return prepare_process_entry(guest_entry_arguments(getenv("PROSPER_GUEST_ARGS")),
+                                 getenv("PROSPER_GUEST_ENV"), error);
+    // NOLINTEND(concurrency-mt-unsafe)
+}
+
 size_t run_guest_inits(const std::vector<uint64_t>& fns) {
+    std::string entry_error;
+    if (!prepare_configured_process_entry(&entry_error)) {
+        std::fprintf(stderr, "[prosper] guest process arguments unavailable before init: %s\n",
+                     entry_error.c_str());
+        return 0;
+    }
     // boot_program runs module init code before run_entry. This is already guest execution and can
     // create more guest threads, so waiting for run_entry to arm leaves the earliest code invisible.
     if (!fns.empty()) guest_execution_thread_enter(/*primary=*/true);
@@ -4089,58 +4105,20 @@ size_t run_guest_inits(const std::vector<uint64_t>& fns) {
 }
 
 BootResult run_entry(const LoadedImage& img) {
-    const size_t STK = 16 * 1024 * 1024;
-    void* stk = mmap(nullptr, STK, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     BootResult r;
-    if (stk == MAP_FAILED) { r.kind = 2; r.detail = "guest stack mmap failed"; return r; }
-
-    register_thread_stack((uint64_t)pthread_self(), stk, STK);   // guest main thread
-
-    uint64_t top = ((uint64_t)stk + STK) & ~(uint64_t)0xf;
-    // LoadExec supplies an exact argv vector. Ordinary eboot boots keep their explicitly configured
-    // PROSPER_GUEST_ARGS. CONFIDENCE: HIGH on the argv/crt0 stack layout.
-    std::vector<std::string> args = guest_entry_arguments(getenv("PROSPER_GUEST_ARGS"));
-    // Copy each arg string onto the stack (high→low), collecting guest pointers.
-    std::vector<uint64_t> argptrs;
-    for (const auto& a : args) {
-        size_t n = a.size() + 1;
-        top -= n; memcpy((void*)top, a.c_str(), n);
-        argptrs.push_back(top);
+    std::string entry_error;
+    if (!prepare_configured_process_entry(&entry_error)) {
+        r.kind = 2;
+        r.detail = entry_error;
+        return r;
     }
-    // PROSPER_GUEST_ENV="KEY=VAL;KEY=VAL": inject environment strings the guest's libc getenv() will see
-    // (the crt0 envp is otherwise empty). Used to feed the guest's bundled Boehm GC its env knobs
-    // (e.g. GC_DONT_GC=1 to disable collection, or GC_INITIAL_HEAP_SIZE) when investigating GC-driven
-    // corruption. ';'-separated so values may contain '='. CONFIDENCE: HIGH on the SysV envp layout.
-    std::vector<uint64_t> envptrs;
-    if (const char* ge = getenv("PROSPER_GUEST_ENV")) {
-        std::string s(ge); size_t i = 0;
-        while (i < s.size()) {
-            size_t j = s.find(';', i);
-            std::string kv = s.substr(i, j == std::string::npos ? std::string::npos : j - i);
-            if (!kv.empty()) { size_t n = kv.size() + 1; top -= n; memcpy((void*)top, kv.c_str(), n); envptrs.push_back(top); }
-            if (j == std::string::npos) break; i = j + 1;
-        }
-        top &= ~(uint64_t)0xf;
-    }
-    top &= ~(uint64_t)0xf;
-    // crt0 vector: argc, argv[0..N-1], NULL, envp[0..M-1], NULL, auxv AT_NULL(0,0).
-    std::vector<uint64_t> vecv;
-    vecv.push_back(args.size());
-    for (uint64_t pp : argptrs) vecv.push_back(pp);
-    vecv.push_back(0);   // argv terminator
-    for (uint64_t pp : envptrs) vecv.push_back(pp);
-    vecv.push_back(0);   // envp terminator
-    vecv.push_back(0); vecv.push_back(0);   // auxv AT_NULL
-    if (vecv.size() & 1) vecv.push_back(0);   // keep an even count so the ≡8(mod16) placement below holds
-    const uint64_t* vec = vecv.data(); size_t vecsz = vecv.size() * sizeof(uint64_t);
-    top -= vecsz; top &= ~(uint64_t)0xf;   // 16-aligned base for the vector
-    // The Sony crt _start pushes an odd number of words before its first call, so it
-    // expects entry rsp ≡ 8 (mod 16) (like a normal callee), NOT 16-aligned. Placing
-    // the vector 8 below a 16-boundary makes every downstream call correctly aligned,
-    // so alignment-sensitive SIMD (vmovaps) in callees doesn't #GP.
-    top -= 8;
-    memcpy((void*)top, vec, vecsz);
-    uint64_t sp = top, rdi = sp, rsi = 0;
+    const ProcessEntryContext context = process_entry_context();
+    void* stk = context.stack;
+    const size_t STK = context.stack_bytes;
+    register_thread_stack((uint64_t)pthread_self(), stk, STK);
+    // Reuse the guest-backed crt0 vector already visible to eager module initializers. Native
+    // getargv and the entry argument must identify the same array, including exact LoadExec data.
+    uint64_t sp = context.stack_pointer, rdi = sp, rsi = 0;
 
     g_trap_kind = 0; g_fault_addr = nullptr; g_fault_rip = 0; g_armed_tid = cur_tid();
     arm_bp();     // write the PROSPER_BP int3 now that the guest image is fully mapped

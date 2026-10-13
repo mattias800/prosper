@@ -1559,6 +1559,8 @@ bool emit_cfg_state_machine(
     // so `s_mov_b64 dst, s[N:N+1]` over both reloaded halves of one mask stays a mask. Tracked only
     // with an exact native Wave64 subgroup, where that move also materializes the ballot words.
     std::vector<SpilledMaskHalves> wave64_spilled_halves_in(starts.size());
+    const bool track_active_vectors = tracks_active_vector_words(b, barrier_half_phase);
+    std::map<uint32_t, std::set<int>> active_vectors_after;
     const bool track_spilled_halves =
         b.is_compute && b.wave_size == 64 && b.native_subgroup_size == 64;
     // Dispatcher Function variables persist SCC's Boolean value but not whether that value is an
@@ -1611,20 +1613,12 @@ bool emit_cfg_state_machine(
         return root >= 0 && root <= 105 ? root : -1;
     };
     if ((b.is_compute || b.is_fragment) && b.wave_size == 64 && !starts.empty()) {
-        seed_native_logical_entry_marks(wave64_spilled_halves_in.front(), initial);
-        for (const auto& mask : initial.sreg_bool)
-            if (!initial.sreg_bool_b32.contains(mask.first) && mask.first <= 105)
-                wave64_b64_mask_in.front().insert(mask.first);
-        if (initial.vcc) wave64_b64_mask_in.front().insert(106);
-        for (const auto& value : initial.sreg)
-            if (value.first <= 124) wave64_scalar_word_in.front().insert(value.first);
-        for (const auto& value : initial.sreg_input)
-            if (value.first <= 124) wave64_scalar_word_in.front().insert(value.first);
-        // Direct descriptors intentionally live outside RegState's ordinary scalar map, but their
-        // entry words are real scalar data until shader code overwrites them. Seed the MUST facts
-        // from the same resource-table ranges used by the emitter's direct-descriptor fallback.
-        for (int reg : direct_descriptor_sregs)
-            if (reg <= 124) wave64_scalar_word_in.front().insert(reg);
+        seed_native_logical_entry_domains(wave64_spilled_halves_in.front(), initial,
+                                          direct_descriptor_sregs, wave64_b64_mask_in.front(),
+                                          wave64_scalar_word_in.front());
+        if (track_active_vectors)
+            seed_active_vector_words(wave64_spilled_halves_in.front().active_vectors, initial,
+                                     wave64_spilled_halves_in.front().relayed_vectors);
         wave64_scalar_scc_valid_in.front() = initial.scc != 0;
         for (int reg : inherited_entry_m0)
             if (reg <= 105) wave64_m0_token_word_in.front().insert(reg);
@@ -2165,6 +2159,12 @@ bool emit_cfg_state_machine(
                         readlane_words.insert(base + static_cast<int>(word));
             std::vector<int> vector_writes;
             for_each_possible_vector_write(in, [&](int reg) { vector_writes.push_back(reg); });
+            if (track_active_vectors) {
+                advance_active_vector_words(halves.active_vectors, in, scalar_writes, vector_writes,
+                                            mask_write, relay_sources.active_defined,
+                                            vector_write_completes_active_word(in));
+                if (record_compare) active_vectors_after[in.pc] = halves.active_vectors.current;
+            }
             if (track_spilled_halves)
                 advance_spilled_mask_halves(halves, in, masks, static_mask_keys, scalar_writes,
                                             vector_writes, mask_write);
@@ -2210,12 +2210,9 @@ bool emit_cfg_state_machine(
                                               /*record_compare*/ false))
                     return false;
             }
-            // Which SGPR holds a reloaded half is block-local: emit_alu's per-lane mask for a
-            // v_readlane'd half does not survive a dispatcher edge, so a move into VCC after the
-            // edge would copy data words while the analysis called it a mask (#4603 review). The
-            // spill-slot and pair-definition facts describe memory and stay valid across edges.
-            halves.sregs.clear();
             for (uint32_t successor : successors[block]) {
+                const auto edge_halves =
+                    active_vector_edge_state(halves, ins, lo, hi, starts[successor], vregs);
                 if (!wave64_b64_reachable[successor]) {
                     wave64_b64_reachable[successor] = true;
                     wave64_b64_mask_in[successor] = masks;
@@ -2223,7 +2220,7 @@ bool emit_cfg_state_machine(
                     wave64_scalar_word_in[successor] = scalar_words;
                     wave64_m0_token_word_in[successor] = m0_tokens;
                     wave64_readlane_word_in[successor] = readlane_words;
-                    wave64_spilled_halves_in[successor] = halves;
+                    wave64_spilled_halves_in[successor] = edge_halves;
                     wave64_slot_domain_in[successor] = slot_domains;
                     wave64_scalar_scc_valid_in[successor] = scalar_scc;
                     pending.push_back(successor);
@@ -2257,7 +2254,7 @@ bool emit_cfg_state_machine(
                 std::set<int> joined_readlane_words = wave64_readlane_word_in[successor];
                 joined_readlane_words.insert(readlane_words.begin(), readlane_words.end());
                 SpilledMaskHalves joined_halves = wave64_spilled_halves_in[successor];
-                meet_spilled_mask_halves(joined_halves, halves);
+                meet_spilled_mask_halves(joined_halves, edge_halves);
                 SpillSlotDomains joined_slots = wave64_slot_domain_in[successor];
                 meet_spill_slot_domains(joined_slots, slot_domains);
                 const bool joined_scalar_scc = wave64_scalar_scc_valid_in[successor] && scalar_scc;
@@ -2964,6 +2961,7 @@ bool emit_cfg_state_machine(
         RegState state;
         state.vector_native_interpolation = initial.vector_native_interpolation;
         state.vector_wave_size = initial.vector_wave_size;
+        state.track_scc_definition = initial.track_scc_definition;
         state.scalar_presence_has_no_placeholders = false;
         state.max_vgpr = initial.max_vgpr;
         state.sreg_input = initial.sreg_input;
@@ -3203,6 +3201,8 @@ bool emit_cfg_state_machine(
             }
         }
         state.exec_narrowed = true; // state-machine joins may carry a narrowed EXEC edge
+        if (track_active_vectors && dispatch != UINT32_MAX && entry_wave64_b64)
+            restore_active_vector_words(halves_in.active_vectors.current, state);
         state.mubuf_pcrel_tables = initial.mubuf_pcrel_tables;
         state.smem_pcrel_tables = initial.smem_pcrel_tables;
         state.mtbuf_pcrel_tables = initial.mtbuf_pcrel_tables;
@@ -3693,6 +3693,8 @@ bool emit_cfg_state_machine(
                         state, in,
                         allows_compute_scalar_vcc_bridge(b), saved_masks);
                 if (handled && ok) retain_saved_mask_words(b, state, in);
+                if (handled && ok && track_active_vectors)
+                    restore_active_vector_instruction(active_vectors_after, in, state);
                 if (handled && ok) {
                     packet_raw_masks.expire(state, in);
                     packet_raw_masks.stage(b, state, in);
@@ -6341,7 +6343,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             // exit-iteration refinement is intentionally omitted for it.
             else if (pr.dom == 2) {
                 rs.scc = pr.phi;
-                if (b.wave_size == 32) {
+                if (b.wave_size == 32 || rs.track_scc_definition) {
                     // This path publishes the header phi, not the fresh check predicate.
                     rs.scc_merge_placeholder = true;
                     rs.scc_loop_blanket.clear();
@@ -7034,7 +7036,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     rs.sreg[pr.reg] = merged;
                 } else if (pr.dom == 2) {
                     rs.scc = merged;
-                    if (b.wave_size == 32) {
+                    if (b.wave_size == 32 || rs.track_scc_definition) {
                         rs.scc_merge_placeholder = check_marks.scc;
                         rs.scc_loop_blanket = check_marks.scc_blanket;
                         if (L.direct_exec_breaks || L.direct_wave_breaks) {

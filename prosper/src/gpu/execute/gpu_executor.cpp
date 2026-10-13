@@ -679,8 +679,8 @@ struct InterpolationCacheKeyHash {
         hash = hash_mix(hash, key.analysis_identity);
         hash = hash_mix(hash, key.has_system_inputs);
         if (key.has_system_inputs) {
-            hash = hash_mix(hash, key.system_inputs.ena);
-            hash = hash_mix(hash, key.system_inputs.addr);
+            hash = hash_mix(hash, key.system_inputs.layout_words());
+            hash = hash_mix(hash, static_cast<uint8_t>(key.system_inputs.front_face_encoding));
         }
         hash = hash_mix(hash, key.passthrough_mask);
         hash = hash_mix(hash, key.flat_mask);
@@ -959,18 +959,19 @@ std::shared_ptr<ShaderCodeAnalysis> make_shader_code_analysis(const uint32_t* co
     auto result = std::make_shared<ShaderCodeAnalysis>();
     result->identity = ++g_next_shader_analysis_identity;
     result->source_dwords = dwords;
-    const size_t span = shader_source_code_span(code, dwords);
+    const size_t span = shader_analysis_source_span(*result, code, dwords);
     result->bounded_span = span < dwords;
     if (code && span) result->code.assign(code, code + span);
     result->code_hash = hash_shader_code(result->code);
-    // All code facts describe this immutable byte version, never a second read from guest VA.
+    // Compiler facts describe retained immutable code, never failed-probe validation words.
     const uint32_t* owned_code = result->code.empty() ? nullptr : result->code.data();
     result->pcrel_dispatch = rdna2_pcrel_dispatch_info(owned_code, result->code.size());
     result->fragment_color_export_mask =
         fragment_color_export_mask(owned_code, result->code.size());
     result->packet_vgpr_requirements = fragment_packet_vgpr_requirements(result->code);
     result->bytes =
-        static_cast<uint64_t>(result->code.size()) * sizeof(uint32_t) +
+        static_cast<uint64_t>(result->code.size() + result->terminal_tail_validation.size()) *
+            sizeof(uint32_t) +
         static_cast<uint64_t>(result->pcrel_dispatch.target_pcs.size()) * sizeof(uint32_t) +
         static_cast<uint64_t>(result->pcrel_dispatch.setup_pcs.size()) * sizeof(uint32_t);
     result->bytes +=
@@ -1015,9 +1016,8 @@ std::shared_ptr<const ShaderCodeAnalysis> analyze_shader_code_cached(const uint3
         const bool readable = code_bytes == 0 ||
                               (code_bytes <= UINT32_MAX &&
                                guest_readable(address, static_cast<uint32_t>(code_bytes)));
-        const bool matches = compatible_length && readable &&
-            (code_bytes == 0 ||
-             memcmp(code, cached->code.data(), static_cast<size_t>(code_bytes)) == 0);
+        const bool matches =
+            compatible_length && readable && shader_analysis_source_matches(*cached, code, dwords);
 
         std::lock_guard lock(cache.mutex);
         auto found = cache.entries.find(address);

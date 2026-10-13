@@ -13,7 +13,8 @@ thresholds, routes, review notes, and verification provenance live in
 
 ## Run
 
-Build `build-linux/boot_trace`, then run from `prosper/`:
+Build `build-linux/screenshot` for routed content guards (`boot_trace` for exact
+draw-submit guards), then run from `prosper/`:
 
 ```bash
 # Run the whole real-game matrix, or one affected title.
@@ -22,6 +23,35 @@ python3 tools/snapshot/snapshot.py check messenger-scene
 python3 tools/snapshot/snapshot.py check dead-cells-gameplay
 python3 tools/snapshot/snapshot.py check blasphemous2-gameplay
 ```
+
+For routed content guards, select the normal desktop app explicitly:
+
+```bash
+PROSPER_SNAPSHOT_APP=build-linux/prosper-app python3 tools/snapshot/snapshot.py check messenger-scene
+```
+
+This runs a visible app window using its existing CPU publication presentation path
+(`PROSPER_APP_GPU_PRESENT=0`). Offscreen/dummy SDL drivers and hidden, minimized or
+occluded windows are refused. The adapter captures the immutable publication only
+after a successful host presentation; images exclude desktop scaling and host HUDs.
+It records the app frontend, CPU path, embedded build/source identity and the
+publication's dimensions, origin, frame sequence and guest flip count. An unknown
+front-buffer index remains `-1` rather than borrowing a newer registry index.
+
+Routes, guest arguments, save policy, render scale, composited-frame requirement,
+sample count, evidence windows and pixel oracles remain those in `snapshots.json`.
+An unchanged displayed image is sampled again at each wall-clock interval, so a
+stalled guest cannot erase the stale tail. No samples are invented before a
+publication reaches the window. PNG or manifest errors, incomplete counts and
+guest faults fail the run. The legacy screenshot frontend's unpaced flip default
+is retained; an explicitly configured `PROSPER_FLIP_PACE_FPS` still wins.
+
+This selection is a host capability diagnostic, not native GPU visual evidence or
+permission to change a reviewed baseline. Exact draw-submit guards retain their
+separate `boot_trace` contract and refuse this selection. The cooperative lock,
+bounded child timeout and shutdown of only the owned process group are shared
+with the legacy runner. Coordinate the complete guard durations before a long
+matrix run; choosing the visible app does not shorten them.
 
 Run the relevant checks after changes to shader recompilation, AGC/PM4 decode,
 render state, texture decode/detiling, executor behavior, or presentation.

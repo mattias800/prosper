@@ -4,6 +4,8 @@
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_terminal_tail_span.hpp"
+#include "gpu/recompiler/rdna2_fragment_terminal_tail.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
@@ -37,7 +39,9 @@ size_t rdna2_recompile_code_span(const uint32_t* code, size_t dwords) {
     if (!code || !dwords) return 0;
     std::vector<Rdna2Inst> ins;
     const size_t program_dwords = rdna2_walk(code, dwords, ins);
-    size_t required = program_dwords;
+    size_t required =
+        std::max(program_dwords, rdna2_terminal_tail_span(code, dwords, ins).retained_dwords);
+    required = std::max(required, rdna2_fragment_terminal_tail(code, dwords, ins).retained_dwords);
     std::vector<Rdna2Inst> terminating_cfg = ins;
     size_t terminating_span = program_dwords;
     if (extend_terminating_if_else(code, dwords, terminating_cfg, &terminating_span))
@@ -68,9 +72,16 @@ bool rdna2_recompile_executable_instructions(const uint32_t* code, size_t dwords
     // The byte-span helper alone is insufficient: it can retain a second executable arm without
     // changing rdna2_walk's first-END prefix. Reuse the same proof and inventory both arms.
     const auto prefix = decoded;
+    const auto terminal_tails = rdna2_terminal_tail_span(code, dwords, prefix);
+    const auto fragment_tails = rdna2_fragment_terminal_tail(code, dwords, prefix);
     size_t executable_dwords = consumed;
     (void)extend_terminating_if_else(code, dwords, decoded, &executable_dwords);
-    size_t required = executable_dwords;
+    size_t required = std::max(executable_dwords, terminal_tails.retained_dwords);
+    required = std::max(required, fragment_tails.retained_dwords);
+    std::unordered_set<uint32_t> executable_pcs;
+    for (const auto& in : decoded) executable_pcs.insert(in.pc);
+    for (const auto& tail : fragment_tails.instructions)
+        if (executable_pcs.insert(tail.pc).second) decoded.push_back(tail);
     (void)detect_pcrel_tables(decoded, code, dwords, &required);
     const auto dispatch = detect_pcrel_dispatch(prefix, code, dwords, consumed);
     if (dispatch.valid) required = std::max(required, dispatch.required_dwords);
@@ -78,6 +89,9 @@ bool rdna2_recompile_executable_instructions(const uint32_t* code, size_t dwords
 
     std::unordered_set<uint32_t> pcs;
     for (const auto& in : decoded) pcs.insert(in.pc);
+    // A retained [NOP]* END target has no additional operand/resource effects to inventory; its
+    // exact terminal proof above authorizes that conditional edge without inventing an instruction.
+    // Unknown or nonterminal targets inside the supplied words remain refused.
     // A conditional branch forward to or past the end of the retained words leaves the program on
     // its taken edge and adds no instruction to the inventory. No such branch survives when a
     // terminating else arm was appended above (that shape's one branch targets the arm), so here
@@ -89,7 +103,10 @@ bool rdna2_recompile_executable_instructions(const uint32_t* code, size_t dwords
     // them that is not an instruction.
     const auto leaves_program = [&](const Rdna2Inst& in) {
         const int64_t target = int64_t(in.pc) + in.len_dwords + in.simm16;
-        return in.opcode != kSoppOpcodeBranch && target >= int64_t(dwords);
+        const bool proven_terminal = std::find(terminal_tails.terminating_targets.begin(),
+                                               terminal_tails.terminating_targets.end(),
+                                               target) != terminal_tails.terminating_targets.end();
+        return in.opcode != kSoppOpcodeBranch && (target >= int64_t(dwords) || proven_terminal);
     };
     for (const auto& in : decoded) {
         unavailable_pc = in.pc;

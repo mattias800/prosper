@@ -65,6 +65,7 @@ void meet_spilled_mask_halves(SpilledMaskHalves& into, const SpilledMaskHalves& 
     into.memory_vectors.insert(incoming.memory_vectors.begin(), incoming.memory_vectors.end());
     into.memory_words.insert(incoming.memory_words.begin(), incoming.memory_words.end());
     into.memory_slots.insert(incoming.memory_slots.begin(), incoming.memory_slots.end());
+    meet_active_vector_words(into.active_vectors, incoming.active_vectors);
     into.exec_known_full = into.exec_known_full && incoming.exec_known_full;
     into.native_interpolation = into.native_interpolation && incoming.native_interpolation;
 }
@@ -171,7 +172,11 @@ SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& st
                   : vector_any(state.relayed_vectors));
     if (readlane && constant_lane(in) && state.lane_written_vgprs.contains(in.src[0].value))
         memory = state.memory_slots.contains({in.src[0].value, in.src[1].value});
-    return {vector_relay, relays, memory};
+    const bool active_defined =
+        state.active_vectors.enabled &&
+        active_vector_sources_defined(state.active_vectors, in, state.relayed_vectors, masks,
+                                      scalar_words, relayed, definite_scc);
+    return {vector_relay, relays, memory, active_defined};
 }
 
 void advance_defined_slots(SpilledMaskHalves& state, const Rdna2Inst& in,

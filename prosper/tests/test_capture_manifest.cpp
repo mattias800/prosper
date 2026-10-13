@@ -1,4 +1,4 @@
-#include "../tools/screenshot/capture_manifest.hpp"
+#include "shared/capture/capture_manifest.hpp"
 
 #include <cstdio>
 #include <cstdlib>

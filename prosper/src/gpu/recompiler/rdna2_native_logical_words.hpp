@@ -2,10 +2,14 @@
 
 #include "gpu/recompiler/rdna2_saved_mask_words.hpp"
 #include <array>
+#include <set>
 
 namespace prosper::gpu {
 struct SpilledMaskHalves;
 void seed_native_logical_entry_marks(SpilledMaskHalves& marks, const RegState& initial);
+void seed_native_logical_entry_domains(SpilledMaskHalves& marks, const RegState& initial,
+                                       const std::set<int>& direct_descriptor_sregs,
+                                       std::set<int>& masks, std::set<int>& scalar_words);
 // Native scalar logical DATA is independent of the lanes participating at this operation.
 bool native_logical_data_word(const RegState& rs, int word, uint32_t& value);
 bool is_native_b64_logical(const SpirvCompute& b, const Rdna2Inst& in);

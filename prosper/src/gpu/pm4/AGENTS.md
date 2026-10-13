@@ -16,6 +16,8 @@ Decodes the PM4 packet stream the guest submits, and maintains the register stat
   bounded performance capture; it does not alter visibility, execute writes or wait for them.
 - `wait_regmem_sample` — retains the exact value used by a wait predicate so later diagnostic
   reads cannot be presented as that decision's sample; queue policy stays in the processor.
+- `scalar_pending_write_overlay` — the existing exact-address scalar overlay math, independent
+  of queue ownership and diagnostic attribution; it does not publish a write.
 
 This is the **entry point of the whole stack**: everything downstream is a consequence of what is
 decoded here, so a decode error does not look like a decode error — it looks like a missing draw, a
