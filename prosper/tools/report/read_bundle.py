@@ -10,6 +10,7 @@ absence of a section the reader knows is reported, not defaulted.
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -26,6 +27,8 @@ def load_bundle(path: str | Path) -> dict:
         text = Path(path).read_text(encoding="utf-8")
     except OSError as error:
         raise BundleError(f"{path}: cannot be read ({error.strerror})") from error
+    except UnicodeError as error:
+        raise BundleError(f"{path}: not readable UTF-8") from error
     try:
         record = json.loads(text)
     except ValueError as error:
@@ -35,15 +38,24 @@ def load_bundle(path: str | Path) -> dict:
     if record.get("type") != "report":
         raise BundleError(f"{path}: not a report bundle (type={record.get('type')!r})")
     schema = record.get("schema")
-    if schema != KNOWN_SCHEMA:
+    if type(schema) is not int or schema != KNOWN_SCHEMA:
         raise BundleError(f"{path}: schema {schema!r} is not readable by this tool")
     for key in ("tool", "build_revision", "build_source_identity", "os", "title_id", "switches"):
         if key not in record:
             raise BundleError(f"{path}: bundle lacks {key!r}")
-    if not isinstance(record["build_revision"], str) or not record["build_revision"]:
-        raise BundleError(f"{path}: build revision must be a nonempty string")
+    for key in ("tool", "build_revision", "build_source_identity"):
+        if not isinstance(record[key], str) or not record[key]:
+            raise BundleError(f"{path}: {key} must be a nonempty string")
+    if record["os"] not in ("linux", "windows", "macos"):
+        raise BundleError(f"{path}: os must name a supported host")
+    title = record["title_id"]
+    if not isinstance(title, str) or (title and not re.fullmatch(r"PPSA[0-9]{5}", title)):
+        raise BundleError(f"{path}: title_id must be empty or a title identifier")
     if not isinstance(record["switches"], dict):
         raise BundleError(f"{path}: switches must be an object")
+    for name, value in record["switches"].items():
+        if not re.fullmatch(r"PROSPER_[A-Z0-9_]+", name) or not isinstance(value, str):
+            raise BundleError(f"{path}: switches must map PROSPER_* names to strings")
     return record
 
 
@@ -55,7 +67,7 @@ def triage_lines(record: dict) -> list[str]:
         f"build: {record['build_revision'][:12]} (source identity present: "
         f"{bool(record['build_source_identity'])})",
         f"os: {record['os']}",
-        f"title: {record['title_id'] or '(no title booted)'}",
+        f"title: {record['title_id'] or '(no title identity)'}",
         f"switches: {len(switches)} PROSPER_* in force",
     ]
 

@@ -41,7 +41,7 @@ def test_valid_bundle_loads_and_triages(tmp_path):
 def test_empty_title_and_switches_are_reported_not_defaulted(tmp_path):
     record = rb.load_bundle(write_bundle(tmp_path, bundle(title_id="", switches={})))
     lines = rb.triage_lines(record)
-    assert any("no title booted" in line for line in lines)
+    assert any("no title identity" in line for line in lines)
     assert any("0 PROSPER_*" in line for line in lines)
 
 
@@ -70,3 +70,31 @@ def test_cli_refuses_without_printing_triage(tmp_path, capsys):
     bad = tmp_path / "bad.json"
     bad.write_text("[]", encoding="utf-8")
     assert rb.main([str(bad)]) == 2
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"schema": True},
+        {"schema": 1.0},
+        {"tool": []},
+        {"tool": ""},
+        {"build_source_identity": {}},
+        {"build_source_identity": ""},
+        {"os": "unknown"},
+        {"title_id": None},
+        {"title_id": "../game"},
+        {"switches": {"PATH": "1"}},
+        {"switches": {"PROSPER_GFXLOG": 1}},
+    ],
+)
+def test_malformed_section_contracts_refuse(tmp_path, change):
+    with pytest.raises(rb.BundleError):
+        rb.load_bundle(write_bundle(tmp_path, bundle(**change)))
+
+
+def test_invalid_utf8_refuses_without_a_traceback(tmp_path, capsys):
+    path = tmp_path / "report.json"
+    path.write_bytes(b'{"type":"report","tool":"\xff"}')
+    assert rb.main([str(path)]) == 2
+    assert capsys.readouterr().out == ""
