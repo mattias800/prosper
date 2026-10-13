@@ -33,14 +33,21 @@ constexpr std::array kSdwaV6 = {0x7e0c02f9u, 0x00851480u};
 constexpr std::array kWritelaneV6 = {0xd7610006u, 0x00010002u};
 // v_movreld_b32 with VDST v6 (indexed through M0), inline-zero source.
 constexpr std::array kMovrelV6 = {0x7e0c8480u};
-// v_fmac_f32_e64 (0x12b) and v_pk_fmac_f16_e64 (0x13c): the VOP3 forms of VOP2 0x2b/0x3c, which
-// accumulate the old destination like 0x11f (the e64 form of 0x1f).
+// FMAC_F32 (0x12b) and the decoder-admitted packed FMAC lowering (0x13c) both read the old
+// destination. The latter is not a verified architectural e64 encoding.
 // SRC2 encodes s2: the decoder exposes a third source field for these opcodes, so the test makes
 // it genuine, leaving the old-destination accumulator as the only missing input.
 constexpr std::array kFmacV6 = {0xd12b0006u, 0x000a0501u};
 constexpr std::array kPkFmacV6 = {0xd13c0006u, 0x000a0501u};
 // v_mac_f32 v6, v1, v2 (VOP2 0x1f): lane-wise accumulator reading its own lane's old word.
 constexpr std::array kMacV6 = {0x3e0c0501u};
+// Synthetic forms accepted by prosper's existing SDWA decoder/lowering. These are not captured
+// PS5 instructions or LLVM-supported SDWA encodings; their old destination still participates
+// in the implemented operation and therefore cannot be certified as a complete replacement.
+constexpr std::array kSdwaMacV6 = {0x3e0c04f9u, 0x06060601u};
+constexpr std::array kSdwaFmacV6 = {0x560c04f9u, 0x06060601u};
+constexpr std::array kSdwaPkFmacV6 = {0x780c04f9u, 0x06060601u};
+constexpr std::array kSdwaFullMovV6 = {0x7e0c02f9u, 0x00060601u};
 // VOPC compare, src0 = v6, vsrc1 = v6.
 constexpr std::array kCmpV6V6 = {0x7c200d06u};
 // VOPC compare, src0 = v6, vsrc1 = v8.
@@ -154,7 +161,7 @@ void vgpr_genuine(RegState& rs, SpirvCompute& b, int r) {
 // v6 holds a placeholder confined to G. A lane-wise accumulator under M combines its own lane's
 // clean sources with its own lane's old word, so the meet stays G: it is accepted under G, and it
 // is NOT rebased to a different writer EXEC M.
-bool accumulator_meet(bool mac_under_writer_exec) {
+bool accumulator_meet(bool mac_under_writer_exec, std::span<const uint32_t> words = kMacV6) {
     Harness h;
     h.rs.vreg[1] = h.b.uconst(3);
     h.rs.vreg[2] = h.b.uconst(4);
@@ -162,7 +169,7 @@ bool accumulator_meet(bool mac_under_writer_exec) {
     h.rs.exec = g;
     h.rs.exec_narrowed = true;
     const auto mov = decode(kMovV6);
-    const auto mac = decode(kMacV6);
+    const auto mac = decode(words);
     const auto cmp = decode(kCmpV6V6);
     if (mov.size() != 1 || mac.size() != 1 || cmp.size() != 1) return false;
     std::vector<Rdna2Inst> all = mov;
@@ -275,4 +282,45 @@ TEST(FreshMaskExecConfinement, FmacAccumulatorReadsStillRefuse) {
     };
     EXPECT_FALSE(predicate_defined(kFmacV6, kCmpV6V6, true, setup));
     EXPECT_FALSE(predicate_defined(kPkFmacV6, kCmpV6V6, true, setup));
+}
+
+TEST(FreshMaskExecConfinement, SdwaAccumulatorCannotConfineAnUndefinedOldWord) {
+    for (const auto words : {kSdwaMacV6, kSdwaFmacV6, kSdwaPkFmacV6}) {
+        const auto ins = decode(words);
+        ASSERT_EQ(ins.size(), 1u);
+        ASSERT_EQ(ins[0].fmt, Rdna2Format::VOP2);
+        ASSERT_TRUE(ins[0].has_sdwa);
+        ASSERT_FALSE(ins[0].has_modifier);
+        ASSERT_EQ(ins[0].sdwa_dst_sel, 6u);
+        ASSERT_TRUE(vector_write_depends_on_old_word(ins[0], true));
+        EXPECT_FALSE(predicate_defined(words, kCmpV6V6, true,
+                                       [](RegState& rs, SpirvCompute& b) {
+                                           vgpr_genuine(rs, b, 1);
+                                           vgpr_genuine(rs, b, 2);
+                                       }))
+            << "opcode " << ins[0].opcode;
+    }
+}
+
+TEST(FreshMaskExecConfinement, SdwaAccumulatorWithGenuineOldWordRemainsDefined) {
+    for (const auto words : {kSdwaMacV6, kSdwaFmacV6, kSdwaPkFmacV6}) {
+        EXPECT_TRUE(predicate_defined(words, kCmpV6V6, true, [](RegState& rs, SpirvCompute& b) {
+            vgpr_genuine(rs, b, 1);
+            vgpr_genuine(rs, b, 2);
+            vgpr_genuine(rs, b, 6);
+        }));
+    }
+}
+
+TEST(FreshMaskExecConfinement, SdwaAccumulatorRetainsOnlyItsOriginalConfinement) {
+    for (const auto words : {kSdwaMacV6, kSdwaFmacV6, kSdwaPkFmacV6}) {
+        EXPECT_TRUE(accumulator_meet(true, words));
+        EXPECT_FALSE(accumulator_meet(false, words));
+    }
+}
+
+TEST(FreshMaskExecConfinement, SdwaFullWordMoveStillConfinesInactiveMissingLanes) {
+    const auto setup = [](RegState& rs, SpirvCompute& b) { vgpr_genuine(rs, b, 1); };
+    EXPECT_TRUE(predicate_defined(kSdwaFullMovV6, kCmpV6V6, true, setup));
+    EXPECT_FALSE(predicate_defined(kSdwaFullMovV6, kCmpV6V6, false, setup));
 }

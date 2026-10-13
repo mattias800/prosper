@@ -23,11 +23,13 @@
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include <gtest/gtest.h>
+#include "fixtures/checked_compute_launch.hpp"
 #include "fixtures/compute_runner.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
+#include <string>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -117,18 +119,44 @@ ShaderResourceTable output_table() {
 }
 
 template <size_t N>
-std::vector<uint32_t> compile(const uint32_t (&prefix)[N], uint32_t native_subgroup_size = 64) {
+std::vector<uint32_t> compile(const uint32_t (&prefix)[N], uint32_t native_subgroup_size = 64,
+                              bool define_tail_input = true, bool observed_launch = true,
+                              uint64_t program_address = 0) {
     std::vector<uint32_t> code(std::begin(prefix), std::end(prefix));
+    // Keep all branch offsets identical in the omitted-producer control.
+    code.push_back(define_tail_input ? 0x7e020280u : 0xbf800000u);
     code.insert(code.end(), std::begin(kTail), std::end(kTail));
     ComputeShaderConfig config;
     config.local_x = 64;
     config.wave_size = 64;
     config.native_subgroup_size = native_subgroup_size;
+    if (observed_launch) prosper::test::complete_compute_launch(config);
     const ShaderResourceTable table = output_table();
-    return recompile_compute(code.data(), code.size(), &table, config);
+    return recompile_compute(code.data(), code.size(), &table, config,
+                             {RecompileDiagnosticStage::Compute, program_address});
 }
 
 }   // namespace
+
+TEST(CfgSpilledMaskHalves, MissingTailCompareInputStaysRefused) {
+    ASSERT_FALSE(compile(kReassembled, 64, true, true, 0x50610001u).empty())
+        << last_terminal_reject_reason(0x50610001u);
+    EXPECT_TRUE(compile(kReassembled, 64, false, true, 0x50610002u).empty());
+    const std::string reason = last_terminal_reject_reason(0x50610002u);
+    EXPECT_NE(reason.find("cfg-recompile-reject mode=unresolved-operand pc=25"), std::string::npos)
+        << reason;
+    EXPECT_NE(reason.find("words=7c020300"), std::string::npos) << reason;
+}
+
+TEST(CfgSpilledMaskHalves, HostSubgroupWidthDoesNotSupplyGuestLaunchWords) {
+    ASSERT_FALSE(compile(kReassembled, 64, true, true, 0x50610003u).empty())
+        << last_terminal_reject_reason(0x50610003u);
+    EXPECT_TRUE(compile(kReassembled, 64, true, false, 0x50610004u).empty());
+    const std::string reason = last_terminal_reject_reason(0x50610004u);
+    EXPECT_NE(reason.find("reason=native-logical-data-words-unavailable pc=2 words=87946a7e"),
+              std::string::npos)
+        << reason;
+}
 
 TEST(CfgSpilledMaskHalves, AMaskRebuiltFromBothSpilledHalvesRestoresExecAcrossTheEdge) {
     const std::vector<uint32_t> spv = compile(kReassembled);

@@ -145,6 +145,8 @@ bool present_acquire_rendered_frame(PresentFrameLease& out) {
     if (!g_frame || g_frame->empty() || !g_frame_w || !g_frame_h) return false;
     out.frame_seq = g_frame_seq.load(std::memory_order_relaxed);
     out.guest_present_count = g_frame_guest_present_count;
+    out.source = g_frame_origin == PresentFrameOrigin::GuestScanout ? PresentSource::GuestScanout
+                                                                    : PresentSource::Rendered;
     out.width = g_frame_w;
     out.height = g_frame_h;
     out.rgba = g_frame;

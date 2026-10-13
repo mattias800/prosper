@@ -252,28 +252,9 @@ int main(int argc, char** argv) {
     auto trap = loop();
     trap[2] = branch(0x12, 0);
     reject(trap, "unmodelled-control-flow", "unmodelled scalar control remains unproved");
-    // Interpolation decodes exactly one VGPR source, so scalar liveness scans through it.
     auto interpolation = loop();
     interpolation[2] = 0xc8000000u;
-    CHECK(analyze(interpolation).admitted, "interpolation reads no scalar word");
-    // A buffer descriptor read stays fail-closed: the liveness proof cannot bound it.
-    // The two-word load goes between the mask OR and the backedge, which retargets -6.
-    auto descriptor_read = loop();
-    descriptor_read.insert(descriptor_read.begin() + 5, 0xe0301020u);
-    descriptor_read.insert(descriptor_read.begin() + 6, 0x80150604u);
-    descriptor_read[7] = branch(0x09, -6);
-    {
-        std::vector<Rdna2Inst> ins;
-        CHECK(rdna2_walk(descriptor_read.data(), descriptor_read.size(), ins) ==
-                  descriptor_read.size(),
-              "descriptor fixture decodes");
-        CHECK(ins[5].fmt == Rdna2Format::MUBUF, "descriptor read is a buffer load");
-        CHECK(ins[5].opcode == 0x0cu, "buffer_load_dword");
-        CHECK(ins[5].src[1].kind == OperandKind::SGPR && ins[5].src[1].value == 84,
-              "its SRSRC names the pair base");
-    }
-    reject(descriptor_read, "scalar-or-unmodelled-read",
-           "unknown read inventories stay fail-closed");
+    reject(interpolation, "scalar-or-unmodelled-read", "unknown read inventories stay fail-closed");
 
     reject(loop(), "ordinary-aligned-pair-required", "odd SGPR pair roots are outside the contract", 2, 85);
     reject(loop(), "missing-loop-header", "the supplied header must name an instruction", 99);

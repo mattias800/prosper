@@ -4,6 +4,7 @@
 #pragma once
 
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_active_vector_words.hpp"
 
 #include <cstdint>
 #include <map>
@@ -49,6 +50,7 @@ struct SpilledMaskHalves {
     // does not turn their placeholder bits into genuine scalar lane-mask inputs.
     std::set<int> relayed_vectors, memory_vectors, memory_words;
     std::set<std::pair<int, int>> memory_slots;
+    ActiveVectorWords active_vectors;
     bool exec_known_full = false;
     bool native_interpolation = false;
     bool operator==(const SpilledMaskHalves&) const = default;
@@ -58,6 +60,7 @@ struct SpilledVectorSourceMarks {
     bool vector_relay = false;
     bool scalar_relay = false;
     bool memory = false;
+    bool active_defined = false;
 };
 // Snapshot before ANY scalar/mask destination fact changes, including an aliasing VOP3B SDST.
 SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& state,

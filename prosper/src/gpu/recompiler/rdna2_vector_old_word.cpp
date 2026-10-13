@@ -111,8 +111,9 @@ bool vector_write_depends_on_old_word(const Rdna2Inst& in, bool full_exec) {
                      in.opcode == 0x39 || in.opcode == 0x3a));
         case Rdna2Format::VOP3P: return in.opcode == 0x21 || in.opcode == 0x22;
         case Rdna2Format::VOP3:
-            // 0x12b/0x13c are the VOP3 (e64) forms of VOP2 0x2b/0x3c (v_fmac_f32, v_pk_fmac_f16):
-            // like 0x11f (the e64 form of 0x1f, v_mac_f32) they accumulate the old destination.
+            // FMAC_F32 (0x12b) reads the old destination, as does MAC_F32 (0x11f). Prosper also
+            // lowers the decoder-admitted 0x13c through its packed FMAC accumulator service;
+            // this dependency does not establish that form as an architectural e64 encoding.
             return in.opcode == 0x361 || in.opcode == 0x11f || in.opcode == 0x12b ||
                    in.opcode == 0x13c ||
                    (in.opcode >= 0x303 && in.opcode <= 0x30e && in.opcode != 0x306) ||

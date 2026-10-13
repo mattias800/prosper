@@ -18,6 +18,7 @@
 #endif
 
 #include "host/image/exec_image.hpp"
+#include "host/image/process_entry.hpp"
 #include "host/image/module_start_params.hpp"
 #include "host/image/guest_executable.hpp"
 #include "host/image/runtime_module_load.hpp"
@@ -1595,7 +1596,19 @@ void set_module_start_param_ranges(const std::vector<std::pair<uint64_t, uint64_
     g_modstart_param_ranges = ranges;
 }
 
+bool prepare_configured_process_entry(std::string* error) {
+    if (process_entry_context().stack) return true;
+    return prepare_process_entry(guest_entry_arguments(getenv("PROSPER_GUEST_ARGS")),
+                                 getenv("PROSPER_GUEST_ENV"), error);
+}
+
 size_t run_guest_inits(const std::vector<uint64_t>& fns) {
+    std::string entry_error;
+    if (!prepare_configured_process_entry(&entry_error)) {
+        std::fprintf(stderr, "[prosper] guest process arguments unavailable before init: %s\n",
+                     entry_error.c_str());
+        return 0;
+    }
     if (!fns.empty()) guest_execution_thread_enter(/*primary=*/true);
     ULONG_PTR stack_lo = 0, stack_hi = 0;
     GetCurrentThreadStackLimits(&stack_lo, &stack_hi);
@@ -1639,45 +1652,23 @@ size_t run_guest_inits(const std::vector<uint64_t>& fns) {
 }
 
 BootResult run_entry(const LoadedImage& img) {
-    const size_t STK = 16 * 1024 * 1024;
-    void* stk = VirtualAlloc(nullptr, STK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     BootResult r;
-    if (!stk) { r.kind = 2; r.detail = "guest stack VirtualAlloc failed"; return r; }
+    std::string entry_error;
+    if (!prepare_configured_process_entry(&entry_error)) {
+        r.kind = 2;
+        r.detail = entry_error;
+        return r;
+    }
+    const ProcessEntryContext context = process_entry_context();
+    void* stk = context.stack;
+    const size_t STK = context.stack_bytes;
     register_thread_stack(cur_tid(), stk, STK);
     guest_execution_thread_enter(/*primary=*/true);
     arm_diag_breakpoints();
     trace_guest_thread_lifecycle(true, (uint64_t)pthread_self(), cur_tid(), stk, STK);
-
-    uint64_t top = ((uint64_t)(uintptr_t)stk + STK) & ~(uint64_t)0xf;
-    std::vector<std::string> args = guest_entry_arguments(getenv("PROSPER_GUEST_ARGS"));
-    std::vector<uint64_t> argptrs;
-    for (const auto& a : args) { size_t n = a.size() + 1; top -= n; memcpy((void*)(uintptr_t)top, a.c_str(), n); argptrs.push_back(top); }
-    std::vector<uint64_t> envptrs;
-    if (const char* ge = getenv("PROSPER_GUEST_ENV")) {
-        std::string s(ge); size_t i = 0;
-        while (i < s.size()) {
-            size_t j = s.find(';', i);
-            std::string kv = s.substr(i, j == std::string::npos ? std::string::npos : j - i);
-            if (!kv.empty()) { size_t n = kv.size() + 1; top -= n; memcpy((void*)(uintptr_t)top, kv.c_str(), n); envptrs.push_back(top); }
-            if (j == std::string::npos) break; i = j + 1;
-        }
-        top &= ~(uint64_t)0xf;
-    }
-    top &= ~(uint64_t)0xf;
-    // crt0 vector: argc, argv[], NULL, envp[], NULL, auxv AT_NULL(0,0). rsp ≡ 8 (mod 16) at entry.
-    std::vector<uint64_t> vecv;
-    vecv.push_back(args.size());
-    for (uint64_t pp : argptrs) vecv.push_back(pp);
-    vecv.push_back(0);
-    for (uint64_t pp : envptrs) vecv.push_back(pp);
-    vecv.push_back(0);
-    vecv.push_back(0); vecv.push_back(0);
-    if (vecv.size() & 1) vecv.push_back(0);
-    size_t vecsz = vecv.size() * sizeof(uint64_t);
-    top -= vecsz; top &= ~(uint64_t)0xf;
-    top -= 8;
-    memcpy((void*)(uintptr_t)top, vecv.data(), vecsz);
-    uint64_t sp = top, rdi = sp, rsi = 0;
+    // Reuse the guest-backed crt0 vector already visible to eager module initializers. Native
+    // getargv and the entry argument must identify the same array, including exact LoadExec data.
+    uint64_t sp = context.stack_pointer, rdi = sp, rsi = 0;
 
     // Describe the switched guest stack in the TEB. We `mov %rsp` to `stk` below, but Windows still
     // thinks the thread's stack is the original host-thread stack (NT_TIB.StackBase/StackLimit). When

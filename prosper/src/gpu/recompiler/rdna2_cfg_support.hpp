@@ -331,11 +331,8 @@ sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R,
                     in.src[1].value != 125 && (in.src[1].value == R || in.src[1].value + 1 == R))
                     return false;
                 break;
-            case Rdna2Format::VINTRP:
-                // Interpolation reads VGPR params and M0 only; it never reads an ordinary SGPR.
-                // (R == 124 returns false up front, so the implicit M0 read needs no case here.)
-                break;
-            default: return false;   // memory/branch/unknown: can't bound reads of R -> assume live
+            default:
+                return false;   // memory/branch/interp/unknown: can't bound reads of R -> assume live
         }
         if (index + 1 < ins.size()) pending.push_back(index + 1);
     }
@@ -383,12 +380,15 @@ inline bool is_wave64_vcc_lo_scalar_b32_candidate(const Rdna2Inst& in) {
 }
 
 inline std::unordered_set<uint32_t>
-proven_wave64_vcc_b32_low_only_pcs(const std::vector<Rdna2Inst>& ins, bool include_logical = true) {
+proven_wave64_vcc_b32_low_only_pcs(const std::vector<Rdna2Inst>& ins, bool include_logical = true,
+                                   bool include_high_cselect = false) {
     std::unordered_set<uint32_t> result;
     for (const Rdna2Inst& in : ins) {
         if (in.is_end) break;
-        const bool candidate = include_logical ? is_wave64_vcc_lo_scalar_b32_candidate(in)
-                                               : is_wave64_vcc_lo_scalar_cselect(in);
+        const bool candidate =
+            (include_high_cselect && is_wave64_vcc_lo_cselect_reading_vcc_hi(in)) ||
+            (include_logical ? is_wave64_vcc_lo_scalar_b32_candidate(in)
+                             : is_wave64_vcc_lo_scalar_cselect(in));
         // Scalar scratch may use either physical VCC word and combine the two as ordinary dwords.
         // The sibling may be read as scalar data, but it must be dead before any pair/mask-domain
         // observation. MaskDomainOnly is exactly that whole-CFG proof.
@@ -1807,6 +1807,22 @@ inline ScalarSourceMarks scalar_source_marks(const RegState& rs, const Rdna2Inst
         const bool scalar = o.kind == OperandKind::SGPR ||
                             (o.kind == OperandKind::Special && o.value >= 106 && o.value <= 124);
         if (!scalar) continue;
+        // CNDMASK's third operand consumes the current Bool domain, not the saved mask's
+        // physical scalar halves. A fresh predicate can be genuine while those halves cannot
+        // be reconstructed. Retain actual merge poison and DATA roles; map membership alone
+        // must not authenticate an absent, relayed or numerically overwritten mask.
+        if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x101 && k == 2 &&
+            o.kind == OperandKind::SGPR && o.value >= 0 && o.value <= 105) {
+            const auto mask = rs.sreg_bool.find(o.value);
+            const uint32_t mask_words = rs.sreg_bool_b32.contains(o.value) ? 1u : 2u;
+            bool genuine = mask != rs.sreg_bool.end() && mask->second;
+            for (uint32_t w = 0; w < mask_words; ++w) {
+                const int reg = o.value + static_cast<int>(w);
+                genuine = genuine && !rs.sreg_merge_placeholder.contains(reg);
+                marks.memory = marks.memory || rs.sreg_memory_pattern.contains(reg);
+            }
+            if (genuine) continue;
+        }
         uint32_t width = scalar_alu_source_words(in, k);
         if (width == 0 || width == UINT32_MAX) width = 2;   // unknown: both words of a pair
         if (width > 2) width = static_cast<uint32_t>(std::max(0, 125 - o.value));   // a range

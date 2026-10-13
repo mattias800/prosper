@@ -20,15 +20,48 @@ static int failures = 0;
 // This narrow source gate complements the behavior tests below. The app owns the actual
 // successful-host-present decision; removing that call site otherwise leaves every isolated
 // timeline/ring test green while reinstating #3828. Comments cannot satisfy the gate.
-static std::string active_app_source() {
-    std::ifstream file(PROSPER_APP_MAIN_SOURCE);
-    std::string line, active;
-    while (std::getline(file, line)) {
-        if (const size_t comment = line.find("//"); comment != std::string::npos)
-            line.resize(comment);
-        active += line + '\n';
+static std::string strip_app_comments(std::string_view source) {
+    std::string active(source);
+    char quote = 0;
+    bool escaped = false, line_comment = false, block_comment = false;
+    for (size_t i = 0; i < source.size(); ++i) {
+        const char c = source[i];
+        const char next = i + 1 < source.size() ? source[i + 1] : '\0';
+        if (line_comment) {
+            if (c == '\n')
+                line_comment = false;
+            else
+                active[i] = ' ';
+        } else if (block_comment) {
+            if (c == '*' && next == '/') {
+                active[i] = active[i + 1] = ' ';
+                ++i;
+                block_comment = false;
+            } else if (c != '\n') {
+                active[i] = ' ';
+            }
+        } else if (quote) {
+            if (escaped)
+                escaped = false;
+            else if (c == '\\')
+                escaped = true;
+            else if (c == quote)
+                quote = 0;
+        } else if (c == '"' || c == '\'') {
+            quote = c;
+        } else if (c == '/' && (next == '/' || next == '*')) {
+            line_comment = next == '/';
+            block_comment = next == '*';
+            active[i] = active[i + 1] = ' ';
+            ++i;
+        }
     }
     return active;
+}
+
+static std::string active_app_source() {
+    std::ifstream file(PROSPER_APP_MAIN_SOURCE);
+    return strip_app_comments(std::string(std::istreambuf_iterator<char>(file), {}));
 }
 
 static size_t matching_brace(std::string_view source, size_t open) {
@@ -85,8 +118,21 @@ static bool fallback_and_expiry_wired(const std::string& source) {
     const std::string_view fallback(source.data() + begin, end - begin);
     const size_t convert = fallback.find("interactive_grab_on_cpu_fallback(");
     const size_t bmp = fallback.find("flushGrabScreenshot(cf.rgba->data()");
-    const std::string_view loop_entry(source.data() + loop,
-                                      std::min<size_t>(source.size() - loop, 250));
+    const size_t loop_open = source.find('{', loop);
+    const size_t loop_close = matching_brace(source, loop_open);
+    const size_t poll_call = source.find("expirePendingGrabProducer();", loop_open);
+    if (loop_close == std::string::npos || poll_call == std::string::npos ||
+        poll_call >= loop_close)
+        return false;
+    // Startup observers may precede the poll. Follow the actual loop scope instead of a
+    // character budget, while refusing a poll hidden inside a conditional/nested block.
+    for (size_t cursor = loop_open + 1; cursor < poll_call;) {
+        const size_t nested_open = source.find('{', cursor);
+        if (nested_open == std::string::npos || nested_open >= poll_call) break;
+        const size_t nested_close = matching_brace(source, nested_open);
+        if (nested_close == std::string::npos || nested_close >= poll_call) return false;
+        cursor = nested_close + 1;
+    }
     const size_t expiry_open = source.find('{', expiry);
     const size_t expiry_close = matching_brace(source, expiry_open);
     if (expiry_close == std::string::npos) return false;
@@ -96,13 +142,20 @@ static bool fallback_and_expiry_wired(const std::string& source) {
     const size_t expire_call = expiry_body.find("interactive_grab_expire_producer_wait(");
     const size_t early_return = expiry_body.find("return;");
     return convert != std::string::npos && bmp != std::string::npos && convert < bmp &&
-           loop_entry.find("expirePendingGrabProducer();") != std::string::npos &&
            owned_poll != std::string::npos && expire_call > owned_poll &&
            expire_call != std::string::npos &&
            (early_return == std::string::npos || early_return > expire_call);
 }
 
 int main() {
+    const std::string quoted_comments =
+        "const char* text = \"https://example.invalid/*literal*/\\\"//quoted\"; "
+        "char slash = '/';\n";
+    CHECK(strip_app_comments(quoted_comments) == quoted_comments,
+          "comment-like text and escaped quotes inside literals remain intact");
+    CHECK(strip_app_comments("first/* { hidden\n } */second// hidden\nthird") ==
+              "first           \n     second         \nthird",
+          "both comment forms are masked without joining tokens or changing newlines");
     const std::string app_source = active_app_source();
     CHECK(!app_source.empty() && gpu_close_wired(app_source) &&
           fallback_and_expiry_wired(app_source),
@@ -149,6 +202,35 @@ int main() {
                                  "omitted_cpu_fallback");
     CHECK(!fallback_and_expiry_wired(omitted_fallback),
           "#3828: removing the live CPU fallback transition makes the wiring gate fail");
+    const size_t loop_start = app_source.find("while (running && !prosper_stop_requested()) {");
+    const size_t poll_call = app_source.find("expirePendingGrabProducer();", loop_start);
+    CHECK(poll_call != std::string::npos,
+          "#3828: the loop polling omission controls have an actual call to remove");
+    if (poll_call != std::string::npos) {
+        const std::string poll_statement = "expirePendingGrabProducer();";
+        std::string omitted_poll = app_source;
+        omitted_poll.erase(poll_call, poll_statement.size());
+        CHECK(!fallback_and_expiry_wired(omitted_poll),
+              "#3828: removing the per-loop expiry poll makes the wiring gate fail");
+        std::string commented_poll = app_source;
+        commented_poll.replace(poll_call, poll_statement.size(), "/* " + poll_statement + " */");
+        CHECK(!fallback_and_expiry_wired(strip_app_comments(commented_poll)),
+              "#3828: a block-commented expiry poll fails the active-code wiring gate");
+        std::string nested_poll = app_source;
+        nested_poll.replace(poll_call, poll_statement.size(),
+                            "if (false) { " + poll_statement + " }");
+        CHECK(!fallback_and_expiry_wired(nested_poll),
+              "#3828: a conditionally unreachable expiry poll fails the wiring gate");
+        const size_t loop_open = omitted_poll.find('{', loop_start);
+        const size_t loop_close = matching_brace(omitted_poll, loop_open);
+        CHECK(loop_close != std::string::npos,
+              "#3828: the outside-loop polling control has an actual loop boundary");
+        if (loop_close != std::string::npos) {
+            omitted_poll.insert(loop_close + 1, "\n" + poll_statement + "\n");
+            CHECK(!fallback_and_expiry_wired(omitted_poll),
+                  "#3828: moving expiry polling outside the loop fails the wiring gate");
+        }
+    }
     std::string bmp_gated_expiry = app_source;
     if (const size_t expiry = bmp_gated_expiry.find("auto expirePendingGrabProducer = [&] {");
             expiry != std::string::npos) {

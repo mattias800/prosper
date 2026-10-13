@@ -26,6 +26,7 @@
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include <gtest/gtest.h>
+#include "fixtures/checked_compute_launch.hpp"
 #include "fixtures/compute_runner.h"
 
 #include <cstddef>
@@ -40,6 +41,10 @@ namespace {
 
 constexpr uint32_t kLanes = 64;
 constexpr uint32_t kOpSwitch = 251;
+
+// The reduced kernels branch on s4/s5, so supply actual scalar producers rather than relying
+// on an uninitialized register's historical zero placeholder.
+constexpr uint32_t kBranchInputs[] = {0xBE840380u, 0xBE850380u};
 
 // x = lane; s30 = 7; v20[28] = s30; if (s4 == 0) v2 = 1;
 // join: s14 = v20[28]; s2 = v0[0]; v3 = float(s14 + x); s[30:31] = exec (s30 is a mask LATER).
@@ -57,11 +62,13 @@ const uint32_t kDataSpillOfALaterMask[] = {
 // Wave64 `s_mov_b64 s[30:31], vcc` is dual-domain, so s30 IS a MUST scalar word at the spill: only
 // the mask-pair exclusion keeps this slot a mask slot.
 //
-// v3 = 0; vcc = (40 > x); s[30:31] = vcc; v20[28] = s30; if (s4 == 0) v2 = 1;
-// join: s14 = v20[28]; exec = s[14:15]; v3 = 1; exec = -1; out[x] = v3 (1 below lane 40, else 0)
+// v3 = 0; vcc = (40 > x); s[30:31] = vcc; v20[28] = s30; v20[29] = s31;
+// if (s4 == 0) v2 = 1; join: s14 = v20[28]; s15 = v20[29]; exec = s[14:15];
+// v3 = 1; exec = -1; out[x] = v3 (1 below lane 40, else 0).
+// Both physical halves are required: the upper eight active lanes are not supplied by s14 alone.
 const uint32_t kMaskSpill[] = {
-    0x7E060280u, 0x7D8800A8u, 0xBE9E046Au, 0xD7610014u, 0x0001381Eu,
-    0xBF068004u, 0xBF840001u, 0x7E040281u, 0xD760000Eu, 0x00013914u,
+    0x7E060280u, 0x7D8800A8u, 0xBE9E046Au, 0xD7610014u, 0x0001381Eu, 0xD7610014u, 0x00013A1Fu,
+    0xBF068004u, 0xBF840001u, 0x7E040281u, 0xD760000Eu, 0x00013914u, 0xD760000Fu, 0x00013B14u,
     0xBEFE040Eu, 0x7E060281u, 0xBEFE04C1u, 0xE0702000u, 0x80020300u,
 };
 // #4600 shape 1: the saved mask is spilled, reloaded and spilled AGAIN in one block before the
@@ -70,16 +77,18 @@ const uint32_t kMaskSpill[] = {
 // v3 = 0; vcc = (40 > x); s[30:31] = vcc; v21[5] = s30; s30 = v21[5]; v20[28] = s30;
 // if (s4 == 0) v2 = 1; join: s14 = v20[28]; exec = s[14:15]; v3 = 1; exec = -1; out[x] = v3
 const uint32_t kMaskReSpill[] = {
-    0x7E060280u, 0x7D8800A8u, 0xBE9E046Au, 0xD7610015u, 0x00010A1Eu, 0xD760001Eu, 0x00010B15u,
-    0xD7610014u, 0x0001381Eu, 0xBF068004u, 0xBF840001u, 0x7E040281u, 0xD760000Eu, 0x00013914u,
+    0x7E060280u, 0x7D8800A8u, 0xBE9E046Au, 0xD7610015u, 0x00010A1Eu, 0xD760001Eu,
+    0x00010B15u, 0xD7610014u, 0x00013A1Fu, 0xD7610014u, 0x0001381Eu, 0xBF068004u,
+    0xBF840001u, 0x7E040281u, 0xD760000Eu, 0x00013914u, 0xD760000Fu, 0x00013B14u,
     0xBEFE040Eu, 0x7E060281u, 0xBEFE04C1u, 0xE0702000u, 0x80020300u,
 };
 // Shape 1 with the reload in an SGPR that is not otherwise a mask key: the second spill slot is a
 // mask slot only because the analysis proves the write stores a Bool. Native Wave64 only.
 // ... v21[5] = s30; s40 = v21[5]; v20[28] = s40; ... join as kMaskReSpill
 const uint32_t kMaskReSpillThroughAnotherSgpr[] = {
-    0x7E060280u, 0x7D8800A8u, 0xBE9E046Au, 0xD7610015u, 0x00010A1Eu, 0xD7600028u, 0x00010B15u,
-    0xD7610014u, 0x00013828u, 0xBF068004u, 0xBF840001u, 0x7E040281u, 0xD760000Eu, 0x00013914u,
+    0x7E060280u, 0x7D8800A8u, 0xBE9E046Au, 0xD7610015u, 0x00010A1Eu, 0xD7600028u,
+    0x00010B15u, 0xD7610014u, 0x00013A1Fu, 0xD7610014u, 0x00013828u, 0xBF068004u,
+    0xBF840001u, 0x7E040281u, 0xD760000Eu, 0x00013914u, 0xD760000Fu, 0x00013B14u,
     0xBEFE040Eu, 0x7E060281u, 0xBEFE04C1u, 0xE0702000u, 0x80020300u,
 };
 // #4600 shape 2: a VALU DATA read of a word reloaded from a mask slot, on the portable route.
@@ -163,16 +172,21 @@ ShaderResourceTable output_table() {
     return table;
 }
 
-template <size_t N>
-std::vector<uint32_t> compile_native(const uint32_t (&prefix)[N], uint32_t wave = 64) {
-    std::vector<uint32_t> code(std::begin(prefix), std::end(prefix));
+template <class Words>
+std::vector<uint32_t> compile_native(const Words& prefix, uint32_t wave = 64,
+                                     uint64_t program_address = 0x50611000u) {
+    std::vector<uint32_t> code(std::begin(kBranchInputs), std::end(kBranchInputs));
+    code.insert(code.end(), std::begin(prefix), std::end(prefix));
+    code.push_back(0x7e020280u); // v1 = 0, consumed by the irreducible tail's compare
     code.insert(code.end(), std::begin(kTail), std::end(kTail));
     ComputeShaderConfig config;
     config.local_x = wave;
     config.wave_size = wave;
     config.native_subgroup_size = wave;
+    prosper::test::complete_compute_launch(config);
     const ShaderResourceTable table = output_table();
-    return recompile_compute(code.data(), code.size(), &table, config);
+    return recompile_compute(code.data(), code.size(), &table, config,
+                             {RecompileDiagnosticStage::Compute, program_address});
 }
 
 // A straight-line native Wave32 kernel (no kTail), one 32-lane wave.
@@ -182,6 +196,7 @@ std::vector<uint32_t> compile_wave32(const uint32_t (&code)[N]) {
     config.local_x = 32;
     config.wave_size = 32;
     config.native_subgroup_size = 32;
+    prosper::test::complete_compute_launch(config);
     const ShaderResourceTable table = output_table();
     return recompile_compute(code, N, &table, config);
 }
@@ -200,7 +215,9 @@ std::vector<uint32_t> run_native(const std::vector<uint32_t>& spv, uint32_t lane
 template <size_t N>
 std::string portable_refusals(const uint32_t (&code)[N], std::vector<uint32_t>& spv) {
     TerminalRejectCapture capture;
-    spv = recompile_valu(code, N, /*num_inputs*/ 1, /*out_vgpr*/ 3);
+    std::vector<uint32_t> words(std::begin(kBranchInputs), std::end(kBranchInputs));
+    words.insert(words.end(), std::begin(code), std::end(code));
+    spv = recompile_valu(words.data(), words.size(), /*num_inputs*/ 1, /*out_vgpr*/ 3);
     std::string all;
     for (const auto& [tag, payload] : capture.take()) {
         all += tag;
@@ -223,10 +240,27 @@ bool has_opcode(const std::vector<uint32_t>& spv, uint32_t opcode) {
 
 template <size_t N>
 std::vector<uint32_t> compile(const uint32_t (&code)[N]) {
-    return recompile_valu(code, N, /*num_inputs*/ 1, /*out_vgpr*/ 3);
+    std::vector<uint32_t> words(std::begin(kBranchInputs), std::end(kBranchInputs));
+    words.insert(words.end(), std::begin(code), std::end(code));
+    return recompile_valu(words.data(), words.size(), /*num_inputs*/ 1, /*out_vgpr*/ 3);
 }
 
 }  // namespace
+
+TEST(CfgSpillSlotDomain, MissingPhysicalHighMaskHalfStaysRefused) {
+    ASSERT_FALSE(compile_native(kMaskSpill, 64, 0x50611001u).empty())
+        << last_terminal_reject_reason(0x50611001u);
+    std::vector<uint32_t> missing_high(std::begin(kMaskSpill), std::end(kMaskSpill));
+    // Remove only the high-half reload; keep every PC and branch target unchanged.
+    ASSERT_EQ(missing_high.at(12), 0xd760000fu);
+    ASSERT_EQ(missing_high.at(13), 0x00013b14u);
+    missing_high[12] = missing_high[13] = 0xbf800000u;
+    EXPECT_TRUE(compile_native(missing_high, 64, 0x50611002u).empty());
+    EXPECT_NE(last_terminal_reject_reason(0x50611002u)
+                  .find("cfg-recompile-reject mode=unresolved-operand pc=16 words=befe040e"),
+              std::string::npos)
+        << last_terminal_reject_reason(0x50611002u);
+}
 
 TEST(CfgSpillSlotDomain, DataSpilledBeforeTheSameSgprBecomesAMaskSurvivesTheBlockEdge) {
     const std::vector<uint32_t> spv = compile(kDataSpillOfALaterMask);
@@ -243,7 +277,8 @@ TEST(CfgSpillSlotDomain, DataSpilledBeforeTheSameSgprBecomesAMaskSurvivesTheBloc
 
 TEST(CfgSpillSlotDomain, AMaskSpillKeepsTheMaskDomain) {
     const std::vector<uint32_t> spv = compile_native(kMaskSpill);
-    ASSERT_FALSE(spv.empty()) << "a spilled saved mask restores EXEC across the block edge";
+    ASSERT_FALSE(spv.empty()) << "a spilled saved mask restores EXEC across the block edge\n"
+                              << last_terminal_reject_reason(0x50611000u);
     EXPECT_TRUE(has_opcode(spv, kOpSwitch)) << "it lowered through the CFG dispatcher";
     if (!prosper::test::default_compute_required_subgroup_supported(64u, kLanes))
         GTEST_SKIP() << "the device cannot require a 64-lane compute subgroup";
@@ -260,7 +295,8 @@ TEST(CfgSpillSlotDomain, AMaskSpillKeepsTheMaskDomain) {
 // EXEC with no lanes, so every lane read 0.
 TEST(CfgSpillSlotDomain, AReSpilledMaskReloadKeepsTheMask) {
     const std::vector<uint32_t> spv = compile_native(kMaskReSpill);
-    ASSERT_FALSE(spv.empty()) << "a native Wave64 dispatcher holds the reload as the mask";
+    ASSERT_FALSE(spv.empty()) << "a native Wave64 dispatcher holds the reload as the mask\n"
+                              << last_terminal_reject_reason(0x50611000u);
     EXPECT_TRUE(has_opcode(spv, kOpSwitch)) << "it lowered through the CFG dispatcher";
     if (!prosper::test::default_compute_required_subgroup_supported(64u, kLanes))
         GTEST_SKIP() << "the device cannot require a 64-lane compute subgroup";
@@ -277,7 +313,8 @@ TEST(CfgSpillSlotDomain, AReSpilledMaskReloadKeepsTheMask) {
 // static rule made that slot a data slot, so the Bool was lost at the edge and EXEC restored empty.
 TEST(CfgSpillSlotDomain, AMaskReSpilledThroughAnotherSgprKeepsTheMask) {
     const std::vector<uint32_t> spv = compile_native(kMaskReSpillThroughAnotherSgpr);
-    ASSERT_FALSE(spv.empty()) << "a native Wave64 dispatcher holds the reload as the mask";
+    ASSERT_FALSE(spv.empty()) << "a native Wave64 dispatcher holds the reload as the mask\n"
+                              << last_terminal_reject_reason(0x50611000u);
     EXPECT_TRUE(has_opcode(spv, kOpSwitch)) << "it lowered through the CFG dispatcher";
     if (!prosper::test::default_compute_required_subgroup_supported(64u, kLanes))
         GTEST_SKIP() << "the device cannot require a 64-lane compute subgroup";
@@ -298,7 +335,7 @@ TEST(CfgSpillSlotDomain, APortableDataReadOfAMaskReloadIsRefused) {
     std::vector<uint32_t> spv;
     const std::string reasons = portable_refusals(kDataReadOfAMaskReload, spv);
     EXPECT_TRUE(spv.empty()) << "a portable data read of a reloaded mask has no word to read";
-    EXPECT_NE(reasons.find("cfg-recompile-reject mode=unresolved-operand pc=11 words=4a06000e"),
+    EXPECT_NE(reasons.find("cfg-recompile-reject mode=unresolved-operand pc=13 words=4a06000e"),
               std::string::npos)
         << "the refusal is the data read of s14, v_add_nc_u32 v3, s14, v0\n"
         << reasons;
@@ -328,7 +365,7 @@ TEST(CfgSpillSlotDomain, AReloadOfADataOrMaskSlotIsRefused) {
     std::vector<uint32_t> spv;
     const std::string reasons = portable_refusals(kDataOrMaskSlotReload, spv);
     EXPECT_TRUE(spv.empty()) << "neither Function variable holds the reloaded word on every path";
-    EXPECT_NE(reasons.find("pc=13 reason=wave64-ambiguous-mask-read"), std::string::npos)
+    EXPECT_NE(reasons.find("pc=15 reason=wave64-ambiguous-mask-read"), std::string::npos)
         << reasons;
 }
 

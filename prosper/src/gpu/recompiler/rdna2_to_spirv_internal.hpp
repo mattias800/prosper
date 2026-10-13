@@ -2527,6 +2527,8 @@ struct SpirvCompute {
     }
     // SPI_PS_INPUT_ENA.ANCILLARY_ENA places the rasterized primitive's render-target
     // array index in bits 26:16 of its one VGPR. Other ancillary fields remain zero.
+    uint32_t v_front_facing = 0;
+    uint32_t fragment_front_face_word(FragmentFrontFaceEncoding encoding);
     uint32_t fragment_ancillary_layer_bits();
     // DPP16 quad_perm (#273 — DOLL's manual ddx/ddy in its sharpen/AA PSs): the value of `x` at quad
     // lane t = QP[my_lane] is reconstructed as x + (tx-px)·dPdx(x) + (ty-py)·dPdy(x), where (px,py) =
@@ -2988,6 +2990,7 @@ struct RegState {
     PortableMaskHalfTypes portable_mask_half_types;
     std::unordered_map<int, uint32_t> vreg, sreg;
     VectorWordMarks vreg_source_marks;
+    MimgSourceProof mimg_sources;
     bool vector_full_exec =
         false;   // provenance fact; dispatcher runtime predication stays enabled
     bool vector_native_interpolation = false;
@@ -3064,6 +3067,9 @@ struct RegState {
     // s_cselect/s_cmov/s_addc/s_subb carries the mark into its destination even with clean
     // explicit sources.
     bool scc_merge_placeholder = false;
+    // Scoped Wave64 fragment scalar-VCC admission needs an actual SCC producer, just as Wave32
+    // does. Other Wave64 paths retain their established entry/condition policy.
+    bool track_scc_definition = false;
     std::set<uint64_t> scc_loop_blanket;
     int max_vgpr = 0;          // highest statically referenced VGPR in this shader
     // Immutable raw user-data words for DIRECT descriptors. They stay absent from `sreg` so
@@ -3514,6 +3520,9 @@ struct LoopBlanketCheck {
     // The carried words defined on the preheader edge, each with the enclosing assumptions its
     // preheader value already depends on (empty when it is plainly defined).
     std::map<int, std::set<uint64_t>> carried;
+    // Hard vector words whose missing lanes lie outside this preheader EXEC domain. Their header
+    // reads remain conditional on each back edge defining the same domain, not just the same ID.
+    std::map<int, uint32_t> confined;
     uint32_t header_pc = 0;
     template <class Registers>
     LoopBlanketCheck(const RegState& rs, const Registers& registers, uint32_t header)
@@ -3540,8 +3549,12 @@ struct LoopBlanketCheck {
                 const uint64_t root = blanket_root(header_pc, entry.first);
                 const auto back = carried_word_marks(rs, entry.first);
                 if (violated.contains(root) || !back.placeholder) continue;
-                const bool held =
-                    !back.hard && std::none_of(back.blanket_roots.begin(), back.blanket_roots.end(),
+                const auto owner = confined.find(entry.first);
+                const bool domain_held =
+                    !back.hard || (owner != confined.end() &&
+                                   vector_word_defined_in_exec(rs, back, owner->second));
+                const bool held = domain_held &&
+                                  std::none_of(back.blanket_roots.begin(), back.blanket_roots.end(),
                                                [&](uint64_t r) { return violated.contains(r); });
                 if (!held) grew = violated.insert(root).second || grew;
             }
@@ -3563,6 +3576,7 @@ struct LoopBlanketCheck {
                 if (invalid(source.blanket_roots)) {
                     source.blanket_roots.clear();
                     source.hard = true;
+                    source.outside_exec = 0;
                 }
         };
         sanitize(exits.blanket, exits.vectors);
@@ -3589,7 +3603,7 @@ struct LoopBlanketCheck {
 template <class Registers>
 void mark_loop_carried(RegState& rs, const Registers& carried, const std::vector<Rdna2Inst>& ins,
                        uint32_t lo, uint32_t hi, LoopBlanketCheck& blanket) {
-    mark_vector_loop_carried(rs, ins, lo, hi, blanket.carried);
+    mark_vector_loop_carried(rs, ins, lo, hi, blanket.carried, blanket.confined);
     // A full preheader does not prove a full backedge. Clear the independent proof; ordinary
     // entry-iteration full writes still follow exec_narrowed and initialize their old generation.
     for (const auto& in : ins)
@@ -4031,7 +4045,7 @@ inline void propagate_merge_placeholder(RegState& rs, const Rdna2Inst& in,
     const bool move_preserves_scc =
         in.fmt == Rdna2Format::SOP1 &&
         (in.opcode == kSop1OpcodeMovB32 || in.opcode == kSop1OpcodeMovB64);
-    if (rs.vector_wave_size == 32) {
+    if (rs.vector_wave_size == 32 || rs.track_scc_definition) {
         record_wave32_scalar_condition(rs, in, marks);
         return;
     }

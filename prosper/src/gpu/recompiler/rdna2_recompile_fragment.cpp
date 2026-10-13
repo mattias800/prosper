@@ -533,6 +533,23 @@ static std::vector<uint32_t> recompile_fragment_impl(
         }
     }
     RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
+    if (b.wave_size == 64) {
+        auto scalar_only = proven_wave64_vcc_b32_low_only_pcs(ins, /*include_logical*/ true,
+                                                              /*include_high_cselect*/ true);
+        rs.track_scc_definition = std::any_of(ins.begin(), ins.end(), [&](const auto& in) {
+            return (is_wave64_vcc_lo_scalar_cselect(in) ||
+                    is_wave64_vcc_lo_cselect_reading_vcc_hi(in)) &&
+                   !scalar_only.contains(in.pc);
+        });
+        // Proven scalar-only selects retain generic lowering and its entry/width contract.
+        b.vcc_b32_low_only_pcs = std::move(scalar_only);
+        b.vcc_b32_low_only_analysis_done = true;
+        if (rs.track_scc_definition) {
+            // Initial bfalse is storage, not an architectural SCC. Only the new live scalar-VCC
+            // path opts into definition tracking; reuse the existing per-writer/merge proof.
+            rs.scc_merge_placeholder = true;
+        }
+    }
     // Which S_LOAD_DWORDX2 loads are descriptor-table POINTERS rather than data. Seeded here, not
     // only in the CFG dispatcher: a shader emitted straight-line otherwise carries an empty set and
     // its SRT pointer load reaches the constant-buffer path and rejects the whole shader (#3616).
@@ -582,6 +599,10 @@ static std::vector<uint32_t> recompile_fragment_impl(
                     }
                 } else if (field >= 8 && field <= 11) {
                     rs.vreg[(int)vgpr] = b.guest_pixel_position_component(field - 8);
+                } else if (field == 12) {
+                    const uint32_t value =
+                        b.fragment_front_face_word(system_inputs->front_face_encoding);
+                    if (value) rs.vreg[(int)vgpr] = value;
                 } else if (field == 13) {
                     rs.vreg[(int)vgpr] = b.fragment_ancillary_layer_bits();
                 }
