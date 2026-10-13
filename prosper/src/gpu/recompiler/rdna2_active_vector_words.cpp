@@ -254,10 +254,13 @@ void advance_active_vector_words(ActiveVectorWords& state, const Rdna2Inst& in,
             // Every possible comparison result is masked by the incoming EXEC.
             state.current = before;
             exec_domain = {false, before_domain.within};
-        } else if (saveexec && (in.opcode == 0x24 || in.opcode == 0x27)) {
-            state.current = before;   // AND_SAVEEXEC and ANDN2_SAVEEXEC only narrow the old EXEC.
-            exec_domain =
-                logical_domain(in.opcode == 0x24 ? 0x0f : 0x15, before_domain, left_domain);
+        } else if (saveexec && in.opcode == 0x24) {
+            state.current = before;   // S0 & EXEC only narrows old EXEC.
+            exec_domain = logical_domain(0x0f, left_domain, before_domain);
+        } else if (saveexec && in.opcode == 0x27) {
+            // RDNA2 ISA 70648 §12.3: S0 & ~EXEC selects a subset of S0, not of old EXEC.
+            state.current = left;
+            exec_domain = logical_domain(0x15, left_domain, before_domain);
         } else if (saveexec && (in.opcode == 0x25 || in.opcode == 0x26)) {
             state.current = intersect(before, left);
             exec_domain =

@@ -314,3 +314,43 @@ TEST(FlatActiveWord, FusedShiftAddCannotInventItsMissingScalarSource) {
     code.insert(code.begin() + 3, {0xd7460001u, 0x04010014u}); // absent s20
     missing(compile(code, true), 7, true);
 }
+
+namespace {
+std::vector<uint32_t> saveexec_address(uint32_t opcode, bool parent_addresses) {
+    std::vector<uint32_t> code{
+        0xbe84047eu, // retain the actual parent EXEC
+        0x7dea0080u, // active subset A from genuine local-ID v0
+        0x7e02020cu,
+        0x7e04020du, // pointer words exist only under A
+        0xbe860004u | (opcode << 8), // s_*_saveexec_b64 s[6:7],s[4:5]
+        0xdc308000u,
+        0x037d0001u,
+        0x7d280680u,
+        0xbf810000u,
+    };
+    if (parent_addresses) {
+        code[2] = code[3] = 0xbf800000u;
+        code.insert(code.begin(), {0x7e02020cu, 0x7e04020du});
+    }
+    return code;
+}
+} // namespace
+
+TEST(FlatActiveWord, AndSaveexecKeepsTheOldActiveAddressDomain) {
+    dispatcher_module(compile(saveexec_address(0x24, false), true));
+}
+
+TEST(FlatActiveWord, Andn2SaveexecCannotBorrowTheOldActiveAddressDomain) {
+    // ANDN2 activates parent & ~A. Neither address word was defined in those lanes.
+    missing(compile(saveexec_address(0x27, false), true), 7, true);
+}
+
+TEST(FlatActiveWord, Andn2SaveexecRetainsGenuineParentAddressWords) {
+    dispatcher_module(compile(saveexec_address(0x27, true), true));
+}
+
+TEST(FlatActiveWord, AliasingAndn2SaveexecCannotBorrowTheOldActiveAddressDomain) {
+    auto code = saveexec_address(0x27, false);
+    code[4] = 0xbe842704u; // destination aliases S0; the old parent must be read first
+    missing(compile(code, true), 7, true);
+}
