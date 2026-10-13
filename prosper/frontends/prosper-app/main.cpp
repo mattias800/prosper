@@ -1683,7 +1683,8 @@ static std::string this_executable(const char* argv0) {
 // selects the new game without having to filter what the user originally passed.
 //
 // A second in-process boot is not available: the app cannot tear down a running guest (#352). Until
-// that lands, a fresh process is the honest way to switch titles.
+// that lands, a fresh process is the honest way to switch titles — and the way the library opens
+// a title while staying up itself (the caller then keeps running instead of exiting).
 static bool relaunch_with_dump(int argc, char** argv, const std::string& app0_root) {
     const std::string exe = this_executable(argc > 0 ? argv[0] : nullptr);
     if (exe.empty()) return false;
@@ -3142,6 +3143,25 @@ int main(int argc, char** argv) {
     // path from a consumed one.
     auto open_game = [&](const std::string& picked) -> bool {
         const std::string root = prosper::frontend::resolve_app0_root(picked, pathProbe);
+#ifdef PROSPER_HAVE_LIBRARY_UI
+        // The library stays up: Play/Open spawns the title in its own process (its own window),
+        // so closing the game window ends only the game and this library can open another title.
+        // The capture pipes stay installed: on Windows the child gets the console directly
+        // (no handle inheritance), on POSIX its output forwards through our readers.
+        if (!root.empty() && libraryUi.ready() && !g_guest_started && !g_boot_attempted) {
+            fprintf(stderr, "[app] opening %s in a new window\n", root.c_str());
+            if (relaunch_with_dump(argc, argv, root)) {
+                record_recent(root);
+                return true;
+            }
+            fprintf(stderr, "[app] could not start the new process\n");
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "prosper",
+                                     "Could not open the game in a new window.\n\n"
+                                     "Quit and start prosper again with the other game.",
+                                     win);
+            return false;
+        }
+#endif
         switch (prosper::frontend::decide_open_action(root, g_boot_attempted)) {
         case prosper::frontend::GameOpenAction::ignore:
             fprintf(stderr, "[app] not a PS5 title: %s\n", picked.c_str());
@@ -3708,8 +3728,9 @@ int main(int argc, char** argv) {
                 }
                 switch (act.kind) {
                 case prosper::frontend::LibraryAction::Kind::open:
-                    // Straight through the same start_guest() path argv, the drop target and the
-                    // picker all use — the library chooses a title, it does not boot one differently.
+                    // Through open_game like argv, the drop target and the picker — while the
+                    // library is up that spawns a separate game window and stays here, so the
+                    // library chooses a title, it does not host one.
                     if (!open_game(act.app0_root)) libraryStatus = "Could not start that game.";
                     break;
                 case prosper::frontend::LibraryAction::Kind::browse:

@@ -2,9 +2,10 @@
 // library_ui.hpp — the game library screen: a game list (cover, name, serial, region, version,
 // path) the user picks a title from, plus a read-only controls view.
 //
-// This is the app's idle state. Once a guest boots, the library is torn down and the window goes back
-// to presenting game frames; prosper runs one game per launch (#352), so the library never draws over a
-// running title and never competes with the present path for the swapchain.
+// This is the app's idle state. A Play/Open spawns the guest in its own process (its own
+// window) and the library stays up, so closing the game window ends only the game and another
+// title can be opened. prosper still runs one game per process (#352): the library never draws
+// over a running title and never competes with the present path for the swapchain.
 //
 // It renders with Dear ImGui through the app's EXISTING Vulkan device and swapchain (third_party/imgui),
 // adding only a render pass and per-image framebuffers — no second device, no second window. Cover art
