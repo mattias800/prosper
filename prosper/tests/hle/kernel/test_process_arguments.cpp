@@ -32,7 +32,9 @@ PROSPER_GUEST_ABI uint64_t argument_consuming_initializer(uint64_t, uint64_t, ui
 
 void configure(const char* name, const char* value) {
 #ifdef _WIN32
-    SetEnvironmentVariableA(name, value);
+    // Boot reads getenv's CRT table, which SetEnvironmentVariableA does not update in-process.
+    // An empty CRT value removes the variable, matching the nullptr case below.
+    if (_putenv_s(name, value ? value : "") != 0) std::_Exit(27);
 #else
     // Only the isolated death-test child configures its environment, before guest execution.
     // NOLINTBEGIN(concurrency-mt-unsafe)
