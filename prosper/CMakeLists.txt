@@ -3640,6 +3640,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_native_barrier_mask_halves.cpp
     INCLUDES tests tests/gpu/recompiler
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_fragment_fixture_inputs
+    SOURCES tests/gpu/recompiler/test_fragment_fixture_inputs.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_saved_mask_words
     SOURCES tests/gpu/recompiler/test_saved_mask_words.cpp
     INCLUDES tests

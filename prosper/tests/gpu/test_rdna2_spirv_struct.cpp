@@ -1,6 +1,7 @@
 // test_rdna2_spirv_struct -- structural checks for RDNA2->SPIR-V output that do not require Vulkan.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "fixtures/checked_compute_launch.hpp"
+#include "fixtures/fragment_control_flow_inputs.hpp"
 #include "fixtures/native_structural_launch.hpp"
 #include "gpu/resources/mip_chain_plan.hpp"
 #include "gpu/resources/shader_resources.hpp"
@@ -1908,8 +1909,8 @@ int main() {
         0xf800000fu, 0x03020100u,             // exp mrt0 v0,v1,v2,v3
         0xbf810000u,
     };
-    const auto fragment_exec_ballot_lane_spill_spv = recompile_fragment(
-        fragment_exec_ballot_lane_spill, std::size(fragment_exec_ballot_lane_spill));
+    const auto fragment_exec_ballot_lane_spill_spv =
+        prosper::test::compile_fragment_control_flow_fixture(fragment_exec_ballot_lane_spill);
     if (fragment_exec_ballot_lane_spill_spv.empty() ||
         !has_opcode(fragment_exec_ballot_lane_spill_spv, 251) ||
         !has_opcode(fragment_exec_ballot_lane_spill_spv, 339) ||
@@ -1937,8 +1938,9 @@ int main() {
               std::end(fragment_exec_ballot_lane_spill),
               std::begin(fragment_exec_ballot_lane_spill_mutated));
     fragment_exec_ballot_lane_spill_mutated[0] = 0xbeac047cu; // s_mov_b64 s[44:45],m0
-    if (!recompile_fragment(fragment_exec_ballot_lane_spill_mutated,
-                            std::size(fragment_exec_ballot_lane_spill_mutated)).empty()) {
+    if (!prosper::test::compile_fragment_control_flow_fixture(
+             fragment_exec_ballot_lane_spill_mutated)
+             .empty()) {
         printf("  [FAIL] same-site unproven S_MOV_B64 source received a fragment ballot\n");
         return 1;
     }
@@ -1948,8 +1950,9 @@ int main() {
               std::begin(fragment_exec_ballot_lane_spill_mutated));
     fragment_exec_ballot_lane_spill_mutated[2] =
         0x0001027cu; // exact GTA pc28 site: v_writelane_b32 v20,m0,1
-    if (!recompile_fragment(fragment_exec_ballot_lane_spill_mutated,
-                            std::size(fragment_exec_ballot_lane_spill_mutated)).empty()) {
+    if (!prosper::test::compile_fragment_control_flow_fixture(
+             fragment_exec_ballot_lane_spill_mutated)
+             .empty()) {
         printf("  [FAIL] exact V_WRITELANE site accepted an unproven scalar source\n");
         return 1;
     }
@@ -1959,8 +1962,9 @@ int main() {
               std::begin(fragment_exec_ballot_lane_spill_mutated));
     fragment_exec_ballot_lane_spill_mutated[26] =
         0xbefe0408u; // exact restore site: s_mov_b64 exec,s[8:9]
-    if (!recompile_fragment(fragment_exec_ballot_lane_spill_mutated,
-                            std::size(fragment_exec_ballot_lane_spill_mutated)).empty()) {
+    if (!prosper::test::compile_fragment_control_flow_fixture(
+             fragment_exec_ballot_lane_spill_mutated)
+             .empty()) {
         printf("  [FAIL] exact EXEC restore site accepted an absent scalar pair\n");
         return 1;
     }
@@ -1984,7 +1988,8 @@ int main() {
         0xf800000fu, 0x03020100u, // exp mrt0 v0,v1,v2,v3
         0xbf810000u,
     };
-    const auto quadmask_spv = recompile_fragment(quadmask_fragment, std::size(quadmask_fragment));
+    const auto quadmask_spv =
+        prosper::test::compile_fragment_control_flow_fixture(quadmask_fragment);
     if (quadmask_spv.empty()) {
         printf("  [FAIL] fragment s_quadmask_b64 did not recompile\n");
         return 1;
@@ -2081,18 +2086,18 @@ int main() {
     // it. The scalar compare overwrites SCC before S_CSELECT, so only producer-to-consumer SSA
     // provenance may attach ScalarReduce.
     const uint32_t execz_vote_with_unrelated_scalar_select[] = {
-        0x7e020280u,              // v_mov_b32 v1, 0
-        0x7c2200f0u,              // v_cmp_* -> VCC
-        0xbf880002u,              // s_cbranch_execz +2 (WaveAny control-flow vote)
+        0x7e000280u,   // v_mov_b32 v0, 0: the vote's actual compared input
+        0xbe800380u,   // s_mov_b32 s0, 0: the unrelated scalar compare's input
+        0x7e020280u,   // v_mov_b32 v1, 0
+        0x7c2200f0u,   // v_cmp_* -> VCC
+        0xbf880002u,   // s_cbranch_execz +2 (WaveAny control-flow vote)
         0xbe8503f2u, 0x7e020205u,
-        0xbec0037eu,              // s_mov_b32 s64, exec_lo
-        0xbf060000u,              // s_cmp_eq_u32 s0, s0 -> fresh scalar SCC
-        0x856b807eu,              // s_cselect_b32 vcc_hi, exec_lo, 0
-        0x8a406b40u,              // s_andn2_b32 s64, s64, vcc_hi
-        0xbefe0940u,              // s_wqm_b32 exec_lo, s64
-        0x7e000280u, 0x7e040280u, 0x7e0602f2u,
-        0xf800180fu, 0x03020100u,
-        0xbf810000u,
+        0xbec0037eu,   // s_mov_b32 s64, exec_lo
+        0xbf060000u,   // s_cmp_eq_u32 s0, s0 -> fresh scalar SCC
+        0x856b807eu,   // s_cselect_b32 vcc_hi, exec_lo, 0
+        0x8a406b40u,   // s_andn2_b32 s64, s64, vcc_hi
+        0xbefe0940u,   // s_wqm_b32 exec_lo, s64
+        0x7e000280u, 0x7e040280u, 0x7e0602f2u, 0xf800180fu, 0x03020100u, 0xbf810000u,
     };
     const auto unrelated_scalar_select_spv = recompile_fragment_wave32_for_test(
         execz_vote_with_unrelated_scalar_select,
@@ -2203,13 +2208,14 @@ int main() {
         std::begin(fragment_scalar_vcc_suffix), std::end(fragment_scalar_vcc_suffix));
     fragment_live_vcc_suffix.insert(fragment_live_vcc_suffix.begin() + 8,
                                     0x02020100u); // v_cndmask observes implicit VCC
-    const auto fragment_live_vcc_suffix_spv = recompile_fragment(
-        fragment_live_vcc_suffix.data(), fragment_live_vcc_suffix.size());
+    const auto fragment_live_vcc_suffix_spv = prosper::test::compile_fragment_control_flow_fixture(
+        fragment_live_vcc_suffix, {RecompileDiagnosticStage::Fragment, 0x50630100u});
     if (fragment_live_vcc_suffix_spv.empty() ||
         fragment_spirv_required_subgroup_size(fragment_live_vcc_suffix_spv) != 64 ||
         !(fragment_spirv_required_subgroup_reasons(fragment_live_vcc_suffix_spv) &
           kFragmentWaveReasonLaneId)) {
         printf("  [FAIL] live fragment VCC mutation lost its exact lane-id contract\n");
+        printf("  terminal: %s\n", last_terminal_reject_reason(0x50630100u).c_str());
         return 1;
     }
     printf("  [ok]   scalar-only fragment VCC scratch avoids lane identity; mask use retains it\n");
