@@ -14,10 +14,13 @@ WHAT IT DOES
 ------------
     compare_runs.py BASELINE.jsonl CANDIDATE.jsonl
 
-Reads the `run`, `conditions` and `summary` records of each manifest. If every condition that decides
-comparability matches, it prints per-field deltas and exits 1 when a regression threshold is crossed.
+Reads the `run`, `conditions`, `switches` and `summary` records of each manifest. If every
+condition that decides comparability matches, it prints per-field deltas and exits 1 when a
+regression threshold is crossed.
 If any condition differs or is missing in either run it prints each reason and exits 2 WITHOUT printing
-a delta. Only the build revision and the measured fields may differ.
+a delta. Only the build revision, the build source identity, the measured fields, and
+host-capability/diagnostic switch differences may differ: a difference in a selector or an
+unclassified switch refuses, because a run with behaviour switches is not evidence (ADR 0023).
 
 EXIT CODES
     0  comparable, no regression
@@ -44,6 +47,7 @@ import argparse
 import json
 import math
 import sys
+from pathlib import Path
 
 # Conditions that must be IDENTICAL, and present, in both runs. Each is a way two rates have been
 # wrongly compared in this project's history. (record, key) pairs.
@@ -96,12 +100,69 @@ class ManifestError(Exception):
     """A manifest that cannot be read at all (as opposed to one that is merely not comparable)."""
 
 
+# ADR 0023: a run with behaviour switches is not evidence. The `switches` record carries every
+# PROSPER_* variable the run's environment held; a difference in a selector (or in an unclassified
+# switch, which is honestly "unverified" rather than silently accepted) refuses the comparison.
+# host-capability and diagnostic differences stay comparable: by the charter's definitions neither
+# changes what the guest sees. An unknown name refuses: it is a switch the registry never saw, so
+# no class can vouch for it. An unreadable registry refuses every difference for the same reason.
+_SWITCH_CLASSES = None
+
+
+def _switch_classes():
+    """Name -> class from switch_registry.txt, read once. Empty when unreadable (fail closed)."""
+    global _SWITCH_CLASSES
+    if _SWITCH_CLASSES is None:
+        _SWITCH_CLASSES = {}
+        registry = (
+            Path(__file__).resolve().parent.parent.parent
+            / "tools"
+            / "env"
+            / "switch_registry.txt"
+        )
+        try:
+            text = registry.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            text = ""
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) >= 2 and parts[0].startswith("PROSPER_"):
+                _SWITCH_CLASSES[parts[0]] = parts[1]
+    return _SWITCH_CLASSES
+
+
+def _switch_refusals(baseline_switches, candidate_switches):
+    """Refusals from the two `switches` maps. Empty means no evidence problem."""
+    reasons = []
+    classes = _switch_classes()
+    absent = object()
+    for name in sorted(set(baseline_switches) | set(candidate_switches)):
+        old = baseline_switches.get(name, absent)
+        new = candidate_switches.get(name, absent)
+        if old == new:
+            continue
+        cls = classes.get(name, "unclassified")
+        if cls in ("host-capability", "diagnostic"):
+            continue
+        old_text = "<absent>" if old is absent else repr(old)
+        new_text = "<absent>" if new is absent else repr(new)
+        reasons.append(
+            f"switches.{name}: baseline {old_text} != candidate {new_text} "
+            f"(class {cls}; a run with behaviour switches is not evidence)"
+        )
+    return reasons
+
+
 def _reject_nonfinite_json(value):
     raise ValueError(f"non-finite JSON number {value}")
 
 
 def load_manifest(path):
-    """Return {'run': ..., 'conditions': ..., 'summary': ...}, keeping the LAST record of each type."""
+    """Return {'run': ..., 'conditions': ..., 'switches': ..., 'summary': ...}, keeping the LAST
+    record of each type."""
     records = {}
     try:
         with open(path, encoding="utf-8") as handle:
@@ -116,6 +177,7 @@ def load_manifest(path):
                 if isinstance(record, dict) and record.get("type") in (
                     "run",
                     "conditions",
+                    "switches",
                     "summary",
                 ):
                     records[record["type"]] = record
@@ -149,16 +211,33 @@ def refusals(baseline, candidate):
     """Every reason the pair is not comparable. Empty means comparable."""
     reasons = []
     for label, records in (("baseline", baseline), ("candidate", candidate)):
-        for record in ("run", "conditions", "summary"):
+        for record in ("run", "conditions", "switches", "summary"):
             if record not in records:
-                hint = (
-                    " (the manifest predates the `conditions` record; re-run it)"
-                    if record == "conditions"
-                    else ""
-                )
+                hint = ""
+                if record == "conditions":
+                    hint = " (the manifest predates the `conditions` record; re-run it)"
+                elif record == "switches":
+                    hint = " (the manifest predates the `switches` record; re-run it)"
                 reasons.append(f"{label}: no `{record}` record{hint}")
     if reasons:
         return reasons
+
+    switch_maps = {}
+    for label, records in (("baseline", baseline), ("candidate", candidate)):
+        entry = records["switches"]
+        if type(entry.get("schema")) is not int or entry["schema"] != 1:
+            reasons.append(f"{label}: unsupported `switches` schema; re-run it")
+            continue
+        switches = entry.get("switches")
+        if not isinstance(switches, dict) or any(
+            not isinstance(name, str) or not isinstance(value, str)
+            for name, value in switches.items()
+        ):
+            reasons.append(f"{label}: `switches` record is malformed (not a string map); re-run it")
+        else:
+            switch_maps[label] = switches
+    if len(switch_maps) == 2:
+        reasons.extend(_switch_refusals(switch_maps["baseline"], switch_maps["candidate"]))
 
     for record, key in MATCH_KEYS + [("run", k) for k in ASSERTION_MATCH_KEYS]:
         a, b = _get(baseline, record, key), _get(candidate, record, key)
@@ -250,7 +329,7 @@ def render(rows, baseline, candidate):
     lines = []
     revision_a = baseline["run"].get("build_revision", "?")
     revision_b = candidate["run"].get("build_revision", "?")
-    lines.append("comparable: same title, route, GPU, driver, present path and pacing")
+    lines.append("comparable: same title, route, GPU, driver, present path, pacing and behaviour switches")
     if revision_a == revision_b:
         lines.append(
             f"note: both runs are build {revision_a[:12]}; this is a noise measurement, "
