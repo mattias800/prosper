@@ -382,3 +382,70 @@ TEST(FreshMaskExecConfinement, ALoadReadsItsAddressLoopObligationBeforeWritingTh
         EXPECT_TRUE(fresh_mask_sources_defined(h.b, h.rs, decode(kCmpV6V6)[0]));
     }
 }
+
+TEST(FreshMaskExecConfinement, ABufferSpecialOffsetRetainsCurrentUnavailableDataMarks) {
+    for (int word : {106, 108, 124})
+        for (bool unavailable : {false, true}) {
+            std::array<uint32_t, 2> words{0xe8b01000u,
+                                          (static_cast<uint32_t>(word) << 24u) | 0x00020601u};
+            EXPECT_FALSE(predicate_defined(words, kCmpV6V6, true,
+                                           [word, unavailable](RegState& rs, SpirvCompute& b) {
+                                               vgpr_genuine(rs, b, 1);
+                                               vgpr_genuine(rs, b, 6);
+                                               sgpr_genuine(rs, b, word);
+                                               if (unavailable)
+                                                   rs.unavailable_saved_mask_words.insert(word);
+                                               else
+                                                   rs.sreg_merge_placeholder.insert(word);
+                                           }));
+        }
+}
+
+TEST(FreshMaskExecConfinement, ABufferSpecialOffsetRecordsItsCurrentLoopObligation) {
+    for (int word : {106, 108, 124}) {
+        Harness h;
+        h.rs.exec = h.b.btrue();
+        h.rs.exec_narrowed = true;
+        vgpr_genuine(h.rs, h.b, 1);
+        vgpr_genuine(h.rs, h.b, 6);
+        sgpr_genuine(h.rs, h.b, word);
+        const uint64_t root = blanket_root(23, word);
+        h.rs.sreg_merge_placeholder.insert(word);
+        h.rs.sreg_loop_blanket[word].insert(root);
+        const std::array<uint32_t, 2> words{0xe8b01000u,
+                                            (static_cast<uint32_t>(word) << 24u) | 0x00020601u};
+        const auto ins = decode(words);
+        ASSERT_EQ(ins.size(), 1u);
+        const auto before = snapshot_saved_b64_masks(h.b, h.rs, ins[0]);
+        EXPECT_TRUE(h.b.loop_blanket_roots_read.contains(root));
+        EXPECT_FALSE(before.source_marks.placeholder);
+        EXPECT_TRUE(before.source_marks.blanket_roots.empty());
+        record_vector_word_marks(h.rs, ins[0], before.source_marks);
+        EXPECT_TRUE(fresh_mask_sources_defined(h.b, h.rs, decode(kCmpV6V6)[0]));
+    }
+}
+
+TEST(FreshMaskExecConfinement, ABufferSccOffsetRetainsItsCurrentConditionAndLoopMarks) {
+    for (bool defined : {false, true})
+        for (bool loop : {false, true}) {
+            Harness h;
+            h.rs.exec = h.b.btrue();
+            h.rs.exec_narrowed = true;
+            vgpr_genuine(h.rs, h.b, 1);
+            vgpr_genuine(h.rs, h.b, 6);
+            const std::array<uint32_t, 2> words{0xe8b01000u, 0xfd020601u};
+            const auto ins = decode(words);
+            ASSERT_EQ(ins.size(), 1u);
+            seed_vector_word_definedness(h.rs, ins, false, 64);
+            h.rs.scc = h.b.btrue();
+            h.rs.scc_merge_placeholder = !defined || loop;
+            const uint64_t root = blanket_root(27, 253);
+            if (loop && defined) h.rs.scc_loop_blanket.insert(root);
+            const auto before = snapshot_saved_b64_masks(h.b, h.rs, ins[0]);
+            EXPECT_EQ(h.b.loop_blanket_roots_read.contains(root), loop && defined);
+            EXPECT_EQ(before.source_marks.placeholder, !defined);
+            EXPECT_TRUE(before.source_marks.blanket_roots.empty());
+            record_vector_word_marks(h.rs, ins[0], before.source_marks);
+            EXPECT_EQ(fresh_mask_sources_defined(h.b, h.rs, decode(kCmpV6V6)[0]), defined);
+        }
+}

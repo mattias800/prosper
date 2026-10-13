@@ -142,9 +142,20 @@ SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& st
             for (uint32_t word = 0; word < words; ++word)
                 vector_relay = vector_relay || !available(in.src[0].value + static_cast<int>(word));
             const auto& offset = in.src[2];
-            if (offset.kind == OperandKind::SGPR)
-                vector_relay = vector_relay || !scalar_words.contains(offset.value) ||
-                               relayed.contains(offset.value);
+            const bool scalar_word =
+                offset.kind == OperandKind::SGPR ||
+                (offset.kind == OperandKind::Special && offset.value >= 106 && offset.value <= 124);
+            if (scalar_word) {
+                // Retain an architectural VCC mask beside DATA facts; actual numeric ballot
+                // materialization still requires the emitter's exact native-wave contract.
+                const bool vcc_mask_word = offset.kind == OperandKind::Special &&
+                                           offset.value <= 107 && masks.contains(106) &&
+                                           !scalar_words.contains(offset.value);
+                vector_relay = vector_relay || relayed.contains(offset.value) ||
+                               (!scalar_words.contains(offset.value) && !vcc_mask_word);
+            } else if (offset.kind == OperandKind::Special && offset.value == 253) {
+                vector_relay = vector_relay || !definite_scc;
+            }
         }
     }
     if (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x43) vector_relay = true;

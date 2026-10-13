@@ -521,3 +521,143 @@ TEST(FlatActiveWord, AnUnusedBufferAddressFieldIsNotAMissingInput) {
             accepted(compile(code, dispatcher), dispatcher);
         }
 }
+
+namespace {
+struct ScalarOffsetCase {
+    bool typed;
+    bool dispatcher;
+    int target;
+    bool supplied;
+    bool edge;
+};
+
+std::vector<uint32_t> scalar_offset_buffer(const ScalarOffsetCase& arm) {
+    std::vector<uint32_t> code{
+        0x7e060281u, // whole-entry genuine old v3
+        0x7e020280u, // genuine current VADDR v1
+        0xbe800300u | (static_cast<uint32_t>(arm.target) << 16u) |
+            (arm.supplied ? 0x80u : 0x16u), // copy zero or absent s22 into the scalar offset
+        0xbe84047eu,
+        0x7dea0080u,
+        arm.typed ? 0xe8b01000u : 0xe0301000u,
+        (static_cast<uint32_t>(arm.target) << 24u) | 0x00030301u,
+        0x7d280680u,
+        0xbf810000u,
+    };
+    if (arm.edge) code.insert(code.end() - 2, {0xbf060000u, 0xbf850001u, 0xbf800000u});
+    return code;
+}
+
+class FlatActiveWordScalarOffset : public testing::TestWithParam<ScalarOffsetCase> {};
+
+std::vector<ScalarOffsetCase> scalar_offset_cases() {
+    std::vector<ScalarOffsetCase> cases;
+    for (bool typed : {false, true})
+        for (bool dispatcher : {false, true})
+            for (int target : {20, 108, 124}) // ordinary s20, ttmp0 and M0
+                for (bool supplied : {false, true})
+                    for (bool edge : {false, true})
+                        cases.push_back({typed, dispatcher, target, supplied, edge});
+    return cases;
+}
+} // namespace
+
+TEST_P(FlatActiveWordScalarOffset, CurrentNumericOffsetDefinesTheNewLoadResult) {
+    const auto& arm = GetParam();
+    const auto code = scalar_offset_buffer(arm);
+    const auto result = compile(code, arm.dispatcher);
+    if (arm.supplied)
+        accepted(result, arm.dispatcher);
+    else
+        missing(result, static_cast<uint32_t>(code.size() - 2), arm.dispatcher);
+}
+
+INSTANTIATE_TEST_SUITE_P(BufferLoad, FlatActiveWordScalarOffset,
+                         testing::ValuesIn(scalar_offset_cases()),
+                         [](const testing::TestParamInfo<ScalarOffsetCase>& info) {
+                             const auto& arm = info.param;
+                             return std::string(arm.typed ? "Mtbuf" : "Mubuf") +
+                                    (arm.dispatcher ? "Dispatcher" : "Structured") +
+                                    (arm.target == 20    ? "S20"
+                                     : arm.target == 108 ? "Ttmp0"
+                                                         : "M0") +
+                                    (arm.supplied ? "Supplied" : "Absent") +
+                                    (arm.edge ? "Edge" : "Direct");
+                         });
+
+TEST(FlatActiveWord, ABufferNullOffsetHasItsArchitecturalZeroValue) {
+    for (bool typed : {false, true})
+        for (bool dispatcher : {false, true}) {
+            auto code = scalar_offset_buffer({typed, dispatcher, 124, true, true});
+            code[2] = 0xbf800000u; // no scalar data producer needed for SGPR_NULL
+            code[6] = 0x7d030301u;
+            accepted(compile(code, dispatcher), dispatcher);
+        }
+}
+
+TEST(FlatActiveWord, ABufferOffsetRetainsExactNativeMaskMaterialization) {
+    for (bool typed : {false, true})
+        for (bool dispatcher : {false, true})
+            for (uint32_t source : {106u, 107u, 126u, 127u}) {
+                auto code = scalar_offset_buffer({typed, dispatcher, 124, true, false});
+                code[2] = 0xbf800000u;
+                code[6] = (source << 24u) | 0x00030301u;
+                // CMPX supplies actual VCC/EXEC before the offset is read.
+                accepted(compile(code, dispatcher), dispatcher);
+            }
+}
+
+TEST(FlatActiveWord, ABufferSccOffsetUsesItsCurrentNumericCondition) {
+    for (bool typed : {false, true})
+        for (bool dispatcher : {false, true})
+            for (bool supplied : {false, true})
+                for (bool edge : {false, true}) {
+                    auto code = scalar_offset_buffer({typed, dispatcher, 124, true, edge});
+                    code[2] = supplied ? 0xbf068080u : 0xbf068016u;   // SCC from zero or absent s22
+                    code[6] = 0xfd030301u;   // SCC is consumed as a numeric 0/1 offset
+                    const auto result = compile(code, dispatcher);
+                    if (supplied)
+                        accepted(result, dispatcher);
+                    else
+                        missing(result, static_cast<uint32_t>(code.size() - 2), dispatcher);
+                }
+}
+
+TEST(FlatActiveWord, ABufferSccOffsetCannotUseTheUnproducedEntryCondition) {
+    for (bool typed : {false, true})
+        for (bool dispatcher : {false, true})
+            for (bool edge : {false, true}) {
+                auto code = scalar_offset_buffer({typed, dispatcher, 124, true, edge});
+                code[2] = 0xbf800000u;
+                code[6] = 0xfd030301u;
+                missing(compile(code, dispatcher), static_cast<uint32_t>(code.size() - 2),
+                        dispatcher);
+            }
+}
+
+TEST(FlatActiveWord, ABufferSccOffsetRequiresAGenuineConditionOnBothIncomingArms) {
+    for (bool typed : {false, true})
+        for (bool dispatcher : {false, true})
+            for (bool supplied : {false, true}) {
+                auto code = scalar_offset_buffer({typed, dispatcher, 124, true, false});
+                code.erase(code.begin() + 2);
+                code.insert(
+                    code.begin() + 2,
+                    {
+                        0xbf060000u,
+                        0xbf850002u,   // genuine incoming branch condition
+                        0xbf068080u,
+                        0xbf820001u,   // one arm computes genuine SCC
+                        supplied ? 0xbf068080u : 0xbf068016u,   // the other arm needs actual s22
+                    });
+                code[10] = 0xfd030301u;
+                const auto result = compile(code, dispatcher);
+                if (supplied)
+                    accepted(result, dispatcher);
+                else
+                    // A dispatcher refuses the unavailable joined SCC at the offset read;
+                    // structured emission retains its mark until the fresh comparison.
+                    missing(result, static_cast<uint32_t>(code.size() - (dispatcher ? 4 : 2)),
+                            dispatcher);
+            }
+}

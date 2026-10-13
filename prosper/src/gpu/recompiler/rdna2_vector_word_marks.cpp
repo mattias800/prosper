@@ -6,6 +6,7 @@
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_vector_old_word.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -146,8 +147,16 @@ void seed_vector_word_definedness(RegState& rs, const std::vector<Rdna2Inst>& in
     // later complete writers retire the mark, while preserved old bits/lanes retain it.
     const int highest = shader_max_vgpr(instructions);
     rs.vector_wave_size = wave_size;
-    if (wave_size == 32) {
+    const bool scc_offset =
+        std::any_of(instructions.begin(), instructions.end(), [](const auto& in) {
+            return (in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF) &&
+                   in.n_src >= 3 && in.src[2].kind == OperandKind::Special &&
+                   in.src[2].value == 253;
+        });
+    if (scc_offset) rs.track_scc_definition = true;
+    if (wave_size == 32 || scc_offset) {
         // These producing entries supply no architectural SCC input; bfalse is storage only.
+        // A numeric buffer offset requires its actual producer even in ordinary Wave64.
         rs.scc_merge_placeholder = true;
         rs.scc_loop_blanket.clear();
     }
@@ -218,12 +227,33 @@ ScalarSourceMarks vector_source_marks(const RegState& rs, const Rdna2Inst& in) {
             for (uint32_t word = 0; word < words; ++word)
                 address_word(in.src[0].value + static_cast<int>(word));
             const auto& offset = in.src[2];
-            if (offset.kind == OperandKind::SGPR) {
-                if (sreg_word_blanket_only(rs, offset.value)) {
+            // SOFFSET consumes scalar DATA: VCC scratch, ttmp and M0 carry the same current
+            // unavailable/relay/loop marks as ordinary SGPRs despite decoding as Special.
+            const bool scalar_word =
+                offset.kind == OperandKind::SGPR ||
+                (offset.kind == OperandKind::Special && offset.value >= 106 && offset.value <= 124);
+            if (scalar_word) {
+                if (rs.unavailable_saved_mask_words.contains(offset.value)) {
+                    missing_address();
+                } else if (sreg_word_blanket_only(rs, offset.value)) {
                     const auto& roots = rs.sreg_loop_blanket.at(offset.value);
                     if (!marks.hard) marks.blanket_roots.insert(roots.begin(), roots.end());
-                } else if (!b32_source_word_defined(rs, offset)) {
+                } else {
+                    // An untracked VCC word is materialized from the current mask only by the
+                    // emitter's exact native-wave gate. Its Bool presence grants no DATA here.
+                    const bool vcc_mask_word = offset.kind == OperandKind::Special &&
+                                               offset.value <= 107 &&
+                                               !rs.sreg.contains(offset.value);
+                    if (sreg_word_may_be_fabricated(rs, offset.value) ||
+                        (!vcc_mask_word && !b32_source_word_defined(rs, offset)))
+                        missing_address();
+                }
+            } else if (offset.kind == OperandKind::Special && offset.value == 253) {
+                if (!rs.scc || (rs.scc_merge_placeholder && rs.scc_loop_blanket.empty())) {
                     missing_address();
+                } else if (rs.scc_merge_placeholder && !marks.hard) {
+                    marks.blanket_roots.insert(rs.scc_loop_blanket.begin(),
+                                               rs.scc_loop_blanket.end());
                 }
             }
         }
