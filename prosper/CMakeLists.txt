@@ -2687,6 +2687,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_current_carry_inputs.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_legacy_coverage_fixtures
+    SOURCES tests/gpu/recompiler/test_legacy_coverage_fixtures.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_saved_exec_data
     SOURCES tests/gpu/recompiler/test_saved_exec_data.cpp
     INCLUDES tests
