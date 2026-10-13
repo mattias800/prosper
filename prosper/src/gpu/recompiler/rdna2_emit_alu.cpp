@@ -1502,8 +1502,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             const bool gtav_wave32_vcchi_scalar_packet =
                 allows_compute_scalar_vcc_bridge(b) && b.native_subgroup_size == 32 &&
                 is_gtav_wave32_vcchi_scalar_packet(in);
-            if (b.is_compute && b.wave_size == 64 && in.opcode == 0x0a &&
-                in.dst.kind == OperandKind::SGPR && in.dst.value == 106) {
+            if ((b.is_compute || (b.is_fragment && !b.vcc_b32_low_only_pcs.contains(in.pc) &&
+                                  (is_wave64_vcc_lo_scalar_cselect(in) ||
+                                   is_wave64_vcc_lo_cselect_reading_vcc_hi(in)))) &&
+                b.wave_size == 64 && in.opcode == 0x0a && in.dst.kind == OperandKind::SGPR &&
+                in.dst.value == 106) {
                 // A B32 write leaves Wave64 VCC_HI untouched, so the resulting mixed physical pair
                 // can remain in the architectural mask domain only when the dispatcher proves that
                 // sibling is scalar data at this exact PC. Otherwise admit only a whole-stream
@@ -1511,11 +1514,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const bool path_local_scalar_pair =
                     rs.scalar_presence_has_no_placeholders && rs.sreg.contains(107);
                 const bool complete_scalar_pair =
-                    path_local_scalar_pair || b.vcc_b32_scalar_pair_pcs.contains(in.pc);
+                    b.is_fragment
+                        ? vcc_b32_scalar_pair_defined(b, rs, in)
+                        : path_local_scalar_pair || b.vcc_b32_scalar_pair_pcs.contains(in.pc);
                 if ((!is_wave64_vcc_lo_scalar_cselect(in) &&
                      !(complete_scalar_pair && rs.sreg.contains(107) &&
                        is_wave64_vcc_lo_cselect_reading_vcc_hi(in))) ||
-                    (!complete_scalar_pair && !b.vcc_b32_low_only_pcs.contains(in.pc)) || !rs.scc) {
+                    (!complete_scalar_pair && !b.vcc_b32_low_only_pcs.contains(in.pc)) || !rs.scc ||
+                    (b.is_fragment && !scalar_condition_source_defined(b, rs))) {
                     ok = false; return true;
                 }
                 const uint32_t selected = b.sel(

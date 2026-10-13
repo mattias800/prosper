@@ -380,12 +380,15 @@ inline bool is_wave64_vcc_lo_scalar_b32_candidate(const Rdna2Inst& in) {
 }
 
 inline std::unordered_set<uint32_t>
-proven_wave64_vcc_b32_low_only_pcs(const std::vector<Rdna2Inst>& ins, bool include_logical = true) {
+proven_wave64_vcc_b32_low_only_pcs(const std::vector<Rdna2Inst>& ins, bool include_logical = true,
+                                   bool include_high_cselect = false) {
     std::unordered_set<uint32_t> result;
     for (const Rdna2Inst& in : ins) {
         if (in.is_end) break;
-        const bool candidate = include_logical ? is_wave64_vcc_lo_scalar_b32_candidate(in)
-                                               : is_wave64_vcc_lo_scalar_cselect(in);
+        const bool candidate =
+            (include_high_cselect && is_wave64_vcc_lo_cselect_reading_vcc_hi(in)) ||
+            (include_logical ? is_wave64_vcc_lo_scalar_b32_candidate(in)
+                             : is_wave64_vcc_lo_scalar_cselect(in));
         // Scalar scratch may use either physical VCC word and combine the two as ordinary dwords.
         // The sibling may be read as scalar data, but it must be dead before any pair/mask-domain
         // observation. MaskDomainOnly is exactly that whole-CFG proof.

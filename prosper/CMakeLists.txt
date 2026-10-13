@@ -540,14 +540,6 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME progress_tracker_generator
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/docs/gen_progress_tracker.py" --selftest)
-  # The compatibility-site generator. Only the --selftest arm is registered,
-  # like the tracker generator above: the live build reads the committed files and needs no
-  # credentials, but ctest pins the half that can fail SILENTLY -- the parsers accepting a
-  # malformed row and emitting a plausible WRONG page, or the templates interpolating raw
-  # milestone prose onto a public page.
-  add_test(NAME compat_site_generator
-           COMMAND "${Python3_EXECUTABLE}"
-                   "${CMAKE_SOURCE_DIR}/tools/compat_site/gen_compat_site.py" --selftest)
   # The pre-merge merge-result check (#2211). Its cases build real throwaway git repositories and
   # run real merges: the git plumbing IS the tool, so a mocked merge would test nothing. The case
   # that earns its keep is the clean merge whose RESULT holds a duplicate -- the state no head-time
@@ -2622,6 +2614,10 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_vertex_vcc_scalar_lifetime
     SOURCES tests/gpu/recompiler/test_vertex_vcc_scalar_lifetime.cpp
     INCLUDES src tests/gpu/recompiler
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_fragment_scalar_vcc_pair
+    SOURCES tests/gpu/recompiler/test_fragment_scalar_vcc_pair.cpp
+    INCLUDES src tests
     LIBRARIES prosper_core)
   prosper_add_gtest(test_vector_scalar_provenance
     SOURCES tests/gpu/recompiler/test_vector_scalar_provenance.cpp

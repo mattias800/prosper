@@ -46,7 +46,8 @@ void record_wave32_scalar_condition(RegState& rs, const Rdna2Inst& in,
         rs.scc_loop_blanket.clear();
 }
 bool scalar_condition_source_defined(const SpirvCompute& b, const RegState& rs) {
-    if (!(b.is_compute || b.is_fragment) || b.wave_size != 32) return rs.scc != 0;
+    if (!(b.is_compute || b.is_fragment) || (b.wave_size != 32 && !rs.track_scc_definition))
+        return rs.scc != 0;
     if (rs.scc && !rs.scc_merge_placeholder) return true;
     if (rs.scc && !rs.scc_loop_blanket.empty()) {
         // The existing back-edge proof owns these exact scalar/vector assumptions.
