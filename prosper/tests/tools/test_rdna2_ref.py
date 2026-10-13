@@ -746,11 +746,23 @@ def test_carve_program_stops_at_garbage_truncation_or_end():
 
 
 def test_carve_program_extends_past_a_forward_branch_target():
-    # s_branch +2 over the first endpgm: the carve ends at the second one.
-    inner = pack(sopp(2, 2) + sopp(1) + sopp(1))
+    # ISA ch. 4: target = branch PC + 4 + SIMM16 * 4. +1 reaches the second endpgm.
+    inner = pack(sopp(2, 1) + sopp(1) + sopp(1))
     assert R.carve_program(inner, 0) == inner
     # ...and with no endpgm at or past the target there is no program.
     assert R.carve_program(pack(sopp(2, 2) + sopp(1)), 0) is None
+
+
+def test_carve_program_refuses_a_target_just_after_the_last_endpgm():
+    # +2 targets byte 12, not the endpgm at byte 8. Its end is not a branch target.
+    assert R.carve_program(pack(sopp(2, 2) + sopp(1) + sopp(1)), 0) is None
+
+
+@pytest.mark.parametrize("limit", [0, 1, 2, 3])
+def test_carve_program_does_not_decode_past_the_byte_limit(limit):
+    end = pack(sopp(1))
+    assert R.carve_program(end, 0, limit=limit) is None
+    assert R.carve_program(end, 0, limit=len(end)) == end
 
 
 def test_carve_orbshdr_at_default_header():
@@ -804,5 +816,6 @@ def test_firmware_carve_deduplicates_across_libraries(tmp_path):
     prog = prog_mov_end()
     (tmp_path / "libSceGnmDriver-a.sprx").write_bytes(b"OrbShdr" + bytes(0x40 - 7) + prog)
     (tmp_path / "libSceGnmDriver-b.sprx").write_bytes(b"OrbShdr" + bytes(0x40 - 7) + prog)
-    (tmp_path / "other.sprx").write_bytes(b"OrbShdr" + bytes(0x40 - 7) + prog)
+    other = pack(sop1(3, 0, LIT) + [200] + sopp(1))
+    (tmp_path / "other.sprx").write_bytes(b"OrbShdr" + bytes(0x40 - 7) + other)
     assert R.firmware_programs(tmp_path) == [prog]
