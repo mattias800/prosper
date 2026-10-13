@@ -331,8 +331,11 @@ sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R,
                     in.src[1].value != 125 && (in.src[1].value == R || in.src[1].value + 1 == R))
                     return false;
                 break;
-            default:
-                return false;   // memory/branch/interp/unknown: can't bound reads of R -> assume live
+            case Rdna2Format::VINTRP:
+                // Interpolation reads VGPR params and M0 only; it never reads an ordinary SGPR.
+                // (R == 124 returns false up front, so the implicit M0 read needs no case here.)
+                break;
+            default: return false;   // memory/branch/unknown: can't bound reads of R -> assume live
         }
         if (index + 1 < ins.size()) pending.push_back(index + 1);
     }
