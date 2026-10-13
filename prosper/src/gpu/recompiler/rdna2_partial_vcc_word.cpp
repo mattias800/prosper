@@ -76,6 +76,14 @@ void initialize_partial_vcc_word_proof(SpirvCompute& b, const std::vector<Rdna2I
     rdna2_walk(code, dwords, original);
     if (ins != original) return;
     b.partial_vcc_original_words.assign(code, code + dwords);
+    // The invocation-local READFIRST fallback can reach both scalar branches and the comparison
+    // itself through scalar/vector relays. A builder service flag is not proof that this body
+    // actually dispatches its exact common-phase service. Keep this new recovery out of every
+    // READFIRST program until that producing route is bound; existing admissions are unchanged.
+    if (std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
+            return in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02;
+        }))
+        return;
 
     std::map<uint32_t, size_t> at;
     for (size_t i = 0; i < ins.size(); ++i)
@@ -114,14 +122,15 @@ void initialize_partial_vcc_word_proof(SpirvCompute& b, const std::vector<Rdna2I
         // READFIRST fallback can instead drive invocation-local SCC control. A reaching VCC
         // producer alone cannot authorize partial replacement inside that host branch. Only
         // genuine numeric constant/copy comparisons establish this bounded SCC proof; once an
-        // unproved scalar branch is crossed, no later compare recovers whole-wave control.
+        // unproved scalar source or branch is crossed, no later compare recovers that authority.
         if (in.fmt == Rdna2Format::SOPC)
             after.scc_uniform =
                 in.opcode <= 0x0bu && constant_word(before, in, 0) && constant_word(before, in, 1);
         else if (in.fmt == Rdna2Format::SOP2 || in.fmt == Rdna2Format::SOPK ||
                  (in.fmt == Rdna2Format::SOP1 && !sop1_opcode_leaves_scc_unmodified(in.opcode)))
             after.scc_uniform = false;
-        if (in.fmt == Rdna2Format::SOPP && (in.opcode == 4u || in.opcode == 5u))
+        if (scalar_reads_scc(in) ||
+            (in.fmt == Rdna2Format::SOPP && (in.opcode == 4u || in.opcode == 5u)))
             after.wave_control &= before.scc_uniform;
         const auto source = plain_move(in) ? constant_word(before, in) : std::nullopt;
         for_each_scalar_write(in, [&](int base, uint32_t width) {

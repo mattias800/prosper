@@ -576,11 +576,24 @@ TEST(PartialVccWord, LegacyFloatSlotsRequireTheExplicitExactAbi) {
             vm.run_buffers(64, {{0, input}, {1, output}}, 1);
         EXPECT_FALSE(vm.error.empty()) << "malformed ABI variant=" << variant;
     }
+    auto foreign_set = module;
+    for (size_t at = 5; at < foreign_set.size(); at += foreign_set[at] >> 16)
+        if ((foreign_set[at] & 0xffffu) == 71 && (foreign_set[at] >> 16) == 4 &&
+            foreign_set[at + 2] == 34)
+            foreign_set[at + 3] = 2;
+    bpermute_oracle::Interpreter foreign(foreign_set);
+    foreign.storage_descriptor_set = 2;
+    foreign.legacy_float_word_storage = true;
+    foreign.run_buffers(64, {{0, input}, {1, output}}, 1);
+    EXPECT_EQ(foreign.error, "unsupported live storage ABI");
     scalar_branch_output(module);   // same actual module preserves raw input and output bits
 }
 TEST(PartialVccWord, ScalarControlNeedsAnActualUniformSccProducer) {
     auto code = scalar_branch(false);
     EXPECT_EQ(proved(code), (std::set<uint32_t>{5}));
+    code[2] = 0xbf800000u;   // absent numeric s20 cannot supply the SOPC's DATA
+    EXPECT_TRUE(proved(code).empty());
+    code = scalar_branch(false);
     code[3] = 0xbf800000u;   // initial nonzero false SCC SSA is not a producer
     EXPECT_TRUE(proved(code).empty());
 }
@@ -636,4 +649,113 @@ TEST(PartialVccWord, NativeWidthAloneDoesNotAuthorizeInvocationLocalControl) {
     auto expected = std::vector<uint32_t>(64);
     expected[0] = expected[40] = 1;
     output_is(bitmap(40, false, 1), expected, address + 1, config);
+}
+namespace {
+std::vector<uint32_t> scalar_predicate(bool readfirst) {
+    return {0x7e020281u, readfirst ? 0x7e280500u : 0xbe940380u,
+            0x7d840014u, 0xbeea0380u,
+            0x02060280u, 0xbf810000u};
+}
+void zero_scalar_predicate_output(const std::vector<uint32_t>& module) {
+    std::vector<uint32_t> input(64), output(64, 0xdeadbeefu);
+    for (uint32_t lane = 0; lane < 64; ++lane) input[lane] = lane;
+    bpermute_oracle::Interpreter vm(module);
+    vm.legacy_float_word_storage = true;
+    const auto values = vm.run_buffers(64, {{0, input}, {1, output}}, 1);
+    ASSERT_TRUE(vm.error.empty()) << vm.error;
+    ASSERT_EQ(values.size(), 64u);
+    for (uint32_t lane = 0; lane < 64; ++lane) EXPECT_EQ(values[lane], 0u) << "lane=" << lane;
+}
+}   // namespace
+TEST(PartialVccWord, AnApproximateScalarSourceCannotSupplyTheOldComparisonBits) {
+    const auto code = scalar_predicate(true);
+    const auto module = recompile_valu(code.data(), code.size(), 1, 3);
+    EXPECT_TRUE(module.empty()) << "READFIRST's predicate lineage needs an exact service";
+    if (!module.empty()) zero_scalar_predicate_output(module);
+}
+TEST(PartialVccWord, ARealConstantScalarSourceSuppliesTheSamePredicateConsumer) {
+    const auto code = scalar_predicate(false);
+    const auto module = recompile_valu(code.data(), code.size(), 1, 3);
+    ASSERT_FALSE(module.empty());
+    zero_scalar_predicate_output(module);
+}
+TEST(PartialVccWord, AnExistingPortableServiceDoesNotInventANewRecoveryRoute) {
+    auto code = scalar_predicate(true);
+    code.insert(code.end() - 1, {0xe0702000u, 0x80020300u});
+    EXPECT_TRUE(compile(code, 0x5135001090ull).empty());
+    // The old exact service still produces without a partial replacement. A builder flag alone
+    // cannot prove it runs in every body/slice, so this new route deliberately declines READFIRST.
+    code[3] = 0xbf800000u;
+    auto expected = std::vector<uint32_t>(64);
+    expected[0] = 1;
+    output_is(code, expected, 0x5135001091ull);
+}
+namespace {
+std::vector<uint32_t> implicit_scc_predicate(bool carry, bool supplied) {
+    auto code = scalar_predicate(false);
+    code[1] = carry ? 0x821480a8u : 0x8514a9a8u;
+    if (supplied) code.insert(code.begin() + 1, 0xbf06a8a8u);   // real CMP_EQ_U32 40,40: SCC=true
+    return code;
+}
+void implicit_scc_output(const std::vector<uint32_t>& module, uint32_t selected) {
+    std::vector<uint32_t> input(64), output(64, 0xdeadbeefu);
+    for (uint32_t lane = 0; lane < 64; ++lane) input[lane] = lane;
+    bpermute_oracle::Interpreter vm(module);
+    vm.legacy_float_word_storage = true;
+    const auto values = vm.run_buffers(64, {{0, input}, {1, output}}, 1);
+    ASSERT_TRUE(vm.error.empty()) << vm.error;
+    ASSERT_EQ(values.size(), 64u);
+    for (uint32_t lane = 0; lane < 64; ++lane)
+        EXPECT_EQ(values[lane], lane == selected ? 1u : 0u) << "lane=" << lane;
+}
+}   // namespace
+TEST(PartialVccWord, InitialSccStorageDoesNotAuthenticateASelectPredicate) {
+    const auto code = implicit_scc_predicate(false, false);
+    EXPECT_TRUE(recompile_valu(code.data(), code.size(), 1, 3).empty());
+    EXPECT_TRUE(proved(code).empty());
+}
+TEST(PartialVccWord, InitialSccStorageDoesNotAuthenticateACarryPredicate) {
+    const auto code = implicit_scc_predicate(true, false);
+    EXPECT_TRUE(recompile_valu(code.data(), code.size(), 1, 3).empty());
+    EXPECT_TRUE(proved(code).empty());
+}
+TEST(PartialVccWord, ARealSccProducerSuppliesTheSelectAndCarryPredicate) {
+    for (bool carry : {false, true}) {
+        const auto code = implicit_scc_predicate(carry, true);
+        const auto module = recompile_valu(code.data(), code.size(), 1, 3);
+        ASSERT_FALSE(module.empty());
+        implicit_scc_output(module, carry ? 41u : 40u);
+        auto false_producer = code;
+        false_producer[1] = 0xbf06a9a8u;   // actual CMP_EQ_U32 40,41: SCC=false
+        const auto false_module =
+            recompile_valu(false_producer.data(), false_producer.size(), 1, 3);
+        ASSERT_FALSE(false_module.empty());
+        implicit_scc_output(false_module, carry ? 40u : 41u);
+    }
+}
+TEST(PartialVccWord, AnExplicitInitialSccWordDoesNotAuthenticateComparisonBits) {
+    auto code = scalar_predicate(false);
+    code[1] = 0xbe9403fdu;   // S_MOV_B32 s20,SCC: explicit numeric DATA read of absent entry SCC
+    EXPECT_TRUE(proved(code).empty());
+    EXPECT_TRUE(recompile_valu(code.data(), code.size(), 1, 3).empty());
+    code.insert(code.begin() + 1, 0xbf06a8a8u);
+    const auto module = recompile_valu(code.data(), code.size(), 1, 3);
+    ASSERT_FALSE(module.empty());
+    // Actual SCC=true becomes scalar1; comparison only has a low bit, removed by LO=0.
+    zero_scalar_predicate_output(module);
+}
+TEST(PartialVccWord, AFlagWithoutAConsumedReadfirstServiceCannotAuthenticateThePredicate) {
+    auto code = scalar_predicate(true);
+    code.insert(code.end() - 1, {0xe0702000u, 0x80020300u});
+    code.pop_back();   // no END: the builder flag cannot force the existing exact service route
+    const auto module = compile(code, 0x5135001100ull);
+    EXPECT_TRUE(module.empty());
+    if (!module.empty()) {
+        bpermute_oracle::Interpreter vm(module);
+        const auto output = vm.run(64, std::vector<uint32_t>(64, 0xdeadbeefu));
+        ASSERT_TRUE(vm.error.empty()) << vm.error;
+        for (uint32_t lane = 0; lane < 64; ++lane) EXPECT_EQ(output[lane], 0u) << "lane=" << lane;
+    }
+    code[1] = 0xbe940380u;   // genuine scalar0 keeps the same prefix-store API producing
+    output_is(code, std::vector<uint32_t>(64, 0u), 0x5135001101ull);
 }

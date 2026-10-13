@@ -786,7 +786,8 @@ struct Interpreter {
                       if (ty(array).op != 29 || ty(array).a.size() != 1)
                           fail("unsupported live storage ABI");
                       const auto& element = ty(ty(array).a.at(0));
-                      const bool float_word = legacy_float_word_storage && binding->second <= 1 &&
+                      const bool float_word = legacy_float_word_storage &&
+                                              storage_descriptor_set == 0 && binding->second <= 1 &&
                                               element.op == 22 &&
                                               element.a == std::vector<uint32_t>{32};
                       if ((!uint_type(ty(array).a[0]) && !float_word) ||
