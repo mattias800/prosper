@@ -93,6 +93,7 @@ void publish_parent_words(ActiveVectorWords& state, const Words& words) {
 
 void meet_complementary_exec_data(ComplementaryExecData& into,
                                   const ComplementaryExecData& incoming) {
+    meet_saved_complement_data(into.saved, incoming.saved);
     into.current_parents = intersection(std::move(into.current_parents), incoming.current_parents);
     for (auto mask = into.parents.begin(); mask != into.parents.end();) {
         const auto other = incoming.parents.find(mask->first);
@@ -114,6 +115,7 @@ void meet_complementary_exec_data(ComplementaryExecData& into,
 void advance_complementary_exec_data(ActiveVectorWords& state, const Rdna2Inst& in,
                                      const std::vector<std::pair<int, uint32_t>>& scalar_writes,
                                      int mask_write) {
+    auto saved = prepare_saved_complement_data(state, in, scalar_writes, mask_write);
     // CONFIDENCE: HIGH -- set identities refer to the actual current architectural values.
     // A partial/aliasing write expires the old pair and every relation that referred to it.
     auto& proof = state.complement;
@@ -194,6 +196,7 @@ void advance_complementary_exec_data(ActiveVectorWords& state, const Rdna2Inst& 
         proof.parent = parent;
         proof.first_words = first_words;
     }
+    complete_saved_complement_data(state, std::move(saved));
 }
 
 void publish_complementary_exec_word(ActiveVectorWords& state, int word) {
