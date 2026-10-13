@@ -110,7 +110,8 @@ TEST(VisibleSnapshotCapture, DelayedPublicationDoesNotCreateCatchupSamples) {
     EXPECT_FALSE(clock.due(8.1));
     EXPECT_TRUE(clock.due(10));
     EXPECT_FALSE(clock.complete());
-    EXPECT_TRUE(clock.timed_out(30));
+    EXPECT_FALSE(clock.timed_out(30)); // legacy screenshot tests elapsed > timeout
+    EXPECT_TRUE(clock.timed_out(30.1));
 }
 
 TEST(VisibleSnapshotCapture, MissingRequiredCaptureOptionsRefuse) {
@@ -231,7 +232,7 @@ TEST_F(VisibleSnapshotFiles, NeverPublishedOrNeverShownCannotSatisfyTheRequest) 
     ASSERT_TRUE(start());
     capture.retain(frame(gpu::PresentSource::Rendered), false);
     EXPECT_FALSE(capture.poll_elapsed(39, true));
-    EXPECT_TRUE(capture.poll_elapsed(40, true));
+    EXPECT_TRUE(capture.poll_elapsed(40.1, true));
     EXPECT_EQ(capture.finish(), 1);
     EXPECT_TRUE(records("sample").empty());
     const auto summary = records("summary");
@@ -242,12 +243,12 @@ TEST_F(VisibleSnapshotFiles, NeverPublishedOrNeverShownCannotSatisfyTheRequest) 
     EXPECT_FALSE(std::filesystem::exists(directory / "sample_0.png"));
 }
 
-TEST_F(VisibleSnapshotFiles, PublicationAtTheDeadlineCannotBecomeASuccess) {
+TEST_F(VisibleSnapshotFiles, PublicationBeyondTheDeadlineCannotBecomeASuccess) {
     capture.request.count = 1;
     capture.request.timeout = 5;
     ASSERT_TRUE(start());
     capture.retain(frame(gpu::PresentSource::Rendered), true);
-    EXPECT_TRUE(capture.poll_elapsed(5, true));
+    EXPECT_TRUE(capture.poll_elapsed(5.1, true));
     EXPECT_EQ(capture.finish(), 1);
     EXPECT_TRUE(records("sample").empty());
     EXPECT_FALSE(std::filesystem::exists(directory / "sample_0.png"));
@@ -311,7 +312,7 @@ TEST_F(VisibleSnapshotFiles, PrimaryGuestFaultDoesNotShortenTheRequestedWallCloc
     capture.retain(frame(gpu::PresentSource::Rendered), true);
     screenshot::publish_guest_outcome(2, 0x1234, 0x5678, "synthetic fault");
     EXPECT_FALSE(capture.poll_elapsed(5, true));
-    EXPECT_TRUE(capture.poll_elapsed(40, true));
+    EXPECT_TRUE(capture.poll_elapsed(40.1, true));
     EXPECT_EQ(capture.finish(), 1);
     const auto summary = records("summary");
     ASSERT_EQ(summary.size(), 1u);

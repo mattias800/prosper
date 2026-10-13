@@ -25,7 +25,7 @@ public:
     SnapshotCaptureClock(double interval, double timeout, int count)
         : interval_(interval), timeout_(timeout), count_(count) {}
     bool due(double elapsed) const { return saved_ < count_ && elapsed - last_ >= interval_; }
-    bool timed_out(double elapsed) const { return elapsed >= timeout_ && !complete(); }
+    bool timed_out(double elapsed) const { return elapsed > timeout_ && !complete(); }
     bool complete() const { return saved_ == count_; }
     void sampled(double elapsed) {
         last_ = elapsed;
