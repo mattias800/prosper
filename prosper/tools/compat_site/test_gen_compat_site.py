@@ -5,14 +5,20 @@ case runs the real committed files, which must parse and join without error. The
 XSS arms use a milestone the page must escape, so a template that interpolates raw
 data fails here instead of shipping script injection on a public page.
 
-Runs under pytest, or directly (`python3 test_gen_compat_site.py`) as ctest
-`compat_site_generator` does.
+Runs under pytest; ctest `compat_site_generator` runs the generator's separate
+stdlib selftest. Browser rendering checks require Node.js.
 """
 
 from __future__ import annotations
 
+import json
+import shutil
+import subprocess
 import sys
+from html.parser import HTMLParser
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gen_compat_site import (  # noqa: E402
@@ -31,7 +37,9 @@ from gen_compat_site import (  # noqa: E402
     render_index,
     strip_md,
     vendor_covers,
+    vendor_logo,
 )
+from site_page import PAGE_SCRIPT  # noqa: E402
 
 TRACKER = (
     "| Title | Title ID | Rung | Ladder | FPS | Guard | Oracle | Open blockers | Tracker | Status doc |\n"
@@ -159,6 +167,96 @@ def test_hostile_url_and_filename_are_escaped():
         assert point in page, point
     for raw in ("t.tracker.url}", "t.doc_url}`", 't.cover}"', 't.colour}"'):
         assert raw not in page, raw
+
+
+def test_vendor_logo_refuses_escaping_symlink(tmp_path):
+    """The fixed logo path must obey the same resolved-checkout boundary as covers."""
+    root = tmp_path / "root"
+    (root / "assets").mkdir(parents=True)
+    out = tmp_path / "out"
+    out.mkdir()
+    logo = root / "assets" / "prosper-logo.png"
+    logo.write_bytes(b"inside logo")
+    assert vendor_logo(root, out) == "prosper-logo.png"
+    assert (out / "prosper-logo.png").read_bytes() == b"inside logo"
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"synthetic outside data")
+    logo.unlink()
+    try:
+        logo.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("this platform cannot create the symlink refusal fixture")
+    with pytest.raises(ParseError, match="escapes the checkout"):
+        vendor_logo(root, out)
+    assert (out / "prosper-logo.png").read_bytes() == b"inside logo"
+
+
+def test_browser_rendering_escapes_hostile_attributes_and_text():
+    """Run the actual client renderer, then parse its HTML to detect extra attributes/tags."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js is required to execute the page's browser renderer")
+    titles = build(parse_tracker_table(TRACKER), parse_compat_table(COMPAT))
+    title = titles[0]
+    title.update(
+        title='Demo <script>bad</script> " &',
+        cover='covers/demo" onerror="bad.webp',
+        doc_url='https://example.test/doc" onclick="bad',
+        milestone='<img src=x onerror="bad"> & milestone',
+        hint='hint" onclick="bad',
+    )
+    title["tracker"]["url"] = 'https://example.test/" onclick="bad'
+    harness = r"""
+const fs = require('fs'), vm = require('vm');
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+const nodes = {};
+function element() {
+  return {innerHTML:'', textContent:'', hidden:true, children:[],
+    classList:{add(){}, remove(){}, toggle(){}, contains(){return false;}},
+    querySelector(){return element();}, addEventListener(){}, setAttribute(){}};
+}
+const context = {
+  document:{getElementById(id){return nodes[id] || (nodes[id] = element());},
+    addEventListener(){}, querySelectorAll(){return [];}},
+  fetch(){return Promise.resolve({json(){return Promise.resolve(input.payload);}})}
+};
+vm.runInNewContext(input.script, context);
+setImmediate(() => process.stdout.write(nodes.grid.innerHTML));
+"""
+    result = subprocess.run(
+        [node, "-e", harness],
+        input=json.dumps(
+            {"script": PAGE_SCRIPT, "payload": {"titles": titles, "buckets": counts(titles)}}
+        ),
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=10,
+    )
+
+    class Tags(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.tags = []
+            self.text = []
+
+        def handle_starttag(self, tag, attrs):
+            self.tags.append((tag, dict(attrs)))
+
+        def handle_data(self, data):
+            self.text.append(data)
+
+    parsed = Tags()
+    parsed.feed(result.stdout)
+    assert any(tag == "article" for tag, _ in parsed.tags), result.stdout
+    assert not any(tag == "script" for tag, _ in parsed.tags), result.stdout
+    assert not any(key.startswith("on") for _, attrs in parsed.tags for key in attrs), result.stdout
+    images = [attrs for tag, attrs in parsed.tags if tag == "img"]
+    assert len(images) == 1 and images[0]["src"] == title["cover"]
+    assert images[0]["alt"] == title["title"]
+    links = [attrs["href"] for tag, attrs in parsed.tags if tag == "a"]
+    assert links == [title["tracker"]["url"], title["doc_url"]]
+    assert title["title"] in parsed.text and title["milestone"] in parsed.text
 
 
 def test_site_has_every_section_and_no_leftover_tokens():

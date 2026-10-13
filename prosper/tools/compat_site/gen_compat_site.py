@@ -480,11 +480,15 @@ def vendor_logo(root: Path, out: Path) -> str:
     Missing logo aborts the build like a missing cover: a header pointing at an image
     outside the checkout would publish a broken brand mark.
     """
-    source = root / LOGO_SRC
+    base = root.resolve()
+    source = (base / LOGO_SRC).resolve()
+    if not source.is_relative_to(base):
+        raise ParseError(f"site logo escapes the checkout: {LOGO_SRC}")
     if not source.is_file():
         raise ParseError(f"site logo not found in checkout: {LOGO_SRC}")
-    (out / source.name).write_bytes(source.read_bytes())
-    return source.name
+    name = Path(LOGO_SRC).name
+    (out / name).write_bytes(source.read_bytes())
+    return name
 
 
 def write_site(root: Path, out: Path) -> dict:
@@ -623,6 +627,24 @@ def selftest() -> None:
                 pass
             else:
                 raise AssertionError(f"escaping cover {evil!r} was vendored")
+        logo = base / LOGO_SRC
+        logo.write_bytes(b"synthetic logo")
+        logo_out = Path(tmp) / "out"
+        assert vendor_logo(base, logo_out) == "prosper-logo.png"
+        assert (logo_out / "prosper-logo.png").read_bytes() == b"synthetic logo"
+        logo.unlink()
+        try:
+            logo.symlink_to(Path(tmp) / "outside.webp")
+        except (OSError, NotImplementedError):
+            print("selftest: logo symlink control skipped; platform cannot create symlinks")
+        else:
+            try:
+                vendor_logo(base, logo_out)
+            except ParseError:
+                pass
+            else:
+                raise AssertionError("escaping logo symlink was vendored")
+            assert (logo_out / "prosper-logo.png").read_bytes() == b"synthetic logo"
     # The real committed files must parse: the selftest pins the live contract.
     live_rows = parse_tracker_table(TRACKER_MD.read_text(encoding="utf-8"))
     live_compat_text = COMPAT_MD.read_text(encoding="utf-8")

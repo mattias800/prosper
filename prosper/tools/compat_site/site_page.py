@@ -285,7 +285,7 @@ TEMPLATE = """<!DOCTYPE html>
 <meta name="description" content="prosper is a PS5 to PC compatibility layer for Linux and Windows. Guest code runs natively, system libraries are reimplemented, and the GPU stream is translated to Vulkan.">
 <meta name="theme-color" content="#06080d">
 <meta property="og:title" content="prosper - run PS5 games natively on your PC">
-<meta property="og:description" content="Wine/Proton for PS5. Live compatibility list for @@COUNT@@ titles.">
+<meta property="og:description" content="PS5 to PC compatibility layer. Live compatibility list for @@COUNT@@ titles.">
 <link rel="icon" href="@@LOGO@@">
 <style>@@CSS@@</style></head><body>
 <nav class="top"><div class="wrap">
@@ -295,7 +295,7 @@ TEMPLATE = """<!DOCTYPE html>
 </div></nav>
 
 <header class="hero" id="top"><div class="wrap">
-<span class="eyebrow">Wine / Proton for PS5</span>
+<span class="eyebrow">PS5 to PC compatibility layer</span>
 <h1 class="display">Run PS5 games <span class="grad">natively</span> on your PC.</h1>
 <p class="lede">prosper is a user-space compatibility layer for Linux and Windows. The PS5 CPU is x86-64, so game code
 runs natively with no CPU emulation. The work is loading the game, reimplementing Sony's system libraries, and
@@ -309,12 +309,12 @@ translating the GPU to Vulkan.</p>
 
 <section id="how"><div class="wrap">
 <div class="kicker">How it works</div><h2>Native code, translated graphics</h2>
-<p class="sub">No emulated CPU means no emulation overhead on the game itself. prosper only translates what the PC
-genuinely cannot run.</p>
+<p class="sub">On compatible x86-64 hosts, guest CPU instructions execute natively. prosper adapts loaded modules,
+reimplements system interfaces, and translates GPU commands and shaders.</p>
 <div class="cards">
-<div class="card"><div class="ico">&#9889;</div><h3>Runs natively</h3><p>Zen 2 is x86-64. Game code executes at host speed, so the game itself is what gets tested, not a second copy of it.</p></div>
+<div class="card"><div class="ico">&#9889;</div><h3>Runs natively</h3><p>The PS5 CPU uses x86-64 instructions. Guest code runs on a compatible host CPU with ABI and platform adaptation.</p></div>
 <div class="card"><div class="ico">&#128230;</div><h3>Loader and linker</h3><p>SELF/ELF modules are parsed, relocated and linked into one address space against a global export table.</p></div>
-<div class="card"><div class="ico">&#128218;</div><h3>Reimplemented libraries</h3><p>libc, libkernel, graphics and services are rebuilt from published interfaces, the way Wine reimplements Win32.</p></div>
+<div class="card"><div class="ico">&#128218;</div><h3>Reimplemented libraries</h3><p>libc, libkernel, graphics and services are reimplemented from platform contracts and direct guest evidence.</p></div>
 <div class="card"><div class="ico">&#127912;</div><h3>GPU to Vulkan</h3><p>AGC command streams are decoded and RDNA2 shaders are recompiled to SPIR-V for a Vulkan 1.4 backend.</p></div>
 </div></div></section>
 
