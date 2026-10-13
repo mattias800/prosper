@@ -87,6 +87,16 @@ std::vector<uint32_t> guarded_loop(uint32_t writer, uint32_t extension, bool cle
             0xf800180fu, 0x09090909u,
             kEnd};
 }
+
+std::vector<uint32_t> loop_with_header_relay(bool clean) {
+    auto code = guarded_loop(kSampleLz, kImageWord1, clean);
+    code.insert(code.begin() + 9, 0x7e100306u);   // v_mov_b32 v8,v6 at the header
+    code[10] = 0x7d041087u;   // v_cmp_eq_i32 7,v8
+    code[5] = 0xbf88000bu;   // shifted saved EXEC restore
+    code[16] = 0xbf82fff8u;   // backedge includes the new header relay
+    return code;
+}
+
 }   // namespace
 
 TEST(ActiveImageWordDefinedness, GuardedLoopAcceptsAnInitializedBackedge) {
@@ -115,6 +125,51 @@ TEST(ActiveImageWordDefinedness, GuardedLoopRejectsAnUninitializedBackedge) {
         EXPECT_TRUE(module.empty()) << "the preheader's EXEC owner cannot authenticate later v7";
         EXPECT_NE(last_terminal_reject_reason(address).find("loop-carried v6"), std::string::npos);
     }
+}
+
+TEST(ActiveImageWordDefinedness, OneGenuineBackedgeArmCannotHideThePoisonedArm) {
+    for (bool clean : {true, false}) {
+        Harness h;
+        const std::vector<uint32_t> words{kCmpx, kSampleLz, kImageWord1, kCompare,
+                                          clean ? 0x7e0c0287u : 0x7e0c0307u};
+        std::vector<Rdna2Inst> ins;
+        rdna2_walk(words.data(), words.size(), ins);
+        seed_vector_word_definedness(h.rs, ins, false, 64);
+        ASSERT_TRUE(h.emit(ins[0]));
+        ASSERT_TRUE(h.emit(ins[1]));
+        LoopBlanketCheck check(h.rs, std::set<int>{}, ins[3].pc);
+        mark_vector_loop_carried(h.rs, ins, ins[3].pc, ins[3].pc + 1, check.carried,
+                                 check.confined);
+        auto exits = loop_check_marks(h.rs);
+        ASSERT_TRUE(fresh_mask_sources_defined(h.b, h.rs, ins[2]));
+        const auto unchanged = merge_edge_marks(h.rs, std::set<int>{});
+        ASSERT_TRUE(h.emit(ins[3]));
+        // This is the shipping structured-if merge boundary: one edge writes the destination,
+        // and the other retains its genuine loop-header value. The public counted-loop route
+        // presently cannot carry an inner SCC if, so exercise its actual meet and audit here.
+        join_merge_scc_and_slots(h.rs, unchanged);
+        EXPECT_EQ(check.holds(h.b, h.rs, exits), clean);
+        if (!clean) {
+            EXPECT_EQ(h.rs.vreg_source_marks.at(6).outside_exec, 0u);
+            EXPECT_EQ(exits.vectors.at(6).outside_exec, 0u);
+        }
+    }
+}
+
+TEST(ActiveImageWordDefinedness, HeaderVectorRelayKeepsTheFailedCarriedRoot) {
+    Harness h;
+    constexpr uint64_t address = 0x10001200u;
+    const auto clean = loop_with_header_relay(true);
+    ASSERT_FALSE(recompile_fragment(clean.data(), clean.size(), &h.table, nullptr, UINT32_MAX,
+                                    nullptr, false, {RecompileDiagnosticStage::Fragment, address})
+                     .empty())
+        << last_terminal_reject_reason(address);
+    const auto poison = loop_with_header_relay(false);
+    EXPECT_TRUE(recompile_fragment(poison.data(), poison.size(), &h.table, nullptr, UINT32_MAX,
+                                   nullptr, false, {RecompileDiagnosticStage::Fragment, address})
+                    .empty());
+    EXPECT_NE(last_terminal_reject_reason(address).find("loop-carried v6"), std::string::npos)
+        << "v8's complete header write must carry v6's per-iteration obligation";
 }
 
 TEST(ActiveImageWordDefinedness, NarrowerCleanBackedgePreservesTheRequiredWiderDomain) {
