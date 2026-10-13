@@ -20,15 +20,48 @@ static int failures = 0;
 // This narrow source gate complements the behavior tests below. The app owns the actual
 // successful-host-present decision; removing that call site otherwise leaves every isolated
 // timeline/ring test green while reinstating #3828. Comments cannot satisfy the gate.
-static std::string active_app_source() {
-    std::ifstream file(PROSPER_APP_MAIN_SOURCE);
-    std::string line, active;
-    while (std::getline(file, line)) {
-        if (const size_t comment = line.find("//"); comment != std::string::npos)
-            line.resize(comment);
-        active += line + '\n';
+static std::string strip_app_comments(std::string_view source) {
+    std::string active(source);
+    char quote = 0;
+    bool escaped = false, line_comment = false, block_comment = false;
+    for (size_t i = 0; i < source.size(); ++i) {
+        const char c = source[i];
+        const char next = i + 1 < source.size() ? source[i + 1] : '\0';
+        if (line_comment) {
+            if (c == '\n')
+                line_comment = false;
+            else
+                active[i] = ' ';
+        } else if (block_comment) {
+            if (c == '*' && next == '/') {
+                active[i] = active[i + 1] = ' ';
+                ++i;
+                block_comment = false;
+            } else if (c != '\n') {
+                active[i] = ' ';
+            }
+        } else if (quote) {
+            if (escaped)
+                escaped = false;
+            else if (c == '\\')
+                escaped = true;
+            else if (c == quote)
+                quote = 0;
+        } else if (c == '"' || c == '\'') {
+            quote = c;
+        } else if (c == '/' && (next == '/' || next == '*')) {
+            line_comment = next == '/';
+            block_comment = next == '*';
+            active[i] = active[i + 1] = ' ';
+            ++i;
+        }
     }
     return active;
+}
+
+static std::string active_app_source() {
+    std::ifstream file(PROSPER_APP_MAIN_SOURCE);
+    return strip_app_comments(std::string(std::istreambuf_iterator<char>(file), {}));
 }
 
 static size_t matching_brace(std::string_view source, size_t open) {
@@ -115,6 +148,14 @@ static bool fallback_and_expiry_wired(const std::string& source) {
 }
 
 int main() {
+    const std::string quoted_comments =
+        "const char* text = \"https://example.invalid/*literal*/\\\"//quoted\"; "
+        "char slash = '/';\n";
+    CHECK(strip_app_comments(quoted_comments) == quoted_comments,
+          "comment-like text and escaped quotes inside literals remain intact");
+    CHECK(strip_app_comments("first/* { hidden\n } */second// hidden\nthird") ==
+              "first           \n     second         \nthird",
+          "both comment forms are masked without joining tokens or changing newlines");
     const std::string app_source = active_app_source();
     CHECK(!app_source.empty() && gpu_close_wired(app_source) &&
           fallback_and_expiry_wired(app_source),
@@ -171,6 +212,10 @@ int main() {
         omitted_poll.erase(poll_call, poll_statement.size());
         CHECK(!fallback_and_expiry_wired(omitted_poll),
               "#3828: removing the per-loop expiry poll makes the wiring gate fail");
+        std::string commented_poll = app_source;
+        commented_poll.replace(poll_call, poll_statement.size(), "/* " + poll_statement + " */");
+        CHECK(!fallback_and_expiry_wired(strip_app_comments(commented_poll)),
+              "#3828: a block-commented expiry poll fails the active-code wiring gate");
         std::string nested_poll = app_source;
         nested_poll.replace(poll_call, poll_statement.size(),
                             "if (false) { " + poll_statement + " }");
