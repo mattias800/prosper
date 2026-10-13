@@ -13,7 +13,7 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <iomanip>
+#include <ios>
 #include <set>
 #include <string>
 #include <utility>
@@ -115,7 +115,7 @@ std::vector<uint32_t> loop_with_coordinate_root(bool clean) {
     return code;
 }
 
-void check_image_reads(std::vector<uint32_t> image, std::set<int> reads,
+void check_image_reads(std::vector<uint32_t> image, const std::set<int>& reads,
                        ResourceClass cls = ResourceClass::Texture, uint32_t dimension = 1,
                        uint32_t samples = 1) {
     // Real initializers precede an independent genuine v7 CMPX. Removing a coordinate producer
