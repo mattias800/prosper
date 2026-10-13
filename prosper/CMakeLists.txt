@@ -2053,9 +2053,9 @@ if(TARGET prosper_core)
   add_test(NAME prosper_app_game_library COMMAND test_prosper_app_game_library)
 
   # ADR 0021, static slice: the versioned bug-report writer needs no SDL or
-  # dump), so its bytes are pinned here. prosper_add_gtest: each TEST is its own ctest case.
+  # dump, so its bytes are pinned here. prosper_add_gtest: each TEST is its own ctest case.
   prosper_add_gtest(test_prosper_app_report_bundle
-    SOURCES frontends/prosper-app/test_report_bundle.cpp
+    SOURCES tests/frontend/test_report_bundle.cpp
             frontends/shared/capture/capture_manifest.cpp
     INCLUDES frontends frontends/prosper-app
     LIBRARIES prosper_core)
