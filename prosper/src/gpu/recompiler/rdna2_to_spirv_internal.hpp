@@ -666,6 +666,11 @@ struct SpirvCompute {
     // SOP2 writes into VCC whose scalar sources are all written earlier in the same basic block
     // (rdna2_local_vcc_data.hpp). Recomputed per emit_body; no record pass erases it.
     std::unordered_set<uint32_t> vcc_local_scalar_write_pcs;
+    // Predicate-only partial VCC replacements: actual complete compare and constant-word MUST
+    // producers, bound to the exact original consumer. No initial placeholder or ballot authority.
+    bool partial_vcc_word_analysis_done = false;
+    std::vector<uint32_t> partial_vcc_original_words;
+    std::map<uint32_t, Rdna2Inst> partial_vcc_word_pcs;
     // S_BFE_U64 may write VCC as both a scalar pair and a per-lane predicate. In a CFG
     // dispatcher, the sreg variables can contain fabricated zero placeholders, so only the
     // MUST-scalar source proof permits retaining its complete scalar result.
