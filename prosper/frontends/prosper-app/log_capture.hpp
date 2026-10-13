@@ -163,27 +163,36 @@ public:
     bool installed() const { return installed_; }
 
 #ifndef _WIN32
-    // A library-launched game must outlive these readers. Map each captured descriptor to its
-    // original destination in the child only; the library keeps its capture installed. File
-    // actions duplicate even CLOEXEC saved descriptors before exec closes the originals.
-    // Returns a POSIX error number, including file-action setup failures, without spawning on
-    // partial setup. The caller owns the returned child PID and must reap it.
-    int spawn_child(pid_t& child, char* const argv[], char* const envp[]) const {
-        if (!argv || !argv[0]) return EINVAL;
-        posix_spawn_file_actions_t actions;
-        int error = ::posix_spawn_file_actions_init(&actions);
+    // Prepare child-only replacements for the captured streams. Zero means initialized actions
+    // (empty when not installed); an error leaves no actions to destroy. Never let a setup failure
+    // become an apparently successful spawn that inherits capture pipes whose readers may die.
+    int spawn_console_actions(posix_spawn_file_actions_t* actions) const {
+        if (!actions) return EINVAL;
+        int error = ::posix_spawn_file_actions_init(actions);
         if (error != 0) return error;
         if (installed_) {
             for (const Stream& s : streams_) {
-                error = ::posix_spawn_file_actions_adddup2(&actions, s.saved, s.target);
-                if (error != 0) break;
+                error = ::posix_spawn_file_actions_adddup2(actions, s.saved, s.target);
+                if (error != 0) {
+                    ::posix_spawn_file_actions_destroy(actions);
+                    return error;
+                }
             }
         }
-        if (error == 0) {
-            pid_t spawned = 0;
-            error = ::posix_spawn(&spawned, argv[0], &actions, nullptr, argv, envp);
-            if (error == 0) child = spawned;
-        }
+        return 0;
+    }
+
+    // A library-launched game must outlive these readers. File actions duplicate even CLOEXEC
+    // saved descriptors before exec closes the originals, retaining the library's capture.
+    // Returns a POSIX error number. The caller owns the returned child PID and must reap it.
+    int spawn_child(pid_t& child, char* const argv[], char* const envp[]) const {
+        if (!argv || !argv[0]) return EINVAL;
+        posix_spawn_file_actions_t actions;
+        int error = spawn_console_actions(&actions);
+        if (error != 0) return error;
+        pid_t spawned = 0;
+        error = ::posix_spawn(&spawned, argv[0], &actions, nullptr, argv, envp);
+        if (error == 0) child = spawned;
         ::posix_spawn_file_actions_destroy(&actions);
         return error;
     }

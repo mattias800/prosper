@@ -1732,6 +1732,13 @@ static bool relaunch_with_dump(int argc, char** argv, const std::string& app0_ro
     // the user instead of this process quitting into nothing. POSIX permits an implementation to
     // return 0 and let the child exit 127 instead; there the relaunch would degrade to the old
     // silent behaviour rather than misbehave.
+    //
+    // The library session keeps the Game Log capture installed while a game it launched may
+    // outlive it: without actions the child inherits fds 1/2 pointing at pipes whose readers die
+    // with this process, and its later writes die of SIGPIPE once the library is closed. Hand it
+    // the console instead. After the old path's uninstall there is nothing to rescue, so the same
+    // helper covers both: after uninstall it adds no descriptor replacements. Setup errors
+    // fail the launch visibly instead of falling back to the capture pipes.
     pid_t child = 0;
     const int rc = g_log_capture.spawn_child(child, cargv.data(), environ);
     if (rc != 0) {
@@ -3083,6 +3090,7 @@ int main(int argc, char** argv) {
     };
     // Used at startup and after each successful interactive launch, while the library stays up.
     auto refresh_recent = [&](const prosper::frontend::AppConfig& cfg) {
+        if (!wantLibrary) return;
         std::vector<prosper::frontend::LibraryUi::RecentGame> recents;
         for (const std::string& root : cfg.recent_games) {
             const std::string json = host_library_io().read_file(root + "/sce_sys/param.json");
