@@ -123,7 +123,9 @@ TEST(FragmentFrontFace, PublishedRawWordsFollowActualBooleanInput) {
         const uint32_t value = b.fragment_front_face_word(encoding);
         ASSERT_NE(value, 0u);
         const auto back = facing_word(b, value, false), front = facing_word(b, value, true);
-        ASSERT_TRUE(back.has_value() && front.has_value());
+        if (!back.has_value() || !front.has_value()) {
+            FAIL() << "both faces must produce a typed raw input word";
+        }
         // Independent raw ABI expectations, rather than constants read back from a round trip.
         EXPECT_EQ(*front,
                   encoding == FragmentFrontFaceEncoding::AllBits ? 0xffffffffu : 0x3f800000u);
