@@ -68,7 +68,7 @@
 #include "gpu/timeline/gpu_timeline.hpp"
 #include "shared/device/device_identity.hpp"
 #include "shared/live/live_renderer.hpp"           // register_live_renderer (frontends/shared)
-#include "capture_manifest.hpp"
+#include "shared/capture/capture_manifest.hpp"
 #ifdef PROSPER_VIDEO_MF
 #include "media_foundation_backend.hpp" // native Windows AvPlayer demux + hardware decode
 #endif

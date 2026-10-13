@@ -1,4 +1,4 @@
-#include "capture_manifest.hpp"
+#include "shared/capture/capture_manifest.hpp"
 
 #include "build_revision.hpp"   // revision this binary was compiled from
 

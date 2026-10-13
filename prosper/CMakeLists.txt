@@ -1114,14 +1114,14 @@ if(TARGET prosper_core)
 
   # Screenshot evidence classification/JSON is pure and must remain testable without Vulkan or a dump.
   add_executable(test_capture_manifest tests/test_capture_manifest.cpp
-                                       tools/screenshot/capture_manifest.cpp
+                                       frontends/shared/capture/capture_manifest.cpp
                                        # The framerate the manifest reports. A pure TU with no
                                        # dependency beyond the standard library, so it links here
                                        # without dragging prosper_core (or Vulkan) into the test.
                                        src/gpu/present/present_frame_rate.cpp)
   # `src` and the revision library are for `build_revision.hpp` only: the run header records the
   # revision the binary was compiled from, so the manifest self-describes. Still no Vulkan, no dump.
-  target_include_directories(test_capture_manifest PRIVATE tools/screenshot src)
+  target_include_directories(test_capture_manifest PRIVATE frontends src)
   target_link_libraries(test_capture_manifest PRIVATE prosper_build_revision)
   add_test(NAME capture_manifest COMMAND test_capture_manifest)
 
@@ -6839,7 +6839,7 @@ endif()
 if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
   if(WIN32)
     add_executable(screenshot tools/screenshot/screenshot.cpp
-                              tools/screenshot/capture_manifest.cpp
+                              frontends/shared/capture/capture_manifest.cpp
                               tools/screenshot/overlay_text.cpp)
     prosper_hosts_a_guest(screenshot)
                               # Spells a `shared/...` include, which resolves from `frontends`.
@@ -6851,7 +6851,7 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
     find_package(ZLIB QUIET)
     if(ZLIB_FOUND)
       add_executable(screenshot tools/screenshot/screenshot.cpp
-                                tools/screenshot/capture_manifest.cpp
+                                frontends/shared/capture/capture_manifest.cpp
                                 tools/screenshot/overlay_text.cpp)
                                 # Spells a `shared/...` include, which resolves from `frontends`.
                                 target_include_directories(screenshot PRIVATE frontends)
