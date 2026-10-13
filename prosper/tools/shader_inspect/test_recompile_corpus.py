@@ -175,3 +175,25 @@ def test_synthetic_success_without_output_is_not_recorded(tmp_path, monkeypatch)
     monkeypatch.setattr(rc.subprocess, "run", fake_run)
     with pytest.raises(rc.InspectorError, match="SPIR-V output"):
         rc.collect(tmp_path, "inspector")
+
+
+def test_empty_corpus_is_unevaluated_without_starting_inspector(tmp_path, monkeypatch):
+    inspector = tmp_path / "inspector.exe"
+    inspector.write_bytes(b"")
+    monkeypatch.setattr(
+        rc.subprocess, "run", lambda *_a, **_k: pytest.fail("empty corpus ran inspector")
+    )
+    assert rc.main(["record", str(tmp_path), "--inspect", str(inspector)]) == 2
+
+
+@pytest.mark.parametrize("text", ["not JSON", "[]", "null"])
+def test_invalid_baseline_is_unevaluated(tmp_path, monkeypatch, text):
+    inspector = tmp_path / "inspector.exe"
+    inspector.write_bytes(b"")
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(text)
+    monkeypatch.setattr(rc, "collect", lambda *_a: {"cs_x.bin": {"stage": "compute"}})
+    assert (
+        rc.main(["check", str(tmp_path), "--inspect", str(inspector), "--baseline", str(baseline)])
+        == 2
+    )

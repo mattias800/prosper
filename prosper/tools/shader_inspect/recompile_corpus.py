@@ -103,7 +103,7 @@ def recompile(inspect: str, blob: Path, stage: str) -> dict:
 def collect(corpus: Path, inspect: str) -> dict:
     blobs = sorted(p for p in corpus.rglob("*.bin") if stage_of(p))
     if not blobs:
-        raise SystemExit(f"no cs_/ps_/vs_ blobs under {corpus}")
+        raise InspectorError(f"no cs_/ps_/vs_ blobs under {corpus}")
     # Keyed by the path under the corpus: two subdirectories may hold the same basename.
     return {p.relative_to(corpus).as_posix(): recompile(inspect, p, stage_of(p)) for p in blobs}
 
@@ -171,7 +171,7 @@ def main(argv=None) -> int:
     # Absolute: Windows CreateProcess does not resolve a relative, forward-slashed executable path.
     try:
         results = collect(args.corpus.resolve(), str(Path(args.inspect).resolve()))
-    except InspectorError as err:
+    except (InspectorError, OSError) as err:
         print(err, file=sys.stderr)
         return 2
     if args.mode == "record":
@@ -184,7 +184,14 @@ def main(argv=None) -> int:
     if not args.baseline or not args.baseline.exists():
         print("check needs an existing --baseline", file=sys.stderr)
         return 2
-    problems = diff(json.loads(args.baseline.read_text()), results)
+    try:
+        baseline = json.loads(args.baseline.read_text())
+        if not isinstance(baseline, dict):
+            raise ValueError("baseline must contain a JSON object")
+    except (OSError, ValueError) as err:
+        print(f"could not read baseline: {err}", file=sys.stderr)
+        return 2
+    problems = diff(baseline, results)
     for line in problems:
         print(line)
     print(f"{len(results)} blobs, {len(problems)} differences")
