@@ -651,7 +651,7 @@ def test_wsl_pipeline_preserves_status_and_cleans_object(mc_status, dump_status)
     # The production object path is a UUID in /tmp. Use only the same safe name
     # alphabet here, including when Windows Python drives MSYS bash.
     proc = subprocess.run(
-        [bash, "-c", "mktemp -d"],
+        [bash, "-c", "mktemp -d /tmp/rdna2_ref_test_XXXXXXXX"],
         capture_output=True,
         text=True,
         check=True,
