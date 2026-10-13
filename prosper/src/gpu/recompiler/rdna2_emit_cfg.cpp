@@ -1559,6 +1559,8 @@ bool emit_cfg_state_machine(
     // so `s_mov_b64 dst, s[N:N+1]` over both reloaded halves of one mask stays a mask. Tracked only
     // with an exact native Wave64 subgroup, where that move also materializes the ballot words.
     std::vector<SpilledMaskHalves> wave64_spilled_halves_in(starts.size());
+    const bool track_active_vectors = tracks_active_vector_words(b, barrier_half_phase);
+    std::map<uint32_t, std::set<int>> active_vectors_after;
     const bool track_spilled_halves =
         b.is_compute && b.wave_size == 64 && b.native_subgroup_size == 64;
     // Dispatcher Function variables persist SCC's Boolean value but not whether that value is an
@@ -1611,20 +1613,12 @@ bool emit_cfg_state_machine(
         return root >= 0 && root <= 105 ? root : -1;
     };
     if ((b.is_compute || b.is_fragment) && b.wave_size == 64 && !starts.empty()) {
-        seed_native_logical_entry_marks(wave64_spilled_halves_in.front(), initial);
-        for (const auto& mask : initial.sreg_bool)
-            if (!initial.sreg_bool_b32.contains(mask.first) && mask.first <= 105)
-                wave64_b64_mask_in.front().insert(mask.first);
-        if (initial.vcc) wave64_b64_mask_in.front().insert(106);
-        for (const auto& value : initial.sreg)
-            if (value.first <= 124) wave64_scalar_word_in.front().insert(value.first);
-        for (const auto& value : initial.sreg_input)
-            if (value.first <= 124) wave64_scalar_word_in.front().insert(value.first);
-        // Direct descriptors intentionally live outside RegState's ordinary scalar map, but their
-        // entry words are real scalar data until shader code overwrites them. Seed the MUST facts
-        // from the same resource-table ranges used by the emitter's direct-descriptor fallback.
-        for (int reg : direct_descriptor_sregs)
-            if (reg <= 124) wave64_scalar_word_in.front().insert(reg);
+        seed_native_logical_entry_domains(wave64_spilled_halves_in.front(), initial,
+                                          direct_descriptor_sregs, wave64_b64_mask_in.front(),
+                                          wave64_scalar_word_in.front());
+        if (track_active_vectors)
+            seed_active_vector_words(wave64_spilled_halves_in.front().active_vectors, initial,
+                                     wave64_spilled_halves_in.front().relayed_vectors);
         wave64_scalar_scc_valid_in.front() = initial.scc != 0;
         for (int reg : inherited_entry_m0)
             if (reg <= 105) wave64_m0_token_word_in.front().insert(reg);
@@ -2165,6 +2159,12 @@ bool emit_cfg_state_machine(
                         readlane_words.insert(base + static_cast<int>(word));
             std::vector<int> vector_writes;
             for_each_possible_vector_write(in, [&](int reg) { vector_writes.push_back(reg); });
+            if (track_active_vectors) {
+                advance_active_vector_words(halves.active_vectors, in, scalar_writes, vector_writes,
+                                            mask_write, relay_sources.active_defined,
+                                            vector_write_completes_active_word(in));
+                if (record_compare) active_vectors_after[in.pc] = halves.active_vectors.current;
+            }
             if (track_spilled_halves)
                 advance_spilled_mask_halves(halves, in, masks, static_mask_keys, scalar_writes,
                                             vector_writes, mask_write);
@@ -3203,6 +3203,8 @@ bool emit_cfg_state_machine(
             }
         }
         state.exec_narrowed = true; // state-machine joins may carry a narrowed EXEC edge
+        if (track_active_vectors && dispatch != UINT32_MAX && entry_wave64_b64)
+            restore_active_vector_words(halves_in.active_vectors.current, state);
         state.mubuf_pcrel_tables = initial.mubuf_pcrel_tables;
         state.smem_pcrel_tables = initial.smem_pcrel_tables;
         state.mtbuf_pcrel_tables = initial.mtbuf_pcrel_tables;
@@ -3693,6 +3695,8 @@ bool emit_cfg_state_machine(
                         state, in,
                         allows_compute_scalar_vcc_bridge(b), saved_masks);
                 if (handled && ok) retain_saved_mask_words(b, state, in);
+                if (handled && ok && track_active_vectors)
+                    restore_active_vector_instruction(active_vectors_after, in, state);
                 if (handled && ok) {
                     packet_raw_masks.expire(state, in);
                     packet_raw_masks.stage(b, state, in);

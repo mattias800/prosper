@@ -92,6 +92,16 @@ bool relative_constant_offset(const SpirvCompute& b, uint32_t value, uint32_t& o
 
 }   // namespace
 
+bool vector_write_completes_active_word(const Rdna2Inst& in) {
+    return complete_full_word_write(in) ||
+           (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x346 && !in.has_modifier && !in.has_dpp &&
+            !vector_write_depends_on_old_word(in, true)) ||
+           (in.fmt == Rdna2Format::FLAT && in.opcode >= 0x08 && in.opcode <= 0x0f &&
+            (in.flat_segment == 0 || in.flat_segment == 2) && !in.flat_lds &&
+            in.src[0].kind == OperandKind::VGPR && in.src[0].value >= 0 && in.src[0].value < 255 &&
+            in.src[1].kind == OperandKind::Special && in.src[1].value == 125);
+}
+
 void seed_vector_word_definedness(RegState& rs, const std::vector<Rdna2Inst>& instructions,
                                   bool native_interpolation, uint32_t wave_size) {
     // CONFIDENCE: HIGH -- operand_bits/vreg_old supply zero for absent ordinary VGPRs. That
@@ -223,6 +233,7 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
     if (!width) return;
     const bool relative = in.fmt == Rdna2Format::VOP1 && in.opcode == kVop1OpcodeMovreldB32;
     const bool preserve = vector_write_depends_on_old_word(in, full_exec);
+    const bool complete = complete_full_word_write(in);
     const int end = relative ? rs.max_vgpr + 1 : in.dst.value + static_cast<int>(width);
     for (int reg = in.dst.value; reg < end; ++reg) {
         ScalarSourceMarks result = source;
@@ -232,7 +243,6 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
         // A write defines its word only in the lanes it writes. Confinement is granted only when the
         // form writes the complete word of every active lane; any other form (preserved bits,
         // selected lanes, relative destinations, cross-lane forms) leaves the old word unconfined.
-        const bool complete = complete_full_word_write(in);
         const bool narrowed_write = rs.exec_narrowed && !rdna2_instruction_may_change_exec(in);
         if (!complete) {
             result.outside_exec = 0;
