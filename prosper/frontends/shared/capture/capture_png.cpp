@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <system_error>
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
@@ -136,7 +137,8 @@ bool write_png(const char* path, const uint8_t* rgba, uint32_t w, uint32_t h, st
 
     FILE* f = fopen(path, "wb");
     if (!f) {
-        error = std::string("open failed: ") + strerror(errno);
+        error = std::string("open failed: ") +
+                std::error_code(errno, std::generic_category()).message();
         return false;
     }
     static const uint8_t sig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
@@ -158,14 +160,16 @@ bool write_png(const char* path, const uint8_t* rgba, uint32_t w, uint32_t h, st
     put_chunk(f, "IDAT", comp.data(), clen);
     put_chunk(f, "IEND", nullptr, 0);
     if (ferror(f)) {
-        error = std::string("write failed: ") + strerror(errno);
+        error = std::string("write failed: ") +
+                std::error_code(errno, std::generic_category()).message();
         fclose(f);
         std::error_code remove_error;
         std::filesystem::remove(path, remove_error);
         return false;
     }
     if (fclose(f) != 0) {
-        error = std::string("close failed: ") + strerror(errno);
+        error = std::string("close failed: ") +
+                std::error_code(errno, std::generic_category()).message();
         std::error_code remove_error;
         std::filesystem::remove(path, remove_error);
         return false;

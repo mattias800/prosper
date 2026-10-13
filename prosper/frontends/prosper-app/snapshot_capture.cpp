@@ -19,10 +19,11 @@ bool positive_number(const char* text, double& number) {
     return !errno && end != text && !*end && std::isfinite(number) && number > 0;
 }
 const char* environment(const char* name) {
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): one UI-thread boot snapshots configured launch settings.
     const char* result = std::getenv(name);
     return result ? result : "";
 }
-} // namespace
+}   // namespace
 
 bool SnapshotCaptureRequest::argument(const std::string& option, int& index, int argc, char** argv,
                                       std::string& error) {

@@ -1322,7 +1322,8 @@ LONG WINAPI report_unhandled_fault(EXCEPTION_POINTERS* ep) {
 // relaunch must strip an app-authored value so the next title re-resolves its own (#2973 review).
 bool g_guest_args_app_set = false;
 bool g_boot_attempted = false;
-static prosper::frontend::SnapshotCapture g_snapshot_capture;
+// The main-local adapter outlives guest callbacks: a booted app exits through _Exit.
+static prosper::frontend::SnapshotCapture* g_snapshot_capture = nullptr;
 
 // Install the host frontends (audio out, controller in, dialogs) at the same point boot_trace does:
 // right after the built-in HLE is registered, before the guest runs. Each is built in only when its
@@ -1447,14 +1448,14 @@ static bool start_guest(const std::string& app0_root, std::string* err) {
                       prosper::frontend::selected_guest_executable()))
         return false;
     std::string captureError;
-    if (!g_snapshot_capture.start(app0_root, captureError)) {
+    if (!g_snapshot_capture->start(app0_root, captureError)) {
         if (err) *err = captureError;
         return false;
     }
     g_guest_started = true;
     g_guest_thread = std::thread([]{
         const BootResult result = run_entry(g_prog.imgs[0]);
-        if (g_snapshot_capture.enabled())
+        if (g_snapshot_capture->enabled())
             prosper::screenshot::publish_guest_outcome(result.kind, result.fault_rip,
                                                        result.fault_addr, result.detail.c_str());
         fprintf(stderr,
@@ -1740,6 +1741,9 @@ static bool relaunch_with_dump(int argc, char** argv, const std::string& app0_ro
 } // namespace
 
 int main(int argc, char** argv) {
+    // Construct the manifest stream during startup rather than before main.
+    prosper::frontend::SnapshotCapture snapshotCapture;
+    g_snapshot_capture = &snapshotCapture;
 #ifdef _WIN32
     g_previous_unhandled_filter = SetUnhandledExceptionFilter(report_unhandled_fault);
 #endif
@@ -1772,7 +1776,7 @@ int main(int argc, char** argv) {
         std::string a = argv[i];
         if (a.starts_with("--snapshot-")) {
             std::string error;
-            if (!g_snapshot_capture.request.argument(a, i, argc, argv, error)) {
+            if (!g_snapshot_capture->request.argument(a, i, argc, argv, error)) {
                 std::fprintf(stderr, "prosper-app: %s\n", error.c_str());
                 return 2;
             }
@@ -1899,11 +1903,11 @@ int main(int argc, char** argv) {
     pick.test_pattern = testPattern;
 
     std::string snapshotError;
-    if (!g_snapshot_capture.request.valid(snapshotError)) {
+    if (!g_snapshot_capture->request.valid(snapshotError)) {
         std::fprintf(stderr, "prosper-app: %s\n", snapshotError.c_str());
         return 2;
     }
-    if (g_snapshot_capture.enabled()) {
+    if (g_snapshot_capture->enabled()) {
         if (dump.empty() || testPattern) {
             std::fprintf(stderr,
                          "prosper-app: snapshot capture requires a real game and visible window\n");
@@ -2075,7 +2079,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (g_snapshot_capture.enabled()) {
+    if (g_snapshot_capture->enabled()) {
         const char* driver = SDL_GetCurrentVideoDriver();
         if (!driver || std::string(driver) == "offscreen" || std::string(driver) == "dummy") {
             std::fprintf(stderr, "[snapshot] no normal desktop video driver; capture refused\n");
@@ -3238,12 +3242,12 @@ int main(int argc, char** argv) {
     const uint64_t perfLoopStartNs = prosper::perf::monotonic_now_ns();
     bool guestEndReported = false;
     while (running && !prosper_stop_requested()) {
-        if (g_snapshot_capture.enabled()) {
+        if (g_snapshot_capture->enabled()) {
             const auto captureWindowFlags = SDL_GetWindowFlags(win);
             const bool captureVisible =
                 !(captureWindowFlags &
                   (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED | SDL_WINDOW_OCCLUDED));
-            if (g_snapshot_capture.poll(captureVisible)) break;
+            if (g_snapshot_capture->poll(captureVisible)) break;
         }
         drainStagedGrabCandidate();
         expirePendingGrabProducer();
@@ -4175,7 +4179,7 @@ int main(int argc, char** argv) {
                 } else {
                     lastFrameSeq = frame.frame_seq;
                     shown.record(prosper::frontend::PresentedFrameSource::Cpu, running);
-                    g_snapshot_capture.retain(frame, true);
+                    g_snapshot_capture->retain(frame, true);
                     lastFrameProgress = std::chrono::steady_clock::now();
                     prosper::frontend::FrameGrabScreenshotEvidence source;
                     source.host_presented = true;
@@ -4324,7 +4328,7 @@ int main(int argc, char** argv) {
     perfCapture.cancel();     // never publish a short/incomplete .prperf on a graceful early exit
     prosper_request_stop();   // signal the guest run-loop to wind down at its next boundary
     fprintf(stderr, "[app] shutting down after %llu presented frame(s)\n", (unsigned long long)shown);
-    const int captureExit = g_snapshot_capture.finish();
+    const int captureExit = g_snapshot_capture->finish();
     const int exitCode =
         captureExit ? captureExit
                     : prosper::app::exit_status(g_guest_end_kind.load(std::memory_order_acquire),

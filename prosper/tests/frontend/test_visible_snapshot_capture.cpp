@@ -4,6 +4,7 @@
 #include "build_revision.hpp"
 #include "fixtures/test_scratch.h"
 #include <gtest/gtest.h>
+#include <cstddef>
 #include <fstream>
 #include <iterator>
 #include <memory>
@@ -222,7 +223,8 @@ TEST_F(VisibleSnapshotFiles, CompletedShownPixelsRemainStaleSamplesAndDecodeByte
         ASSERT_NE(decoded, nullptr) << stbi_failure_reason();
         EXPECT_EQ(width, 2);
         EXPECT_EQ(height, 1);
-        const std::vector<uint8_t> pixels(decoded, decoded + width * height * 4);
+        const auto bytes = static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4;
+        const std::vector<uint8_t> pixels(decoded, decoded + bytes);
         stbi_image_free(decoded);
         EXPECT_EQ(pixels, (std::vector<uint8_t>{1, 2, 3, 255, 4, 5, 6, 255}));
     }
