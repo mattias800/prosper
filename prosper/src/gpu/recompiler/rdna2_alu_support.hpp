@@ -631,7 +631,8 @@ inline bool refuse_mask_write(SpirvCompute& b, const RegState& rs, const Rdna2In
 inline bool vcc_b32_scalar_pair_defined(const SpirvCompute& b, const RegState& rs,
                                         const Rdna2Inst& in) {
     if (b.vcc_b32_scalar_pair_pcs.contains(in.pc)) return true;
-    if (!b.is_compute || b.wave_size != 64 || !b32_sources_defined(rs, in)) return false;
+    if ((!b.is_compute && !b.is_fragment) || b.wave_size != 64 || !b32_sources_defined(rs, in))
+        return false;
     Operand sibling;
     sibling.kind = OperandKind::Special;
     sibling.value = in.dst.value == 106 ? 107 : 106;

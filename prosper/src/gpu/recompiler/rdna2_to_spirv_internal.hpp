@@ -3065,6 +3065,9 @@ struct RegState {
     // s_cselect/s_cmov/s_addc/s_subb carries the mark into its destination even with clean
     // explicit sources.
     bool scc_merge_placeholder = false;
+    // Scoped Wave64 fragment scalar-VCC admission needs an actual SCC producer, just as Wave32
+    // does. Other Wave64 paths retain their established entry/condition policy.
+    bool track_scc_definition = false;
     std::set<uint64_t> scc_loop_blanket;
     int max_vgpr = 0;          // highest statically referenced VGPR in this shader
     // Immutable raw user-data words for DIRECT descriptors. They stay absent from `sreg` so
@@ -4040,7 +4043,7 @@ inline void propagate_merge_placeholder(RegState& rs, const Rdna2Inst& in,
     const bool move_preserves_scc =
         in.fmt == Rdna2Format::SOP1 &&
         (in.opcode == kSop1OpcodeMovB32 || in.opcode == kSop1OpcodeMovB64);
-    if (rs.vector_wave_size == 32) {
+    if (rs.vector_wave_size == 32 || rs.track_scc_definition) {
         record_wave32_scalar_condition(rs, in, marks);
         return;
     }
