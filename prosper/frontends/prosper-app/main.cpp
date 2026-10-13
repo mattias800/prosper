@@ -2075,6 +2075,14 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (g_snapshot_capture.enabled()) {
+        const char* driver = SDL_GetCurrentVideoDriver();
+        if (!driver || std::string(driver) == "offscreen" || std::string(driver) == "dummy") {
+            std::fprintf(stderr, "[snapshot] no normal desktop video driver; capture refused\n");
+            return 1;   // refuse before the argv path can launch the guest
+        }
+    }
+
     // Boot the game (unless test-pattern): the shared start_guest() path registers the live renderer
     // so the guest's GPU submits composite to frames on the present layer, boots through
     // boot_program, and runs the guest on its own thread while this thread owns the window +
@@ -2123,13 +2131,6 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[app] SDL_CreateWindow: %s\n", err);
         if (vulkan_error_means_no_driver(err)) report_no_vulkan_driver();
         return exit_startup_failure();
-    }
-    if (g_snapshot_capture.enabled()) {
-        const char* driver = SDL_GetCurrentVideoDriver();
-        if (!driver || std::string(driver) == "offscreen" || std::string(driver) == "dummy") {
-            std::fprintf(stderr, "[snapshot] no normal desktop video driver; capture refused\n");
-            return exit_startup_failure();
-        }
     }
     // Title-bar + taskbar icon from the baked-in mark. Cosmetic: a failure keeps the default
     // icon and is said once, never fatal. The bytes are already RGBA, so no decode is needed.
