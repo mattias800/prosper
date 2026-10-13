@@ -1717,6 +1717,7 @@ static bool relaunch_with_dump(int argc, char** argv, const std::string& app0_ro
     }
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
+    return true;
 #else
     std::vector<char*> cargv;
     cargv.reserve(args.size() + 1);
@@ -3152,6 +3153,7 @@ int main(int argc, char** argv) {
             fprintf(stderr, "[app] opening %s in a new window\n", root.c_str());
             if (relaunch_with_dump(argc, argv, root)) {
                 record_recent(root);
+                fprintf(stderr, "[app] game started in a new window; the library stays open\n");
                 return true;
             }
             fprintf(stderr, "[app] could not start the new process\n");
