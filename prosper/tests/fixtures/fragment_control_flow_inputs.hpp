@@ -60,4 +60,4 @@ compile_ngg_phi_fixture_with_declared_predicate(std::span<const uint32_t> body) 
     code.insert(code.end(), body.begin() + 14, body.end());
     return prosper::gpu::recompile_vertex(code.data(), code.size());
 }
-} // namespace prosper::test
+}   // namespace prosper::test
