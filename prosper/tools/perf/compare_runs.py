@@ -122,7 +122,7 @@ def _switch_classes():
         )
         try:
             text = registry.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeError):
             text = ""
         for line in text.splitlines():
             line = line.strip()
@@ -138,16 +138,19 @@ def _switch_refusals(baseline_switches, candidate_switches):
     """Refusals from the two `switches` maps. Empty means no evidence problem."""
     reasons = []
     classes = _switch_classes()
+    absent = object()
     for name in sorted(set(baseline_switches) | set(candidate_switches)):
-        old = baseline_switches.get(name, "<absent>")
-        new = candidate_switches.get(name, "<absent>")
+        old = baseline_switches.get(name, absent)
+        new = candidate_switches.get(name, absent)
         if old == new:
             continue
         cls = classes.get(name, "unclassified")
         if cls in ("host-capability", "diagnostic"):
             continue
+        old_text = "<absent>" if old is absent else repr(old)
+        new_text = "<absent>" if new is absent else repr(new)
         reasons.append(
-            f"switches.{name}: baseline {old!r} != candidate {new!r} "
+            f"switches.{name}: baseline {old_text} != candidate {new_text} "
             f"(class {cls}; a run with behaviour switches is not evidence)"
         )
     return reasons
@@ -221,7 +224,11 @@ def refusals(baseline, candidate):
 
     switch_maps = {}
     for label, records in (("baseline", baseline), ("candidate", candidate)):
-        switches = records["switches"].get("switches")
+        entry = records["switches"]
+        if type(entry.get("schema")) is not int or entry["schema"] != 1:
+            reasons.append(f"{label}: unsupported `switches` schema; re-run it")
+            continue
+        switches = entry.get("switches")
         if not isinstance(switches, dict) or any(
             not isinstance(name, str) or not isinstance(value, str)
             for name, value in switches.items()

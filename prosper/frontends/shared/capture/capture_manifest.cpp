@@ -8,6 +8,8 @@
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <memory>
+#include <cwchar>
 #include <sstream>
 #include <unordered_set>
 
@@ -288,50 +290,51 @@ std::string manifest_conditions_json(const CaptureConditions& c) {
 
 std::string manifest_run_json(const CaptureRunConfig& c) {
     std::ostringstream line;
-    line << "{\"type\":\"run\",\"schema\":1"
-         << ",\"title\":\"" << json_escape(c.title) << "\""
-         // The revision this BINARY was compiled from, not the revision of the checkout it is run
-         // from. Those differ whenever a lane checks out new work and measures without rebuilding,
-         // and nothing else in the artifact can tell them apart: the source tree looks current, the
-         // run succeeds, and the result is a confident measurement of the wrong build (instrument
-         // trap 81). Recording it here makes every manifest self-describing, including archived ones
-         // nobody can re-run. `tools/revision/check_build_revision.py` is the active check.
-          << ",\"build_revision\":\"" << json_escape(prosper::embedded_build_revision()) << "\""
-          // The BUILD beside the HEAD: HEAD alone does not see dirty or untracked
-          // compiled edits, and never samples the toolchain or configuration.
-          // Same-binary A/B arms compare this for equality by reading the run
-          // record, not by trusting the checkout either arm ran from.
-          << ",\"build_source_identity\":\""
-          << json_escape(prosper::embedded_build_source_identity()) << "\""
-         << ",\"timestamp\":\"" << json_escape(c.timestamp) << "\""
-         << ",\"output_dir\":\"" << json_escape(c.output_dir) << "\""
-         << ",\"input_route\":\"" << json_escape(c.input_route) << "\""
-         << ",\"capture_mode\":\"" << (c.time_mode ? "wall_seconds" : "rendered_frames") << "\""
-         << ",\"seconds\":" << std::fixed << std::setprecision(6) << c.seconds
-         << ",\"every\":" << c.every << ",\"requested\":" << c.requested
-         << ",\"warmup_ms\":" << c.warmup_ms
-         << ",\"warmup_submits\":" << c.warmup_submits
-         << ",\"render_every\":\"" << json_escape(c.render_every) << "\""
-         << ",\"render_every_for_ms\":\"" << json_escape(c.render_every_for_ms) << "\""
-         << ",\"render_scale\":\"" << json_escape(c.render_scale) << "\""
-         << ",\"render_target_dim\":\"" << json_escape(c.render_target_dim) << "\""
-         << ",\"render_resource_dim\":\"" << json_escape(c.render_resource_dim) << "\""
-         << ",\"assertions\":{\"min_distinct_frames\":" << c.min_distinct_frames
-         << ",\"max_stale_seconds\":" << std::fixed << std::setprecision(6) << c.max_stale_seconds
-         << ",\"min_pixel_distinct_frames\":" << c.min_pixel_distinct_frames
-         << ",\"max_pixel_stale_seconds\":" << std::fixed << std::setprecision(6)
-         << c.max_pixel_stale_seconds
-         << ",\"require_composited_frame\":" << (c.require_composited_frame ? "true" : "false")
-         << ",\"fps_overlay\":" << (c.fps_overlay ? "true" : "false")
-         << ",\"min_present_count\":" << c.min_present_count
-         << ",\"min_frame_seq\":" << c.min_frame_seq
-         << ",\"allow_guest_fault\":" << (c.allow_guest_fault ? "true" : "false")
-         // Sampling policy rather than an assertion, but recorded in the same object so one line
-         // still reproduces the whole invocation.
-         << ",\"stop_after_guest_fault\":" << (c.stop_after_guest_fault ? "true" : "false")
-         << ",\"guest_fault_settle_seconds\":" << std::fixed << std::setprecision(6)
-         << c.guest_fault_settle_seconds
-         << ",\"required_crc32\":";
+    line
+        << "{\"type\":\"run\",\"schema\":1"
+        << ",\"title\":\"" << json_escape(c.title)
+        << "\""
+        // The revision this BINARY was compiled from, not the revision of the checkout it is run
+        // from. Those differ whenever a lane checks out new work and measures without rebuilding,
+        // and nothing else in the artifact can tell them apart: the source tree looks current, the
+        // run succeeds, and the result is a confident measurement of the wrong build (instrument
+        // trap 81). Recording it here makes every manifest self-describing, including archived ones
+        // nobody can re-run. `tools/revision/check_build_revision.py` is the active check.
+        << ",\"build_revision\":\"" << json_escape(prosper::embedded_build_revision())
+        << "\""
+        // The BUILD beside the HEAD: HEAD alone does not see dirty or untracked
+        // compiled edits, and never samples the toolchain or configuration.
+        // Same-binary A/B arms compare this for equality by reading the run
+        // record, not by trusting the checkout either arm ran from.
+        << ",\"build_source_identity\":\"" << json_escape(prosper::embedded_build_source_identity())
+        << "\""
+        << ",\"timestamp\":\"" << json_escape(c.timestamp) << "\""
+        << ",\"output_dir\":\"" << json_escape(c.output_dir) << "\""
+        << ",\"input_route\":\"" << json_escape(c.input_route) << "\""
+        << ",\"capture_mode\":\"" << (c.time_mode ? "wall_seconds" : "rendered_frames") << "\""
+        << ",\"seconds\":" << std::fixed << std::setprecision(6) << c.seconds
+        << ",\"every\":" << c.every << ",\"requested\":" << c.requested
+        << ",\"warmup_ms\":" << c.warmup_ms << ",\"warmup_submits\":" << c.warmup_submits
+        << ",\"render_every\":\"" << json_escape(c.render_every) << "\""
+        << ",\"render_every_for_ms\":\"" << json_escape(c.render_every_for_ms) << "\""
+        << ",\"render_scale\":\"" << json_escape(c.render_scale) << "\""
+        << ",\"render_target_dim\":\"" << json_escape(c.render_target_dim) << "\""
+        << ",\"render_resource_dim\":\"" << json_escape(c.render_resource_dim) << "\""
+        << ",\"assertions\":{\"min_distinct_frames\":" << c.min_distinct_frames
+        << ",\"max_stale_seconds\":" << std::fixed << std::setprecision(6) << c.max_stale_seconds
+        << ",\"min_pixel_distinct_frames\":" << c.min_pixel_distinct_frames
+        << ",\"max_pixel_stale_seconds\":" << std::fixed << std::setprecision(6)
+        << c.max_pixel_stale_seconds
+        << ",\"require_composited_frame\":" << (c.require_composited_frame ? "true" : "false")
+        << ",\"fps_overlay\":" << (c.fps_overlay ? "true" : "false")
+        << ",\"min_present_count\":" << c.min_present_count
+        << ",\"min_frame_seq\":" << c.min_frame_seq << ",\"allow_guest_fault\":"
+        << (c.allow_guest_fault ? "true" : "false")
+        // Sampling policy rather than an assertion, but recorded in the same object so one line
+        // still reproduces the whole invocation.
+        << ",\"stop_after_guest_fault\":" << (c.stop_after_guest_fault ? "true" : "false")
+        << ",\"guest_fault_settle_seconds\":" << std::fixed << std::setprecision(6)
+        << c.guest_fault_settle_seconds << ",\"required_crc32\":";
     if (c.required_crc32_set)
         line << "\"" << std::hex << std::setw(8) << std::setfill('0') << c.required_crc32
              << std::dec << "\"";
@@ -492,23 +495,40 @@ void record_switch(std::map<std::string, std::string>& out, const std::string& e
     out[name] = entry.substr(at + 1);
 }
 
-} // namespace
+}   // namespace
 
-std::map<std::string, std::string> collect_prosper_switches() {
+std::optional<std::map<std::string, std::string>> collect_prosper_switches() {
     std::map<std::string, std::string> out;
 #ifdef _WIN32
-    // GetEnvironmentStringsA returns NUL-separated "NAME=value" entries behind a
-    // final NUL. environ is not reliably populated under MinGW, so read the block.
-    char* block = GetEnvironmentStringsA();
-    if (!block) return out;
-    for (char* entry = block; *entry != '\0'; entry += std::strlen(entry) + 1)
-        record_switch(out, entry);
-    FreeEnvironmentStringsA(block);
+    // The wide block preserves values outside the OEM code page. Serialize UTF-8;
+    // collection or conversion failure must never look like verified absence.
+    const std::unique_ptr<wchar_t, decltype(&FreeEnvironmentStringsW)> block(
+        GetEnvironmentStringsW(), &FreeEnvironmentStringsW);
+    if (!block) return std::nullopt;
+    for (const wchar_t* entry = block.get(); *entry != L'\0'; entry += std::wcslen(entry) + 1) {
+        if (std::wcslen(entry) <= 8 ||
+            CompareStringOrdinal(entry, 8, L"PROSPER_", 8, TRUE) != CSTR_EQUAL)
+            continue;
+        const int bytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, entry, -1, nullptr, 0,
+                                              nullptr, nullptr);
+        if (bytes == 0) return std::nullopt;
+        std::string utf8(static_cast<size_t>(bytes), '\0');
+        if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, entry, -1, utf8.data(), bytes,
+                                nullptr, nullptr) != bytes)
+            return std::nullopt;
+        utf8.pop_back();   // The API's byte count includes the terminator.
+        // Windows environment names are case-insensitive, as are runtime lookups.
+        // Canonicalize the ASCII name so a lower-case setting reaches the registry.
+        for (char& ch : utf8) {
+            if (ch == '=') break;
+            if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 'a' + 'A');
+        }
+        record_switch(out, utf8);
+    }
 #elif defined(__APPLE__)
     // environ is not directly addressable on Apple targets; _NSGetEnviron is
     // the documented accessor (a manual `extern char** environ` mislinks there).
-    for (char** entry = *_NSGetEnviron(); entry && *entry; ++entry)
-        record_switch(out, *entry);
+    for (char** entry = *_NSGetEnviron(); entry && *entry; ++entry) record_switch(out, *entry);
 #else
     for (char** entry = environ; entry && *entry; ++entry) record_switch(out, *entry);
 #endif
@@ -523,8 +543,7 @@ std::string manifest_switches_json(const std::map<std::string, std::string>& swi
     for (const auto& entry : switches) {
         if (!first) line << ",";
         first = false;
-        line << "\"" << json_escape(entry.first) << "\":\"" << json_escape(entry.second)
-             << "\"";
+        line << "\"" << json_escape(entry.first) << "\":\"" << json_escape(entry.second) << "\"";
     }
     line << "}}";
     return line.str();

@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -252,7 +253,8 @@ std::string manifest_run_json(const CaptureRunConfig& config);
 // this is the third leg: every PROSPER_* variable present in the run's
 // environment, so a reader can tell from the artifact whether it qualifies as
 // evidence. Sorted by name, so two runs diff cleanly.
-std::map<std::string, std::string> collect_prosper_switches();
+// Unavailable collection is distinct from an empty, successfully collected map.
+std::optional<std::map<std::string, std::string>> collect_prosper_switches();
 std::string manifest_switches_json(const std::map<std::string, std::string>& switches);
 
 // The conditions a framerate depends on that the `run` line cannot know: it is written before the

@@ -14,6 +14,8 @@ import sys
 import tempfile
 import unittest
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import compare_runs as cr  # noqa: E402
 
@@ -321,56 +323,60 @@ class Cli(unittest.TestCase):
             self.assertEqual(self.run_main(base, invalid_utf8)[0], 2)
 
 
-class SwitchRefusals(unittest.TestCase):
-    """ADR 0023: a run with behaviour switches is not evidence.
+def test_identical_switches_are_comparable():
+    pair = manifest(switches={"switches": {"PROSPER_GFXLOG": "1"}})
+    assert cr.refusals(pair, pair) == []
 
-    Each arm matches EVERYWHERE except one switch, so a refusal can only be
-    attributed to that switch. Registry classes are read from the real
-    switch_registry.txt: PROSPER_GFXLOG is diagnostic, PROSPER_WAVE64_EXCHANGE
-    is a selector, PROSPER_FLIP_PACE_FPS is unclassified.
-    """
 
-    def test_identical_switches_are_comparable(self):
-        pair = manifest(switches={"switches": {"PROSPER_GFXLOG": "1"}})
-        self.assertEqual(cr.refusals(pair, manifest(switches={"switches": {"PROSPER_GFXLOG": "1"}})), [])
+def test_build_source_identity_may_differ_like_the_revision():
+    candidate = manifest(run={"build_source_identity": "b" * 64})
+    assert cr.refusals(manifest(), candidate) == []
 
-    def test_build_source_identity_may_differ_like_the_revision(self):
-        candidate = manifest(run={"build_source_identity": "b" * 64})
-        self.assertEqual(cr.refusals(manifest(), candidate), [])
 
-    def test_diagnostic_only_difference_is_comparable(self):
-        base = manifest(switches={"switches": {"PROSPER_GFXLOG": "1"}})
-        candidate = manifest(switches={"switches": {"PROSPER_GFXLOG": "2"}})
-        self.assertEqual(cr.refusals(base, candidate), [])
+@pytest.mark.parametrize("old,new", [("1", "2"), (None, "1")])
+def test_diagnostic_difference_is_comparable(old, new):
+    base = manifest(switches={"switches": {} if old is None else {"PROSPER_GFXLOG": old}})
+    candidate = manifest(switches={"switches": {"PROSPER_GFXLOG": new}})
+    assert cr.refusals(base, candidate) == []
 
-    def test_selector_difference_refuses(self):
-        base = manifest(switches={"switches": {"PROSPER_WAVE64_EXCHANGE": "0"}})
-        candidate = manifest(switches={"switches": {"PROSPER_WAVE64_EXCHANGE": "1"}})
-        reasons = cr.refusals(base, candidate)
-        self.assertTrue(any("PROSPER_WAVE64_EXCHANGE" in r for r in reasons), reasons)
 
-    def test_unclassified_difference_refuses(self):
-        base = manifest(switches={"switches": {"PROSPER_FLIP_PACE_FPS": ""}})
-        candidate = manifest(switches={"switches": {"PROSPER_FLIP_PACE_FPS": "60"}})
-        reasons = cr.refusals(base, candidate)
-        self.assertTrue(any("PROSPER_FLIP_PACE_FPS" in r for r in reasons), reasons)
+@pytest.mark.parametrize("name", ["PROSPER_WAVE64_EXCHANGE", "PROSPER_FLIP_PACE_FPS", "PROSPER_FUTURE_SWITCH"])
+@pytest.mark.parametrize("old,new", [("0", "1"), (None, "<absent>"), ("<absent>", None)])
+def test_behaviour_switch_differences_refuse(name, old, new):
+    base = manifest(switches={"switches": {} if old is None else {name: old}})
+    candidate = manifest(switches={"switches": {} if new is None else {name: new}})
+    reasons = cr.refusals(base, candidate)
+    assert any(f"switches.{name}:" in reason for reason in reasons), reasons
 
-    def test_unknown_switch_difference_refuses(self):
-        base = manifest(switches={"switches": {}})
-        candidate = manifest(switches={"switches": {"PROSPER_FUTURE_SWITCH": "1"}})
-        reasons = cr.refusals(base, candidate)
-        self.assertTrue(any("PROSPER_FUTURE_SWITCH" in r for r in reasons), reasons)
 
-    def test_a_manifest_without_switches_is_refused_and_says_why(self):
-        old = manifest()
-        del old["switches"]
-        reasons = cr.refusals(manifest(), old)
-        self.assertTrue(any("predates the `switches` record" in r for r in reasons), reasons)
+def test_a_manifest_without_switches_is_refused_and_says_why():
+    old = manifest()
+    del old["switches"]
+    reasons = cr.refusals(manifest(), old)
+    assert any("predates the `switches` record" in reason for reason in reasons), reasons
 
-    def test_a_diagnostic_left_set_on_one_side_only_is_still_comparable(self):
-        base = manifest(switches={"switches": {}})
-        candidate = manifest(switches={"switches": {"PROSPER_GFXLOG": "1"}})
-        self.assertEqual(cr.refusals(base, candidate), [])
+
+@pytest.mark.parametrize("schema", [None, 0, 2, True, "1"])
+def test_unknown_switch_schema_refuses(schema):
+    candidate = manifest(switches={"schema": schema})
+    assert any("unsupported `switches` schema" in reason for reason in cr.refusals(manifest(), candidate))
+
+
+@pytest.mark.parametrize("switches", [None, [], {"PROSPER_WAVE64_EXCHANGE": 1}])
+def test_malformed_switch_map_refuses(switches):
+    candidate = manifest(switches={"switches": switches})
+    assert any("malformed" in reason for reason in cr.refusals(manifest(), candidate))
+
+
+@pytest.mark.parametrize("error", [OSError("unreadable"), UnicodeError("invalid encoding")])
+def test_unreadable_registry_refuses_a_diagnostic_difference(monkeypatch, error):
+    def unreadable(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(cr, "_SWITCH_CLASSES", None)
+    monkeypatch.setattr(cr.Path, "read_text", unreadable)
+    candidate = manifest(switches={"switches": {"PROSPER_GFXLOG": "1"}})
+    assert any("PROSPER_GFXLOG" in reason for reason in cr.refusals(manifest(), candidate))
 
 
 if __name__ == "__main__":
