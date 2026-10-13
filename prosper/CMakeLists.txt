@@ -3317,6 +3317,10 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_terminal_tail_retention
     SOURCES tests/gpu/execute/test_terminal_tail_retention.cpp
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_fragment_terminal_tail
+    SOURCES tests/gpu/execute/test_fragment_terminal_tail.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   # Cache switches are process-cached. These distinct processes exercise the actual bypass paths.
   foreach(source_policy IN ITEMS analysis_off decode_off both_off)
     add_test(NAME shader_source_window_${source_policy}
