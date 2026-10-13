@@ -280,7 +280,11 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
             result.outside_exec = 0;
         } else if (narrowed_write) {
             // Outside EXEC the old word survives; inside it the result is the source relayed.
-            const bool defined_inside = vector_word_defined_in_exec(rs, source, rs.exec);
+            const bool image_proof = in.fmt == Rdna2Format::MIMG && result.hard;
+            const bool defined_inside =
+                vector_word_defined_in_exec(rs, source, rs.exec) &&
+                (!image_proof || (rs.mimg_sources.pc == in.pc && rs.mimg_sources.enabled &&
+                                  rs.mimg_sources.defined));
             result.outside_exec = defined_inside ? rs.exec : 0u;
             if (defined_inside && result.hard) {
                 // A narrower write leaves genuine old lanes in the rest of the prior owner. Keep
@@ -290,6 +294,9 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
                                         old.outside_exec != rs.exec &&
                                         exec_within(rs, rs.exec, old.outside_exec);
                 result.blanket_roots = source.blanket_roots;
+                if (image_proof)
+                    result.blanket_roots.insert(rs.mimg_sources.roots.begin(),
+                                                rs.mimg_sources.roots.end());
                 if (keep_wider) {
                     result.outside_exec = old.outside_exec;
                     result.blanket_roots.insert(old.blanket_roots.begin(), old.blanket_roots.end());
@@ -310,6 +317,43 @@ bool vector_word_defined_in_exec(const RegState& rs, const ScalarSourceMarks& ma
     if (!marks.placeholder) return true;
     if (!marks.hard) return !marks.blanket_roots.empty();
     return marks.outside_exec != 0 && exec_within(rs, exec, marks.outside_exec);
+}
+
+void begin_mimg_source_proof(RegState& rs, uint32_t pc) {
+    rs.mimg_sources = {pc, rs.exec_narrowed, true, {}, {}};
+}
+
+void record_mimg_source_word(RegState& rs, int reg) {
+    auto& proof = rs.mimg_sources;
+    if (!proof.enabled || !proof.words.insert(reg).second) return;
+    const auto value = rs.vreg.find(reg);
+    const auto marks = vector_word(rs, reg);
+    if (reg < 0 || reg > 255 || value == rs.vreg.end() || !value->second ||
+        !vector_word_defined_in_exec(rs, marks, rs.exec))
+        proof.defined = false;
+    proof.roots.insert(marks.blanket_roots.begin(), marks.blanket_roots.end());
+}
+
+void record_mimg_address_operand(RegState& rs, const Rdna2Inst& in, uint32_t index) {
+    // NSA's first VGPR is VADDR; subsequent register numbers come from the actual extra dwords.
+    // Zero padding beyond the encoded instruction cannot invent an additional v0 operand.
+    if (rs.mimg_sources.enabled && in.len_dwords > 2u && index > 0u &&
+        2u + (index - 1u) / 4u >= in.len_dwords)
+        rs.mimg_sources.defined = false;
+}
+
+uint32_t read_mimg_source_word(SpirvCompute& b, RegState& rs, int reg) {
+    record_mimg_source_word(rs, reg);
+    const auto value = rs.vreg.find(reg);
+    return value == rs.vreg.end() ? b.uconst(0) : value->second;
+}
+
+int mimg_address_vgpr(RegState& rs, const Rdna2Inst& in, uint32_t index) {
+    record_mimg_address_operand(rs, in, index);
+    if (in.len_dwords <= 2u) return in.src[0].value + static_cast<int>(index);
+    if (!index) return in.src[0].value;
+    const uint32_t offset = index - 1u;
+    return static_cast<int>((in.words[2u + offset / 4u] >> (8u * (offset % 4u))) & 0xffu);
 }
 
 void mark_vector_loop_carried(RegState& rs, const std::vector<Rdna2Inst>& ins, uint32_t lo,

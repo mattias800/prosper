@@ -28,6 +28,16 @@ struct ScalarSourceMarks {
 };
 using VectorWordMarks = std::map<int, ScalarSourceMarks>;
 
+// The successful MIMG lowering's actual active-lane reads, before any destination replacement.
+// This authenticates only its new confined-word proof; it does not change image admission policy.
+struct MimgSourceProof {
+    uint32_t pc = UINT32_MAX;
+    bool enabled = false;
+    bool defined = false;
+    std::set<int> words;
+    std::set<uint64_t> roots;
+};
+
 // Pure write effect, shared by structured provenance and current-EXEC CFG DATA facts.
 bool vector_write_completes_active_word(const Rdna2Inst& in);
 void union_source_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other);
@@ -47,6 +57,11 @@ bool fresh_mask_sources_defined(SpirvCompute& b, const RegState& rs, const Rdna2
 void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSourceMarks& source);
 void join_vector_word_marks(VectorWordMarks& into, const VectorWordMarks& other);
 bool vector_word_defined_in_exec(const RegState& rs, const ScalarSourceMarks& marks, uint32_t exec);
+void begin_mimg_source_proof(RegState& rs, uint32_t pc);
+void record_mimg_source_word(RegState& rs, int reg);
+void record_mimg_address_operand(RegState& rs, const Rdna2Inst& in, uint32_t index);
+uint32_t read_mimg_source_word(SpirvCompute& b, RegState& rs, int reg);
+int mimg_address_vgpr(RegState& rs, const Rdna2Inst& in, uint32_t index);
 void mark_vector_loop_carried(RegState& rs, const std::vector<Rdna2Inst>& ins, uint32_t lo,
                               uint32_t hi, std::map<int, std::set<uint64_t>>& carried,
                               std::map<int, uint32_t>& confined);

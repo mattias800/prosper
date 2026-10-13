@@ -5,6 +5,7 @@
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include "gpu/recompiler/storage_dst_sel.hpp"
 #include "gpu/recompiler/rdna2_dot.hpp"
 #include "gpu/recompiler/rdna2_dpp_row_shr.hpp"
@@ -7550,7 +7551,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             const uint32_t SQ_DIM_2D = 1u;
             const uint32_t SQ_DIM_3D = 2u;
             const uint32_t SQ_DIM_2D_ARRAY = 5u;   // (x, y, layer) -- #2265
-            auto vread = [&](int r){ auto it = rs.vreg.find(r); return it == rs.vreg.end() ? b.uconst(0) : it->second; };
+            begin_mimg_source_proof(rs, in.pc);
+            auto vread = [&](int r) { return read_mimg_source_word(b, rs, r); };
 
             // IMAGE_BVH_INTERSECT_RAY (GFX10 opcode 0xe6) has an image encoding but consumes a
             // four-dword BVH descriptor and eleven NSA VGPR operands. Vulkan ray-query support is
@@ -7584,11 +7586,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     return true;
                 }
 
-                auto addr_vgpr = [&](uint32_t k) -> int {
-                    if (k == 0u) return in.src[0].value;
-                    const uint32_t j = k - 1u;
-                    return static_cast<int>((in.words[2u + j / 4u] >> (8u * (j % 4u))) & 0xffu);
-                };
+                auto addr_vgpr = [&](uint32_t k) { return mimg_address_vgpr(rs, in, k); };
                 uint32_t a[11]{};
                 for (uint32_t k = 0; k < 11; ++k) a[k] = vread(addr_vgpr(k));
 
@@ -8210,13 +8208,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 // Non-NSA coords follow VADDR; NSA coord0=VADDR, coord k>=1 is byte (k-1) of
                 // words[2..3] (dword2=addr1..4, dword3=addr5..8), verified via llvm-mc gfx1010.
-                const bool nsa = in.len_dwords > 2;
-                int va = in.src[0].value;
-                auto coord_vgpr = [&](uint32_t k) -> int {
-                    if (!nsa || k == 0) return va + (nsa ? 0 : (int)k);
-                    uint32_t j = k - 1;
-                    return (int)((in.words[2 + j / 4] >> (8 * (j % 4))) & 0xFFu);
-                };
+                auto coord_vgpr = [&](uint32_t k) { return mimg_address_vgpr(rs, in, k); };
                 uint32_t coords[3] = {0, 0, 0};
                 for (uint32_t k = 0; k < ncoord; k++) coords[k] = vread(coord_vgpr(k));
                 uint32_t sample = ms ? vread(coord_vgpr(ncoord)) : 0;   // MSAA sample index = coord after the spatial ones
@@ -8635,9 +8627,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 ok = false;
                 return true;
             }
-            int va = in.src[0].value;
-            auto cvg = [&](uint32_t k) -> int { if (!nsa || k == 0) return va + (nsa ? 0 : (int)k);
-                uint32_t j = k - 1; return (int)((in.words[2 + j / 4] >> (8 * (j % 4))) & 0xFFu); };
+            auto cvg = [&](uint32_t k) { return mimg_address_vgpr(rs, in, k); };
             uint32_t out[4];
             if (dimcube) {
                 // Cube-processed coordinates encode face selection and a normalized in-face pair;

@@ -5,11 +5,16 @@
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_saved_mask_words.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
+#include "gpu/resources/shader_resources.hpp"
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <cstdint>
+#include <iomanip>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -97,6 +102,56 @@ std::vector<uint32_t> loop_with_header_relay(bool clean) {
     return code;
 }
 
+std::vector<uint32_t> loop_with_coordinate_root(bool clean) {
+    auto code = guarded_loop(kSampleLz, kImageWord1, true);
+    // The header reuses the texture descriptor s[8:15], so its counter must not overwrite s10.
+    code[8] = 0xbe840380u;   // s_mov_b32 s4,0
+    code[11] = 0xbf0a8204u;
+    code[14] = 0x80048104u;
+    code[13] = clean ? 0x7e000280u : 0x7e000307u;   // backedge v0 = 0 or uninitialized v7
+    code.insert(code.begin() + 9, {kSampleLz, kImageWord1});   // sample from carried v0 at header
+    code[5] = 0xbf88000cu;
+    code[17] = 0xbf82fff7u;
+    return code;
+}
+
+void check_image_reads(std::vector<uint32_t> image, std::set<int> reads,
+                       ResourceClass cls = ResourceClass::Texture, uint32_t dimension = 1,
+                       uint32_t samples = 1) {
+    // Real initializers precede an independent genuine v7 CMPX. Removing a coordinate producer
+    // never removes the EXEC producer; unused packed/NSA siblings stay absent.
+    std::vector<int> cases{-1};
+    cases.insert(cases.end(), reads.begin(), reads.end());
+    for (int missing : cases) {
+        SCOPED_TRACE(missing);
+        Harness h;
+        auto& resource = h.table.resources.front();
+        resource.cls = cls;
+        resource.img_dim = dimension;
+        resource.depth = dimension == 2 || dimension == 5 || dimension == 7 ? 8 : 1;
+        resource.sample_count = samples;
+        std::vector<uint32_t> code;
+        for (int reg = 0; reg < 6; ++reg) {
+            if (reg == missing || !reads.contains(reg)) {
+                code.push_back(0xbf800000u);
+                h.rs.vreg.erase(reg);
+            } else {
+                code.push_back(0x7e000280u + (static_cast<uint32_t>(reg) << 17u));
+            }
+        }
+        code.insert(code.end(), {0x7e0e0280u, 0x7da40e80u});   // initialize v7; CMPX 0,v7
+        code.insert(code.end(), image.begin(), image.end());
+        code.insert(code.end(), {0x7d040c87u, kEnd});
+        std::vector<Rdna2Inst> ins;
+        rdna2_walk(code.data(), code.size(), ins);
+        seed_vector_word_definedness(h.rs, ins, false, 64);
+        for (size_t i = 0; i < 9; ++i) ASSERT_TRUE(h.emit(ins[i]));
+        ASSERT_EQ(ins[8].fmt, Rdna2Format::MIMG);
+        EXPECT_EQ(h.rs.mimg_sources.words, reads);
+        EXPECT_EQ(h.rs.mimg_sources.defined, missing < 0);
+        EXPECT_EQ(fresh_mask_sources_defined(h.b, h.rs, ins[9]), missing < 0);
+    }
+}
 }   // namespace
 
 TEST(ActiveImageWordDefinedness, GuardedLoopAcceptsAnInitializedBackedge) {
@@ -124,6 +179,94 @@ TEST(ActiveImageWordDefinedness, GuardedLoopRejectsAnUninitializedBackedge) {
                                false, {RecompileDiagnosticStage::Fragment, address});
         EXPECT_TRUE(module.empty()) << "the preheader's EXEC owner cannot authenticate later v7";
         EXPECT_NE(last_terminal_reject_reason(address).find("loop-carried v6"), std::string::npos);
+    }
+}
+
+TEST(ActiveImageWordDefinedness, MissingImageCoordinatesCannotAuthenticateANewActiveWord) {
+    Harness h;
+    const auto genuine = guarded_loop(kSampleLz, kImageWord1, true);
+    ASSERT_FALSE(recompile_fragment(genuine.data(), genuine.size(), &h.table).empty());
+    for (size_t missing : {0u, 1u}) {
+        auto code = genuine;
+        code[missing] = 0xbf800000u;   // retain PCs and the genuine v2 CMPX source
+        EXPECT_TRUE(recompile_fragment(code.data(), code.size(), &h.table).empty())
+            << "missing coordinate v" << missing << " is fabricated zero storage";
+    }
+}
+
+TEST(ActiveImageWordDefinedness, CoordinateProofLeavesTheInheritedFullExecAdmissionUnchanged) {
+    Harness h;
+    const auto genuine = guarded_loop(kSampleLz, kImageWord1, true);
+    for (int missing : {-1, 0, 1}) {
+        auto code = genuine;
+        code[4] = 0xbf800000u;   // full EXEC: outside the new active-word proof boundary
+        if (missing >= 0) code[static_cast<size_t>(missing)] = 0xbf800000u;
+        EXPECT_FALSE(recompile_fragment(code.data(), code.size(), &h.table).empty());
+    }
+}
+
+TEST(ActiveImageWordDefinedness, ImageMaskKeepsItsCoordinateLoopObligation) {
+    Harness h;
+    const auto clean = loop_with_coordinate_root(true);
+    ASSERT_FALSE(recompile_fragment(clean.data(), clean.size(), &h.table).empty());
+    const auto poison = loop_with_coordinate_root(false);
+    constexpr uint64_t address = 0x10001300u;
+    EXPECT_TRUE(recompile_fragment(poison.data(), poison.size(), &h.table, nullptr, UINT32_MAX,
+                                   nullptr, false, {RecompileDiagnosticStage::Fragment, address})
+                    .empty());
+    EXPECT_NE(last_terminal_reject_reason(address).find("loop-carried v0"), std::string::npos);
+}
+
+TEST(ActiveImageWordDefinedness, SampleReadsRespectNsaMipAndGradientOperands) {
+    check_image_reads({kSampleLz, kImageWord1}, {0, 1});
+    check_image_reads({kSampleLz | 2u, kImageWord1, 4u}, {0, 4});
+    check_image_reads({0xf0900108u, kImageWord1}, {0, 1, 2});   // SAMPLE_L: explicit mip
+    check_image_reads({0xf088010cu, kImageWord1, 0x04030201u, 5u}, {0, 1, 2, 3, 4, 5});
+}
+
+TEST(ActiveImageWordDefinedness, PackedAndStorageReadsUseTheirActualDimensions) {
+    check_image_reads({0xf0000108u, kImageWord1 | 0x40000000u}, {0});   // packed A16 load
+    check_image_reads({0xf0000108u, 0x00020600u}, {0, 1}, ResourceClass::StorageImage);
+    check_image_reads({0xf0000110u, 0x00020600u}, {0, 1, 2}, ResourceClass::StorageImage, 2);
+    check_image_reads({0xf0000128u, 0x00020600u}, {0, 1, 2}, ResourceClass::StorageImage, 5);
+    check_image_reads({0xf0000130u, 0x00020600u}, {0, 1, 2}, ResourceClass::StorageImage, 6, 4);
+}
+
+TEST(ActiveImageWordDefinedness, MissingEncodedNsaOperandCannotBorrowPaddingAsV0) {
+    Harness h;
+    h.rs.vreg[3] = h.rs.vreg[4] = h.rs.vreg[5] = h.b.uconst(0);
+    const std::vector<uint32_t> code{kCmpx,       0xf088010au, kImageWord1,
+                                     0x04030201u, 0x7d040c87u, kEnd};
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(code.data(), code.size(), ins);
+    seed_vector_word_definedness(h.rs, ins, false, 64);
+    ASSERT_TRUE(h.emit(ins[0]));
+    ASSERT_TRUE(h.emit(ins[1]));
+    EXPECT_FALSE(h.rs.mimg_sources.defined)
+        << "six gradient operands require the second NSA dword, even when v0 is genuine";
+    EXPECT_FALSE(fresh_mask_sources_defined(h.b, h.rs, ins[2]));
+}
+
+TEST(ActiveImageWordDefinedness, AnOverlappingDestinationCannotInventItsOldCoordinate) {
+    for (bool missing : {false, true}) {
+        Harness h;
+        if (missing) h.rs.vreg.erase(0);
+        const std::vector<uint32_t> code{missing ? 0xbf800000u : 0x7e000280u,
+                                         0x7e020280u,
+                                         0x7e040280u,
+                                         kCmpx,
+                                         kSampleLz,
+                                         0x00820000u,
+                                         0x7d040087u,
+                                         kEnd};
+        std::vector<Rdna2Inst> ins;
+        rdna2_walk(code.data(), code.size(), ins);
+        seed_vector_word_definedness(h.rs, ins, false, 64);
+        for (size_t i = 0; i < 5; ++i) ASSERT_TRUE(h.emit(ins[i]));
+        ASSERT_TRUE(h.rs.vreg.contains(0)) << "the image now owns a produced destination value";
+        EXPECT_EQ(h.rs.mimg_sources.defined, !missing)
+            << "the proof must describe coordinates before that destination replacement";
+        EXPECT_EQ(fresh_mask_sources_defined(h.b, h.rs, ins[5]), !missing);
     }
 }
 

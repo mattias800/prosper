@@ -2988,6 +2988,7 @@ struct RegState {
     PortableMaskHalfTypes portable_mask_half_types;
     std::unordered_map<int, uint32_t> vreg, sreg;
     VectorWordMarks vreg_source_marks;
+    MimgSourceProof mimg_sources;
     bool vector_full_exec =
         false;   // provenance fact; dispatcher runtime predication stays enabled
     bool vector_native_interpolation = false;
