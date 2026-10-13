@@ -381,6 +381,8 @@ void register_kernel_mem_hle();
 void register_kernel_time_hle();
 // libkernel system-state entry points (operation mode, coredump handler); called by register_kernel_hle().
 void register_kernel_system_hle();
+// libkernel getargc/getargv over the process's actual guest startup vector.
+void register_process_arguments_hle();
 // sceKernelSetPrtAperture / sceKernelGetPrtAperture; called by register_kernel_hle().
 void register_prt_aperture_hle();
 

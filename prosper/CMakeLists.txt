@@ -2679,6 +2679,14 @@ if(TARGET prosper_core)
     SOURCES tests/host/image/test_module_entry_abi.cpp
     INCLUDES src
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_process_arguments
+    SOURCES tests/hle/kernel/test_process_arguments.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_process_entry
+    SOURCES tests/host/image/test_process_entry.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_support_modules
     SOURCES tests/loader/test_support_modules.cpp
     INCLUDES src tests

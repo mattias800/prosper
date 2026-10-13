@@ -178,7 +178,9 @@ bool guest_stack_for_thread(uint64_t tid, void** base, size_t* size);
 
 // Run dependent-module init functions (C++ global ctors etc.) before entry. Each is
 // called under a per-thread recovery point; a faulting init is skipped (best-effort).
-// Returns the number that ran without faulting.
+// Returns the number that ran without faulting. Startup-vector preparation failure skips all
+// initializers and returns zero, which is not a fatal boot status; run_entry independently prepares
+// the vector and returns an error before guest entry if preparation still fails.
 size_t run_guest_inits(const std::vector<uint64_t>& fns);
 
 // Register guest-address ranges whose module_start expects a real SCE module-param
