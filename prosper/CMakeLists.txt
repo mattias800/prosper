@@ -2666,6 +2666,10 @@ if(TARGET prosper_core)
     LIBRARIES prosper_core
     INCLUDES tests
   )
+  prosper_add_gtest(test_current_carry_inputs
+    SOURCES tests/gpu/recompiler/test_current_carry_inputs.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_saved_exec_data
     SOURCES tests/gpu/recompiler/test_saved_exec_data.cpp
     INCLUDES tests

@@ -1637,6 +1637,10 @@ inline uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
                 return source < 2 ? 1u : UINT32_MAX;
             if (in.opcode == kVop3OpcodeLshlrevB64 || in.opcode == kVop3OpcodeLshrrevB64)
                 return source == 0 ? 1u : (source == 1 ? 2u : UINT32_MAX);
+            // CONFIDENCE: HIGH -- carry-in ADD/SUB/SUBREV lower SRC0/SRC1 as B32;
+            // only SRC2 names the actual SGPR-pair predicate (RDNA2 70648, section 12.7).
+            if (in.opcode == 0x128 || in.opcode == 0x129 || in.opcode == 0x12a)
+                return source < 2 ? 1u : (source == 2 ? 2u : UINT32_MAX);
             if (in.opcode == 0x101)
                 return source < 2 ? 1u : 2u;   // cndmask data is B32; condition is a pair
             // B32 VOP3 forms, each of whose sources is ONE dword. The list is an allowlist over a
