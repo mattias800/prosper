@@ -40,10 +40,11 @@ bool complete_full_word_write(const Rdna2Inst& in) {
     if (in.fmt == Rdna2Format::MUBUF) return rdna2_tfe_status_vgpr(in) < 0;
     // CONFIDENCE: HIGH -- a completed ordinary image reader writes every selected result dword
     // in every active lane. Its predication preserves only lanes outside EXEC, not destination
-    // bits inside EXEC. Atomics, packed results and status-bearing forms retain their old proof.
+    // bits inside EXEC. Empty DMASK has only a conservative storage inventory and assigns no
+    // result words. Atomics, packed results and status-bearing forms retain their old proof.
     if (in.fmt == Rdna2Format::MIMG)
-        return !rdna2_instruction_may_write_memory(in) && !in.mimg_d16 && !in.mimg_tfe &&
-               !in.mimg_lwe;
+        return in.mimg_dmask != 0 && !rdna2_instruction_may_write_memory(in) && !in.mimg_d16 &&
+               !in.mimg_tfe && !in.mimg_lwe;
     // A DWORD SDWA destination still replaces all 32 bits. Narrow preserved destinations
     // remain excluded; source selection/modifiers do not make a complete destination partial.
     if (!lane_wise_vector_op(in) || (in.has_sdwa && in.sdwa_dst_sel != 6)) return false;

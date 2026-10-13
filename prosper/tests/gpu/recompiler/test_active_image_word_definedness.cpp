@@ -388,6 +388,37 @@ TEST(ActiveImageWordDefinedness, RestoringExecCannotExposeAnUnwrittenImageLane) 
     EXPECT_FALSE(h.emit(ins[2]));
 }
 
+TEST(ActiveImageWordDefinedness, AnEmptyImageMaskCannotDefineUntouchedDestinationWords) {
+    Harness h;
+    const auto ins = program(kSampleLz & ~0xf00u);
+    ASSERT_EQ(ins[1].mimg_dmask, 0u);
+    ASSERT_EQ(rdna2_vgpr_write_count(ins[1]), 4u)
+        << "the conservative storage inventory does not prove an actual write";
+    seed_vector_word_definedness(h.rs, ins, false, 64);
+    ASSERT_TRUE(h.emit(ins[0]));
+    ASSERT_TRUE(h.emit(ins[1]));
+    for (int reg = 6; reg < 10; ++reg) {
+        EXPECT_FALSE(h.rs.vreg.contains(reg)) << "DMASK=0 assigns no destination word";
+        ASSERT_TRUE(h.rs.vreg_source_marks.contains(reg));
+        EXPECT_EQ(h.rs.vreg_source_marks.at(reg).outside_exec, 0u) << "v" << reg;
+    }
+    EXPECT_FALSE(fresh_mask_sources_defined(h.b, h.rs, ins[2]));
+    EXPECT_FALSE(h.emit(ins[2])) << "the image emitted no genuine v6 value to compare";
+}
+
+TEST(ActiveImageWordDefinedness, AnEmptyImageMaskRetainsAGenuinePriorDestination) {
+    Harness h;
+    const auto ins = program(kSampleLz & ~0xf00u);
+    const uint32_t prior = h.b.uconst(7);
+    h.rs.vreg[6] = prior;
+    seed_vector_word_definedness(h.rs, ins, false, 64);
+    ASSERT_TRUE(h.emit(ins[0]));
+    ASSERT_TRUE(h.emit(ins[1]));
+    EXPECT_EQ(h.rs.vreg.at(6), prior) << "DMASK=0 leaves the existing destination intact";
+    EXPECT_TRUE(fresh_mask_sources_defined(h.b, h.rs, ins[2]));
+    EXPECT_TRUE(h.emit(ins[2]));
+}
+
 TEST(ActiveImageWordDefinedness, ADescriptorRefusalDoesNotDefineAnImageResult) {
     Harness h;
     h.table.resources.clear();
