@@ -1311,17 +1311,7 @@ struct SpirvCompute {
         }
     }
     static int forced_array_layer() {
-        return static_cast<int>(compiler_choice(CompilerChoice::ForcedArrayLayer, [] {
-        static const int v = [] {
-            const char* e = getenv("PROSPER_FORCE_LAYER");
-            if (!e || !*e) return -1;
-            char* end = nullptr;
-            const long n = strtol(e, &end, 10);
-            if (!end || *end || n < 0 || n > 65535) return -1;
-            return (int)n;
-        }();
-        return v;
-        }));
+        return static_cast<int>(compiler_choice(CompilerChoice::ForcedArrayLayer));
     }
     void image_sample_2d_array(uint32_t binding, uint32_t u_bits, uint32_t v_bits,
                                uint32_t layer_bits, uint32_t out[4]);

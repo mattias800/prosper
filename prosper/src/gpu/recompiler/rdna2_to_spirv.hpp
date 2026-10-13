@@ -22,6 +22,7 @@
 #include "gpu/recompiler/fragment_float_flags.hpp"
 #include "gpu/recompiler/fragment_export_formats.hpp"
 #include "gpu/recompiler/fragment_arithmetic_observation.hpp"
+#include "gpu/recompiler/compiler_choices.hpp"
 #include "gpu/recompiler/float_transport_config.hpp"
 #include "gpu/recompiler/fragment_packet_exports.hpp"
 #include "gpu/recompiler/compute_dispatch_launch.hpp"
@@ -861,6 +862,9 @@ struct ComputeShaderConfig {
     // avoiding the portable but much wider RGBA32_UINT CPU-conversion interchange format.
     bool packed_r11_storage = true;
     FloatTransportConfig float_transport{};
+    // ADR 0006: values for the switch-type compiler choices this module's emitters read. Unset
+    // entries still read the environment until every stage has migrated.
+    CompilerChoiceSet choices{};
 };
 
 // Translate a game compute program without the synthetic binding-0 input / binding-1 output used by

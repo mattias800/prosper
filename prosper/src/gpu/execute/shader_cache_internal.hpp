@@ -18,6 +18,7 @@
 #include "gpu/capture/fold_capture.hpp"
 #include "gpu/capture/fragment_compile_case.hpp"
 #include "gpu/execute/gpu_execute.hpp"
+#include "gpu/recompiler/compiler_choices.hpp"
 #include "gpu/recompiler/compute_dispatch_launch.hpp"
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
 #include "gpu/execute/split_t8_proof.hpp"
@@ -227,6 +228,7 @@ struct ShaderCompileKey {
     uint32_t compute_native_storage_format_support = 0;
     bool compute_storage_buffer_int64_atomics = false;
     bool compute_packed_r11_storage = true;
+    CompilerChoiceSet compute_choices{};   // ADR 0006: request-carried switches, part of the module
     uint32_t vertex_lds_dwords = 0;
     uint32_t vertices_per_instance = 0;
     // Aliases ShaderCodeAnalysis::code and keeps that immutable analysis alive. Warm lookups used to
@@ -302,6 +304,7 @@ struct ShaderCompileKey {
                    other.compute_native_storage_format_support &&
                compute_storage_buffer_int64_atomics == other.compute_storage_buffer_int64_atomics &&
                compute_packed_r11_storage == other.compute_packed_r11_storage &&
+               compute_choices == other.compute_choices &&
                vertex_lds_dwords == other.vertex_lds_dwords &&
                vertices_per_instance == other.vertices_per_instance &&
                resources == other.resources && same_code && same_chain_code;
@@ -406,6 +409,10 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, key.compute_native_storage_format_support);
             hash = hash_mix(hash, key.compute_storage_buffer_int64_atomics);
             hash = hash_mix(hash, key.compute_packed_r11_storage);
+            for (const auto& choice : key.compute_choices.value) {
+                hash = hash_mix(hash, choice.has_value());
+                hash = hash_mix(hash, choice.value_or(0));
+            }
         }
         hash = hash_mix(hash, key.vertex_lds_dwords);
         hash = hash_mix(hash, key.vertices_per_instance);

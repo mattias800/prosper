@@ -7994,9 +7994,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 //
                 // Never acceptable in a run that produces progression evidence: every unresolved sample
                 // reads a flat value.
-                if (!res && compiler_choice(CompilerChoice::MimgSoft, [] {
-                        return getenv("PROSPER_MIMG_SOFT") != nullptr;
-                    })) {
+                if (!res && compiler_choice(CompilerChoice::MimgSoft) != 0) {
                     const uint32_t soft = b.uconst(fbits(0.5f));
                     uint32_t comps = 0;
                     for (uint32_t m = 0; m < 4; ++m) if (in.mimg_dmask & (1u << m)) ++comps;
@@ -8605,9 +8603,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // faces, explicit LOD/bias, DREF and packed offsets are not spatial coordinates. Explicit
             // gradients receive the same per-axis scale so mip selection remains identical.
             const bool normalize_sampler_coordinates = res->unnormalized &&
-                compiler_choice(CompilerChoice::NormalizeSamplerCoordinates, [] {
-                    return getenv("PROSPER_NO_UNNORMALIZED_COORD_NORMALIZE") == nullptr;
-                });
+                compiler_choice(CompilerChoice::NormalizeSamplerCoordinates) != 0;
             auto normalized_spatial = [&](uint32_t coordinate, uint32_t extent) {
                 if (!normalize_sampler_coordinates) return coordinate;
                 if (!extent) { ok = false; return b.uconst(0); }

@@ -3526,6 +3526,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_compute_dpp_row_or.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_compute_request_choices
+    SOURCES tests/gpu/recompiler/test_compute_request_choices.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_compute_dpp_row_fadd
     SOURCES tests/gpu/recompiler/test_compute_dpp_row_fadd.cpp
     INCLUDES tests

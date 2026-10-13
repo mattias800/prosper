@@ -8884,6 +8884,9 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
             config.native_storage_format_support;
         config.packed_r11_storage =
             std::getenv("PROSPER_NO_PACKED_R11_STORAGE") == nullptr;
+        // ADR 0006: the request carries the switch-type choices; the environment is read here, by the
+        // caller, not inside the recompiler.
+        config.choices = compiler_choices_from_environment();
         // Keep the stored capture module portable by compiling capture-bound dispatches through
         // device-independent storage paths (raw uvec4 or exact packed R32ui), so optional format
         // support never becomes an artifact ABI. Capture v39 also retains the raw shader and
