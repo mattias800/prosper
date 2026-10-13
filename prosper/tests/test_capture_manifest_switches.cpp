@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <iterator>
 #include <map>
 #include <optional>
 #include <string>
@@ -115,6 +116,54 @@ TEST_F(CaptureSwitches, AbsentProbeIsNotInvented) {
     EXPECT_FALSE(switches->contains(kProbe));
 }
 
+#ifndef _WIN32
+TEST_F(CaptureSwitches, InvalidUtf8RefusesCollection) {
+    const char* const invalid_values[] = {"\x80",
+                                          "\xff",
+                                          "\xc0\xaf",
+                                          "\xc2",
+                                          "\xc2x",
+                                          "\xe2\x82",
+                                          "\xe0\x9f\xbf",
+                                          "\xed\xa0\x80",
+                                          "\xf0\x8f\xbf\xbf",
+                                          "\xf0\x9f\x99",
+                                          "\xf4\x90\x80\x80",
+                                          "\xf5\x80\x80\x80"};
+    for (size_t i = 0; i < std::size(invalid_values); ++i) {
+        SCOPED_TRACE(i);
+        // NOLINTNEXTLINE(concurrency-mt-unsafe): This isolated CTest process owns the probe.
+        ASSERT_EQ(setenv(kProbe, invalid_values[i], 1), 0);
+        EXPECT_FALSE(collect_prosper_switches().has_value());
+    }
+}
+
+TEST_F(CaptureSwitches, ValidUtf8BoundariesRemainExact) {
+    const char* const values[] = {"",
+                                  "ASCII",
+                                  "\xc2\x80",
+                                  "\xdf\xbf",
+                                  "\xe0\xa0\x80",
+                                  "\xed\x9f\xbf",
+                                  "\xee\x80\x80",
+                                  "\xef\xbf\xbf",
+                                  "\xf0\x90\x80\x80",
+                                  "\xf4\x8f\xbf\xbf"};
+    for (size_t i = 0; i < std::size(values); ++i) {
+        SCOPED_TRACE(i);
+        // NOLINTNEXTLINE(concurrency-mt-unsafe): This isolated CTest process owns the probe.
+        ASSERT_EQ(setenv(kProbe, values[i], 1), 0);
+        const auto switches = collect_prosper_switches();
+        if (!switches) {
+            FAIL() << "Valid UTF-8 must remain collectable";
+            return;
+        }
+        ASSERT_TRUE(switches->contains(kProbe));
+        EXPECT_EQ(switches->at(kProbe), values[i]);
+    }
+}
+#endif
+
 #ifdef _WIN32
 TEST_F(CaptureSwitches, WindowsNamesAreCaseInsensitive) {
     ASSERT_TRUE(SetEnvironmentVariableW(L"PROSPER_TEST_MANIFEST_SWITCH_PROBE", nullptr));
@@ -134,4 +183,4 @@ TEST_F(CaptureSwitches, InvalidUnicodeRefusesCollection) {
     EXPECT_FALSE(collect_prosper_switches().has_value());
 }
 #endif
-} // namespace
+}   // namespace

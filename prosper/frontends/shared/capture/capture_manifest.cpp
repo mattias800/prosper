@@ -486,13 +486,42 @@ bool is_switch_name(const std::string& name) {
     return name.size() > 8 && name.compare(0, 8, "PROSPER_") == 0;
 }
 
-void record_switch(std::map<std::string, std::string>& out, const std::string& entry) {
+bool valid_utf8(const std::string& text) {
+    for (size_t at = 0; at < text.size();) {
+        const auto lead = static_cast<unsigned char>(text[at]);
+        if (lead < 0x80) {
+            ++at;
+            continue;
+        }
+        if (lead < 0xc2 || lead > 0xf4) return false;
+        const size_t count = lead < 0xe0 ? 2 : lead < 0xf0 ? 3 : 4;
+        if (count > text.size() - at) return false;
+        uint32_t scalar = lead & (count == 2 ? 0x1fu : count == 3 ? 0x0fu : 0x07u);
+        for (size_t i = 1; i < count; ++i) {
+            const auto byte = static_cast<unsigned char>(text[at + i]);
+            if ((byte & 0xc0u) != 0x80u) return false;
+            scalar = (scalar << 6) | (byte & 0x3fu);
+        }
+        // JSON requires Unicode scalar values in their shortest UTF-8 encoding.
+        if ((count == 3 && scalar < 0x800) || (count == 4 && scalar < 0x10000) ||
+            (scalar >= 0xd800 && scalar <= 0xdfff) || scalar > 0x10ffff)
+            return false;
+        at += count;
+    }
+    return true;
+}
+
+bool record_switch(std::map<std::string, std::string>& out, const std::string& entry) {
     // Split at the FIRST '=': values legitimately contain '=' (pad routes, dims).
     const size_t at = entry.find('=');
-    if (at == std::string::npos) return;
+    if (at == std::string::npos) return true;
     const std::string name = entry.substr(0, at);
-    if (!is_switch_name(name)) return;
+    if (!is_switch_name(name)) return true;
+    // POSIX environment entries are arbitrary bytes. Refuse an unreadable manifest
+    // before boot, rather than replacing bytes or silently losing a switch.
+    if (!valid_utf8(entry)) return false;
     out[name] = entry.substr(at + 1);
+    return true;
 }
 
 }   // namespace
@@ -523,14 +552,16 @@ std::optional<std::map<std::string, std::string>> collect_prosper_switches() {
             if (ch == '=') break;
             if (ch >= 'a' && ch <= 'z') ch = static_cast<char>(ch - 'a' + 'A');
         }
-        record_switch(out, utf8);
+        if (!record_switch(out, utf8)) return std::nullopt;
     }
 #elif defined(__APPLE__)
     // environ is not directly addressable on Apple targets; _NSGetEnviron is
     // the documented accessor (a manual `extern char** environ` mislinks there).
-    for (char** entry = *_NSGetEnviron(); entry && *entry; ++entry) record_switch(out, *entry);
+    for (char** entry = *_NSGetEnviron(); entry && *entry; ++entry)
+        if (!record_switch(out, *entry)) return std::nullopt;
 #else
-    for (char** entry = environ; entry && *entry; ++entry) record_switch(out, *entry);
+    for (char** entry = environ; entry && *entry; ++entry)
+        if (!record_switch(out, *entry)) return std::nullopt;
 #endif
     return out;
 }
