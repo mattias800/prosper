@@ -29,7 +29,7 @@ TEST(ProcessEntry, GuestBackedLayoutIncludesEnvironmentAndAlignment) {
             for (size_t n = 0; n < strings.size(); ++n) {
                 const uint64_t pointer = v[indices[n]];
                 if (pointer < begin || pointer >= begin + c.stack_bytes ||
-                    std::strcmp(reinterpret_cast<const char*>(pointer), strings[n].c_str()))
+                    std::strcmp(reinterpret_cast<const char*>(pointer), strings[n].c_str()) != 0)
                     std::_Exit(26);
             }
             std::_Exit(23);
@@ -42,8 +42,8 @@ TEST(ProcessEntry, OversizedInputCannotPublishOrUnderflowTheStack) {
         {
             prosper::test::suppress_coredump();
             std::string error;
-            if (prosper::prepare_process_entry({std::string(17 * 1024 * 1024, 'x')}, nullptr,
-                                               &error) ||
+            if (prosper::prepare_process_entry({std::string(size_t{17} * 1024 * 1024, 'x')},
+                                               nullptr, &error) ||
                 error.empty())
                 std::_Exit(24);
             const auto refused = prosper::process_entry_context();

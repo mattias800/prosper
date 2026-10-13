@@ -22,7 +22,9 @@ prosper::HleFn argv_query = nullptr;
 uint64_t initializer_argc = 0;
 uint64_t initializer_argv = 0;
 
-PROSPER_SYSV_ABI uint64_t argument_consuming_initializer(uint64_t, uint64_t, uint64_t) {
+// This is entered as guest code. On Windows it must use SysV, while the queried HLE functions
+// below retain their ordinary host ABI. A host-ABI initializer can overwrite the bridge's saves.
+PROSPER_GUEST_ABI uint64_t argument_consuming_initializer(uint64_t, uint64_t, uint64_t) {
     initializer_argc = argc_query(1, 2, 3, 4, 5, 6);
     initializer_argv = argv_query(6, 5, 4, 3, 2, 1);
     return 0;
@@ -32,10 +34,13 @@ void configure(const char* name, const char* value) {
 #ifdef _WIN32
     SetEnvironmentVariableA(name, value);
 #else
+    // Only the isolated death-test child configures its environment, before guest execution.
+    // NOLINTBEGIN(concurrency-mt-unsafe)
     if (value)
         setenv(name, value, 1);
     else
         unsetenv(name);
+    // NOLINTEND(concurrency-mt-unsafe)
 #endif
 }
 
@@ -61,7 +66,7 @@ bool initializers(const std::vector<std::string>& expected) {
     for (size_t n = 0; n < expected.size(); ++n) {
         const uint64_t begin = reinterpret_cast<uint64_t>(context.stack);
         if (argv[n] < begin || argv[n] >= begin + context.stack_bytes ||
-            std::strcmp(reinterpret_cast<const char*>(argv[n]), expected[n].c_str()))
+            std::strcmp(reinterpret_cast<const char*>(argv[n]), expected[n].c_str()) != 0)
             return false;
     }
     return argv[expected.size()] == 0;
@@ -118,7 +123,7 @@ TEST(ProcessArguments, FailedPreparationSkipsInitializersAndPrimaryEntry) {
         {
             prosper::test::suppress_coredump();
             configure("PROSPER_GUEST_ENV", nullptr);
-            prosper::set_guest_entry_arguments({std::string(17 * 1024 * 1024, 'x')});
+            prosper::set_guest_entry_arguments({std::string(size_t{17} * 1024 * 1024, 'x')});
             initializer_argc = UINT64_MAX;
             initializer_argv = UINT64_MAX;
             if (prosper::run_guest_inits(

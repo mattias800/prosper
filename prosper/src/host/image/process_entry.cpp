@@ -15,7 +15,7 @@
 
 namespace prosper {
 namespace {
-constexpr size_t kStackBytes = 16 * 1024 * 1024;
+constexpr size_t kStackBytes = size_t{16} * 1024 * 1024;
 std::atomic<const ProcessEntryContext*> published{nullptr};
 struct ProcessEntryOwner {
     std::mutex mutex;
@@ -64,7 +64,7 @@ bool prepare_process_entry(const std::vector<std::string>& arguments,
     // Budget strings, vector words, the existing 16-byte alignment and entry bias before writing.
     // Keep usable stack below the crt0 data; an oversized configuration must not underflow it.
     // CONFIDENCE: LOW on this reserve, an implementation capacity bound rather than an SDK limit.
-    constexpr size_t kDataBudget = kStackBytes - 64 * 1024;
+    constexpr size_t kDataBudget = kStackBytes - size_t{64} * 1024;
     size_t bytes = 64;
     const auto add = [&](size_t size) {
         if (size > kDataBudget - bytes) return false;
@@ -115,9 +115,11 @@ bool prepare_process_entry(const std::vector<std::string>& arguments,
     // CONFIDENCE: HIGH — native libkernel startup saves argc=[crt0], argv=crt0+8, and the getters
     // return those cached cells (libkernel+0x2ef08/0x2ef1f, +0x2f0a7/+0x2f0ae and +0x2fc30/+0x2fc40).
     owner->context = std::make_unique<ProcessEntryContext>(ProcessEntryContext{
-        stack, kStackBytes, top, static_cast<uint32_t>(arguments.size()), top + 8});
+        nullptr, kStackBytes, top, static_cast<uint32_t>(arguments.size()), top + 8});
+    // Transfer the mapping only after the context allocation succeeds. Published guest pointers
+    // remain valid for the process lifetime.
+    owner->context->stack = pending_stack.release();
     published.store(owner->context.get(), std::memory_order_release);
-    pending_stack.release();   // Published guest pointers remain valid for the process lifetime.
     return true;
 }
 

@@ -4032,8 +4032,11 @@ static void dump_fault_bytes(uint64_t start, int n) {
 
 bool prepare_configured_process_entry(std::string* error) {
     if (process_entry_context().stack) return true;
+    // Boot-only environment reads precede guest workers; later calls reuse the published context.
+    // NOLINTBEGIN(concurrency-mt-unsafe)
     return prepare_process_entry(guest_entry_arguments(getenv("PROSPER_GUEST_ARGS")),
                                  getenv("PROSPER_GUEST_ENV"), error);
+    // NOLINTEND(concurrency-mt-unsafe)
 }
 
 size_t run_guest_inits(const std::vector<uint64_t>& fns) {
