@@ -97,3 +97,18 @@ def test_main_reports_could_not_run_for_a_failing_inspector(tmp_path, monkeypatc
     code = rc.main(["record", str(corpus), "--inspect", str(inspector), "--out", str(out)])
     assert code == 2
     assert not out.exists()
+
+
+def test_exit_zero_without_a_stage_recompile_line_is_an_inspector_failure(tmp_path, monkeypatch):
+    (tmp_path / "cs_x.bin").write_bytes(b"\0")
+    monkeypatch.setattr(rc.subprocess, "run", lambda cmd, **_kw: _Done("noise\n", returncode=0))
+    with pytest.raises(rc.InspectorError):
+        rc.collect(tmp_path, "inspector")
+
+
+def test_nonzero_exit_with_a_stage_recompile_line_is_an_accepted_refusal(tmp_path, monkeypatch):
+    (tmp_path / "cs_x.bin").write_bytes(b"\0")
+    refusal = "stage-recompile stage=compute status=undetermined-no-resource-table\n"
+    monkeypatch.setattr(rc.subprocess, "run", lambda cmd, **_kw: _Done(refusal, returncode=3))
+    results = rc.collect(tmp_path, "inspector")
+    assert results["cs_x.bin"]["verdict"] == [refusal.strip()]
