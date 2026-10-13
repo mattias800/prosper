@@ -20,7 +20,7 @@ struct PendingWriterIdentity {
     // Unique inside this process's bounded capture, including repeated packets/queue handles.
     uint64_t occurrence = 0;
     WaitTraceSubmitIdentity submit;
-    uint64_t packet = 0, stream_order = 0, enqueued_us = 0;
+    uint64_t packet = 0, stream_order = 0, captured_us = 0;
     bool packet_known = false, order_known = false;
     uint32_t kind = 0;
     uint64_t address = 0, bytes = 0, payload = 0;

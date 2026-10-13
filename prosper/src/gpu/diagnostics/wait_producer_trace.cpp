@@ -47,7 +47,7 @@ std::array<char, 768> format_identity(const char* role, const PendingWriterIdent
         out.data(), out.size(),
         " %s-present=%u %s-occurrence=%llu %s-origin=%u %s-queue-known=%u %s-queue=0x%x"
         " %s-submit-known=%u %s-submit=%llu %s-packet-known=%u %s-packet=0x%llx"
-        " %s-order-known=%u %s-order=%llu %s-enqueued-us=%llu %s-kind=%u"
+        " %s-order-known=%u %s-order=%llu %s-captured-us=%llu %s-kind=%u"
         " %s-address=0x%llx %s-bytes=%llu"
         " %s-payload-known=%u %s-payload=0x%llx",
         role, producer ? 1u : 0u, role, static_cast<unsigned long long>(p.occurrence), role,
@@ -55,7 +55,7 @@ std::array<char, 768> format_identity(const char* role, const PendingWriterIdent
         p.submit.submit_known ? 1u : 0u, role, static_cast<unsigned long long>(p.submit.submit),
         role, p.packet_known ? 1u : 0u, role, static_cast<unsigned long long>(p.packet), role,
         p.order_known ? 1u : 0u, role, static_cast<unsigned long long>(p.stream_order), role,
-        static_cast<unsigned long long>(p.enqueued_us), role, p.kind, role,
+        static_cast<unsigned long long>(p.captured_us), role, p.kind, role,
         static_cast<unsigned long long>(p.address), role, static_cast<unsigned long long>(p.bytes),
         role, p.payload_known ? 1u : 0u, role, static_cast<unsigned long long>(p.payload));
     if (written < 0 || static_cast<size_t>(written) >= out.size())
@@ -103,7 +103,7 @@ PendingWriterTrace capture_pending_writer_identity(const Pm4Command& command) {
     producer->packet = producer->packet_known ? payload - sizeof(uint32_t) : 0;
     producer->order_known = command.stream_order != 0;
     producer->stream_order = command.stream_order;
-    producer->enqueued_us = diagnostics::diag_now_us();
+    producer->captured_us = diagnostics::diag_now_us();
     producer->kind = static_cast<uint32_t>(command.kind);
     if (command.kind == K::ReleaseMem) {
         producer->address = command.rel_addr;
