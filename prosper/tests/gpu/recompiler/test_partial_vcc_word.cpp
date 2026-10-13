@@ -99,7 +99,7 @@ std::set<uint32_t> proved(const std::vector<uint32_t>& code, bool partial = fals
 std::vector<uint32_t> join(uint32_t right) {
     // Both actual CFG predecessors define s20, then one MOV consumes it at pc5. The proof
     // examines both edges independently of any other constant-branch specialization.
-    return {0x7d8400a8u, 0xbf840002u, 0xbe940380u, 0xbf820001u, right, 0xbeea0314u, 0xbf810000u};
+    return {0x7d8400a8u, 0xbf860002u, 0xbe940380u, 0xbf820001u, right, 0xbeea0314u, 0xbf810000u};
 }
 }   // namespace
 TEST(PartialVccWord, TheUnchangedLegacyCurrentPredicateStillProduces) {
@@ -302,12 +302,12 @@ TEST(PartialVccWord, ALogicalPredicateDoesNotSupplyUnprovedPhysicalHighData) {
     EXPECT_TRUE(compile(code, address + 1, c).empty());
 }
 TEST(PartialVccWord, AnActualCompareMustReachEveryIncomingEdge) {
-    const std::vector<uint32_t> code{0xbf840002u, 0x7d8400a8u, 0xbf820001u,
+    const std::vector<uint32_t> code{0xbf068080u, 0xbf840002u, 0x7d8400a8u, 0xbf820001u,
                                      0xbf800000u, 0xbeea0380u, 0xbf810000u};
     EXPECT_TRUE(proved(code).empty());
     auto genuine = code;
-    genuine[3] = 0x7d8400a8u;
-    EXPECT_EQ(proved(genuine), (std::set<uint32_t>{4}));
+    genuine[4] = 0x7d8400a8u;
+    EXPECT_EQ(proved(genuine), (std::set<uint32_t>{5}));
 }
 TEST(PartialVccWord, ARecursiveSliceCannotReseedTheOriginalProof) {
     auto code = branch(40);
@@ -504,4 +504,136 @@ TEST(PartialVccWord, AHighWordCopySnapshotsTheGenuineLowDataBeforePublication) {
     auto expected = std::vector<uint32_t>(64);
     expected[0] = expected[32] = 1;
     output_is(code, expected, 0x5135000120ull);
+}
+namespace {
+std::vector<uint32_t> scalar_branch(bool readfirst) {
+    return {0x7e020281u, 0x7d8400a8u, readfirst ? 0x7e280500u : 0xbe940380u,
+            0xbf068014u, 0xbf840001u, 0xbeea03c1u,
+            0x02060280u, 0xbf810000u};
+}
+void scalar_branch_output(const std::vector<uint32_t>& module) {
+    std::vector<uint32_t> input(64), output(64, 0xdeadbeefu);
+    for (uint32_t lane = 0; lane < 64; ++lane) input[lane] = lane;
+    bpermute_oracle::Interpreter vm(module);
+    vm.legacy_float_word_storage = true;
+    const auto values = vm.run_buffers(64, {{0, input}, {1, output}}, 1);
+    ASSERT_TRUE(vm.error.empty()) << vm.error;
+    ASSERT_EQ(values.size(), 64u);
+    for (uint32_t lane = 0; lane < 64; ++lane)
+        EXPECT_EQ(values[lane], lane < 32 || lane == 40 ? 1u : 0u) << "lane=" << lane;
+}
+}   // namespace
+TEST(PartialVccWord, AnInvocationLocalScalarBranchCannotAdmitANewWordReplacement) {
+    const auto code = scalar_branch(true);
+    const auto module = recompile_valu(code.data(), code.size(), 1, 3);
+    EXPECT_TRUE(module.empty()) << "READFIRST's scalar branch needs an exact whole-wave route";
+    // A mistaken admission must expose the actual wrong picture, not merely count a module.
+    if (!module.empty()) scalar_branch_output(module);
+}
+TEST(PartialVccWord, ARealConstantScalarBranchRetainsTheSameProducingRegion) {
+    const auto code = scalar_branch(false);
+    const auto module = recompile_valu(code.data(), code.size(), 1, 3);
+    ASSERT_FALSE(module.empty());
+    scalar_branch_output(module);
+}
+TEST(PartialVccWord, LegacyFloatSlotsRequireTheExplicitExactAbi) {
+    const auto code = scalar_branch(false);
+    const auto module = recompile_valu(code.data(), code.size(), 1, 3);
+    ASSERT_FALSE(module.empty());
+    std::vector<uint32_t> input(64), output(64, 0xdeadbeefu);
+    for (uint32_t lane = 0; lane < 64; ++lane) input[lane] = lane;
+    bpermute_oracle::Interpreter strict(module);
+    strict.run_buffers(64, {{0, input}, {1, output}}, 1);
+    EXPECT_EQ(strict.error, "unsupported live storage ABI");
+    for (uint32_t variant = 0; variant < 4; ++variant) {
+        auto malformed = module;
+        bool changed = false;
+        for (size_t at = 5; at < malformed.size();) {
+            const uint32_t size = malformed[at] >> 16, opcode = malformed[at] & 0xffffu;
+            ASSERT_GT(size, 0u);
+            ASSERT_LE(at + size, malformed.size());
+            if (variant == 0 && opcode == 22 && size == 3) {
+                malformed[at + 2] = 64;   // float64 slots cannot borrow scalar-word transport
+                changed = true;
+            } else if (opcode == 71 && size == 4 && malformed[at + 2] == 6 && variant == 1) {
+                malformed[at + 3] = 8;   // actual ArrayStride must remain exactly four bytes
+                changed = true;
+            } else if (opcode == 71 && size == 4 && malformed[at + 2] == 34 && variant == 2) {
+                malformed[at + 3] = 1;   // the shell's supplied buffers belong to set zero
+                changed = true;
+            } else if (opcode == 71 && size == 4 && malformed[at + 2] == 33 && variant == 3) {
+                malformed[at + 3] += 2;   // float-word allowance belongs only to bindings 0/1
+                changed = true;
+            }
+            at += size;
+        }
+        ASSERT_TRUE(changed);
+        bpermute_oracle::Interpreter vm(malformed);
+        vm.legacy_float_word_storage = true;
+        if (variant == 3)
+            vm.run_buffers(64, {{2, input}, {3, output}}, 3);
+        else
+            vm.run_buffers(64, {{0, input}, {1, output}}, 1);
+        EXPECT_FALSE(vm.error.empty()) << "malformed ABI variant=" << variant;
+    }
+    scalar_branch_output(module);   // same actual module preserves raw input and output bits
+}
+TEST(PartialVccWord, ScalarControlNeedsAnActualUniformSccProducer) {
+    auto code = scalar_branch(false);
+    EXPECT_EQ(proved(code), (std::set<uint32_t>{5}));
+    code[3] = 0xbf800000u;   // initial nonzero false SCC SSA is not a producer
+    EXPECT_TRUE(proved(code).empty());
+}
+TEST(PartialVccWord, ANewCompareCannotRepairEarlierInvocationLocalControl) {
+    auto code = scalar_branch(true);
+    code.insert(code.begin() + 5, 0x7d8400a8u);   // fresh VCC inside the unproved scalar arm
+    EXPECT_TRUE(proved(code).empty());
+}
+TEST(PartialVccWord, AScalarSccOverwriteEndsTheEarlierUniformComparisonProof) {
+    auto code = scalar_branch(false);
+    code.insert(code.begin() + 4, 0xbe960714u);   // NOT_B32 s22,s20 writes SCC
+    EXPECT_TRUE(proved(code).empty());
+    code[4] = 0xbe960314u;   // MOV_B32 preserves the genuinely uniform SCC
+    EXPECT_EQ(proved(code), (std::set<uint32_t>{6}));
+}
+TEST(PartialVccWord, EveryIncomingScalarBranchMustHaveUniformControl) {
+    // The actual VCC producer drives a whole-wave split. Only one arm supplies uniform SCC;
+    // the later SCC branch must not borrow it from the other predecessor.
+    const std::vector<uint32_t> code{0x7d8400a8u, 0xbf860002u, 0xbf068080u, 0xbf820001u,
+                                     0xbf800000u, 0xbf840001u, 0xbeea03c1u, 0xbf810000u};
+    EXPECT_TRUE(proved(code).empty());
+    auto genuine = code;
+    genuine[4] = 0xbf068080u;
+    EXPECT_EQ(proved(genuine), (std::set<uint32_t>{6}));
+}
+TEST(PartialVccWord, AnUnprovedPredecessorCannotBorrowTheOtherArmsWaveControl) {
+    // Both arms retain a genuine VCC and eventually uniform SCC, but one first crosses an
+    // unproved SCC branch. A later genuine compare cannot erase that control-domain loss.
+    const std::vector<uint32_t> code{0x7d8400a8u, 0xbf860002u, 0xbf840000u, 0xbf820001u,
+                                     0xbf800000u, 0xbeea03c1u, 0xbf810000u};
+    EXPECT_TRUE(proved(code).empty());
+    auto genuine = code;
+    genuine[2] = 0xbf800000u;
+    EXPECT_EQ(proved(genuine), (std::set<uint32_t>{5}));
+}
+TEST(PartialVccWord, CopyingAnInvocationLocalScalarDoesNotMakeItsControlUniform) {
+    auto code = scalar_branch(true);
+    code.insert(code.begin() + 3, 0xbe950314u);   // MOV_B32 s21,s20 preserves the unproved source
+    code[4] = 0xbf068015u;   // compare the relay, not the original word
+    EXPECT_TRUE(proved(code).empty());
+    EXPECT_TRUE(recompile_valu(code.data(), code.size(), 1, 3).empty());
+}
+TEST(PartialVccWord, NativeWidthAloneDoesNotAuthorizeInvocationLocalControl) {
+    ComputeShaderConfig config;
+    config.native_subgroup_size = 64;
+    auto code = scalar_branch(true);
+    code.insert(code.end() - 1, {0xe0702000u, 0x80020300u});
+    constexpr uint64_t address = 0x5135001080ull;
+    EXPECT_TRUE(compile(code, address, config).empty());
+    // A genuine straight-line replacement still produces in the same native profile. Its
+    // logical predicate adds no physical ballot or raw-launch authority. Constant scalar arms
+    // can be sliced by the native entry prepass; this proof never reseeds a recursive slice.
+    auto expected = std::vector<uint32_t>(64);
+    expected[0] = expected[40] = 1;
+    output_is(bitmap(40, false, 1), expected, address + 1, config);
 }

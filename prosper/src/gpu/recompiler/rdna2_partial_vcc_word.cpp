@@ -9,11 +9,15 @@ namespace prosper::gpu {
 namespace {
 struct Facts {
     bool vcc = false;
+    bool wave_control = true;
+    bool scc_uniform = false;
     std::array<std::optional<uint32_t>, 128> words{};
 };
 
 void meet(Facts& into, const Facts& other) {
     into.vcc &= other.vcc;
+    into.wave_control &= other.wave_control;
+    into.scc_uniform &= other.scc_uniform;
     for (size_t word = 0; word < into.words.size(); ++word)
         if (into.words[word] != other.words[word]) into.words[word].reset();
 }
@@ -23,8 +27,9 @@ bool plain_move(const Rdna2Inst& in) {
            !in.synthetic_terminator;
 }
 
-std::optional<uint32_t> constant_word(const Facts& before, const Rdna2Inst& in) {
-    const auto source = in.src[0];
+std::optional<uint32_t> constant_word(const Facts& before, const Rdna2Inst& in, size_t index = 0) {
+    if (index >= in.n_src) return std::nullopt;
+    const auto source = in.src[index];
     if (source.kind == OperandKind::InlineInt) return static_cast<uint32_t>(source.value);
     if (source.kind == OperandKind::Literal && in.has_literal) return in.literal;
     if ((source.kind == OperandKind::SGPR || source.kind == OperandKind::Special) &&
@@ -105,6 +110,19 @@ void initialize_partial_vcc_word_proof(SpirvCompute& b, const std::vector<Rdna2I
         const auto& in = ins[i];
         const auto before = *incoming[i];
         auto after = before;
+        // CONFIDENCE: HIGH -- a scalar instruction belongs to the whole guest wave. The legacy
+        // READFIRST fallback can instead drive invocation-local SCC control. A reaching VCC
+        // producer alone cannot authorize partial replacement inside that host branch. Only
+        // genuine numeric constant/copy comparisons establish this bounded SCC proof; once an
+        // unproved scalar branch is crossed, no later compare recovers whole-wave control.
+        if (in.fmt == Rdna2Format::SOPC)
+            after.scc_uniform =
+                in.opcode <= 0x0bu && constant_word(before, in, 0) && constant_word(before, in, 1);
+        else if (in.fmt == Rdna2Format::SOP2 || in.fmt == Rdna2Format::SOPK ||
+                 (in.fmt == Rdna2Format::SOP1 && !sop1_opcode_leaves_scc_unmodified(in.opcode)))
+            after.scc_uniform = false;
+        if (in.fmt == Rdna2Format::SOPP && (in.opcode == 4u || in.opcode == 5u))
+            after.wave_control &= before.scc_uniform;
         const auto source = plain_move(in) ? constant_word(before, in) : std::nullopt;
         for_each_scalar_write(in, [&](int base, uint32_t width) {
             for (uint32_t half = 0; half < width; ++half) {
@@ -128,7 +146,7 @@ void initialize_partial_vcc_word_proof(SpirvCompute& b, const std::vector<Rdna2I
             after.words[in.dst.value] = source;
             if (in.dst.value == 106 || in.dst.value == 107) {
                 after.vcc = before.vcc;
-                if (before.vcc) b.partial_vcc_word_pcs.emplace(in.pc, in);
+                if (before.vcc && before.wave_control) b.partial_vcc_word_pcs.emplace(in.pc, in);
             }
         }
         for (size_t to : successors[i]) {
