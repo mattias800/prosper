@@ -39,12 +39,15 @@ def carve_program(data: bytes, start: int, limit: int = 1 << 20) -> bytes | None
             insn = D.decode_one(data, off)
         except D.DecodeError:
             return None
+        if insn.size > end - off:
+            return None
         if insn.name in BRANCH_OPS:
             simm = insn.fields["simm16"]
             simm -= 0x10000 if simm & 0x8000 else 0
             max_target = max(max_target, off + 4 + simm * 4)
         off += insn.size
-        if insn.name == "S_ENDPGM" and off >= max_target:
+        # A branch targets an instruction's start, never the byte just after it.
+        if insn.name == "S_ENDPGM" and off - insn.size >= max_target:
             return data[start:off]
     return None
 

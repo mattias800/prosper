@@ -718,6 +718,9 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME compare_runs_logic
            COMMAND "${Python3_EXECUTABLE}"
                    -m pytest -q "${CMAKE_SOURCE_DIR}/tools/perf/test_compare_runs.py")
+  add_test(NAME rdna2_reference_logic
+           COMMAND "${Python3_EXECUTABLE}" -m pytest -q
+                   "${CMAKE_SOURCE_DIR}/tests/tools/test_rdna2_ref.py")
   # The two /proc samplers (#3400 / #3401). Both run against a /proc tree the test BUILDS, so they
   # need no target process, no privileges and no sleeping: wait_profile's arms pin per-thread
   # identity (same-name threads, TID reuse, renames, PID reuse), and lock_holder's pin that a run
