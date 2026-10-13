@@ -329,6 +329,13 @@ TiledVolumeTailLayout tiled_volume_tail_layout(uint32_t width, uint32_t height, 
 //   largest-first. The per-level size is the padded macroblock count
 //   (sw64kb_s3_volume_bytes: ceil dims x 64 KiB blocks, identical to AddrLib's
 //   PowTwoAlign-to-block pitch/height/depth times bytes-per-texel).
+// - Depth slabs: AddrLib (Mesa 26.2.0 Addr2ComputeSurfaceInfo / ComputeSurfaceAddrFromCoord,
+//   run for the PS5's 16-pipe config) repeats the whole chain once per block-depth slab
+//   instead of laying levels out at full depth. For 128^3 at 1 B (block 64x32x32, four
+//   slabs): tail at 0, L1 at 0x10000, L0 at 0x30000 inside a 0xb0000-byte slab chain;
+//   L0 texel (0,0,32) is at 0xe0000 and (0,0,64) at 0x190000; total 0x2c0000. Chains no
+//   deeper than one block (every shape the earlier hand tests used) are one slab and
+//   identical to a flat layout. This is an AddrLib MODEL result, not hardware.
 // - OPEN: the tail is assumed to occupy exactly one 64 KiB block (AddrLib reserves
 //   blockSize * PowTwoAlign(firstTailDepth, blockSlices) / blockSlices, which is one
 //   block whenever the first tail depth fits the block depth -- guaranteed here by the
@@ -341,6 +348,10 @@ struct TiledVolumeChainLevelUnproven {
     size_t level_bytes = 0;
     uint32_t tail_x = 0, tail_y = 0;
     uint32_t width = 0, height = 0, depth = 0;
+    // One chain copy per block-depth slab: byte_offset and level_bytes are within ONE copy, and
+    // texel (x, y, z) of a level lives at (z / block_depth) * slab_stride + byte_offset + ...
+    size_t slab_stride = 0;
+    size_t slab_count = 0;
     bool in_tail = false;
     bool supported = false;
 };

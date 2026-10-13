@@ -2295,16 +2295,28 @@ tiled_volume_chain_layout_unproven(uint32_t width, uint32_t height, uint32_t dep
     // remaining levels smallest-first, largest last. Walk down so the smallest non-tail
     // level takes the lowest address after the tail. The one-block tail assumption is
     // documented in tile.hpp (OPEN): the strict depth gate above is what makes it hold.
+    // Depth slabs (AddrLib-verified 2026-10-13, see tile.hpp): a chain deeper than the block
+    // depth is NOT laid out level after level at full depth. Every block-depth slab of the
+    // volume owns one copy of the chain (tail block, then the smaller levels, then level 0's
+    // blocks for that slab), and the copies repeat at slab_stride. All offsets below are
+    // within ONE slab chain; level_bytes is what a level occupies in one slab chain.
+    const uint32_t block_depth = bd[2];
+    const size_t slab_count = (depth + block_depth - 1u) / block_depth;
     size_t offset = first_tail == num_levels ? 0 : (size_t{1} << 16);
     for (uint32_t level = first_tail; level-- > 0;) {
         auto& e = out[level];
-        const size_t need = sw64kb_s3_volume_bytes(e.width, e.height, e.depth, bytes_per_texel);
+        const size_t need = sw64kb_s3_volume_bytes(e.width, e.height, 1, bytes_per_texel);
         if (!need) return {};
         if (need > SIZE_MAX - offset) return {};
         e.byte_offset = offset;
         e.level_bytes = need;
         e.in_tail = false;
         offset += need;
+    }
+    if (offset && slab_count > SIZE_MAX / offset) return {};
+    for (auto& e : out) {
+        e.slab_stride = offset;
+        e.slab_count = slab_count;
     }
     return out;
 }
@@ -2327,7 +2339,11 @@ size_t tiled_volume_chain_bytes_unproven(uint32_t width, uint32_t height, uint32
         if (e.byte_offset > SIZE_MAX - span) return 0;
         end = std::max(end, e.byte_offset + span);
     }
-    return end;
+    // `end` is one slab chain's extent; the chain repeats once per block-depth slab.
+    const size_t stride = layout.front().slab_stride;
+    const size_t slabs = layout.front().slab_count;
+    if (!stride || !slabs || end > stride || stride > SIZE_MAX / slabs) return 0;
+    return stride * slabs;
 }
 
 bool detile_volume_tail_level(uint8_t* dst, const uint8_t* src, size_t src_bytes, uint32_t width,

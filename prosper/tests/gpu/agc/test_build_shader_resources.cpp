@@ -1794,7 +1794,70 @@ TEST(BuildShaderResources, VolumeChainUnprovenNonTailOffsets) {
     ASSERT_EQ(single.size(), 1u) << "single-level chain yields one entry";
     EXPECT_FALSE(single[0].in_tail) << "64-wide level zero is not in the tail";
     EXPECT_EQ(single[0].byte_offset, 0u) << "hand tail-less offset starts at zero";
-    EXPECT_EQ(single[0].level_bytes, 262144u) << "hand 1x2x2 blocks of 64 KiB";
+    // 64x64x64 at 1 B is two 32-slice depth slabs (block 64x32x32): AddrLib repeats a
+    // one-level chain per slab, so one slab holds 1x2 blocks and the whole level is two of them.
+    EXPECT_EQ(single[0].level_bytes, 131072u) << "hand 1x2 blocks of 64 KiB per depth slab";
+    EXPECT_EQ(single[0].slab_count, 2u) << "64 slices over a 32-slice block depth";
+    EXPECT_EQ(single[0].slab_stride, 131072u) << "one slab chain is the one level";
+}
+
+// Depth slabs, against AddrLib's own answers (Mesa 26.2.0 Addr2ComputeSurfaceInfo and
+// Addr2ComputeSurfaceAddrFromCoord, SW_64KB_S 3D, the PS5's 16-pipe Navi10 config, run
+// 2026-10-13). A chain deeper than the block depth repeats once per block-depth slab, with the
+// tail block first, the smaller levels next and level 0's blocks last in each copy. These are the
+// model's numbers, not hardware's: they keep the derivation from drifting off AddrLib.
+TEST(BuildShaderResources, VolumeChainUnprovenDepthSlabsMatchAddrLib) {
+    struct Level {
+        size_t offset;
+        size_t bytes;   // per slab; 0 for a tail level
+    };
+    struct Shape {
+        uint32_t w, h, d, bpe, max_mip;
+        size_t slabs, stride, total;
+        std::vector<Level> levels;   // non-tail levels from level 0 upward
+        uint32_t first_tail;
+    };
+    const Shape shapes[] = {
+        // 128^3 at 1 B: block 64x32x32, four slabs; L2 (32^3) opens the tail.
+        {128, 128, 128, 1, 7, 4, 0xb0000, 0x2c0000, {{0x30000, 0x80000}, {0x10000, 0x20000}}, 2},
+        // 256x64x64 at 1 B: two slabs; L3 (32x32x8) opens the tail.
+        {256,
+         64,
+         64,
+         1,
+         5,
+         2,
+         0xc0000,
+         0x180000,
+         {{0x40000, 0x80000}, {0x20000, 0x20000}, {0x10000, 0x10000}},
+         3},
+        // 64^3 at 8 B: block 32x16x16, four slabs; L2 (16^3) opens the tail.
+        {64, 64, 64, 8, 6, 4, 0xb0000, 0x2c0000, {{0x30000, 0x80000}, {0x10000, 0x20000}}, 2},
+        // 32^3 at 8 B: two 16-slice slabs; L1 (16^3) opens the tail.
+        {32, 32, 32, 8, 5, 2, 0x30000, 0x60000, {{0x10000, 0x20000}}, 1},
+    };
+    for (const auto& s : shapes) {
+        SCOPED_TRACE(testing::Message() << s.w << "x" << s.h << "x" << s.d << " bpe " << s.bpe);
+        const auto chain = tiled_volume_chain_layout_unproven(s.w, s.h, s.d, s.bpe, 9, s.max_mip);
+        ASSERT_EQ(chain.size(), size_t{s.max_mip} + 1u);
+        for (uint32_t level = 0; level < chain.size(); ++level) {
+            EXPECT_EQ(chain[level].in_tail, level >= s.first_tail) << "level " << level;
+            EXPECT_EQ(chain[level].slab_count, s.slabs) << "level " << level;
+            EXPECT_EQ(chain[level].slab_stride, s.stride) << "level " << level;
+        }
+        for (size_t level = 0; level < s.levels.size(); ++level) {
+            EXPECT_EQ(chain[level].byte_offset, s.levels[level].offset) << "level " << level;
+            EXPECT_EQ(chain[level].level_bytes, s.levels[level].bytes) << "level " << level;
+        }
+        EXPECT_EQ(tiled_volume_chain_bytes_unproven(s.w, s.h, s.d, s.bpe, 9, s.max_mip), s.total);
+    }
+    // AddrLib's texel addresses for the 128^3 / 1 B chain: slab index * stride + level offset.
+    // L0 (0,0,32) = 0xe0000 and (0,0,64) = 0x190000; L1 (0,0,32) = 0xc0000.
+    const auto c = tiled_volume_chain_layout_unproven(128, 128, 128, 1, 9, 7);
+    ASSERT_GE(c.size(), 2u);
+    EXPECT_EQ((32u / 32u) * c[0].slab_stride + c[0].byte_offset, 0xe0000u);
+    EXPECT_EQ((64u / 32u) * c[0].slab_stride + c[0].byte_offset, 0x190000u);
+    EXPECT_EQ((32u / 32u) * c[1].slab_stride + c[1].byte_offset, 0xc0000u);
 }
 
 // Span accounting is verified against hand totals, not against the helper itself:
