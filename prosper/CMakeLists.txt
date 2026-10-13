@@ -4666,6 +4666,29 @@ endif()
     SOURCES tests/gpu/pm4/test_agc_multi_acb.cpp
     LIBRARIES prosper_core)
 
+  prosper_add_gtest(test_wait_producer_trace
+    SOURCES tests/gpu/pm4/test_wait_producer_trace.cpp
+    LIBRARIES prosper_core
+    ENVIRONMENT PROSPER_WAIT_PRODUCER_TRACE=1 PROSPER_POST_SUBMIT_VISIBILITY=1
+                PROSPER_WAIT_DEFER=0 PROSPER_EOP_WRITE_SYNC=0
+    PROPERTIES ENVIRONMENT_MODIFICATION "PROSPER_NO_BATCH_RENDERER_WRITE_DRAIN=unset:")
+  prosper_add_gtest(test_wait_producer_trace_budget
+    SOURCES tests/gpu/pm4/test_wait_producer_trace_budget.cpp
+    LIBRARIES prosper_core
+    ENVIRONMENT PROSPER_WAIT_PRODUCER_TRACE=1 PROSPER_POST_SUBMIT_VISIBILITY=1
+                PROSPER_WAIT_DEFER=0 PROSPER_EOP_WRITE_SYNC=0)
+  prosper_add_gtest(test_wait_producer_trace_selective
+    SOURCES tests/gpu/pm4/test_wait_producer_trace_selective.cpp
+    LIBRARIES prosper_core
+    ENVIRONMENT PROSPER_WAIT_PRODUCER_TRACE=1 PROSPER_POST_SUBMIT_VISIBILITY=1
+                PROSPER_NO_BATCH_RENDERER_WRITE_DRAIN=1 PROSPER_WAIT_DEFER=0
+                PROSPER_EOP_WRITE_SYNC=0)
+  prosper_add_gtest(test_wait_producer_trace_disabled
+    SOURCES tests/gpu/pm4/test_wait_producer_trace_disabled.cpp
+    LIBRARIES prosper_core
+    ENVIRONMENT PROSPER_POST_SUBMIT_VISIBILITY=1 PROSPER_WAIT_DEFER=0 PROSPER_EOP_WRITE_SYNC=0
+    PROPERTIES ENVIRONMENT_MODIFICATION "PROSPER_WAIT_PRODUCER_TRACE=unset:")
+
   add_executable(test_agc_submit_multi tests/hle/test_agc_submit_multi.cpp)
   target_include_directories(test_agc_submit_multi PRIVATE tests)
   target_link_libraries(test_agc_submit_multi PRIVATE prosper_core)

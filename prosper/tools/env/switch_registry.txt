@@ -970,6 +970,7 @@ PROSPER_VULKAN_LIB  unclassified
 PROSPER_WAITCALLER  unclassified
 PROSPER_WAITCAP  unclassified
 PROSPER_WAIT_DEFER  unclassified
+PROSPER_WAIT_PRODUCER_TRACE  diagnostic  # bounded pending-writer attribution; does not change waits or write visibility
 PROSPER_WAIT_TIMEOUT_MS  unclassified
 PROSPER_WATCH_ABS  unclassified
 PROSPER_WATCH_COMPANION  unclassified

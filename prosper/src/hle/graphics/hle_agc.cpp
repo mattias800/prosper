@@ -13,6 +13,7 @@
 #include "hle/kernel/hle_kernel_time.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/pm4/command_processor.hpp"
+#include "gpu/diagnostics/wait_producer_trace.hpp"
 #include "gpu/pm4/pm4_decode.hpp"
 #include "gpu/pm4/cond_indirect_buffer.hpp"   // #4610: SetPredication control word
 #include "gpu/execute/gpu_execute.hpp"
@@ -2829,7 +2830,13 @@ static uint64_t submit_dcb_buffers(const gpu::CommandBuffer* buffers, size_t buf
     state.ordered_memory_effects.clear();
     state.capture_dma_data_records = gpu::begin_gpu_timeline_submit(g_submit_count + 1);
     std::vector<size_t> consumed(buffer_count);
-    size_t applied = gpu::run_command_buffers(buffers, buffer_count, state, consumed.data());
+    size_t applied;
+    {
+        gpu::WaitTraceSubmitScope trace({static_cast<uint8_t>(async_compute ? 2 : 1), async_compute,
+                                         static_cast<uint32_t>(queue_id), true,
+                                         g_submit_count + 1});
+        applied = gpu::run_command_buffers(buffers, buffer_count, state, consumed.data());
+    }
     g_submit_count++;
     size_t total_dwords = 0;
     for (size_t i = 0; i < buffer_count; ++i) {
@@ -3027,7 +3034,11 @@ HLE(agc_driver_submit_dcb) {  // (const Packet* packet)
     agc_gpu_state().capture_dma_data_records =
         gpu::begin_gpu_timeline_submit(g_submit_count + 1);
     size_t consumed = 0;
-    size_t applied = gpu::run_command_buffer(p->addr, p->dw_num, agc_gpu_state(), &consumed);
+    size_t applied;
+    {
+        gpu::WaitTraceSubmitScope trace({1, false, 0, true, g_submit_count + 1});
+        applied = gpu::run_command_buffer(p->addr, p->dw_num, agc_gpu_state(), &consumed);
+    }
     g_submit_count++;
     report_short_fold("SubmitDcb", g_submit_count, p->addr, p->dw_num, consumed);
     report_submit_order("SubmitDcb", call_stamp, g_submit_count, p->addr, p->dw_num,
