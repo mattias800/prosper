@@ -24,15 +24,17 @@ def run(*args, code=0, extra=None):
     return p.stdout + p.stderr
 
 
-# Schema 6 (#4703) appends a six-byte export-format tail after every older tail. The offset checks
+# Schemas 6/7 append export formats and front-face encoding after every older tail. The offset checks
 # below were written against schema 5, so they read each official case through as_v5(), which
-# first proves the schema-6 tail is present and holds the all-zero (historical) value.
+# first proves both appended tails hold their unavailable/all-zero historical values.
 EXPORT_TAIL = 6
 
 
 def as_v5(blob):
     blob = bytearray(blob)
-    assert blob[8:12] == (6).to_bytes(4, "little"), "current cases are schema 6"
+    assert blob[8:12] == (7).to_bytes(4, "little"), "current cases are schema 7"
+    assert blob[-9] == 0, "legacy fixtures keep front-face encoding unavailable"
+    del blob[-9]  # remove only schema 7's appended encoding, preserving the schema-6 prefix
     assert blob[-8 - EXPORT_TAIL:-8] == bytes(EXPORT_TAIL), "default export formats are all zero"
     del blob[-8 - EXPORT_TAIL:-8]
     blob[8:12] = (5).to_bytes(4, "little")

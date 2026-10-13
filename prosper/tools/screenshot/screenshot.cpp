@@ -68,7 +68,8 @@
 #include "gpu/timeline/gpu_timeline.hpp"
 #include "shared/device/device_identity.hpp"
 #include "shared/live/live_renderer.hpp"           // register_live_renderer (frontends/shared)
-#include "capture_manifest.hpp"
+#include "shared/capture/capture_manifest.hpp"
+#include "shared/capture/capture_png.hpp"
 #ifdef PROSPER_VIDEO_MF
 #include "media_foundation_backend.hpp" // native Windows AvPlayer demux + hardware decode
 #endif
@@ -82,14 +83,6 @@
 #include "ajm_ffmpeg.hpp"                // AJM MP3 decoder (keeps capture boot behavior app-equivalent)
 #endif
 
-#ifdef _WIN32
-#include <windows.h>
-#include <wincodec.h>
-#include <objbase.h>
-#else
-#include <zlib.h>
-#include <unistd.h>
-#endif
 #include <algorithm>
 #include <climits>
 #include <cmath>
@@ -107,10 +100,15 @@
 #include <thread>
 #include <chrono>
 #include <ctime>
+#ifndef _WIN32
+#include <unistd.h>   // _exit: the detached guest must not race static teardown
+#endif
 
 using namespace prosper;
 
 namespace {
+using prosper::screenshot::crc32_bytes;
+using prosper::screenshot::write_png;
 
 bool set_environment(const char* name, const char* value, bool overwrite) {
     if (!overwrite && getenv(name)) return true;
@@ -119,17 +117,6 @@ bool set_environment(const char* name, const char* value, bool overwrite) {
 #else
     return setenv(name, value, overwrite ? 1 : 0) == 0;
 #endif
-}
-
-uint32_t crc32_bytes(const void* data, size_t len, uint32_t seed = 0) {
-    uint32_t crc = ~seed;
-    const auto* bytes = static_cast<const uint8_t*>(data);
-    for (size_t i = 0; i < len; ++i) {
-        crc ^= bytes[i];
-        for (int bit = 0; bit < 8; ++bit)
-            crc = (crc >> 1) ^ (0xedb88320u & (0u - (crc & 1u)));
-    }
-    return ~crc;
 }
 
 bool parse_nonnegative_double(const char* text, double& value) {
@@ -157,144 +144,6 @@ bool parse_nonnegative_u64(const char* text, uint64_t& value) {
     if (errno || end == text || *end != '\0' || text[0] == '-') return false;
     value = static_cast<uint64_t>(parsed);
     return true;
-}
-
-void put_chunk(FILE* f, const char* type, const uint8_t* data, size_t len) {
-    uint8_t hdr[4] = { (uint8_t)(len >> 24), (uint8_t)(len >> 16), (uint8_t)(len >> 8), (uint8_t)len };
-    fwrite(hdr, 1, 4, f);
-    fwrite(type, 1, 4, f);
-    if (len) fwrite(data, 1, len, f);
-    uint32_t crc = crc32_bytes(type, 4);
-    if (len) crc = crc32_bytes(data, len, crc);
-    uint8_t crcb[4] = { (uint8_t)(crc >> 24), (uint8_t)(crc >> 16), (uint8_t)(crc >> 8), (uint8_t)crc };
-    fwrite(crcb, 1, 4, f);
-}
-
-// Write w*h RGBA8 as an 8-bit RGBA PNG.
-bool write_png(const char* path, const uint8_t* rgba, uint32_t w, uint32_t h,
-               std::string& error) {
-#ifdef _WIN32
-    const HRESULT init_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    const bool uninitialize = SUCCEEDED(init_hr);
-    if (FAILED(init_hr) && init_hr != RPC_E_CHANGED_MODE) {
-        char detail[64];
-        snprintf(detail, sizeof detail, "COM init failed (0x%08lx)", (unsigned long)init_hr);
-        error = detail;
-        return false;
-    }
-
-    IWICImagingFactory* factory = nullptr;
-    IWICStream* stream = nullptr;
-    IWICBitmapEncoder* encoder = nullptr;
-    IWICBitmapFrameEncode* frame = nullptr;
-    IPropertyBag2* properties = nullptr;
-    HRESULT hr = S_OK;
-    bool ok = false;
-    do {
-        hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-                              IID_PPV_ARGS(&factory));
-        if (FAILED(hr)) break;
-        hr = factory->CreateStream(&stream);
-        if (FAILED(hr)) break;
-        const std::wstring wide_path = std::filesystem::path(path).wstring();
-        hr = stream->InitializeFromFilename(wide_path.c_str(), GENERIC_WRITE);
-        if (FAILED(hr)) break;
-        hr = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
-        if (FAILED(hr)) break;
-        hr = encoder->Initialize(stream, WICBitmapEncoderNoCache);
-        if (FAILED(hr)) break;
-        hr = encoder->CreateNewFrame(&frame, &properties);
-        if (FAILED(hr)) break;
-        hr = frame->Initialize(properties);
-        if (FAILED(hr)) break;
-        hr = frame->SetSize(w, h);
-        if (FAILED(hr)) break;
-        WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
-        hr = frame->SetPixelFormat(&format);
-        if (FAILED(hr) || !IsEqualGUID(format, GUID_WICPixelFormat32bppBGRA)) {
-            if (SUCCEEDED(hr)) hr = WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT;
-            break;
-        }
-        if (w == 0 || h == 0 || w > UINT32_MAX / 4) { hr = E_INVALIDARG; break; }
-        const UINT stride = w * 4;
-        if (h > UINT32_MAX / stride) { hr = E_INVALIDARG; break; }
-        const UINT byte_count = stride * h;
-        std::vector<uint8_t> bgra(byte_count);
-        for (size_t i = 0; i < byte_count; i += 4) {
-            bgra[i + 0] = rgba[i + 2];
-            bgra[i + 1] = rgba[i + 1];
-            bgra[i + 2] = rgba[i + 0];
-            bgra[i + 3] = rgba[i + 3];
-        }
-        hr = frame->WritePixels(h, stride, byte_count, bgra.data());
-        if (FAILED(hr)) break;
-        hr = frame->Commit();
-        if (FAILED(hr)) break;
-        hr = encoder->Commit();
-        if (FAILED(hr)) break;
-        ok = true;
-    } while (false);
-
-    if (properties) properties->Release();
-    if (frame) frame->Release();
-    if (encoder) encoder->Release();
-    if (stream) stream->Release();
-    if (factory) factory->Release();
-    if (uninitialize) CoUninitialize();
-    if (!ok) {
-        char detail[64];
-        snprintf(detail, sizeof detail, "WIC PNG encode failed (0x%08lx)", (unsigned long)hr);
-        error = detail;
-        std::error_code remove_error;
-        std::filesystem::remove(path, remove_error);
-    }
-    return ok;
-#else
-    std::vector<uint8_t> raw;
-    raw.reserve((size_t)h * (1 + (size_t)w * 4));
-    for (uint32_t y = 0; y < h; y++) {
-        raw.push_back(0);   // filter: None
-        raw.insert(raw.end(), rgba + (size_t)y * w * 4, rgba + (size_t)(y + 1) * w * 4);
-    }
-    uLongf clen = compressBound((uLong)raw.size());
-    std::vector<uint8_t> comp(clen);
-    const int zrc = compress2(comp.data(), &clen, raw.data(), (uLong)raw.size(), Z_BEST_SPEED);
-    if (zrc != Z_OK) {
-        error = "zlib compress2 failed (" + std::to_string(zrc) + ")";
-        return false;
-    }
-
-    FILE* f = fopen(path, "wb");
-    if (!f) {
-        error = std::string("open failed: ") + strerror(errno);
-        return false;
-    }
-    static const uint8_t sig[8] = { 137, 80, 78, 71, 13, 10, 26, 10 };
-    fwrite(sig, 1, 8, f);
-    uint8_t ihdr[13] = {
-        (uint8_t)(w >> 24), (uint8_t)(w >> 16), (uint8_t)(w >> 8), (uint8_t)w,
-        (uint8_t)(h >> 24), (uint8_t)(h >> 16), (uint8_t)(h >> 8), (uint8_t)h,
-        8,   // bit depth
-        6,   // colour type: RGBA
-        0, 0, 0 };
-    put_chunk(f, "IHDR", ihdr, 13);
-    put_chunk(f, "IDAT", comp.data(), clen);
-    put_chunk(f, "IEND", nullptr, 0);
-    if (ferror(f)) {
-        error = std::string("write failed: ") + strerror(errno);
-        fclose(f);
-        std::error_code remove_error;
-        std::filesystem::remove(path, remove_error);
-        return false;
-    }
-    if (fclose(f) != 0) {
-        error = std::string("close failed: ") + strerror(errno);
-        std::error_code remove_error;
-        std::filesystem::remove(path, remove_error);
-        return false;
-    }
-    return true;
-#endif
 }
 
 // The route as a short label for the annotation: the .pad file's stem, without directories or
@@ -612,24 +461,28 @@ int main(int argc, char** argv) {
     prosper::frontend::register_live_renderer(".", /*dump_bmps=*/false,
         prosper::gpu::FragmentWavePolicy::ProvenVotes);
     Program prog; std::string err;
-    if (!boot_program(dump, prog, &err, [&]{
+    if (!boot_program(dump, prog, &err, [&] {
 #ifdef PROSPER_AUDIO_FFMPEG
-        if (!prosper::ajm::install_ffmpeg_decoder_backend())
-            fprintf(stderr, "[ajm] FFmpeg audio decoder unavailable\n");
+            if (!prosper::ajm::install_ffmpeg_decoder_backend())
+                fprintf(stderr, "[ajm] FFmpeg audio decoder unavailable\n");
 #endif
 #ifdef PROSPER_VIDEO_MF
-        if (!prosper::video::install_media_foundation_backend())
-            fprintf(stderr, "[avp] Media Foundation backend unavailable\n");
+            if (!prosper::video::install_media_foundation_backend())
+                fprintf(stderr, "[avp] Media Foundation backend unavailable\n");
 #endif
 #ifdef PROSPER_VIDEO_VT
-        if (!prosper::video::install_videotoolbox_backend())
-            fprintf(stderr, "[avp] VideoToolbox backend unavailable\n");
+            if (!prosper::video::install_videotoolbox_backend())
+                fprintf(stderr, "[avp] VideoToolbox backend unavailable\n");
 #endif
 #ifdef PROSPER_VIDEO_VAAPI
-        if (!prosper::video::install_vaapi_backend())
-            fprintf(stderr, "[avp] FFmpeg/VA-API backend unavailable\n");
+            if (!prosper::video::install_vaapi_backend())
+                fprintf(stderr, "[avp] FFmpeg/VA-API backend unavailable\n");
 #endif
-    })) { fprintf(stderr, "screenshot: boot failed: %s\n", err.c_str()); return 1; }
+        })) {
+        fprintf(stderr, "screenshot: boot failed: %s\n", err.c_str());
+        if (manifest) fclose(manifest);
+        return 1;
+    }
     std::thread guest([&prog] {
         const BootResult result = run_entry(prog.imgs[0]);
         // Hand the sampling thread the result FIRST. Without this the thread is detached with the
@@ -971,7 +824,10 @@ int main(int argc, char** argv) {
         fprintf(manifest, "%s\n", screenshot::manifest_conditions_json(conditions).c_str());
         const std::string summary = screenshot::manifest_summary_json(
             saved, count, stop, tracker, verdict, guest_outcome, allow_guest_fault, run_rate);
-        if (fprintf(manifest, "%s\n", summary.c_str()) < 0 || fclose(manifest) != 0) {
+        const bool summary_written = fprintf(manifest, "%s\n", summary.c_str()) >= 0;
+        // Close even when the summary write fails; || would short-circuit this cleanup.
+        const bool manifest_closed = fclose(manifest) == 0;
+        if (!summary_written || !manifest_closed) {
             fprintf(stderr, "[shot] manifest close failed: %s: %s\n",
                     manifest_path.c_str(), strerror(errno));
             // Re-fold rather than poke the exit code, so the printed status cannot drift away from

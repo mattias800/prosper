@@ -1,4 +1,4 @@
-#include "capture_manifest.hpp"
+#include "shared/capture/capture_manifest.hpp"
 
 #include "build_revision.hpp"   // revision this binary was compiled from
 
@@ -66,6 +66,7 @@ const char* sampling_stop_name(SamplingStop stop) {
     switch (stop) {
         case SamplingStop::Timeout:    return "timeout";
         case SamplingStop::GuestFault: return "guest-fault";
+        case SamplingStop::FrontendStopped: return "frontend-stopped";
         case SamplingStop::RequestSatisfied: break;
     }
     return "request-satisfied";

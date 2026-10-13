@@ -1447,6 +1447,15 @@ int main(int argc, char** argv) {
     // Fragment: solid green (EXP MRT0).
     { const uint32_t c[] = {0x7E000280u,0x7E0202F2u,0x7E040280u,0x7E0602F2u,0xF800180Fu,0x03020100u,0xBF810000u};
       dump(dir, "fragment_color", recompile_fragment(c, sizeof(c)/4), "recompile_fragment"); }
+    // FRONT_FACE is a real Bool raster input converted to the observed guest raw-word encoding.
+    for (const uint32_t baryc : {0u, 1u << 24}) {
+        const uint32_t c[] = {0x7d040080u, 0x7e120280u, 0x021012f2u, 0x7e140280u,
+                              0x7e1602f2u, 0xf800180fu, 0x0b0a0908u, 0xbf810000u};
+        PixelSystemInputMapping inputs{1u << 12, 1u << 12};
+        inputs.retain_front_face_encoding(true, baryc);
+        dump(dir, baryc ? "fragment_front_face_all_bits" : "fragment_front_face_signed_float",
+             recompile_fragment(c, std::size(c), nullptr, &inputs, UINT32_MAX, nullptr, true));
+    }
     // Fragment: compressed and uncompressed colour exports under every SPI_SHADER_COL_FORMAT
     // decode and output class (#4703): u16/s16 halves into uvec4/ivec4 outputs (Kena's R16_UINT
     // lighting channels), unorm16/snorm16 into a float output, the mismatched value conversions,

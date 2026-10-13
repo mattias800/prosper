@@ -222,7 +222,10 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // v75: observed compute dispatch initiator, packed FULL/PARTIAL register words and original direct
 // packet dimensions, with independent presence. Appended only when some available compute config
 // carries these words; v71-v74 captures keep their exact bytes and load an unknown launch record.
-constexpr uint32_t kVersion = 75;
+// v76 retains the actual front-face compiler input in draw then failure order. Legacy frames
+// leave it unavailable; an observed raw raster register is not retrospectively a compiler argument.
+constexpr uint32_t kVersion = 76;
+constexpr uint32_t kVersionWithFrontFaceEncoding = 76;
 constexpr uint32_t kVersionWithComputeDispatchLaunch = 75;
 constexpr uint32_t kVersionWithUnavailableSource = 74;
 constexpr uint32_t kVersionWithDepthBounds = 73;
@@ -240,6 +243,12 @@ inline bool gpu_capture_has_unavailable_source(const GpuCaptureFile& c) {
 }
 // The lowest version whose tails can hold everything this capture carries.
 inline uint32_t gpu_capture_version_for(const GpuCaptureFile& c) {
+    for (const auto& draw : c.draws)
+        if (draw.system_inputs.front_face_encoding != FragmentFrontFaceEncoding::Unavailable)
+            return kVersionWithFrontFaceEncoding;
+    for (const auto& diagnostic : c.failure_diagnostics)
+        if (diagnostic.system_inputs.front_face_encoding != FragmentFrontFaceEncoding::Unavailable)
+            return kVersionWithFrontFaceEncoding;
     for (const auto& compute : c.computes)
         if (compute.recompile_config_available &&
             compute.recompile_config.dispatch_launch != ComputeDispatchLaunchState{})

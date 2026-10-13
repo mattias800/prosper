@@ -1,4 +1,6 @@
 // command_processor.cpp — see command_processor.hpp.
+#include "gpu/pm4/scalar_pending_write_overlay.hpp"
+#include "gpu/diagnostics/wait_producer_trace.hpp"
 #include "gpu/pm4/command_processor.hpp"
 #include "gpu/pm4/cond_indirect_buffer.hpp"   // #4540
 #include "gpu/pm4/wait_regmem_sample.hpp"
@@ -178,6 +180,10 @@ bool guest_readable(uint64_t addr, uint32_t bytes);
 bool guest_writable(uint64_t addr, uint32_t bytes);
 // Guest GPU writes invalidate renderer-owned copies of overlapping resources.
 void notify_guest_gpu_write(uint64_t addr, uint64_t size);
+static void notify_pending_writer_store(const Pm4Command& c, uint64_t addr, uint64_t size) {
+    notify_guest_gpu_write(addr, size);
+    observe_pending_writer_store(c, addr, size);
+}
 // Names the PM4 packet responsible for the next notify, for PROSPER_GUEST_WRITE_WATCH.
 void set_guest_gpu_write_origin(const char* origin);
 // The 64 KiB Global Data Share (gpu_executor.cpp, declared in gpu_execute.hpp). DMA_DATA can name a
@@ -2493,7 +2499,7 @@ static void honor_eop_write(const Pm4Command& c) {
         fprintf(stderr, "[agc]   EOP write [0x%llx] data_sel=%u value=0x%llx\n",
                 (unsigned long long)c.rel_addr, c.rel_data_sel, (unsigned long long)c.rel_value);
     set_guest_gpu_write_origin("RELEASE_MEM");
-    notify_guest_gpu_write(c.rel_addr, c.rel_data_sel == 1 ? 4 : 8);
+    notify_pending_writer_store(c, c.rel_addr, c.rel_data_sel == 1 ? 4 : 8);
     set_guest_gpu_write_origin(nullptr);
     wake_on_label(c.rel_addr);   // wake any sync_on_address futex waiter on this completion label
 }
@@ -2521,7 +2527,7 @@ static void honor_event_write(const Pm4Command& c) {
     write_trap_scan("EVENT", c.event_addr, pre, &v, sizeof v, pkt_addr(c));
     memcpy((void*)(uintptr_t)c.event_addr, &v, sizeof v);
     set_guest_gpu_write_origin("EVENT_WRITE");
-    notify_guest_gpu_write(c.event_addr, sizeof v);
+    notify_pending_writer_store(c, c.event_addr, sizeof v);
     set_guest_gpu_write_origin(nullptr);
     ring_record(c.event_addr, v, 8, 2, pkt_addr(c));
     clockfence_record(c.event_addr, pre, v, pkt_addr(c), 2);
@@ -2820,7 +2826,7 @@ static bool honor_dma_data(const Pm4Command& c, uint64_t retained_packet_addr = 
                     (unsigned long long)c.dd_dst, c.dd_bytes);
     }
     set_guest_gpu_write_origin("DMA_DATA");
-    notify_guest_gpu_write(c.dd_dst, c.dd_bytes);
+    notify_pending_writer_store(c, c.dd_dst, c.dd_bytes);
     set_guest_gpu_write_origin(nullptr);
     ring_record(c.dd_dst, c.dd_src, (uint8_t)(c.dd_bytes > 255 ? 255 : c.dd_bytes), 4, packet_addr);
     if (writer_provenance_enabled() &&
@@ -2886,7 +2892,7 @@ static void honor_write_data(const Pm4Command& c) {
                         (uint64_t)c.wd_num * 4, pkt_addr(c));
     memcpy((void*)(uintptr_t)c.wd_addr, c.wd_data, (size_t)c.wd_num * 4);
     set_guest_gpu_write_origin("WRITE_DATA");
-    notify_guest_gpu_write(c.wd_addr, static_cast<uint64_t>(c.wd_num) * 4);
+    notify_pending_writer_store(c, c.wd_addr, static_cast<uint64_t>(c.wd_num) * 4);
     set_guest_gpu_write_origin(nullptr);
     ring_record(c.wd_addr, c.wd_data[0], (uint8_t)(c.wd_num * 4 > 255 ? 255 : c.wd_num * 4), 3, pkt_addr(c));
     poolshift_check("WDATA", c.wd_addr, (uint64_t)c.wd_num * 4, c.wd_num ? c.wd_data[0] : 0, pkt_addr(c));
@@ -2980,6 +2986,7 @@ struct PendWrite {
     Pm4Command cmd;
     std::vector<uint32_t> wd_copy;     // owns a WriteData payload (cmd.wd_data repointed here)
     std::chrono::steady_clock::time_point queued{};   // #1945: enqueue instant (see pend_age_note)
+    PendingWriterTrace trace;
 };
 // #1945: how long a completion write actually sat in this queue before it landed in guest memory.
 // The original model promised "post-submit plus ~1 ms of modeled pipe drain"; the WAF family this queue was
@@ -3037,6 +3044,11 @@ PendQueue& pend_q() { static PendQueue* p = new PendQueue; return *p; }
 thread_local uint32_t t_submit_scope_depth = 0;
 void apply_effect(const Pm4Command& c);   // fwd (defined with the WAIT_DEFER machinery below)
 void apply_deferred_effect(const Pm4Command& c);   // fwd: guarded apply (#449)
+static void apply_pending_write(const PendWrite& write) {
+    PendingWriterTraceApplyScope trace(write.trace.get(), write.cmd);
+    pend_age_note(write.queued);
+    apply_deferred_effect(write.cmd);
+}
 void pend_wait_post_submit(PendQueue& p, std::unique_lock<std::mutex>& lk);
 // Drain returns only when every pending write has LANDED, and writes land STRICTLY IN QUEUE ORDER.
 //
@@ -3085,8 +3097,7 @@ void pend_drain_locked(PendQueue& p, std::unique_lock<std::mutex>& lk) {
         // the label page (MallocBinned3, #312). apply_deferred_effect probes guest_readable before
         // the raw memcpy — without it an unmapped label SIGSEGVs here, exactly the case the deferred-
         // stream path already survives (this pend path releases asynchronously too, so it needs it).
-        pend_age_note(w.queued);
-        apply_deferred_effect(w.cmd);
+        apply_pending_write(w);
         lk.lock();
         p.inflight--;
         p.cv.notify_all();               // wake both drain waiters and the pend worker
@@ -3133,6 +3144,7 @@ void pend_enqueue(const Pm4Command& c) {
         w.wd_copy.assign(c.wd_data, c.wd_data + c.wd_num);   // cb memory may be recycled before drain
         w.cmd.wd_data = w.wd_copy.data();
     }
+    w.trace = capture_pending_writer_identity(w.cmd);
     {
         std::lock_guard<std::mutex> lk(p.mx);
         if (!p.worker_started) { p.worker_started = true; std::thread(pend_worker).detach(); }
@@ -3297,8 +3309,7 @@ extern "C" void prosper_gpu_drain_renderer_writes() {
             p.q.erase(it);
             p.inflight++;
             lk.unlock();
-            pend_age_note(w.queued);
-            apply_deferred_effect(w.cmd);
+            apply_pending_write(w);
             lk.lock();
             p.inflight--;
             p.cv.notify_all();
@@ -3386,50 +3397,26 @@ extern "C" void prosper_gpu_drain_renderer_writes() {
         p.q.swap(blocked);
         p.inflight++;
         lk.unlock();
-        for (const PendWrite& write : ready) {
-            pend_age_note(write.queued);
-            apply_deferred_effect(write.cmd);
-        }
+        for (const PendWrite& write : ready) { apply_pending_write(write); }
         lk.lock();
         p.inflight--;
         p.cv.notify_all();
     }
 }
 
-// Resolve a scalar label against the writes queued by the currently executing submit without
-// publishing those writes to guest memory. This gives WAIT_REG_MEM its in-queue ordering semantics
-// while other guest threads continue to see the pre-submit value until the import returns.
-bool pend_overlay_qword(uint64_t addr, uint64_t* value) {
+// Preserve the modeled overlay of the entire pending queue, which can contain other submits.
+// The last matching writer identifies that overlay; it does not establish queue causality.
+bool pend_overlay_qword(uint64_t addr, uint64_t* value,
+                        std::optional<PendingWriterIdentity>* producer = nullptr) {
     PendQueue& p = pend_q();
     std::lock_guard<std::mutex> lk(p.mx);
     if (p.q.empty()) return false;
     uint64_t v = *value;
     bool touched = false;
     for (const PendWrite& w : p.q) {
-        const Pm4Command& c = w.cmd;
-        using K = Pm4Command::Kind;
-        if (c.kind == K::ReleaseMem && c.rel_addr == addr && c.rel_value_valid) {
-            if (c.rel_data_sel == 1) {
-                uint32_t lo = (uint32_t)c.rel_value;
-                memcpy(&v, &lo, sizeof lo);
-                touched = true;
-            } else if (c.rel_data_sel == 2) {
-                v = c.rel_value;
-                touched = true;
-            }
-        } else if (c.kind == K::WriteData && c.wd_valid && c.wd_addr == addr &&
-                   c.wd_data && c.wd_num) {
-            const size_t n = std::min<size_t>((size_t)c.wd_num * 4, sizeof v);
-            memcpy(&v, c.wd_data, n);
-            touched = true;
-        } else if (c.kind == K::DmaData && c.dd_dst == addr && c.dd_valid &&
-                   dma_data_immediate_source(c)) {
-            const uint32_t word = (uint32_t)c.dd_src;
-            const size_t n = std::min<size_t>(c.dd_bytes, sizeof v);
-            for (size_t off = 0; off < n; off += sizeof word)
-                memcpy((uint8_t*)&v + off, &word, std::min(sizeof word, n - off));
-            touched = true;
-        }
+        if (!overlay_pending_scalar_write(w.cmd, addr, &v, dma_data_immediate_source)) continue;
+        touched = true;
+        if (producer) *producer = w.trace ? std::optional(*w.trace) : std::nullopt;
     }
     if (touched) *value = v;
     return touched;
@@ -3522,11 +3509,20 @@ WaitRegMemPredicateSample evaluate_wait_regmem_predicate(const Pm4Command& c) {
     // as NOT satisfied (the barrel-on default) — matching flush_deferred_streams(), which already guards
     // its WAIT_REG_MEM re-check this way. The wm_addr&3 alignment gate at the call site does not catch an
     // unmapped-but-aligned address. #380.
-    return sample_wait_regmem_predicate(c, [](uint64_t address, uint64_t* value) {
-        if (!guest_readable(address, sizeof(uint64_t))) return false;
-        memcpy(value, (const void*)(uintptr_t)address, sizeof(*value));
-        return true;
-    }, pend_overlay_qword);
+    const bool tracing = wait_producer_trace_enabled();
+    std::optional<PendingWriterIdentity> producer;
+    const auto sample = sample_wait_regmem_predicate(
+        c,
+        [](uint64_t address, uint64_t* value) {
+            if (!guest_readable(address, sizeof(uint64_t))) return false;
+            memcpy(value, (const void*)(uintptr_t)address, sizeof(*value));
+            return true;
+        },
+        [&](uint64_t address, uint64_t* value) {
+            return pend_overlay_qword(address, value, tracing ? &producer : nullptr);
+        });
+    if (tracing) observe_wait_producer_decision(c, sample, producer ? &*producer : nullptr);
+    return sample;
 }
 
 bool wait_regmem_satisfied(const Pm4Command& c) {
@@ -3791,6 +3787,7 @@ void submit_completion_pulse(bool submit_rejected) {
 // backstop). Returns how many streams fully completed across both queues.
 int flush_deferred_streams() {
     if (g_deferred.empty()) return 0;
+    WaitTraceSubmitScope unknown_origin({});   // This older tail has no retained submit identity.
     // Legacy SDK callers retain the original eager visibility. Modern callers consult the pending
     // scalar overlay instead, so their completion labels remain post-submit.
     if (!post_submit_visibility_enabled()) prosper_gpu_drain_completion_writes();
