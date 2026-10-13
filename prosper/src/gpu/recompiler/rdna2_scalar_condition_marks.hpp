@@ -1,4 +1,4 @@
-// Current SCC data provenance for Wave32 structured conditions and scalar relays.
+// Current SCC data provenance for Wave32 and the scoped Wave64 fragment scalar-VCC admission.
 #pragma once
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include <cstdint>

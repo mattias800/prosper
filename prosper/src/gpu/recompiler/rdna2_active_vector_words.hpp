@@ -3,6 +3,7 @@
 #pragma once
 
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_complementary_exec_data.hpp"
 
 #include <map>
 #include <set>
@@ -24,6 +25,7 @@ struct ActiveVectorWords {
     // A vector word is genuine wherever the CURRENT value of this saved B64 mask enables a lane.
     // Overwriting a vector with a possibly missing source retires it from every guarantee.
     std::map<int, std::set<int>> masks;
+    ComplementaryExecData complement;
     bool operator==(const ActiveVectorWords&) const = default;
 };
 

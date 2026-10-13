@@ -85,6 +85,7 @@ void seed_active_vector_words(ActiveVectorWords& facts, const RegState& initial,
 }
 
 void meet_active_vector_words(ActiveVectorWords& into, const ActiveVectorWords& incoming) {
+    meet_complementary_exec_data(into.complement, incoming.complement);
     into.enabled = into.enabled && incoming.enabled;
     into.current = intersect(std::move(into.current), incoming.current);
     into.current_is_entry = into.current_is_entry && incoming.current_is_entry;
@@ -147,12 +148,19 @@ bool active_vector_sources_defined(const ActiveVectorWords& state, const Rdna2In
                in.src[0].kind == OperandKind::VGPR && in.src[0].value >= 0 &&
                in.src[0].value < 255 && in.src[1].kind == OperandKind::Special &&
                in.src[1].value == 125 && vector(in.src[0].value) && vector(in.src[0].value + 1);
+    // The emitted plain F32 MAC reads its implicit old VDST before writing the complete result.
+    // Genuine explicit sources cannot repair a missing accumulator. Retain existing DATA only;
+    // this does not classify the operation as an independent full-word writer.
+    const bool mac =
+        !in.has_sdwa && ((in.fmt == Rdna2Format::VOP2 && in.opcode == 0x1f) ||
+                         (in.fmt == Rdna2Format::VOP3 && in.opcode == kVop3OpcodeMacF32));
+    if (mac && !state.current.contains(in.dst.value)) return false;
     // Neither a peer operation nor a relative/selected-slot read may borrow lane-wise ownership.
     if (in.has_dpp || in.has_modifier ||
         (in.fmt == Rdna2Format::VOP1 &&
          (in.opcode == 0x02 || (in.opcode >= 0x40 && in.opcode <= 0x47))) ||
         (in.fmt == Rdna2Format::VOP2 &&
-         (in.opcode == 0x1f || in.opcode == 0x2b || in.opcode == 0x3c)) ||
+         ((!mac && in.opcode == 0x1f) || in.opcode == 0x2b || in.opcode == 0x3c)) ||
         (in.fmt == Rdna2Format::VOP3 && in.opcode >= 0x300 && in.opcode != 0x346) ||
         (in.fmt != Rdna2Format::VOP1 && in.fmt != Rdna2Format::VOP2 &&
          in.fmt != Rdna2Format::VOP3 && in.fmt != Rdna2Format::VOPC))
@@ -191,6 +199,7 @@ void advance_active_vector_words(ActiveVectorWords& state, const Rdna2Inst& in,
                                  const std::vector<std::pair<int, uint32_t>>& scalar_writes,
                                  const std::vector<int>& vector_writes, int mask_write,
                                  bool genuine_active_sources, bool complete_active_word) {
+    advance_complementary_exec_data(state, in, scalar_writes, mask_write);
     // Snapshot masks before an aliasing SDST or saveexec destination overwrites them.
     const Words before = state.current;
     const EntryDomain before_domain{state.current_is_entry, state.current_within_entry};
@@ -300,11 +309,13 @@ void advance_active_vector_words(ActiveVectorWords& state, const Rdna2Inst& in,
         // No saved-mask value can revive DATA destroyed after it was saved, including a
         // later iteration at the same writer PC. Unknown partial/cross-lane writers also retire it.
         if (!genuine_active_sources) {
+            state.complement.first_words.erase(word);
             state.current.erase(word);
             state.entry_words.erase(word);
             for (auto& [mask, words] : state.masks) words.erase(word);
         } else if (complete_active_word) {
             state.current.insert(word);
+            publish_complementary_exec_word(state, word);
             if (state.current_is_entry) {
                 state.entry_words.insert(word);
                 for (int mask : state.within_entry_masks) state.masks[mask].insert(word);

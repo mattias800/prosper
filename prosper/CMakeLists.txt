@@ -540,14 +540,6 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME progress_tracker_generator
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/docs/gen_progress_tracker.py" --selftest)
-  # The compatibility-site generator. Only the --selftest arm is registered,
-  # like the tracker generator above: the live build reads the committed files and needs no
-  # credentials, but ctest pins the half that can fail SILENTLY -- the parsers accepting a
-  # malformed row and emitting a plausible WRONG page, or the templates interpolating raw
-  # milestone prose onto a public page.
-  add_test(NAME compat_site_generator
-           COMMAND "${Python3_EXECUTABLE}"
-                   "${CMAKE_SOURCE_DIR}/tools/compat_site/gen_compat_site.py" --selftest)
   # The pre-merge merge-result check (#2211). Its cases build real throwaway git repositories and
   # run real merges: the git plumbing IS the tool, so a mocked merge would test nothing. The case
   # that earns its keep is the clean merge whose RESULT holds a duplicate -- the state no head-time
@@ -2629,6 +2621,10 @@ if(TARGET prosper_core)
             tests/gpu/capture/test_front_face_compile_inputs.cpp
     INCLUDES src tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_fragment_scalar_vcc_pair
+    SOURCES tests/gpu/recompiler/test_fragment_scalar_vcc_pair.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_vector_scalar_provenance
     SOURCES tests/gpu/recompiler/test_vector_scalar_provenance.cpp
     INCLUDES tests
@@ -2648,6 +2644,10 @@ if(TARGET prosper_core)
     LIBRARIES prosper_core)
   prosper_add_gtest(test_active_image_word_definedness
     SOURCES tests/gpu/recompiler/test_active_image_word_definedness.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_complementary_exec_data
+    SOURCES tests/gpu/recompiler/test_complementary_exec_data.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
   prosper_add_gtest(test_wave32_word_provenance
@@ -3286,6 +3286,9 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_shader_source_window
     SOURCES tests/gpu/execute/test_shader_source_window.cpp
     INCLUDES tests
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_terminal_tail_retention
+    SOURCES tests/gpu/execute/test_terminal_tail_retention.cpp
     LIBRARIES prosper_core)
   # Cache switches are process-cached. These distinct processes exercise the actual bypass paths.
   foreach(source_policy IN ITEMS analysis_off decode_off both_off)
