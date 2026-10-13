@@ -13,9 +13,10 @@ shader_inspect reports a verdict but writes no SPIR-V; that half compares verdic
   recompile_corpus.py check  <corpus-dir> --inspect <shader_inspect> --baseline BASELINE.json
   recompile_corpus.py dumps  <before-dir> <after-dir>
 
-`dumps` compares two PROSPER_SHADER_DUMP_SUCCESS directories from live runs. Each file name is
-`success_<stage>_at_<addr>_<spirv-hash>_<raw-hash>[_main_...]`, so the SPIR-V hash is in the name:
-for every (stage, address, raw-hash) present in both, the SPIR-V hash must be equal. Shaders present
+`dumps` compares two PROSPER_SHADER_DUMP_SUCCESS directories from live runs. Each `.spv` file name is
+`success_<stage>_at_<addr>_<spirv-hash>_<raw-hash>` (only the raw `.bin` of a chained vertex program
+also carries a `_main_...` continuation, so the `.spv` names do not), so the SPIR-V hash is in the
+name: for every (stage, address, raw-hash) present in both, the SPIR-V hash must be equal. Shaders present
 in only one run are reported but are not a failure, since a run may not reach the same programs.
 
 The corpus is local (Sony or title bytes are never committed); only the hash file may be shared.
@@ -116,8 +117,9 @@ def diff(base: dict, now: dict) -> list[str]:
 
 
 def dump_keys(directory: Path) -> dict:
-    """{(stage, address, raw-hash + continuation): {spirv-hash}} from success_*.spv names. One
-    program can compile in several contexts, so a key holds every SPIR-V hash seen for it."""
+    """{(stage, address, raw-hash): {spirv-hash}} from success_*.spv names, which carry no chain
+    continuation. One program can compile in several contexts, so a key holds every SPIR-V hash
+    seen for it."""
     out: dict = {}
     for f in directory.glob("success_*.spv"):
         parts = f.stem.split("_")
@@ -140,56 +142,53 @@ def compare_dumps(before: dict, after: dict) -> tuple[list[str], int]:
     return bad, len(shared)
 
 
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("mode", choices=("record", "check", "dumps"))
-    ap.add_argument("corpus", type=Path)
-    ap.add_argument("after", nargs="?", type=Path, help="dumps: the second directory")
-    ap.add_argument("--inspect", help="path to the shader_inspect binary (record/check)")
-    ap.add_argument("--out", type=Path, help="record: baseline file to write")
-    ap.add_argument("--baseline", type=Path, help="check: baseline file to compare against")
-    args = ap.parse_args(argv)
-    if args.mode == "dumps":
-        if not args.after or not args.corpus.is_dir() or not args.after.is_dir():
-            print("dumps needs two existing directories", file=sys.stderr)
-            return 2
-        before, after = dump_keys(args.corpus), dump_keys(args.after)
-        bad, shared = compare_dumps(before, after)
-        for line in bad:
-            print(line)
-        print(
-            f"{shared} shared programs, {len(bad)} differ, "
-            f"{len(before.keys() - after.keys())} only before, {len(after.keys() - before.keys())} only after"
-        )
-        if shared == 0:
-            print("no program in common: nothing was compared", file=sys.stderr)
-            return 2
-        return 1 if bad else 0
-    if not args.inspect or not args.corpus.is_dir() or not Path(args.inspect).exists():
-        print("corpus directory or shader_inspect binary not found", file=sys.stderr)
+def json_path(path: Path) -> Path | None:
+    """The resolved path of a baseline argument, or None unless it names a `.json` file. The tool
+    reads and writes only baseline JSON, never an arbitrary file a bad argument points at; whether
+    the file exists or can be written stays with the callers' own error handling."""
+    resolved = path.resolve()
+    return resolved if resolved.suffix == ".json" else None
+
+
+def run_dumps(args) -> int:
+    if not args.after or not args.corpus.is_dir() or not args.after.is_dir():
+        print("dumps needs two existing directories", file=sys.stderr)
         return 2
-    # Absolute: Windows CreateProcess does not resolve a relative, forward-slashed executable path.
-    try:
-        results = collect(args.corpus.resolve(), str(Path(args.inspect).resolve()))
-    except (InspectorError, OSError) as err:
-        print(err, file=sys.stderr)
+    before, after = dump_keys(args.corpus), dump_keys(args.after)
+    bad, shared = compare_dumps(before, after)
+    for line in bad:
+        print(line)
+    print(
+        f"{shared} shared programs, {len(bad)} differ, "
+        f"{len(before.keys() - after.keys())} only before, {len(after.keys() - before.keys())} only after"
+    )
+    if shared == 0:
+        print("no program in common: nothing was compared", file=sys.stderr)
         return 2
-    if args.mode == "record":
-        if not args.out:
-            print("record needs --out", file=sys.stderr)
-            return 2
-        try:
-            args.out.write_text(json.dumps(results, indent=1, sort_keys=True) + "\n")
-        except OSError as err:
-            print(f"could not write baseline: {err}", file=sys.stderr)
-            return 2
-        print(f"recorded {len(results)} blobs -> {args.out}")
-        return 0
-    if not args.baseline or not args.baseline.exists():
-        print("check needs an existing --baseline", file=sys.stderr)
+    return 1 if bad else 0
+
+
+def run_record(args, results: dict) -> int:
+    out = json_path(args.out) if args.out else None
+    if out is None:
+        print("record needs --out naming a .json file", file=sys.stderr)
         return 2
     try:
-        baseline = json.loads(args.baseline.read_text())
+        out.write_text(json.dumps(results, indent=1, sort_keys=True) + "\n")
+    except OSError as err:
+        print(f"could not write baseline: {err}", file=sys.stderr)
+        return 2
+    print(f"recorded {len(results)} blobs -> {out}")
+    return 0
+
+
+def run_check(args, results: dict) -> int:
+    path = json_path(args.baseline) if args.baseline else None
+    if path is None or not path.exists():
+        print("check needs an existing --baseline .json file", file=sys.stderr)
+        return 2
+    try:
+        baseline = json.loads(path.read_text())
         if not isinstance(baseline, dict):
             raise ValueError("baseline must contain a JSON object")
     except (OSError, ValueError) as err:
@@ -200,6 +199,29 @@ def main(argv=None) -> int:
         print(line)
     print(f"{len(results)} blobs, {len(problems)} differences")
     return 1 if problems else 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("mode", choices=("record", "check", "dumps"))
+    ap.add_argument("corpus", type=Path)
+    ap.add_argument("after", nargs="?", type=Path, help="dumps: the second directory")
+    ap.add_argument("--inspect", help="path to the shader_inspect binary (record/check)")
+    ap.add_argument("--out", type=Path, help="record: baseline file to write")
+    ap.add_argument("--baseline", type=Path, help="check: baseline file to compare against")
+    args = ap.parse_args(argv)
+    if args.mode == "dumps":
+        return run_dumps(args)
+    if not args.inspect or not args.corpus.is_dir() or not Path(args.inspect).exists():
+        print("corpus directory or shader_inspect binary not found", file=sys.stderr)
+        return 2
+    # Absolute: Windows CreateProcess does not resolve a relative, forward-slashed executable path.
+    try:
+        results = collect(args.corpus.resolve(), str(Path(args.inspect).resolve()))
+    except (InspectorError, OSError) as err:
+        print(err, file=sys.stderr)
+        return 2
+    return run_record(args, results) if args.mode == "record" else run_check(args, results)
 
 
 if __name__ == "__main__":

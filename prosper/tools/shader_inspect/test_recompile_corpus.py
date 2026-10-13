@@ -50,7 +50,8 @@ def test_dump_keys_and_compare(tmp_path):
     (b / "success_vs_at_0000000000003000_dddd_3333.spv").write_bytes(b"")
     bad, shared = rc.compare_dumps(rc.dump_keys(a), rc.dump_keys(b))
     assert shared == 2
-    assert len(bad) == 1 and "['aaaa'] gone" in bad[0]
+    assert len(bad) == 1
+    assert "['aaaa'] gone" in bad[0]
     assert rc.compare_dumps(rc.dump_keys(a), rc.dump_keys(a)) == ([], 2)
 
 
@@ -225,3 +226,10 @@ def test_record_classifies_baseline_write_outcome(tmp_path, monkeypatch, capsys,
         assert "could not write baseline:" in captured.err
         assert captured.out == ""
         assert not output.is_file()
+
+
+def test_baseline_arguments_must_name_json_files(tmp_path):
+    assert rc.json_path(tmp_path / "b.json") == (tmp_path / "b.json").resolve()
+    assert rc.json_path(tmp_path / "b.txt") is None
+    assert rc.json_path(tmp_path / "noextension") is None
+    assert rc.json_path(tmp_path / "b.json.bak") is None
