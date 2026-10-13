@@ -191,7 +191,7 @@ def test_vendor_logo_refuses_escaping_symlink(tmp_path):
     assert (out / "prosper-logo.png").read_bytes() == b"inside logo"
 
 
-def test_browser_rendering_escapes_hostile_attributes_and_text():
+def test_browser_rendering_escapes_hostile_attributes_and_text(tmp_path):
     """Run the actual client renderer, then parse its HTML to detect extra attributes/tags."""
     node = shutil.which("node")
     if not node:
@@ -208,33 +208,43 @@ def test_browser_rendering_escapes_hostile_attributes_and_text():
     title["tracker"]["url"] = 'https://example.test/" onclick="bad'
     harness = r"""
 const fs = require('fs'), vm = require('vm');
-const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+const input = JSON.parse(fs.readFileSync(process.argv[1], 'utf8'));
 const nodes = {};
 function element() {
   return {innerHTML:'', textContent:'', hidden:true, children:[],
     classList:{add(){}, remove(){}, toggle(){}, contains(){return false;}},
     querySelector(){return element();}, addEventListener(){}, setAttribute(){}};
 }
+// This test exercises rendering, not fetch scheduling. Keep loading pending, then
+// supply the decoded records to the actual renderer without cross-realm Promise jobs.
+const pending = {then(){return this;}, catch(){return this;}};
 const context = {
   document:{getElementById(id){return nodes[id] || (nodes[id] = element());},
     addEventListener(){}, querySelectorAll(){return [];}},
-  fetch(){return Promise.resolve({json(){return Promise.resolve(input.payload);}})}
+  fetch(){return pending;}
 };
 vm.runInNewContext(input.script, context);
-setTimeout(() => {
-  if (!nodes.grid || !nodes.grid.innerHTML) { console.error('grid not rendered'); process.exit(2); }
-  process.stdout.write(nodes.grid.innerHTML);
-}, 0);
+context.T = input.payload.titles;
+context.B = input.payload.buckets;
+context.go();
+if (!nodes.grid || !nodes.grid.innerHTML) { console.error('grid not rendered'); process.exit(2); }
+process.stdout.write(nodes.grid.innerHTML);
 """
-    result = subprocess.run(
-        [node, "-e", harness],
-        input=json.dumps(
+    # A file avoids making the browser-escaping assertion depend on Node's stdin
+    # pipe handling. CI timed out before the old asynchronous harness returned.
+    fixture = tmp_path / "page.json"
+    fixture.write_text(
+        json.dumps(
             {"script": PAGE_SCRIPT, "payload": {"titles": titles, "buckets": counts(titles)}}
         ),
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [node, "-e", harness, str(fixture)],
         text=True,
         capture_output=True,
         check=True,
-        timeout=10,
+        timeout=30,
     )
     assert result.stderr == "", result.stderr
 
