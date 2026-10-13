@@ -66,6 +66,7 @@ const char* sampling_stop_name(SamplingStop stop) {
     switch (stop) {
         case SamplingStop::Timeout:    return "timeout";
         case SamplingStop::GuestFault: return "guest-fault";
+        case SamplingStop::FrontendStopped: return "frontend-stopped";
         case SamplingStop::RequestSatisfied: break;
     }
     return "request-satisfied";

@@ -24,6 +24,7 @@
 #include "diagnostics/perf/perf_alarms.hpp"  // #3891: --fps alarm marker
 #include "diagnostics/perf/perf_ledger.hpp"  // #3891: present-cpu-overhead alarm
 #include "gpu/timeline/gpu_timeline.hpp"        // request_interactive_capture_bundle (F9 whole-frame grab)
+#include "snapshot_capture.hpp"
 #include "capture_schedule.hpp"        // exact host-frame screenshot calibration trigger
 #include "shared/present/present_blit.hpp"           // GPU scanout handoff: acquire/release the renderer's front image
 #include "shared/present/present_blit_policy.hpp"    // reject stale CPU/GPU representations of guest flips
@@ -1321,6 +1322,7 @@ LONG WINAPI report_unhandled_fault(EXCEPTION_POINTERS* ep) {
 // relaunch must strip an app-authored value so the next title re-resolves its own (#2973 review).
 bool g_guest_args_app_set = false;
 bool g_boot_attempted = false;
+static prosper::frontend::SnapshotCapture g_snapshot_capture;
 
 // Install the host frontends (audio out, controller in, dialogs) at the same point boot_trace does:
 // right after the built-in HLE is registered, before the guest runs. Each is built in only when its
@@ -1444,9 +1446,17 @@ static bool start_guest(const std::string& app0_root, std::string* err) {
     if (!boot_program(app0_root, g_prog, err, install_host_backends,
                       prosper::frontend::selected_guest_executable()))
         return false;
+    std::string captureError;
+    if (!g_snapshot_capture.start(app0_root, captureError)) {
+        if (err) *err = captureError;
+        return false;
+    }
     g_guest_started = true;
     g_guest_thread = std::thread([]{
         const BootResult result = run_entry(g_prog.imgs[0]);
+        if (g_snapshot_capture.enabled())
+            prosper::screenshot::publish_guest_outcome(result.kind, result.fault_rip,
+                                                       result.fault_addr, result.detail.c_str());
         fprintf(stderr,
                 "[app] guest thread ended: kind=%d detail=%s rip=0x%llx addr=0x%llx "
                 "rax=0x%llx rbx=0x%llx rdi=0x%llx rsi=0x%llx rdx=0x%llx "
@@ -1760,7 +1770,14 @@ int main(int argc, char** argv) {
     pick.bare_launch = (argc <= 1);
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
-        if (a == "--test-pattern") testPattern = true;
+        if (a.starts_with("--snapshot-")) {
+            std::string error;
+            if (!g_snapshot_capture.request.argument(a, i, argc, argv, error)) {
+                std::fprintf(stderr, "prosper-app: %s\n", error.c_str());
+                return 2;
+            }
+        } else if (a == "--test-pattern")
+            testPattern = true;
         // --fps: draw the framerate over the running title. OFF by default -- a clean window is the
         // right default, and a HUD that moved would change what a comparison screenshot shows.
         else if (a == "--fps") showFps = true;
@@ -1880,6 +1897,21 @@ int main(int argc, char** argv) {
     }
     pick.has_dump = !dump.empty();
     pick.test_pattern = testPattern;
+
+    std::string snapshotError;
+    if (!g_snapshot_capture.request.valid(snapshotError)) {
+        std::fprintf(stderr, "prosper-app: %s\n", snapshotError.c_str());
+        return 2;
+    }
+    if (g_snapshot_capture.enabled()) {
+        if (dump.empty() || testPattern) {
+            std::fprintf(stderr,
+                         "prosper-app: snapshot capture requires a real game and visible window\n");
+            return 2;
+        }
+        // Existing diagnostic CPU presentation matches the legacy snapshot frame dimensions.
+        if (!set_environment("PROSPER_APP_GPU_PRESENT", "0")) return 2;
+    }
 
     // --set-games-dir: record the games directory for future launches and exit. This REPLACES the
     // stored list with the one folder (an empty value clears it); adding without disturbing the
@@ -2091,6 +2123,13 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[app] SDL_CreateWindow: %s\n", err);
         if (vulkan_error_means_no_driver(err)) report_no_vulkan_driver();
         return exit_startup_failure();
+    }
+    if (g_snapshot_capture.enabled()) {
+        const char* driver = SDL_GetCurrentVideoDriver();
+        if (!driver || std::string(driver) == "offscreen" || std::string(driver) == "dummy") {
+            std::fprintf(stderr, "[snapshot] no normal desktop video driver; capture refused\n");
+            return exit_startup_failure();
+        }
     }
     // Title-bar + taskbar icon from the baked-in mark. Cosmetic: a failure keeps the default
     // icon and is said once, never fatal. The bytes are already RGBA, so no decode is needed.
@@ -3198,6 +3237,10 @@ int main(int argc, char** argv) {
     const uint64_t perfLoopStartNs = prosper::perf::monotonic_now_ns();
     bool guestEndReported = false;
     while (running && !prosper_stop_requested()) {
+        const auto captureWindowFlags = SDL_GetWindowFlags(win);
+        const bool captureVisible = !(
+            captureWindowFlags & (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED | SDL_WINDOW_OCCLUDED));
+        if (g_snapshot_capture.poll(captureVisible)) break;
         drainStagedGrabCandidate();
         expirePendingGrabProducer();
         // Surface a dead guest in the title bar (and optionally quit) so a black window is never
@@ -4128,6 +4171,7 @@ int main(int argc, char** argv) {
                 } else {
                     lastFrameSeq = frame.frame_seq;
                     shown.record(prosper::frontend::PresentedFrameSource::Cpu, running);
+                    g_snapshot_capture.retain(frame, true);
                     lastFrameProgress = std::chrono::steady_clock::now();
                     prosper::frontend::FrameGrabScreenshotEvidence source;
                     source.host_presented = true;
@@ -4276,9 +4320,11 @@ int main(int argc, char** argv) {
     perfCapture.cancel();     // never publish a short/incomplete .prperf on a graceful early exit
     prosper_request_stop();   // signal the guest run-loop to wind down at its next boundary
     fprintf(stderr, "[app] shutting down after %llu presented frame(s)\n", (unsigned long long)shown);
-    const int exitCode = prosper::app::exit_status(
-        g_guest_end_kind.load(std::memory_order_acquire),
-        exitAfter && (int)shown < exitAfter);
+    const int captureExit = g_snapshot_capture.finish();
+    const int exitCode =
+        captureExit ? captureExit
+                    : prosper::app::exit_status(g_guest_end_kind.load(std::memory_order_acquire),
+                                                exitAfter && (int)shown < exitAfter);
 
     // run_entry does not yet observe the frontend stop flag, so a booted guest cannot be joined.
     // Returning from main after detaching it is unsafe: C++ static teardown destroys HLE/renderer

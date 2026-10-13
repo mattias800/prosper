@@ -1998,6 +1998,25 @@ if(TARGET prosper_core)
   target_include_directories(test_prosper_app_capture_schedule PRIVATE frontends/prosper-app)
   add_test(NAME prosper_app_capture_schedule COMMAND test_prosper_app_capture_schedule)
 
+  prosper_add_gtest(test_visible_snapshot_capture
+    SOURCES tests/frontend/test_visible_snapshot_capture.cpp
+            frontends/prosper-app/snapshot_capture.cpp
+            frontends/shared/capture/capture_manifest.cpp
+    INCLUDES frontends frontends/prosper-app tests third_party/stb
+    LIBRARIES prosper_core)
+  if(WIN32)
+    target_sources(test_visible_snapshot_capture PRIVATE frontends/shared/capture/capture_png.cpp)
+    target_compile_definitions(test_visible_snapshot_capture PRIVATE PROSPER_SNAPSHOT_PNG=1)
+    target_link_libraries(test_visible_snapshot_capture PRIVATE windowscodecs ole32)
+  else()
+    find_package(ZLIB QUIET)
+    if(ZLIB_FOUND)
+      target_sources(test_visible_snapshot_capture PRIVATE frontends/shared/capture/capture_png.cpp)
+      target_compile_definitions(test_visible_snapshot_capture PRIVATE PROSPER_SNAPSHOT_PNG=1)
+      target_link_libraries(test_visible_snapshot_capture PRIVATE ZLIB::ZLIB)
+    endif()
+  endif()
+
   add_executable(test_prosper_app_performance_capture_schedule
     frontends/prosper-app/test_performance_capture_schedule.cpp)
   target_include_directories(test_prosper_app_performance_capture_schedule
@@ -6840,6 +6859,7 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
   if(WIN32)
     add_executable(screenshot tools/screenshot/screenshot.cpp
                               frontends/shared/capture/capture_manifest.cpp
+                              frontends/shared/capture/capture_png.cpp
                               tools/screenshot/overlay_text.cpp)
     prosper_hosts_a_guest(screenshot)
                               # Spells a `shared/...` include, which resolves from `frontends`.
@@ -6852,6 +6872,7 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
     if(ZLIB_FOUND)
       add_executable(screenshot tools/screenshot/screenshot.cpp
                                 frontends/shared/capture/capture_manifest.cpp
+                                frontends/shared/capture/capture_png.cpp
                                 tools/screenshot/overlay_text.cpp)
                                 # Spells a `shared/...` include, which resolves from `frontends`.
                                 target_include_directories(screenshot PRIVATE frontends)
@@ -7193,8 +7214,23 @@ if(PROSPER_APP AND TARGET SDL3::SDL3)
     add_executable(prosper-app frontends/prosper-app/main.cpp frontends/prosper-app/library_ui.cpp
                                frontends/prosper-app/loadexec.cpp
                                frontends/prosper-app/library_media.cpp
-                               frontends/prosper-app/fps_overlay.cpp)
+                               frontends/prosper-app/fps_overlay.cpp
+                               frontends/prosper-app/snapshot_capture.cpp
+                               frontends/shared/capture/capture_manifest.cpp)
     prosper_hosts_a_guest(prosper-app)
+    if(WIN32)
+      target_sources(prosper-app PRIVATE frontends/shared/capture/capture_png.cpp)
+      target_compile_definitions(prosper-app PRIVATE PROSPER_SNAPSHOT_PNG=1)
+      target_link_libraries(prosper-app PRIVATE windowscodecs ole32)
+    else()
+      find_package(ZLIB QUIET)
+      if(ZLIB_FOUND)
+        target_sources(prosper-app PRIVATE frontends/shared/capture/capture_png.cpp)
+        target_compile_definitions(prosper-app PRIVATE PROSPER_SNAPSHOT_PNG=1)
+        target_link_libraries(prosper-app PRIVATE ZLIB::ZLIB)
+      endif()
+    endif()
+
     # third_party/renderdoc: the vendored in-application API header (#3321). Header-only and
     # never linked -- librenderdoc.so is dlopen'd at runtime by the capture trigger.
     target_include_directories(prosper-app PRIVATE src third_party/stb third_party/renderdoc
