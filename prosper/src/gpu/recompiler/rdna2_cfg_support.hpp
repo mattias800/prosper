@@ -331,8 +331,24 @@ sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R,
                     in.src[1].value != 125 && (in.src[1].value == R || in.src[1].value + 1 == R))
                     return false;
                 break;
-            default:
-                return false;   // memory/branch/interp/unknown: can't bound reads of R -> assume live
+            case Rdna2Format::VINTRP:
+                // CONFIDENCE: HIGH -- AMD 70648 10.4.2/Table 53: P1/P2/MOV read VGPRs
+                // and implicit M0, never an ordinary scalar word. EXEC still predicates them;
+                // M0 is excluded above. Reserved opcodes and inconsistent decoded forms prove
+                // nothing. This only extends the ordinary scalar/VCC-word liveness question.
+                if (R < 0 || R > 107 || in.opcode > 2 || in.len_dwords != 1 || in.n_src != 1 ||
+                    in.dst.kind != OperandKind::VGPR || in.dst.value < 0 || in.dst.value > 255 ||
+                    in.src[0].kind != OperandKind::VGPR || in.src[0].value < 0 ||
+                    in.src[0].value > 255 || in.vintrp_attr > 32 || in.vintrp_chan > 3 ||
+                    (in.opcode == 2 && in.src[0].value > 2) || in.has_modifier || in.has_sdwa ||
+                    in.has_dpp || in.has_literal || in.sdst.kind != OperandKind::None ||
+                    in.words[0] !=
+                        (0xc8000000u | (in.opcode << 16u) |
+                         (static_cast<uint32_t>(in.dst.value) << 18u) | (in.vintrp_attr << 10u) |
+                         (in.vintrp_chan << 8u) | static_cast<uint32_t>(in.src[0].value)))
+                    return block(in, "unmodelled-vintrp");
+                break;
+            default: return false;   // memory/branch/unknown: can't bound reads of R -> assume live
         }
         if (index + 1 < ins.size()) pending.push_back(index + 1);
     }
