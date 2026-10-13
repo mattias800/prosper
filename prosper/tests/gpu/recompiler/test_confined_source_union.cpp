@@ -380,3 +380,296 @@ TEST(ConfinedSourceUnion, FreshProfilesAndCodeDoNotReuseTheEarlierWordGeneration
     refused(compile(cat({nested(xor8, {0x7e0e0314u}), {compare8}}), 64, false), 6);
     accepted(compile(cat({nested(), {compare8}})));
 }
+
+// #5128: a complete narrowed writer defines its active domain even when the inactive old
+// generation was conditional on a loop backedge. Publishing that domain must retire only
+// unread old-word roots; MAC and other preserving writers still consume their old generation.
+namespace {
+void conditional_words(Emitter& e, LoopBlanketCheck& check, const Words& writers) {
+    const auto instructions = decode(writers);
+    mark_vector_loop_carried(e.rs, instructions, 0, static_cast<uint32_t>(writers.size()),
+                             check.carried, check.confined);
+}
+constexpr uint32_t mov6_from7 = 0x7e0c0307u;
+constexpr uint32_t mov8 = 0x7e100281u;
+constexpr uint32_t fmac6_from8 = 0x560c10f2u;
+constexpr uint32_t xor9_from6and8 = 0x3a121106u;
+constexpr uint32_t compare9 = 0x7d841309u;
+Words publication_loop(const Words& body, const Words& seed = {mov6}) {
+    const uint32_t size = static_cast<uint32_t>(body.size() + 2u);
+    return cat({seed,
+                {0xbe960380u, 0xbe970383u, 0xbf0a1716u, 0xbf840000u | size},
+                body,
+                {0x80168116u, 0xbf820000u | ((0x10000u - size - 2u) & 0xffffu)}});
+}
+void structured_public(const Result& result) {
+    ASSERT_FALSE(result.module.empty()) << result.reason;
+    bool loop = false, dispatcher = false;
+    for (std::size_t pc = 5; pc < result.module.size();) {
+        const uint32_t count = result.module[pc] >> 16u;
+        ASSERT_NE(count, 0u);
+        ASSERT_LE(pc + count, result.module.size());
+        loop |= (result.module[pc] & 0xffffu) == Op_LoopMerge;
+        dispatcher |= (result.module[pc] & 0xffffu) == Op_Switch;
+        pc += count;
+    }
+    EXPECT_TRUE(loop);
+    EXPECT_FALSE(dispatcher);
+}
+}   // namespace
+
+TEST(ConditionalWordPublication, CompleteWriterPublishesTheSameExecDomainBeforeMac) {
+    Emitter e;
+    ASSERT_TRUE(e.emit({mov6}));
+    LoopBlanketCheck check(e.rs, std::set<int>{}, 0);
+    conditional_words(e, check, {mov6});
+    ASSERT_FALSE(e.rs.vreg_source_marks.at(6).hard);
+    ASSERT_TRUE(e.emit({cmpx_a, mov6, mov8, fmac6_from8}));
+    EXPECT_TRUE(e.defined(compare6));
+    EXPECT_EQ(e.rs.vreg_source_marks.at(6).outside_exec, e.rs.exec);
+    EXPECT_TRUE(e.rs.vreg_source_marks.at(6).blanket_roots.empty());
+}
+
+TEST(ConditionalWordPublication, CompleteWriterCanFeedAnExplicitSourceAndRelay) {
+    Emitter e;
+    ASSERT_TRUE(e.emit({mov6}));
+    LoopBlanketCheck check(e.rs, std::set<int>{}, 0);
+    conditional_words(e, check, {mov6});
+    ASSERT_TRUE(e.emit({cmpx_a, mov6, mov8, xor9_from6and8, 0x7e120309u}));
+    ASSERT_TRUE(e.defined(compare9));
+    e.b.store_output_word(e.rs.vreg.at(9), 1, 0, e.rs.exec);
+    const auto module = e.b.finish();
+    retain(module, "conditional-value");
+    bpermute_oracle::Interpreter vm(module);
+    const auto actual = vm.run_buffers(64, {{1, Words(64, 0xdeadbeefu)}}, 1);
+    ASSERT_TRUE(vm.error.empty()) << vm.error;
+    Words expected(64, 0xdeadbeefu);
+    for (uint32_t lane = 31; lane < 64; ++lane) expected[lane] = 0;
+    EXPECT_EQ(actual, expected);
+}
+
+TEST(ConditionalWordPublication, ACompleteWriteRetiresOnlyItsUnreadOldRoot) {
+    Emitter e;
+    ASSERT_TRUE(e.emit({mov6, mov7}));
+    LoopBlanketCheck check(e.rs, std::set<int>{}, 0);
+    conditional_words(e, check, {mov6, mov7});
+    ASSERT_TRUE(e.emit({cmpx_a, mov6_from7}));
+    const auto& marks = e.rs.vreg_source_marks.at(6);
+    EXPECT_FALSE(marks.hard) << "the original global conditional proof must survive";
+    EXPECT_EQ(marks.outside_exec, e.rs.exec);
+    EXPECT_EQ(marks.blanket_roots, (std::set<uint64_t>{blanket_root(0, kVectorBlanketBase + 6),
+                                                       blanket_root(0, kVectorBlanketBase + 7)}));
+    ASSERT_TRUE(e.defined(compare6));
+    EXPECT_FALSE(e.b.loop_blanket_roots_read.contains(blanket_root(0, kVectorBlanketBase + 6)));
+    EXPECT_TRUE(e.b.loop_blanket_roots_read.contains(blanket_root(0, kVectorBlanketBase + 7)));
+    // The rewritten old destination may be unavailable; only the consumed source must hold.
+    ASSERT_TRUE(e.emit({0x7e0c0314u, full_exec, mov7}));
+    auto exits = loop_check_marks(e.rs);
+    EXPECT_TRUE(check.holds(e.b, e.rs, exits));
+}
+
+TEST(ConditionalWordPublication, AConsumedSourceRootStillRejectsAPoisonedBackedge) {
+    Emitter e;
+    ASSERT_TRUE(e.emit({mov6, mov7}));
+    LoopBlanketCheck check(e.rs, std::set<int>{}, 0);
+    conditional_words(e, check, {mov6, mov7});
+    ASSERT_TRUE(e.emit({cmpx_a, mov6_from7}));
+    ASSERT_TRUE(e.defined(compare6));
+    ASSERT_TRUE(e.emit({0x7e0e0314u}));
+    auto exits = loop_check_marks(e.rs);
+    EXPECT_FALSE(check.holds(e.b, e.rs, exits));
+    EXPECT_EQ(exits.vectors.at(6).outside_exec, 0u);
+    EXPECT_TRUE(exits.vectors.at(6).blanket_roots.empty());
+}
+
+TEST(ConditionalWordPublication, MacStillReadsItsConditionalOldWordRoot) {
+    Emitter e;
+    ASSERT_TRUE(e.emit({cmpx_a, mov6}));
+    LoopBlanketCheck check(e.rs, std::set<int>{}, 0);
+    conditional_words(e, check, {mov6});
+    ASSERT_TRUE(e.emit({mov8, fmac6_from8}));
+    ASSERT_TRUE(e.defined(compare6));
+    EXPECT_TRUE(e.b.loop_blanket_roots_read.contains(blanket_root(0, kVectorBlanketBase + 6)));
+    ASSERT_TRUE(e.emit({0x7e0c0314u}));
+    auto exits = loop_check_marks(e.rs);
+    EXPECT_FALSE(check.holds(e.b, e.rs, exits));
+}
+
+TEST(ConditionalWordPublication, MacCannotBorrowAnOwnerForAnUnconfinedSoftOldWord) {
+    Emitter e;
+    ASSERT_TRUE(e.emit({mov6}));
+    LoopBlanketCheck check(e.rs, std::set<int>{}, 0);
+    conditional_words(e, check, {mov6});
+    ASSERT_TRUE(e.emit({cmpx_a, mov8, fmac6_from8}));
+    EXPECT_FALSE(e.defined(compare6));
+}
+
+TEST(ConditionalWordPublication, AnAbsentAccumulatorCannotBorrowTheNewSourcesOwner) {
+    Emitter e;
+    ASSERT_TRUE(e.emit({cmpx_a, mov8, fmac6_from8}));
+    EXPECT_FALSE(e.defined(compare6));
+}
+
+TEST(ConditionalWordPublication, ACompleteWriterCannotAuthenticateAnAbsentScalarRelay) {
+    Emitter e;
+    ASSERT_TRUE(e.emit({mov6}));
+    LoopBlanketCheck check(e.rs, std::set<int>{}, 0);
+    conditional_words(e, check, {mov6});
+    ASSERT_TRUE(e.emit({cmpx_a, 0x7e0c0214u, mov8, fmac6_from8}));
+    EXPECT_FALSE(e.defined(compare6));
+}
+
+TEST(ConditionalWordPublication, RestoredExecKeepsTheOriginalGlobalBackedgeObligation) {
+    Emitter e;
+    ASSERT_TRUE(e.emit({mov6}));
+    LoopBlanketCheck check(e.rs, std::set<int>{}, 0);
+    conditional_words(e, check, {mov6});
+    ASSERT_TRUE(e.emit({cmpx_a, mov6, full_exec}));
+    ASSERT_TRUE(e.defined(compare6));
+    EXPECT_TRUE(e.b.loop_blanket_roots_read.contains(blanket_root(0, kVectorBlanketBase + 6)));
+    ASSERT_TRUE(e.emit({0x7e0c0314u}));
+    auto exits = loop_check_marks(e.rs);
+    EXPECT_FALSE(check.holds(e.b, e.rs, exits));
+}
+
+TEST(ConditionalWordPublication, RestoredExecCannotReadAHardAccumulatorOutsideItsOwner) {
+    Emitter e;
+    ASSERT_TRUE(e.emit({mov6}));
+    LoopBlanketCheck check(e.rs, std::set<int>{}, 0);
+    conditional_words(e, check, {mov6});
+    ASSERT_TRUE(e.emit({cmpx_a, mov6, mov8, fmac6_from8}));
+    ASSERT_TRUE(e.defined(compare6));
+    ASSERT_TRUE(e.emit({full_exec}));
+    EXPECT_FALSE(e.defined(compare6));
+}
+
+TEST(ConditionalWordPublication, ADisjointOwnerCannotReuseThePublishedGeneration) {
+    Emitter e;
+    ASSERT_TRUE(e.emit({mov6}));
+    LoopBlanketCheck check(e.rs, std::set<int>{}, 0);
+    conditional_words(e, check, {mov6});
+    ASSERT_TRUE(e.emit({0x7da40080u, mov6, full_exec, 0x7daa0080u, mov8, fmac6_from8}));
+    EXPECT_FALSE(e.defined(compare6));
+}
+
+TEST(ConditionalWordPublication, APartialWriterKeepsItsConsumedOldGeneration) {
+    Emitter e;
+    ASSERT_TRUE(e.emit({mov6}));
+    LoopBlanketCheck check(e.rs, std::set<int>{}, 0);
+    conditional_words(e, check, {mov6});
+    ASSERT_TRUE(e.emit({cmpx_a, mov8, 0x7e0c02f9u, 0x00851408u, fmac6_from8}));
+    EXPECT_FALSE(e.defined(compare6));
+}
+
+TEST(ConditionalWordPublication, AnOverwriteWithAnAbsentRelayStartsANewUnconfinedGeneration) {
+    Emitter e;
+    ASSERT_TRUE(e.emit({mov6}));
+    LoopBlanketCheck check(e.rs, std::set<int>{}, 0);
+    conditional_words(e, check, {mov6});
+    ASSERT_TRUE(e.emit({cmpx_a, mov6, mov8, fmac6_from8}));
+    ASSERT_TRUE(e.defined(compare6));
+    ASSERT_TRUE(e.emit({0x7e0c0314u, fmac6_from8}));
+    EXPECT_FALSE(e.defined(compare6));
+}
+
+TEST(ConditionalWordPublication, AContextFreeJoinCannotAuthenticateOneMissingArm) {
+    Emitter e;
+    ASSERT_TRUE(e.emit({mov6}));
+    LoopBlanketCheck check(e.rs, std::set<int>{}, 0);
+    conditional_words(e, check, {mov6});
+    const VectorWordMarks missing{{6, e.rs.vreg_source_marks.at(20)}};
+    ASSERT_TRUE(e.emit({cmpx_a, mov6}));
+    join_vector_word_marks(e.rs.vreg_source_marks, missing);
+    ASSERT_TRUE(e.emit({mov8, fmac6_from8}));
+    EXPECT_FALSE(e.defined(compare6));
+}
+
+TEST(ConditionalWordPublication, PublicLoopPublishesItsCurrentGenerationBeforeTheAccumulator) {
+    structured_public(
+        compile(publication_loop({cmpx_a, mov6, mov8, fmac6_from8, compare6, full_exec})));
+}
+
+TEST(ConditionalWordPublication, PublicLoopRejectsAnUnreadButUnreplacedOldAccumulator) {
+    structured_public(
+        compile(publication_loop({cmpx_a, mov6, mov8, fmac6_from8, compare6, full_exec})));
+    refused(
+        compile(publication_loop({cmpx_a, 0xbf800000u, mov8, fmac6_from8, compare6, full_exec})),
+        9);
+}
+
+TEST(ConditionalWordPublication, PublicLoopRejectsANewAbsentSourceAtItsFreshCompare) {
+    refused(
+        compile(publication_loop({cmpx_a, 0x7e0c0314u, mov8, fmac6_from8, compare6, full_exec})),
+        9);
+}
+
+TEST(ConditionalWordPublication, PublicLoopRequiresBothWriterArms) {
+    const auto body = [](uint32_t other) {
+        return Words{cmpx_a, 0xbf068004u, 0xbf840002u, mov6,     0xbf820001u,
+                     other,  mov8,        fmac6_from8, compare6, full_exec};
+    };
+    structured_public(compile(publication_loop(body(mov6))));
+    refused(compile(publication_loop(body(0xbf800000u))), 13);
+}
+
+TEST(ConditionalWordPublication, PublicLoopChecksTheConsumedSourceOnItsActualBackedge) {
+    const auto body = [](uint32_t rewrite) {
+        return Words{cmpx_a, mov6_from7, mov8, fmac6_from8, compare6, full_exec, rewrite};
+    };
+    structured_public(compile(publication_loop(body(mov7), {mov6, mov7})));
+    const auto poisoned = compile(publication_loop(body(0x7e0e0314u), {mov6, mov7}));
+    EXPECT_TRUE(poisoned.module.empty());
+    EXPECT_NE(poisoned.reason.find("loop-carried v7 is fabricated on the back edge"),
+              std::string::npos)
+        << poisoned.reason;
+}
+
+TEST(ConditionalWordPublication, ANewSoftHeaderCannotReuseThePriorWritersScopedGeneration) {
+    Emitter e;
+    ASSERT_TRUE(e.emit({mov6}));
+    LoopBlanketCheck first(e.rs, std::set<int>{}, 0);
+    conditional_words(e, first, {mov6});
+    ASSERT_TRUE(e.emit({cmpx_a, mov6}));
+    LoopBlanketCheck next(e.rs, std::set<int>{}, 10);
+    auto instructions = decode({mov6});
+    instructions[0].pc = 10;
+    mark_vector_loop_carried(e.rs, instructions, 10, 11, next.carried, next.confined);
+    EXPECT_EQ(e.rs.vreg_source_marks.at(6).outside_exec, 0u);
+    ASSERT_TRUE(e.emit({mov8, fmac6_from8}));
+    EXPECT_FALSE(e.defined(compare6));
+}
+
+TEST(ConditionalWordPublication, AnUnreadFailedGlobalRootKeepsAnIndependentScopedRelay) {
+    Emitter e;
+    ASSERT_TRUE(e.emit({mov6}));
+    LoopBlanketCheck check(e.rs, std::set<int>{}, 0);
+    conditional_words(e, check, {mov6});
+    ASSERT_TRUE(e.emit({cmpx_a, mov6, 0x7e120306u}));
+    ASSERT_TRUE(e.defined(compare9));
+    ASSERT_TRUE(e.emit({0x7e0c0314u}));
+    auto exits = loop_check_marks(e.rs);
+    ASSERT_TRUE(check.holds(e.b, e.rs, exits));
+    EXPECT_TRUE(e.defined(compare9));
+    ASSERT_TRUE(e.emit({full_exec}));
+    EXPECT_FALSE(e.defined(compare9));
+}
+
+TEST(ConditionalWordPublication, AMemoryResultDoesNotPublishAnArithmeticScopedProof) {
+    Emitter e;
+    ASSERT_TRUE(e.emit({mov6}));
+    LoopBlanketCheck check(e.rs, std::set<int>{}, 0);
+    conditional_words(e, check, {mov6});
+    ASSERT_TRUE(e.emit({cmpx_a}));
+    // Test the mark recorder's boundary without claiming a memory emitter or resource admission.
+    // The existing global conditional roots survive; memory requires its own producing proof.
+    const auto instructions = decode({0xe0502000u, 0x80020600u});
+    ASSERT_EQ(instructions.size(), 1u);
+    ASSERT_EQ(instructions[0].fmt, Rdna2Format::MUBUF);
+    ASSERT_EQ(instructions[0].dst.value, 6);
+    const auto source = scalar_source_marks(e.rs, instructions[0]);
+    EXPECT_TRUE(source.memory);
+    record_vector_word_marks(e.rs, instructions[0], source);
+    EXPECT_FALSE(e.rs.vreg_source_marks.at(6).hard);
+    ASSERT_TRUE(e.emit({mov8, fmac6_from8}));
+    EXPECT_FALSE(e.defined(compare6));
+}
