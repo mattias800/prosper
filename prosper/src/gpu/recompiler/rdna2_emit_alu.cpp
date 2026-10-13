@@ -8602,7 +8602,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // sampler and convert texels to normalized coordinates in the shader. Array layers, cube
             // faces, explicit LOD/bias, DREF and packed offsets are not spatial coordinates. Explicit
             // gradients receive the same per-axis scale so mip selection remains identical.
-            const bool normalize_sampler_coordinates = res->unnormalized &&
+            const bool normalize_sampler_coordinates =
+                res->unnormalized &&
                 compiler_choice(CompilerChoice::NormalizeSamplerCoordinates) != 0;
             auto normalized_spatial = [&](uint32_t coordinate, uint32_t extent) {
                 if (!normalize_sampler_coordinates) return coordinate;

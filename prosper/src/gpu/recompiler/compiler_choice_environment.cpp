@@ -28,21 +28,22 @@ int64_t vcc_scalar_merge_from_environment() {
 
 int64_t environment_compiler_choice(CompilerChoice choice) {
     switch (choice) {
-    case CompilerChoice::ForcedArrayLayer: return forced_array_layer_from_environment();
-    case CompilerChoice::VccScalarMerge: return vcc_scalar_merge_from_environment();
-    // Read at every use, never cached: a test arms PROSPER_MIMG_SOFT between compiles.
-    case CompilerChoice::MimgSoft: return std::getenv("PROSPER_MIMG_SOFT") != nullptr ? 1 : 0;
-    case CompilerChoice::NormalizeSamplerCoordinates:
-        return std::getenv("PROSPER_NO_UNNORMALIZED_COORD_NORMALIZE") == nullptr ? 1 : 0;
-    default:
-        return 0;   // not a switch-type choice; the lambda-free form is only used for the four above
+        case CompilerChoice::ForcedArrayLayer: return forced_array_layer_from_environment();
+        case CompilerChoice::VccScalarMerge: return vcc_scalar_merge_from_environment();
+        // Read at every use, never cached: a test arms PROSPER_MIMG_SOFT between compiles.
+        case CompilerChoice::MimgSoft: return std::getenv("PROSPER_MIMG_SOFT") != nullptr ? 1 : 0;
+        case CompilerChoice::NormalizeSamplerCoordinates:
+            return std::getenv("PROSPER_NO_UNNORMALIZED_COORD_NORMALIZE") == nullptr ? 1 : 0;
+        default:
+            return 0;   // not a switch-type choice; the lambda-free form is only used for the four above
     }
 }
 
 CompilerChoiceSet compiler_choices_from_environment() {
     CompilerChoiceSet set;
-    for (const auto choice : {CompilerChoice::ForcedArrayLayer, CompilerChoice::VccScalarMerge,
-                              CompilerChoice::MimgSoft, CompilerChoice::NormalizeSamplerCoordinates})
+    for (const auto choice :
+         {CompilerChoice::ForcedArrayLayer, CompilerChoice::VccScalarMerge,
+          CompilerChoice::MimgSoft, CompilerChoice::NormalizeSamplerCoordinates})
         set.set(choice, environment_compiler_choice(choice));
     return set;
 }
