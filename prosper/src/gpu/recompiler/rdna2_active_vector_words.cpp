@@ -86,6 +86,7 @@ void seed_active_vector_words(ActiveVectorWords& facts, const RegState& initial,
 
 void meet_active_vector_words(ActiveVectorWords& into, const ActiveVectorWords& incoming) {
     meet_complementary_exec_data(into.complement, incoming.complement);
+    meet_saved_exec_data(into.saved_exec, incoming.saved_exec);
     into.enabled = into.enabled && incoming.enabled;
     into.current = intersect(std::move(into.current), incoming.current);
     into.current_is_entry = into.current_is_entry && incoming.current_is_entry;
@@ -200,6 +201,7 @@ void advance_active_vector_words(ActiveVectorWords& state, const Rdna2Inst& in,
                                  const std::vector<int>& vector_writes, int mask_write,
                                  bool genuine_active_sources, bool complete_active_word) {
     advance_complementary_exec_data(state, in, scalar_writes, mask_write);
+    advance_saved_exec_data(state.saved_exec, in, scalar_writes, mask_write);
     // Snapshot masks before an aliasing SDST or saveexec destination overwrites them.
     const Words before = state.current;
     const EntryDomain before_domain{state.current_is_entry, state.current_within_entry};
@@ -315,6 +317,7 @@ void advance_active_vector_words(ActiveVectorWords& state, const Rdna2Inst& in,
             for (auto& [mask, words] : state.masks) words.erase(word);
         } else if (complete_active_word) {
             state.current.insert(word);
+            refresh_equal_saved_exec_word(state, word);
             publish_complementary_exec_word(state, word);
             if (state.current_is_entry) {
                 state.entry_words.insert(word);
