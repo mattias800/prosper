@@ -2,6 +2,7 @@
 // comparisons consume. Missing/partial mappings remain refusals at the actual compare, while
 // usable inputs preserve the NULL-export and saved-ballot dispatcher contracts.
 #include "fixtures/fragment_control_flow_inputs.hpp"
+#include "fixtures/native_structural_launch.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include <gtest/gtest.h>
 #include <cstdint>
@@ -124,4 +125,34 @@ TEST(FragmentFixtureInputs, UnrelatedScalarSelectRequiresItsActualOperands) {
     EXPECT_NE(last_terminal_reject_reason(0x5063000bu).find("pc=10 words=8a406b40"),
               std::string::npos)
         << last_terminal_reject_reason(0x5063000bu);
+}
+
+TEST(StructuralFixtureInputs, VccHighScratchCompareRequiresItsActualVectorInput) {
+    constexpr std::array code = {
+        0xbeeb03ffu, 0x3f400000u, // VCC_HI scalar data before the implicit comparison.
+        0x7e160280u,              // The original reduced compare consumes v11.
+        0x7d841680u, 0x7e4e026bu, 0xbf810000u,
+    };
+    ComputeShaderConfig wave32;
+    wave32.wave_size = 32;
+    const auto wave64 = prosper::test::native_structural::wave64_config(wave32);
+    for (const auto& config : {wave32, wave64}) {
+        const uint64_t address = 0x50630200u + config.wave_size;
+        const auto compile = [&](const auto& words) {
+            return recompile_compute(words.data(), words.size(), nullptr, config,
+                                     {RecompileDiagnosticStage::Compute, address});
+        };
+        const auto module = compile(code);
+        ASSERT_FALSE(module.empty()) << last_terminal_reject_reason(address);
+        if (config.wave_size == 64)
+            EXPECT_TRUE(has_opcode(module, 339)) << "the Wave64 comparison reconstructs HIGH, "
+                                                    "rather than retaining stale scalar data";
+        auto missing = code;
+        missing[2] =
+            0xbf800000u; // Preserve the original comparison PC while omitting its producer.
+        EXPECT_TRUE(compile(missing).empty());
+        const auto reason = last_terminal_reject_reason(address);
+        EXPECT_NE(reason.find("fabricated-fresh-mask-source"), std::string::npos) << reason;
+        EXPECT_NE(reason.find("pc=3 words=7d841680"), std::string::npos) << reason;
+    }
 }

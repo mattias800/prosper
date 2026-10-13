@@ -2404,9 +2404,10 @@ int main() {
     // its data lifetime; the same sequence is intentionally invalid in Wave64, where VCC_HI is the
     // upper half of the compare mask and is therefore overwritten.
     const uint32_t wave32_compute_vopc_preserves_vcc_hi_data[] = {
-        0xbeeb03ffu, 0x3f400000u,            // s_mov_b32 vcc_hi, 0.75f
-        0x7d841680u,                         // v_cmp_eq_u32 vcc, 0, v11
-        0x7e4e026bu,                         // v_mov_b32 v39, vcc_hi
+        0xbeeb03ffu, 0x3f400000u,   // s_mov_b32 vcc_hi, 0.75f
+        0x7e160280u,   // v_mov_b32 v11, 0: the compare's actual input
+        0x7d841680u,   // v_cmp_eq_u32 vcc, 0, v11
+        0x7e4e026bu,   // v_mov_b32 v39, vcc_hi
         0xbf810000u,
     };
     if (recompile_compute(wave32_compute_vopc_preserves_vcc_hi_data,
