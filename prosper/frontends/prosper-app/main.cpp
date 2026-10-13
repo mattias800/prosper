@@ -3238,10 +3238,13 @@ int main(int argc, char** argv) {
     const uint64_t perfLoopStartNs = prosper::perf::monotonic_now_ns();
     bool guestEndReported = false;
     while (running && !prosper_stop_requested()) {
-        const auto captureWindowFlags = SDL_GetWindowFlags(win);
-        const bool captureVisible = !(
-            captureWindowFlags & (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED | SDL_WINDOW_OCCLUDED));
-        if (g_snapshot_capture.poll(captureVisible)) break;
+        if (g_snapshot_capture.enabled()) {
+            const auto captureWindowFlags = SDL_GetWindowFlags(win);
+            const bool captureVisible =
+                !(captureWindowFlags &
+                  (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED | SDL_WINDOW_OCCLUDED));
+            if (g_snapshot_capture.poll(captureVisible)) break;
+        }
         drainStagedGrabCandidate();
         expirePendingGrabProducer();
         // Surface a dead guest in the title bar (and optionally quit) so a black window is never
