@@ -156,3 +156,28 @@ TEST(StructuralFixtureInputs, VccHighScratchCompareRequiresItsActualVectorInput)
         EXPECT_NE(reason.find("pc=3 words=7d841680"), std::string::npos) << reason;
     }
 }
+
+TEST(StructuralFixtureInputs, TwoSourceCarryRequiresTheOriginalComparedWord) {
+    constexpr uint32_t body[] = {
+        0x7d8a06f9u, 0x06868080u, 0xbf068008u, 0xbf840001u, 0xbe800380u, 0xd70f0016u,
+        0x00021f1bu, 0xd5286a17u, 0x00024080u, 0x7e040280u, 0x7c020300u, 0xbf860001u,
+        0x7e040281u, 0x7d840100u, 0xbf870001u, 0xbf82fffdu, 0x7e040d02u, 0xbf810000u,
+    };
+    ComputeShaderConfig config;
+    config.wave_size = 32;
+    config.local_x = 64;
+    auto code = prosper::test::declared_two_source_cfg_fixture(body);
+    const auto compile = [&](uint64_t address) {
+        return recompile_compute(code.data(), code.size(), nullptr, config,
+                                 {RecompileDiagnosticStage::Compute, address});
+    };
+    const auto module = compile(0x50630300u);
+    ASSERT_FALSE(module.empty()) << last_terminal_reject_reason(0x50630300u);
+    EXPECT_TRUE(has_opcode(module, 251)) << "the original join retains its CFG dispatcher";
+    // v3 supplies the original SDWA predicate. An unrelated v27 producer cannot replace it.
+    code[4] = 0xbf800000u;
+    EXPECT_TRUE(compile(0x50630301u).empty());
+    const auto reason = last_terminal_reject_reason(0x50630301u);
+    EXPECT_NE(reason.find("fabricated-fresh-mask-source"), std::string::npos) << reason;
+    EXPECT_NE(reason.find("pc=8 words=7d8a06f9,06868080"), std::string::npos) << reason;
+}

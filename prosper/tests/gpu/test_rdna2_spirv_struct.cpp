@@ -2557,14 +2557,16 @@ int main() {
     wave32_vop3b_two_source_config.wave_size = 32;
     wave32_vop3b_two_source_config.local_x = 64;
     wave32_vop3b_two_source_config.native_subgroup_size = 0;
+    const auto declared_vop3b_two_source_join =
+        prosper::test::declared_two_source_cfg_fixture(wave32_compute_vop3b_two_source_join);
     const auto vop3b_two_source_join_spv = recompile_compute(
-        wave32_compute_vop3b_two_source_join,
-        std::size(wave32_compute_vop3b_two_source_join), nullptr,
-        wave32_vop3b_two_source_config);
+        declared_vop3b_two_source_join.data(), declared_vop3b_two_source_join.size(), nullptr,
+        wave32_vop3b_two_source_config, {RecompileDiagnosticStage::Compute, 0x50630240u});
     if (vop3b_two_source_join_spv.empty() || !has_opcode(vop3b_two_source_join_spv, 251) ||
         !type_result_ids_are_nonzero(vop3b_two_source_join_spv, nullptr) ||
         !phi_ids_are_nonzero(vop3b_two_source_join_spv)) {
         printf("  [FAIL] Wave32 CFG treated two-source VOP3B carry output as reading SRC2\n");
+        printf("  terminal: %s\n", last_terminal_reject_reason(0x50630240u).c_str());
         return 1;
     }
     printf("  [ok]   Wave32 CFG admits exact two-source VOP3B carry packet at an s0 join\n");
@@ -2589,9 +2591,10 @@ int main() {
         0x7e040d02u,                         // pc14: v_mov_b32_e32 v2, v2
         0xbf810000u,
     };
+    const auto declared_vop3_mul_two_source_join =
+        prosper::test::declared_two_source_cfg_fixture(wave32_compute_vop3_mul_two_source_join);
     const auto vop3_mul_two_source_join_spv = recompile_compute(
-        wave32_compute_vop3_mul_two_source_join,
-        std::size(wave32_compute_vop3_mul_two_source_join), nullptr,
+        declared_vop3_mul_two_source_join.data(), declared_vop3_mul_two_source_join.size(), nullptr,
         wave32_vop3b_two_source_config);
     if (vop3_mul_two_source_join_spv.empty() ||
         !has_opcode(vop3_mul_two_source_join_spv, 251) ||
@@ -2601,10 +2604,11 @@ int main() {
         return 1;
     }
     wave32_compute_vop3_mul_two_source_join[5] = 0xd5430001u;
-    if (!recompile_compute(
-             wave32_compute_vop3_mul_two_source_join,
-             std::size(wave32_compute_vop3_mul_two_source_join), nullptr,
-             wave32_vop3b_two_source_config).empty()) {
+    const auto declared_three_source_join =
+        prosper::test::declared_two_source_cfg_fixture(wave32_compute_vop3_mul_two_source_join);
+    if (!recompile_compute(declared_three_source_join.data(), declared_three_source_join.size(),
+                           nullptr, wave32_vop3b_two_source_config)
+             .empty()) {
         printf("  [FAIL] genuine three-source mutation lost its ambiguous s0 dependency\n");
         return 1;
     }
