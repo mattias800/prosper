@@ -4,6 +4,7 @@
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 
 #include <gtest/gtest.h>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -206,4 +207,71 @@ TEST(FragmentScalarVccPair, LiveSelectMayReadTheGenuineHighWord) {
     const auto result = compile(code, 0x27610013u);
     ASSERT_FALSE(result.module.empty()) << result.reason;
     EXPECT_EQ(fragment_spirv_required_subgroup_size(result.module), 64u);
+}
+
+namespace {
+std::vector<uint32_t> dispatcher_select(bool produced_scc) {
+    auto code = program();
+    code[1] = 0xbf800000u;
+    code[2] = 0xbeeb03c0u;   // Genuine VCC_HI move preserves the incoming SCC.
+    code[3] = 0xbf800000u;
+    // The established irreducible tail requires the dispatcher; all compares have real inputs.
+    code.insert(code.begin(),
+                {produced_scc ? 0xbf0d8081u : 0xbf800000u, 0x7e060281u, 0x7e040280u, 0x7c020300u,
+                 0xbf860001u, 0x7e040281u, 0x7d840100u, 0xbf870001u, 0xbf82fffdu, 0x7e040d02u});
+    return code;
+}
+
+bool has_opcode(const std::vector<uint32_t>& module, uint32_t opcode) {
+    for (std::size_t at = 5; at < module.size();) {
+        const uint32_t width = module[at] >> 16;
+        if (!width || width > module.size() - at) return false;
+        if ((module[at] & 0xffffu) == opcode) return true;
+        at += width;
+    }
+    return false;
+}
+}   // namespace
+
+TEST(FragmentScalarVccPair, DispatcherCannotAuthenticateTheEntrySccPlaceholder) {
+    const auto genuine = compile(dispatcher_select(true), 0x27610014u);
+    ASSERT_FALSE(genuine.module.empty()) << genuine.reason;
+    ASSERT_TRUE(has_opcode(genuine.module, 251u)) << "OpSwitch must own the actual CFG route";
+    const auto missing = compile(dispatcher_select(false), 0x27610015u);
+    rejected_at(missing, 14);
+}
+
+TEST(FragmentScalarVccPair, CountedLoopHeaderSccCannotBecomeAProducedExitValue) {
+    std::vector<uint32_t> code{
+        0xbe840380u, 0xbe850382u,   // s4=0, s5=2, preserving the absent entry SCC
+        0xbf0a0504u, 0xbf840002u,   // header compare; exit to pc6
+        0x80048104u, 0xbf82fffcu,   // increment; back to pc2
+        0xbf0d8081u,   // matched control refreshes SCC after the loop
+        0xbeeb03c0u, 0x856a80ffu, 0x00000080u, 0x02020100u, 0x7e000280u,
+        0x7e040280u, 0x7e060280u, 0xf800000fu, 0x03020100u, 0xbf810000u,
+    };
+    const auto refreshed = compile(code, 0x27610016u);
+    ASSERT_FALSE(refreshed.module.empty()) << refreshed.reason;
+    ASSERT_TRUE(has_opcode(refreshed.module, 246u)) << "OpLoopMerge must own the loop";
+    ASSERT_FALSE(has_opcode(refreshed.module, 251u)) << "this must exercise the structured emitter";
+    code[6] = 0xbf800000u;
+    const auto carried = compile(code, 0x27610017u);
+    rejected_at(carried, 8);
+}
+
+TEST(FragmentScalarVccPair, DivergentLoopCheckSccCannotBorrowTheBodyDefinition) {
+    std::vector<uint32_t> code{
+        0xbe840380u, 0x7e040282u, 0x7e060281u, 0x7d020404u, 0xbf860002u,   // VCC header compare; exit to pc7, preserving absent SCC
+        0x80048104u, 0xbf82fffcu,   // body produces SCC; back to pc3
+        0xbf0d8081u,   // matched control refreshes SCC after the loop
+        0xbeeb03c0u, 0x856a80ffu, 0x00000080u, 0x02020100u, 0x7e000280u, 0x7e040280u,
+        0x7e060280u, 0xf800000fu, 0x03020100u, 0xbf810000u,
+    };
+    const auto refreshed = compile(code, 0x27610018u);
+    ASSERT_FALSE(refreshed.module.empty()) << refreshed.reason;
+    ASSERT_TRUE(has_opcode(refreshed.module, 246u)) << "OpLoopMerge must own the loop";
+    ASSERT_FALSE(has_opcode(refreshed.module, 251u)) << "this must exercise the structured emitter";
+    code[7] = 0xbf800000u;
+    const auto carried = compile(code, 0x27610019u);
+    rejected_at(carried, 9);
 }

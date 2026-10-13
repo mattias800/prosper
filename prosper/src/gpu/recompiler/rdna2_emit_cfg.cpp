@@ -6346,7 +6346,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             // exit-iteration refinement is intentionally omitted for it.
             else if (pr.dom == 2) {
                 rs.scc = pr.phi;
-                if (b.wave_size == 32) {
+                if (b.wave_size == 32 || rs.track_scc_definition) {
                     // This path publishes the header phi, not the fresh check predicate.
                     rs.scc_merge_placeholder = true;
                     rs.scc_loop_blanket.clear();
@@ -7039,7 +7039,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     rs.sreg[pr.reg] = merged;
                 } else if (pr.dom == 2) {
                     rs.scc = merged;
-                    if (b.wave_size == 32) {
+                    if (b.wave_size == 32 || rs.track_scc_definition) {
                         rs.scc_merge_placeholder = check_marks.scc;
                         rs.scc_loop_blanket = check_marks.scc_blanket;
                         if (L.direct_exec_breaks || L.direct_wave_breaks) {
