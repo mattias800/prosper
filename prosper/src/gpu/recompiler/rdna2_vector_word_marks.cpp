@@ -331,7 +331,48 @@ bool fresh_mask_sources_defined(SpirvCompute& b, const RegState& rs, const Rdna2
     return true;
 }
 
+void record_native_interpolation_publication(const SpirvCompute& b, RegState& rs,
+                                             const Rdna2Inst& in) {
+    rs.native_interpolation_publication = {};
+    // CONFIDENCE: HIGH -- only the existing native fragment lowering publishes this Input
+    // word. P1 remains its no-op, and owned packets still need the architectural P1/old-P2/M0
+    // inputs. Neither a decoder write span nor a CFG storage reload authenticates this fact.
+    if (!b.is_fragment || b.is_compute || b.is_vertex || b.ngg_workgroup_shell || b.ngg_one_lane ||
+        b.guest_stage != GuestShaderStage::Fragment ||
+        b.physical_domain != PhysicalExecutionDomain::Invocation ||
+        !rs.vector_native_interpolation || !rs.exec || in.fmt != Rdna2Format::VINTRP ||
+        (in.opcode != 1 && in.opcode != 2) || in.len_dwords != 1 || in.n_src != 1 ||
+        in.dst.kind != OperandKind::VGPR || in.dst.value < 0 || in.dst.value > 255 ||
+        in.src[0].kind != OperandKind::VGPR || in.src[0].value < 0 || in.src[0].value > 255 ||
+        in.vintrp_attr >= 32 || in.vintrp_chan > 3 || in.has_modifier || in.has_sdwa ||
+        in.has_dpp || in.has_literal || in.sdst.kind != OperandKind::None ||
+        in.words[0] != (0xc8000000u | (in.opcode << 16u) |
+                        (static_cast<uint32_t>(in.dst.value) << 18u) | (in.vintrp_attr << 10u) |
+                        (in.vintrp_chan << 8u) | static_cast<uint32_t>(in.src[0].value)))
+        return;
+    const auto* layout = b.fragment_interpolation;
+    const uint32_t attribute = 1u << in.vintrp_attr;
+    if (!layout || !layout->valid || !(layout->attribute_mask & attribute)) return;
+    if (in.opcode == 1) {
+        if (!(layout->smooth_mask & attribute)) return;
+    } else if (in.src[0].value >= 3 || (!layout->requires_geometry && in.src[0].value != 2) ||
+               (layout->requires_geometry &&
+                layout->parameter_locations[in.vintrp_attr][in.src[0].value] >= 32)) {
+        return;
+    }
+    const auto value = rs.vreg.find(in.dst.value);
+    if (value == rs.vreg.end() || !value->second) return;
+    rs.native_interpolation_publication = {in.pc, in.dst.value, rs.exec, value->second};
+}
+
 void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSourceMarks& source) {
+    const auto interpolation = std::exchange(rs.native_interpolation_publication, {});
+    const auto value = rs.vreg.find(in.dst.value);
+    const bool published_interpolation =
+        rs.vector_native_interpolation && in.fmt == Rdna2Format::VINTRP &&
+        (in.opcode == 1 || in.opcode == 2) && interpolation.pc == in.pc &&
+        interpolation.destination == in.dst.value && interpolation.exec == rs.exec &&
+        interpolation.value && value != rs.vreg.end() && interpolation.value == value->second;
     const bool full_exec = !rs.exec_narrowed || rs.vector_full_exec;
     if (rdna2_instruction_may_change_exec(in))
         rs.vector_full_exec = vector_exec_is_full_after_write(in, full_exec, rs.vector_wave_size);
@@ -340,7 +381,7 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
     if (!width) return;
     const bool relative = in.fmt == Rdna2Format::VOP1 && in.opcode == kVop1OpcodeMovreldB32;
     const bool preserve = vector_write_depends_on_old_word(in, full_exec);
-    const bool complete = complete_full_word_write(in);
+    const bool complete = published_interpolation || complete_full_word_write(in);
     const int end = relative ? rs.max_vgpr + 1 : in.dst.value + static_cast<int>(width);
     for (int reg = in.dst.value; reg < end; ++reg) {
         const auto old = vector_word(rs, reg);

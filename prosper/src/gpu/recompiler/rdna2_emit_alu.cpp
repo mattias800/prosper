@@ -228,6 +228,7 @@ static bool instruction_reads_scc_as_scalar_data(const Rdna2Inst& in) {
 bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool allow_exec_update,
               const std::unordered_set<uint32_t>* safe_execz, bool allow_smem,
               const ShaderResourceTable* rt, bool allow_wave) {
+    rs.native_interpolation_publication = {};
     if (b.is_fragment && instruction_reads_scc_as_scalar_data(in))
         b.mark_fragment_wave_scalar_use(rs.scc);
     auto& vreg = rs.vreg; uint32_t& vcc = rs.vcc;
@@ -9370,6 +9371,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.vreg[in.dst.value] = b.interp_read(in.vintrp_attr, in.vintrp_chan);
             }
             predicate_write(b, rs, in.dst.value, old);
+            record_native_interpolation_publication(b, rs, in);
             return true;
         }
         default: return false;   // not a VALU format
