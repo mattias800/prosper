@@ -47,6 +47,8 @@ title-id|prosper/frontends/prosper-app/test_game_library.cpp 71
 title-id|prosper/frontends/prosper-app/test_game_path.cpp 26
 title-id|prosper/frontends/prosper-app/test_launcher_media.cpp 6
 title-id|prosper/frontends/prosper-app/test_snap_author.cpp 3
+# note: generic PPSA00000 fixture ids (tests/AGENTS.md rule 6), not title conditions.
+title-id|prosper/frontends/prosper-app/test_report_bundle.cpp 2
 title-id|prosper/frontends/shared/tests/test_performance_capture.cpp 4
 title-id|prosper/src/hle/fs/savedata.cpp 1
 title-id|prosper/src/hle/video/videodec2.cpp 1

@@ -451,5 +451,9 @@ ProcessSample collect_process_sample(uint64_t monotonic_ns, uint64_t guest_prese
                                      std::optional<uint64_t> rendered_frames,
                                      uint64_t host_presented_frames);
 const char* build_revision();
+// Source bytes + toolchain + configuration hashed at build time. Unlike HEAD, this changes
+// for dirty/untracked compiled source edits. Mirrors build_revision() for callers (like the
+// bug-report bundle) that must name the build, not just its revision.
+const char* build_source_identity();
 
 } // namespace prosper::perf

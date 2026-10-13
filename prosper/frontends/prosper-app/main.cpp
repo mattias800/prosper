@@ -45,7 +45,8 @@
 #include "present_policy.hpp"           // bounded-acquire present classification (#1182), pure seam
 #include "window_controls.hpp"           // debounced app-window shortcuts, pure regression seam
 #include "game_path.hpp"                 // dropped/picked path -> app0 root + open action, pure seam
-#include "game_library.hpp"              // scan a games dir -> titles + metadata, pure seam
+#include "game_library.hpp"                                              // scan a games dir -> titles + metadata, pure seam
+#include "report_bundle.hpp"                                             // ADR 0021 --report bundle writer, pure seam
 #include "frame_grab_naming.hpp"         // one stamp + exclusively claimed F9 artifact names
 #include "frame_grab_match.hpp"          // completed producer and frame-boundary join for F9
 #include "shared/perf/performance_capture.hpp"        // bounded F8 pre/post performance artifact
@@ -1769,6 +1770,7 @@ int main(int argc, char** argv) {
     bool setGamesDirSeen = false;
     bool listGames = false;
     bool showFps = false;   // --fps
+    std::string reportDir;  // --report <dir>: write one bug-report bundle and exit, no window
     // Whether to offer the host folder picker at startup (#1469); resolved by should_pick_at_startup.
     prosper::frontend::StartupPickInputs pick{};
     pick.bare_launch = (argc <= 1);
@@ -1824,7 +1826,14 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
-        else if (a == "--list-games") listGames = true;      // print the library and exit (headless)
+        else if (a == "--list-games") listGames = true;                   // print the library and exit (headless)
+        else if (a == "--report") {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "prosper-app: --report requires a directory\n");
+                return 2;
+            }
+            reportDir = argv[++i];
+        }
         else if (a == "--set-games-dir") {                   // persist and exit
             if (i + 1 >= argc) {
                 fprintf(stderr, "prosper-app: --set-games-dir requires a path (\"\" clears it)\n");
@@ -1975,6 +1984,46 @@ int main(int argc, char** argv) {
         fprintf(stderr, "prosper-app: %zu title(s) in %zu folder(s)\n", games.size(),
                 dirs.available.size());
         return prosper::frontend::list_games_exit_code(dirs, games.size());
+    }
+
+    // --report <dir>: write one versioned bug-report bundle and exit, with no window, no
+    // Vulkan and no guest. Static slice (ADR 0021): identity of tool, build, host, title
+    // and switches. Perf-alarm summary, unimplemented NIDs, log tail and fault backtraces
+    // arrive as later sections under a bumped schema version. The bundle carries no paths,
+    // only the title id, so host layout never leaves the machine in it.
+    if (!reportDir.empty()) {
+        prosper::frontend::ReportBundle bundle;
+        bundle.build_revision = prosper::perf::build_revision();
+        bundle.build_source_identity = prosper::perf::build_source_identity();
+        bundle.os = prosper::frontend::report_host_os();
+        if (!dump.empty())
+            bundle.title_id = prosper::frontend::parse_param_title_id(
+                host_library_io().read_file(dump + "/sce_sys/param.json"));
+        bundle.switches = prosper::frontend::collect_report_switches();
+        std::error_code dir_ec;
+        std::filesystem::create_directories(reportDir, dir_ec);
+        if (dir_ec) {
+            std::fprintf(stderr, "prosper-app: cannot create report directory '%s': %s\n",
+                         reportDir.c_str(), dir_ec.message().c_str());
+            return 1;
+        }
+        const std::string path = reportDir + "/report.json";
+        FILE* out = std::fopen(path.c_str(), "wb");
+        if (!out) {
+            std::fprintf(stderr, "prosper-app: cannot open '%s': %s\n", path.c_str(),
+                         std::strerror(errno));
+            return 1;
+        }
+        const std::string line = prosper::frontend::report_bundle_json(bundle);
+        const bool written =
+            std::fprintf(out, "%s\n", line.c_str()) >= 0 && std::fclose(out) == 0;
+        if (!written) {
+            std::fprintf(stderr, "prosper-app: cannot write '%s': %s\n", path.c_str(),
+                         std::strerror(errno));
+            return 1;
+        }
+        std::printf("prosper-app: report written -> %s\n", path.c_str());
+        return 0;
     }
 
     // Persisted host settings: savedata dir, present mode, display mode, volume. These apply ONLY

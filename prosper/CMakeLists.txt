@@ -2046,6 +2046,12 @@ if(TARGET prosper_core)
   target_include_directories(test_prosper_app_game_library PRIVATE frontends/prosper-app)
   add_test(NAME prosper_app_game_library COMMAND test_prosper_app_game_library)
 
+  # ADR 0021, static slice: the versioned bug-report writer is pure (stdlib only, no SDL or
+  # dump), so its bytes are pinned here. prosper_add_gtest: each TEST is its own ctest case.
+  prosper_add_gtest(test_prosper_app_report_bundle
+    SOURCES frontends/prosper-app/test_report_bundle.cpp
+    INCLUDES frontends/prosper-app)
+
   # F9 frame-grab file naming: one stamp and one exclusively claimed name pair per capture, so two
   # titles in one directory cannot overwrite each other and an aborted grab cannot pair with a
   # different capture. Uses a real directory under the build tree and an injected clock — no SDL, no
