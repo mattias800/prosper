@@ -1,5 +1,6 @@
 """Tests for recompile_corpus.py: the pure parts that decide what counts as a changed answer."""
 
+import json
 import sys
 from pathlib import Path
 
@@ -49,7 +50,8 @@ def test_dump_keys_and_compare(tmp_path):
     (b / "success_vs_at_0000000000003000_dddd_3333.spv").write_bytes(b"")
     bad, shared = rc.compare_dumps(rc.dump_keys(a), rc.dump_keys(b))
     assert shared == 2
-    assert len(bad) == 1 and "['aaaa'] gone" in bad[0]
+    assert len(bad) == 1
+    assert "['aaaa'] gone" in bad[0]
     assert rc.compare_dumps(rc.dump_keys(a), rc.dump_keys(a)) == ([], 2)
 
 
@@ -197,3 +199,37 @@ def test_invalid_baseline_is_unevaluated(tmp_path, monkeypatch, text):
         rc.main(["check", str(tmp_path), "--inspect", str(inspector), "--baseline", str(baseline)])
         == 2
     )
+
+
+@pytest.mark.parametrize("output_kind", ["directory", "missing-parent", "file"])
+def test_record_classifies_baseline_write_outcome(tmp_path, monkeypatch, capsys, output_kind):
+    """A failed baseline write is unevaluated, not a shader difference or a successful record."""
+    inspector = tmp_path / "inspector.exe"
+    inspector.write_bytes(b"")
+    results = {"cs_x.bin": {"stage": "compute"}}
+    monkeypatch.setattr(rc, "collect", lambda *_a: results)
+    output = tmp_path / "baseline.json"
+    if output_kind == "directory":
+        output.mkdir()
+    elif output_kind == "missing-parent":
+        output = tmp_path / "absent" / "baseline.json"
+
+    code = rc.main(["record", str(tmp_path), "--inspect", str(inspector), "--out", str(output)])
+    captured = capsys.readouterr()
+    if output_kind == "file":
+        assert code == 0
+        assert json.loads(output.read_text()) == results
+        assert "recorded 1 blobs" in captured.out
+        assert captured.err == ""
+    else:
+        assert code == 2
+        assert "could not write baseline:" in captured.err
+        assert captured.out == ""
+        assert not output.is_file()
+
+
+def test_baseline_arguments_must_name_json_files(tmp_path):
+    assert rc.json_path(tmp_path / "b.json") == (tmp_path / "b.json").resolve()
+    assert rc.json_path(tmp_path / "b.txt") is None
+    assert rc.json_path(tmp_path / "noextension") is None
+    assert rc.json_path(tmp_path / "b.json.bak") is None

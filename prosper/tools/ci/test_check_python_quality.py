@@ -23,7 +23,31 @@ CLEAN = '"""Purpose."""\n\n\ndef f():\n    """Return one."""\n    return 1\n'
 
 
 class PureRules(unittest.TestCase):
-    """Rules that need no filesystem."""
+    """Rules and tool-boundary controls independent of a real contribution."""
+
+    def test_root_uses_native_cwd_and_relative_git_climb(self):
+        # MSYS git can print a root outside native Python's path namespace. Git's
+        # --show-cdup only prints ../ components, which work in either namespace.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            child = root / "space and \u4e2d" / "nested"
+            child.mkdir(parents=True)
+
+            def git_root(cmd, **_kwargs):
+                stdout = "../../\n" if cmd[-1] == "--show-cdup" else "/msys/non-native/root\n"
+                return subprocess.CompletedProcess(cmd, 0, stdout, "")
+
+            with mock.patch.object(cpq.Path, "cwd", return_value=child):
+                with mock.patch.object(cpq.subprocess, "run", side_effect=git_root):
+                    self.assertEqual(root, cpq.toplevel())
+
+    def test_root_refuses_invalid_climb(self):
+        for stdout in ("/foreign/root\n", "../other/\n", "unexpected\n"):
+            with self.subTest(stdout=stdout):
+                result = subprocess.CompletedProcess([], 0, stdout, "")
+                with mock.patch.object(cpq.subprocess, "run", return_value=result):
+                    with self.assertRaisesRegex(RuntimeError, "checkout root"):
+                        cpq.toplevel()
 
     def test_is_python_excludes_third_party(self):
         self.assertTrue(cpq.is_python("prosper/tools/a.py"))

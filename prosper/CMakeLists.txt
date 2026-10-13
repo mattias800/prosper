@@ -599,6 +599,8 @@ if(Python3_Interpreter_FOUND)
   # loudly, when ruff is absent; the python-quality CI job installs it, so there they always run.
   add_test(NAME python_quality_gate
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/test_check_python_quality.py")
+  # Its real ruff control needs the checkout config, also with an external build tree.
+  set_tests_properties(python_quality_gate PROPERTIES WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
   # check_cpp_lint.py gates clang-format/clang-tidy on CHANGED lines only (#4210). The end-to-end
   # arm skips, loudly, without the clang tools; the Linux CI job runs its --selftest directly.
   add_test(NAME cpp_lint_gate
@@ -2664,11 +2666,19 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_fresh_mask_exec_confinement.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_vintrp_scalar_liveness
+    SOURCES tests/gpu/recompiler/test_vintrp_scalar_liveness.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_wave32_mask_scc
     SOURCES tests/gpu/recompiler/test_wave32_mask_scc.cpp
     LIBRARIES prosper_core
     INCLUDES tests
   )
+  prosper_add_gtest(test_current_carry_inputs
+    SOURCES tests/gpu/recompiler/test_current_carry_inputs.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_saved_exec_data
     SOURCES tests/gpu/recompiler/test_saved_exec_data.cpp
     INCLUDES tests
