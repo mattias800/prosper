@@ -2,7 +2,9 @@
 
 #include "gpu/execute/shader_cache_internal.hpp"
 #include "gpu/recompiler/rdna2_terminal_tail_span.hpp"
+#include "gpu/recompiler/rdna2_fragment_terminal_tail.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 namespace prosper::gpu {
@@ -14,9 +16,11 @@ size_t shader_analysis_source_span(ShaderCodeAnalysis& analysis, const uint32_t*
     std::vector<Rdna2Inst> body;
     rdna2_walk(code, dwords, body);
     const auto terminal = rdna2_terminal_tail_span(code, dwords, body);
-    analysis.terminal_tail_limit_required = terminal.source_limit_required;
-    if (terminal.inspected_dwords > span)
-        analysis.terminal_tail_validation.assign(code + span, code + terminal.inspected_dwords);
+    const auto fragment = rdna2_fragment_terminal_tail(code, dwords, body);
+    analysis.terminal_tail_limit_required =
+        terminal.source_limit_required || fragment.source_limit_required;
+    const size_t inspected = std::max(terminal.inspected_dwords, fragment.inspected_dwords);
+    if (inspected > span) analysis.terminal_tail_validation.assign(code + span, code + inspected);
     return span;
 }
 

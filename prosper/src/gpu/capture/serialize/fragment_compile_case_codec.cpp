@@ -209,7 +209,7 @@ uint64_t compile_case_resource_metadata_identity(const ShaderResourceTable* tabl
 std::vector<uint8_t> encode_fragment_compile_case(const FragmentCompileCase& c) {
     validate_fragment_compile_case(c);
     Writer w; const uint8_t magic[8] = {'P','R','F','C','A','S','E',0};
-    w(magic, uint32_t(6));
+    w(magic, uint32_t(7));
     capsule(w, c);
     // Schema 1's field walk remains an unchanged prefix. Retain each marker verbatim: it is a
     // compiler input whose malformed value can cause a refusal, never replay admission authority.
@@ -227,6 +227,8 @@ std::vector<uint8_t> encode_fragment_compile_case(const FragmentCompileCase& c) 
     // Schema 6 appends the colour-export compile input (#4703).
     w(c.export_formats.compressed_formats, c.export_formats.uint_outputs,
       c.export_formats.sint_outputs);
+    // Schema 7 retains the actual front-face encoding argument; older cases keep it unavailable.
+    w(c.system_inputs.front_face_encoding);
     w.value(checksum(w.bytes)); return std::move(w.bytes);
 }
 FragmentCompileCase decode_fragment_compile_case(std::span<const uint8_t> bytes) {
@@ -236,7 +238,7 @@ FragmentCompileCase decode_fragment_compile_case(std::span<const uint8_t> bytes)
     Reader r{bytes.first(bytes.size() - 8)}; uint8_t magic[8]{}; uint32_t schema{}; r(magic, schema);
     const uint8_t wanted[8] = {'P','R','F','C','A','S','E',0};
     check(std::equal(std::begin(magic), std::end(magic), std::begin(wanted)) &&
-              (schema >= 1 && schema <= 6),
+              (schema >= 1 && schema <= 7),
           "compile-case schema");
     FragmentCompileCase c; capsule(r, c);
     if (schema >= 2) {
@@ -257,6 +259,7 @@ FragmentCompileCase decode_fragment_compile_case(std::span<const uint8_t> bytes)
     if (schema >= 6)
         r(c.export_formats.compressed_formats, c.export_formats.uint_outputs,
           c.export_formats.sint_outputs);
+    if (schema >= 7) r(c.system_inputs.front_face_encoding);
     check(r.position == r.bytes.size(), "compile-case trailing data");
     for (size_t k = 0; k < c.blobs.size(); ++k) if (c.blobs[k].alias_of != UINT32_MAX) {
         check(c.blobs[k].alias_of < k, "compile-case alias index");

@@ -45,6 +45,12 @@ changes nothing the guest sees (#4700).
   processor's diagnostics. It never rewrites a packet or completes a fence. Lookup requires a
   complete fault-safe eight-byte sample; unavailable and colliding replacements cannot expose
   a previous sample. Each direct-mapped slot has its own lock, with process-lifetime storage.
+- `wait_producer_trace` — boot-pinned `PROSPER_WAIT_PRODUCER_TRACE` observes pending writers
+  through modeled overlay and after-store notification. Known submit/queue fields come only from
+  the real fold boundary; older deferred work and direct folds stay unknown. Immutable enqueue
+  tags survive packet recycling and worker-context changes. Bounds are 4,096 tags, 64 labels and
+  512 detail records with explicit truncation notices. This is not a queue scheduler or a proof
+  of hardware visibility. Off, it takes cached guards plus one nullable pointer slot per write.
 - `gpu_memory_budget` / `gpu_memory_budget_vk` — how many bytes prosper itself holds on each device
   heap, against that heap's size, with a peak. The split is deliberate: the first header is free of
   Vulkan types so it can be included anywhere, and the second carries the two wrappers every shipped

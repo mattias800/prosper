@@ -717,7 +717,7 @@ if(Python3_Interpreter_FOUND)
   # manifests; every refusal arm differs from the matching pair in exactly one condition.
   add_test(NAME compare_runs_logic
            COMMAND "${Python3_EXECUTABLE}"
-                   "${CMAKE_SOURCE_DIR}/tools/perf/test_compare_runs.py")
+                   -m pytest -q "${CMAKE_SOURCE_DIR}/tools/perf/test_compare_runs.py")
   add_test(NAME rdna2_reference_logic
            COMMAND "${Python3_EXECUTABLE}" -m pytest -q
                    "${CMAKE_SOURCE_DIR}/tests/tools/test_rdna2_ref.py")
@@ -1117,16 +1117,22 @@ if(TARGET prosper_core)
 
   # Screenshot evidence classification/JSON is pure and must remain testable without Vulkan or a dump.
   add_executable(test_capture_manifest tests/test_capture_manifest.cpp
-                                       tools/screenshot/capture_manifest.cpp
+                                       frontends/shared/capture/capture_manifest.cpp
                                        # The framerate the manifest reports. A pure TU with no
                                        # dependency beyond the standard library, so it links here
                                        # without dragging prosper_core (or Vulkan) into the test.
                                        src/gpu/present/present_frame_rate.cpp)
   # `src` and the revision library are for `build_revision.hpp` only: the run header records the
   # revision the binary was compiled from, so the manifest self-describes. Still no Vulkan, no dump.
-  target_include_directories(test_capture_manifest PRIVATE tools/screenshot src)
+  target_include_directories(test_capture_manifest PRIVATE frontends src)
   target_link_libraries(test_capture_manifest PRIVATE prosper_build_revision)
   add_test(NAME capture_manifest COMMAND test_capture_manifest)
+  prosper_add_gtest(test_capture_manifest_switches
+    SOURCES tests/test_capture_manifest_switches.cpp
+            frontends/shared/capture/capture_manifest.cpp
+            src/gpu/present/present_frame_rate.cpp
+    INCLUDES frontends src
+    LIBRARIES prosper_build_revision)
 
   # The burned-in fps annotation (`screenshot --fps-overlay`). Rasterizing text into an RGBA buffer
   # is pure, and an overlay that silently draws nothing looks exactly like one that was never asked
@@ -2001,6 +2007,25 @@ if(TARGET prosper_core)
   target_include_directories(test_prosper_app_capture_schedule PRIVATE frontends/prosper-app)
   add_test(NAME prosper_app_capture_schedule COMMAND test_prosper_app_capture_schedule)
 
+  prosper_add_gtest(test_visible_snapshot_capture
+    SOURCES tests/frontend/test_visible_snapshot_capture.cpp
+            frontends/prosper-app/snapshot_capture.cpp
+            frontends/shared/capture/capture_manifest.cpp
+    INCLUDES frontends frontends/prosper-app tests third_party/stb
+    LIBRARIES prosper_core)
+  if(WIN32)
+    target_sources(test_visible_snapshot_capture PRIVATE frontends/shared/capture/capture_png.cpp)
+    target_compile_definitions(test_visible_snapshot_capture PRIVATE PROSPER_SNAPSHOT_PNG=1)
+    target_link_libraries(test_visible_snapshot_capture PRIVATE windowscodecs ole32)
+  else()
+    find_package(ZLIB QUIET)
+    if(ZLIB_FOUND)
+      target_sources(test_visible_snapshot_capture PRIVATE frontends/shared/capture/capture_png.cpp)
+      target_compile_definitions(test_visible_snapshot_capture PRIVATE PROSPER_SNAPSHOT_PNG=1)
+      target_link_libraries(test_visible_snapshot_capture PRIVATE ZLIB::ZLIB)
+    endif()
+  endif()
+
   add_executable(test_prosper_app_performance_capture_schedule
     frontends/prosper-app/test_performance_capture_schedule.cpp)
   target_include_directories(test_prosper_app_performance_capture_schedule
@@ -2617,6 +2642,12 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_vertex_vcc_scalar_lifetime
     SOURCES tests/gpu/recompiler/test_vertex_vcc_scalar_lifetime.cpp
     INCLUDES src tests/gpu/recompiler
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_fragment_front_face
+    SOURCES tests/gpu/recompiler/test_fragment_front_face.cpp
+            tests/gpu/execute/test_front_face_producer.cpp
+            tests/gpu/capture/test_front_face_compile_inputs.cpp
+    INCLUDES src tests
     LIBRARIES prosper_core)
   prosper_add_gtest(test_fragment_scalar_vcc_pair
     SOURCES tests/gpu/recompiler/test_fragment_scalar_vcc_pair.cpp
@@ -3294,6 +3325,10 @@ if(TARGET prosper_core)
     LIBRARIES prosper_core)
   prosper_add_gtest(test_terminal_tail_retention
     SOURCES tests/gpu/execute/test_terminal_tail_retention.cpp
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_fragment_terminal_tail
+    SOURCES tests/gpu/execute/test_fragment_terminal_tail.cpp
+    INCLUDES tests
     LIBRARIES prosper_core)
   # Cache switches are process-cached. These distinct processes exercise the actual bypass paths.
   foreach(source_policy IN ITEMS analysis_off decode_off both_off)
@@ -4643,6 +4678,29 @@ endif()
   prosper_add_gtest(test_agc_multi_acb
     SOURCES tests/gpu/pm4/test_agc_multi_acb.cpp
     LIBRARIES prosper_core)
+
+  prosper_add_gtest(test_wait_producer_trace
+    SOURCES tests/gpu/pm4/test_wait_producer_trace.cpp
+    LIBRARIES prosper_core
+    ENVIRONMENT PROSPER_WAIT_PRODUCER_TRACE=1 PROSPER_POST_SUBMIT_VISIBILITY=1
+                PROSPER_WAIT_DEFER=0 PROSPER_EOP_WRITE_SYNC=0
+    PROPERTIES ENVIRONMENT_MODIFICATION "PROSPER_NO_BATCH_RENDERER_WRITE_DRAIN=unset:")
+  prosper_add_gtest(test_wait_producer_trace_budget
+    SOURCES tests/gpu/pm4/test_wait_producer_trace_budget.cpp
+    LIBRARIES prosper_core
+    ENVIRONMENT PROSPER_WAIT_PRODUCER_TRACE=1 PROSPER_POST_SUBMIT_VISIBILITY=1
+                PROSPER_WAIT_DEFER=0 PROSPER_EOP_WRITE_SYNC=0)
+  prosper_add_gtest(test_wait_producer_trace_selective
+    SOURCES tests/gpu/pm4/test_wait_producer_trace_selective.cpp
+    LIBRARIES prosper_core
+    ENVIRONMENT PROSPER_WAIT_PRODUCER_TRACE=1 PROSPER_POST_SUBMIT_VISIBILITY=1
+                PROSPER_NO_BATCH_RENDERER_WRITE_DRAIN=1 PROSPER_WAIT_DEFER=0
+                PROSPER_EOP_WRITE_SYNC=0)
+  prosper_add_gtest(test_wait_producer_trace_disabled
+    SOURCES tests/gpu/pm4/test_wait_producer_trace_disabled.cpp
+    LIBRARIES prosper_core
+    ENVIRONMENT PROSPER_POST_SUBMIT_VISIBILITY=1 PROSPER_WAIT_DEFER=0 PROSPER_EOP_WRITE_SYNC=0
+    PROPERTIES ENVIRONMENT_MODIFICATION "PROSPER_WAIT_PRODUCER_TRACE=unset:")
 
   add_executable(test_agc_submit_multi tests/hle/test_agc_submit_multi.cpp)
   target_include_directories(test_agc_submit_multi PRIVATE tests)
@@ -6854,7 +6912,8 @@ endif()
 if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
   if(WIN32)
     add_executable(screenshot tools/screenshot/screenshot.cpp
-                              tools/screenshot/capture_manifest.cpp
+                              frontends/shared/capture/capture_manifest.cpp
+                              frontends/shared/capture/capture_png.cpp
                               tools/screenshot/overlay_text.cpp)
     prosper_hosts_a_guest(screenshot)
                               # Spells a `shared/...` include, which resolves from `frontends`.
@@ -6866,7 +6925,8 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
     find_package(ZLIB QUIET)
     if(ZLIB_FOUND)
       add_executable(screenshot tools/screenshot/screenshot.cpp
-                                tools/screenshot/capture_manifest.cpp
+                                frontends/shared/capture/capture_manifest.cpp
+                                frontends/shared/capture/capture_png.cpp
                                 tools/screenshot/overlay_text.cpp)
                                 # Spells a `shared/...` include, which resolves from `frontends`.
                                 target_include_directories(screenshot PRIVATE frontends)
@@ -7208,8 +7268,23 @@ if(PROSPER_APP AND TARGET SDL3::SDL3)
     add_executable(prosper-app frontends/prosper-app/main.cpp frontends/prosper-app/library_ui.cpp
                                frontends/prosper-app/loadexec.cpp
                                frontends/prosper-app/library_media.cpp
-                               frontends/prosper-app/fps_overlay.cpp)
+                               frontends/prosper-app/fps_overlay.cpp
+                               frontends/prosper-app/snapshot_capture.cpp
+                               frontends/shared/capture/capture_manifest.cpp)
     prosper_hosts_a_guest(prosper-app)
+    if(WIN32)
+      target_sources(prosper-app PRIVATE frontends/shared/capture/capture_png.cpp)
+      target_compile_definitions(prosper-app PRIVATE PROSPER_SNAPSHOT_PNG=1)
+      target_link_libraries(prosper-app PRIVATE windowscodecs ole32)
+    else()
+      find_package(ZLIB QUIET)
+      if(ZLIB_FOUND)
+        target_sources(prosper-app PRIVATE frontends/shared/capture/capture_png.cpp)
+        target_compile_definitions(prosper-app PRIVATE PROSPER_SNAPSHOT_PNG=1)
+        target_link_libraries(prosper-app PRIVATE ZLIB::ZLIB)
+      endif()
+    endif()
+
     # third_party/renderdoc: the vendored in-application API header (#3321). Header-only and
     # never linked -- librenderdoc.so is dlopen'd at runtime by the capture trigger.
     target_include_directories(prosper-app PRIVATE src third_party/stb third_party/renderdoc

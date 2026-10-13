@@ -244,6 +244,35 @@ def screenshot_path():
     return os.path.normpath(os.path.join(HERE, "..", "..", "build-linux", "screenshot"))
 
 
+def content_capture_command(frontend, dump, tmp, sample_seconds, count, runner_timeout,
+                            visible=False):
+    """Keep the legacy sampler request identical when using the normal visible app."""
+    prefix = "--snapshot-" if visible else "--"
+    command = [frontend, dump]
+    if visible:
+        command.append("--snapshot-capture")
+    command.extend([
+        prefix + "seconds", str(sample_seconds), prefix + "count", str(count),
+        prefix + "out", tmp, prefix + "manifest", os.path.join(tmp, "capture.jsonl"),
+        prefix + "timeout", str(runner_timeout), prefix + "require-composited-frame",
+    ])
+    return command
+
+
+def content_capture_frontend(env):
+    """Explicit app selection retains the old CPU publication and unpaced route contract."""
+    app = env.get("PROSPER_SNAPSHOT_APP")
+    if not app:
+        return screenshot_path(), False
+    driver = env.get("SDL_VIDEODRIVER", "")
+    if driver in ("offscreen", "dummy"):
+        raise RuntimeError("visible snapshot capture refuses offscreen/dummy SDL video")
+    env["PROSPER_APP_GPU_PRESENT"] = "0"
+    # The legacy screenshot frontend opts out by default. An explicit guard pacing value wins.
+    env.setdefault("PROSPER_FLIP_PACE_FPS", "0")
+    return app, True
+
+
 def load_manifest():
     if not os.path.exists(MANIFEST):
         return {"snapshots": []}
@@ -1026,6 +1055,9 @@ def approve_content_candidate(entry, verified_by=VERIFIED_BY_AGENT):
 def capture(entry, run_log=None):
     """Boot the game, wait for frame_<F>.bmp, return (bmp_bytes_path_copy, (w,h)).
     Raises RuntimeError on timeout / crash-before-frame."""
+    if os.environ.get("PROSPER_SNAPSHOT_APP"):
+        raise RuntimeError("visible app capture supports routed content guards; exact frame guards "
+                           "need their separate boot_trace contract")
     bt = boot_trace_path()
     if not os.path.exists(bt):
         raise RuntimeError(f"boot_trace not found at {bt} (build it, or set PROSPER_BOOT_TRACE)")
@@ -1153,9 +1185,11 @@ def _guest_failure_suffix(manifest):
 def capture_content(entry, run_log=None):
     """Run the title and measure normal composited screenshots, never renderer intermediates."""
     validate_content_entry(entry)
-    frontend = screenshot_path()
+    env = dict(os.environ)
+    frontend, visible = content_capture_frontend(env)
     if not os.path.exists(frontend):
-        raise RuntimeError(f"screenshot not found at {frontend} (build it, or set PROSPER_SCREENSHOT)")
+        selection = "PROSPER_SNAPSHOT_APP" if visible else "PROSPER_SCREENSHOT"
+        raise RuntimeError(f"capture frontend not found at {frontend} (build it, or set {selection})")
     dump = resolve_dump(entry)
     if not os.path.exists(dump):
         raise RuntimeError(f"game dump not found: {dump} (set PROSPER_GAME_ROOT)")
@@ -1164,7 +1198,6 @@ def capture_content(entry, run_log=None):
     sample_seconds = float(entry.get("sample_seconds", 1))
     if sample_seconds <= 0:
         raise RuntimeError("sample_seconds must be positive")
-    env = dict(os.environ)
     env.update({
         **({"PROSPER_GUEST_FS": "1"} if sys.platform == "darwin" else {}),   # Apple-only (#2098)
         "PROSPER_GUEST_ARGS": "-force-gfx-direct",
@@ -1177,26 +1210,25 @@ def capture_content(entry, run_log=None):
     failed = False
     try:
         apply_entry_env(env, entry, tmp)
-        frontend_run = os.path.join(tmp, "screenshot_snap")
+        # Entry environment/route/save policy must win, including an explicit flip rate.
+        frontend, visible = content_capture_frontend(env)
+        frontend_run = os.path.join(tmp, "prosper_app_snap" if visible else "screenshot_snap")
         shutil.copyfile(frontend, frontend_run)
         os.chmod(frontend_run, 0o755)
         capture_end = float(entry.get("capture_before_seconds", timeout))
         count = max(2, int(math.ceil(capture_end / sample_seconds)) + 1)
         runner_timeout = max(timeout, int(math.ceil(capture_end))) + 30
-        command = [
-            frontend_run, dump, "--seconds", str(sample_seconds), "--count", str(count),
-            "--out", tmp, "--manifest", os.path.join(tmp, "capture.jsonl"),
-            "--timeout", str(runner_timeout), "--require-composited-frame",
-        ]
+        command = content_capture_command(frontend_run, dump, tmp, sample_seconds, count,
+                                          runner_timeout, visible)
         logf = open(run_log, "wb") if run_log else subprocess.DEVNULL
         proc = _spawn_snapshot_process(command, env, logf)
         deadline = time.time() + runner_timeout + 15
         while time.time() < deadline and proc.poll() is None:
             time.sleep(1.0)
         if proc.poll() is None:
-            raise RuntimeError(f"screenshot frontend exceeded {runner_timeout + 15}s")
+            raise RuntimeError(f"capture frontend exceeded {runner_timeout + 15}s")
         if proc.returncode != 0:
-            raise RuntimeError(f"screenshot frontend exited with code {proc.returncode}"
+            raise RuntimeError(f"capture frontend exited with code {proc.returncode}"
                                f"{_guest_failure_suffix(os.path.join(tmp, 'capture.jsonl'))}")
         summary = analyze_content_manifest(tmp, entry)
         return summary["richest"]["path"], summary, tmp

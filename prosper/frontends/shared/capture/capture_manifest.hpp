@@ -5,6 +5,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -132,9 +134,10 @@ RunVerdict decide_run_verdict(bool assertions_failed, const GuestOutcome& guest,
 
 // Why the sampling loop ended. `RequestSatisfied` and `Timeout` are the two reasons the loop always
 // had; `GuestFault` is the early stop (#2584).
-enum class SamplingStop : uint8_t { RequestSatisfied, Timeout, GuestFault };
+enum class SamplingStop : uint8_t { RequestSatisfied, Timeout, GuestFault, FrontendStopped };
 
-const char* sampling_stop_name(SamplingStop stop);   // request-satisfied | timeout | guest-fault
+const char* sampling_stop_name(
+    SamplingStop stop);   // request-satisfied | timeout | guest-fault | frontend-stopped
 
 // Should the sampler stop before its request is satisfied, because nothing new can arrive?
 //
@@ -244,6 +247,15 @@ private:
 std::string json_escape(const std::string& value);
 const char* capture_source_name(CaptureSource source);
 std::string manifest_run_json(const CaptureRunConfig& config);
+
+// Manifest slice of ADR 0021/0023 (head, build, switches per run). The run
+// record above carries head (build_revision) and build (build_source_identity);
+// this is the third leg: every PROSPER_* variable present in the run's
+// environment, so a reader can tell from the artifact whether it qualifies as
+// evidence. Sorted by name, so two runs diff cleanly.
+// Unavailable collection is distinct from an empty, successfully collected map.
+std::optional<std::map<std::string, std::string>> collect_prosper_switches();
+std::string manifest_switches_json(const std::map<std::string, std::string>& switches);
 
 // The conditions a framerate depends on that the `run` line cannot know: it is written before the
 // guest boots and before the renderer has chosen a GPU. Written as its own `conditions` record just
