@@ -720,6 +720,9 @@ struct SpirvCompute {
     std::set<uint32_t> native_uniform_exec_mov_pcs;
     bool structured_wave64_mask_reduction_analysis_done = false;
     std::unordered_set<uint32_t> structured_wave64_mask_reduction_pcs;
+    // Original bounded terminal tails complete scalar liveness at structured joins. The emitter
+    // still consumes its original stream and branch policy; these facts seed no register value.
+    std::vector<Rdna2Inst> saved_mask_liveness_instructions;
     // Exact Wave64 mask spills retain a Bool view in vgpr_lane_mask_slots. When a CFG MUST proof
     // also identifies which physical ballot half the slot represents, V_READLANE can publish the
     // corresponding scalar dword without guessing from the SGPR number or spill lane.

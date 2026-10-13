@@ -717,7 +717,10 @@ if(Python3_Interpreter_FOUND)
   # manifests; every refusal arm differs from the matching pair in exactly one condition.
   add_test(NAME compare_runs_logic
            COMMAND "${Python3_EXECUTABLE}"
-                   "${CMAKE_SOURCE_DIR}/tools/perf/test_compare_runs.py")
+                   -m pytest -q "${CMAKE_SOURCE_DIR}/tools/perf/test_compare_runs.py")
+  add_test(NAME rdna2_reference_logic
+           COMMAND "${Python3_EXECUTABLE}" -m pytest -q
+                   "${CMAKE_SOURCE_DIR}/tests/tools/test_rdna2_ref.py")
   # The two /proc samplers (#3400 / #3401). Both run against a /proc tree the test BUILDS, so they
   # need no target process, no privileges and no sleeping: wait_profile's arms pin per-thread
   # identity (same-name threads, TID reuse, renames, PID reuse), and lock_holder's pin that a run
@@ -1124,6 +1127,12 @@ if(TARGET prosper_core)
   target_include_directories(test_capture_manifest PRIVATE frontends src)
   target_link_libraries(test_capture_manifest PRIVATE prosper_build_revision)
   add_test(NAME capture_manifest COMMAND test_capture_manifest)
+  prosper_add_gtest(test_capture_manifest_switches
+    SOURCES tests/test_capture_manifest_switches.cpp
+            frontends/shared/capture/capture_manifest.cpp
+            src/gpu/present/present_frame_rate.cpp
+    INCLUDES frontends src
+    LIBRARIES prosper_build_revision)
 
   # The burned-in fps annotation (`screenshot --fps-overlay`). Rasterizing text into an RGBA buffer
   # is pure, and an overlay that silently draws nothing looks exactly like one that was never asked
@@ -3316,6 +3325,10 @@ if(TARGET prosper_core)
     LIBRARIES prosper_core)
   prosper_add_gtest(test_terminal_tail_retention
     SOURCES tests/gpu/execute/test_terminal_tail_retention.cpp
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_fragment_terminal_tail
+    SOURCES tests/gpu/execute/test_fragment_terminal_tail.cpp
+    INCLUDES tests
     LIBRARIES prosper_core)
   # Cache switches are process-cached. These distinct processes exercise the actual bypass paths.
   foreach(source_policy IN ITEMS analysis_off decode_off both_off)

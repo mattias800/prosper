@@ -138,6 +138,13 @@ recorded). Together with the `run` record these are what decides whether two rat
 `tools/perf/compare_runs.py BASELINE.jsonl CANDIDATE.jsonl` refuses a pair whose conditions differ
 and exits 2 without printing a delta; see `tools/perf/AGENTS.md`.
 
+Right after the `run` record the manifest carries a `switches` record: every `PROSPER_*` variable
+present in the run's environment, sorted by name. The `run` record itself carries `build_revision`
+(the HEAD the binary was compiled from) and `build_source_identity` (source bytes plus toolchain
+and configuration, so dirty or untracked compiled edits compare unequal). `compare_runs.py` refuses
+a pair whose selector or unclassified switches differ — a run with behaviour switches is not
+evidence (ADR 0023) — while host-capability and diagnostic differences stay comparable.
+
 The summary also carries the frame-time tail: `interval_p90_ms`, `interval_p95_ms`, `interval_p99_ms`
 and `low_1pct_fps` (`1 / p99`), each `null` when the run had too few intervals to resolve it.
 

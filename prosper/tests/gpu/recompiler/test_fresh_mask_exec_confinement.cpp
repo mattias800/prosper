@@ -33,6 +33,21 @@ constexpr std::array kSdwaV6 = {0x7e0c02f9u, 0x00851480u};
 constexpr std::array kWritelaneV6 = {0xd7610006u, 0x00010002u};
 // v_movreld_b32 with VDST v6 (indexed through M0), inline-zero source.
 constexpr std::array kMovrelV6 = {0x7e0c8480u};
+// FMAC_F32 (0x12b) and the decoder-admitted packed FMAC lowering (0x13c) both read the old
+// destination. The latter is not a verified architectural e64 encoding.
+// SRC2 encodes s2: the decoder exposes a third source field for these opcodes, so the test makes
+// it genuine, leaving the old-destination accumulator as the only missing input.
+constexpr std::array kFmacV6 = {0xd12b0006u, 0x000a0501u};
+constexpr std::array kPkFmacV6 = {0xd13c0006u, 0x000a0501u};
+// v_mac_f32 v6, v1, v2 (VOP2 0x1f): lane-wise accumulator reading its own lane's old word.
+constexpr std::array kMacV6 = {0x3e0c0501u};
+// Synthetic forms accepted by prosper's existing SDWA decoder/lowering. These are not captured
+// PS5 instructions or LLVM-supported SDWA encodings; their old destination still participates
+// in the implemented operation and therefore cannot be certified as a complete replacement.
+constexpr std::array kSdwaMacV6 = {0x3e0c04f9u, 0x06060601u};
+constexpr std::array kSdwaFmacV6 = {0x560c04f9u, 0x06060601u};
+constexpr std::array kSdwaPkFmacV6 = {0x780c04f9u, 0x06060601u};
+constexpr std::array kSdwaFullMovV6 = {0x7e0c02f9u, 0x00060601u};
 // VOPC compare, src0 = v6, vsrc1 = v6.
 constexpr std::array kCmpV6V6 = {0x7c200d06u};
 // VOPC compare, src0 = v6, vsrc1 = v8.
@@ -139,6 +154,34 @@ bool predicate_defined_in_subset(std::span<const uint32_t> writes, std::span<con
 void sgpr_genuine(RegState& rs, SpirvCompute& b, int r) {
     rs.sreg[r] = b.uconst(5);
 }
+void vgpr_genuine(RegState& rs, SpirvCompute& b, int r) {
+    rs.vreg[r] = b.uconst(7);
+}
+
+// v6 holds a placeholder confined to G. A lane-wise accumulator under M combines its own lane's
+// clean sources with its own lane's old word, so the meet stays G: it is accepted under G, and it
+// is NOT rebased to a different writer EXEC M.
+bool accumulator_meet(bool mac_under_writer_exec, std::span<const uint32_t> words = kMacV6) {
+    Harness h;
+    h.rs.vreg[1] = h.b.uconst(3);
+    h.rs.vreg[2] = h.b.uconst(4);
+    const uint32_t g = h.b.btrue();
+    h.rs.exec = g;
+    h.rs.exec_narrowed = true;
+    const auto mov = decode(kMovV6);
+    const auto mac = decode(words);
+    const auto cmp = decode(kCmpV6V6);
+    if (mov.size() != 1 || mac.size() != 1 || cmp.size() != 1) return false;
+    std::vector<Rdna2Inst> all = mov;
+    all.insert(all.end(), mac.begin(), mac.end());
+    all.insert(all.end(), cmp.begin(), cmp.end());
+    seed_vector_word_definedness(h.rs, all, false, 64);
+    record_vector_word_marks(h.rs, mov[0], scalar_source_marks(h.rs, mov[0]));
+    h.rs.exec = mac_under_writer_exec ? g : h.b.uconst(79);
+    h.rs.exec_narrowed = true;
+    record_vector_word_marks(h.rs, mac[0], scalar_source_marks(h.rs, mac[0]));
+    return fresh_mask_sources_defined(h.b, h.rs, cmp[0]);
+}
 }   // namespace
 
 TEST(FreshMaskExecConfinement, CompleteWriteCompareUnderTheWritersExecIsDefined) {
@@ -164,6 +207,19 @@ TEST(FreshMaskExecConfinement, ControlEncodingsDecodeAsTheFormsTheyClaim) {
     ASSERT_EQ(s20.size(), 1u);
     EXPECT_EQ(s20[0].src[0].kind, OperandKind::SGPR);
     EXPECT_EQ(s20[0].src[0].value, 20);
+    for (const auto words : {kFmacV6, kPkFmacV6}) {
+        const auto fmac = decode(words);
+        ASSERT_EQ(fmac.size(), 1u);
+        EXPECT_EQ(fmac[0].fmt, Rdna2Format::VOP3);
+        EXPECT_EQ(fmac[0].dst.value, 6);
+    }
+    EXPECT_EQ(decode(kFmacV6)[0].opcode, 0x12bu);
+    EXPECT_EQ(decode(kPkFmacV6)[0].opcode, 0x13cu);
+    const auto mac = decode(kMacV6);
+    ASSERT_EQ(mac.size(), 1u);
+    EXPECT_EQ(mac[0].fmt, Rdna2Format::VOP2);
+    EXPECT_EQ(mac[0].opcode, 0x1fu);
+    EXPECT_EQ(mac[0].dst.value, 6);
 }
 
 TEST(FreshMaskExecConfinement, CompareUnderAnotherExecStillRefuses) {
@@ -205,4 +261,66 @@ TEST(FreshMaskExecConfinement, CompareUnderACmpxSubsetOfTheWritersExecIsDefined)
 TEST(FreshMaskExecConfinement, CompareUnderAnUnrelatedExecRecordStillRefuses) {
     // A recorded parent that is not the writer's EXEC proves nothing about the reader's lanes.
     EXPECT_FALSE(predicate_defined_in_subset(cat({kMovV6, kV8FromV6}), kCmpV8, false));
+}
+
+TEST(FreshMaskExecConfinement, AccumulatorKeepsSharedConfinement) {
+    EXPECT_TRUE(accumulator_meet(/*mac_under_writer_exec=*/true));
+}
+
+TEST(FreshMaskExecConfinement, AccumulatorMeetDoesNotRebaseToWriterExec) {
+    EXPECT_FALSE(accumulator_meet(/*mac_under_writer_exec=*/false));
+}
+
+TEST(FreshMaskExecConfinement, FmacAccumulatorReadsStillRefuse) {
+    // s2 is genuine, and so is s3: the decoder exposes a third source field for these opcodes
+    // and scalar_source_words reads the s[2:3] pair, so s3 must not be the missing input.
+    const auto setup = [](RegState& rs, SpirvCompute& b) {
+        vgpr_genuine(rs, b, 1);
+        vgpr_genuine(rs, b, 2);
+        sgpr_genuine(rs, b, 2);
+        sgpr_genuine(rs, b, 3);
+    };
+    EXPECT_FALSE(predicate_defined(kFmacV6, kCmpV6V6, true, setup));
+    EXPECT_FALSE(predicate_defined(kPkFmacV6, kCmpV6V6, true, setup));
+}
+
+TEST(FreshMaskExecConfinement, SdwaAccumulatorCannotConfineAnUndefinedOldWord) {
+    for (const auto words : {kSdwaMacV6, kSdwaFmacV6, kSdwaPkFmacV6}) {
+        const auto ins = decode(words);
+        ASSERT_EQ(ins.size(), 1u);
+        ASSERT_EQ(ins[0].fmt, Rdna2Format::VOP2);
+        ASSERT_TRUE(ins[0].has_sdwa);
+        ASSERT_FALSE(ins[0].has_modifier);
+        ASSERT_EQ(ins[0].sdwa_dst_sel, 6u);
+        ASSERT_TRUE(vector_write_depends_on_old_word(ins[0], true));
+        EXPECT_FALSE(predicate_defined(words, kCmpV6V6, true,
+                                       [](RegState& rs, SpirvCompute& b) {
+                                           vgpr_genuine(rs, b, 1);
+                                           vgpr_genuine(rs, b, 2);
+                                       }))
+            << "opcode " << ins[0].opcode;
+    }
+}
+
+TEST(FreshMaskExecConfinement, SdwaAccumulatorWithGenuineOldWordRemainsDefined) {
+    for (const auto words : {kSdwaMacV6, kSdwaFmacV6, kSdwaPkFmacV6}) {
+        EXPECT_TRUE(predicate_defined(words, kCmpV6V6, true, [](RegState& rs, SpirvCompute& b) {
+            vgpr_genuine(rs, b, 1);
+            vgpr_genuine(rs, b, 2);
+            vgpr_genuine(rs, b, 6);
+        }));
+    }
+}
+
+TEST(FreshMaskExecConfinement, SdwaAccumulatorRetainsOnlyItsOriginalConfinement) {
+    for (const auto words : {kSdwaMacV6, kSdwaFmacV6, kSdwaPkFmacV6}) {
+        EXPECT_TRUE(accumulator_meet(true, words));
+        EXPECT_FALSE(accumulator_meet(false, words));
+    }
+}
+
+TEST(FreshMaskExecConfinement, SdwaFullWordMoveStillConfinesInactiveMissingLanes) {
+    const auto setup = [](RegState& rs, SpirvCompute& b) { vgpr_genuine(rs, b, 1); };
+    EXPECT_TRUE(predicate_defined(kSdwaFullMovV6, kCmpV6V6, true, setup));
+    EXPECT_FALSE(predicate_defined(kSdwaFullMovV6, kCmpV6V6, false, setup));
 }

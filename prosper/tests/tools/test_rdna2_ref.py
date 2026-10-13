@@ -15,6 +15,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 
+from rdna2_ref import corpus as R  # noqa: E402
 from rdna2_ref import decode as D  # noqa: E402
 from rdna2_ref import llvm_check as L  # noqa: E402
 from rdna2_ref import machine as M  # noqa: E402
@@ -710,3 +711,111 @@ def test_reference_model_synthetic_value_expectations():
         vgpr={(0, lane): 3 for lane in range(64)},
     )
     assert all(w6.vgpr[0][lane] == 5 for lane in range(64))
+
+
+# ---- corpus carvers (synthetic blobs; real corpora are local-only) ----------------------
+def pack(words):
+    """Little-endian bytes of a word list (the inverse of corpus.words)."""
+    return struct.pack(f"<{len(words)}I", *words) if words else b""
+
+
+def prog_mov_end():
+    """s_mov_b32 s0, 100; s_endpgm — via the file's own ISA encoders, not raw hex."""
+    return pack(sop1(3, 0, LIT) + [100] + sopp(1))
+
+
+def test_words_splits_little_endian_dwords():
+    assert R.words(pack([1, 2, 3])) == [1, 2, 3]
+    assert R.words(b"") == []
+
+
+def test_carve_program_single_block():
+    prog = prog_mov_end()
+    assert R.carve_program(prog, 0) == prog
+
+
+def test_carve_program_without_endpgm_is_none():
+    assert R.carve_program(pack(sop1(3, 0, LIT) + [100]), 0) is None
+
+
+def test_carve_program_stops_at_garbage_truncation_or_end():
+    assert R.carve_program(pack([0xFFFFFFFF]), 0) is None
+    assert R.carve_program(pack(sop1(3, 0, LIT)), 0) is None
+    assert R.carve_program(b"", 0) is None
+    assert R.carve_program(prog_mov_end(), 99) is None
+
+
+def test_carve_program_extends_past_a_forward_branch_target():
+    # ISA ch. 4: target = branch PC + 4 + SIMM16 * 4. +1 reaches the second endpgm.
+    inner = pack(sopp(2, 1) + sopp(1) + sopp(1))
+    assert R.carve_program(inner, 0) == inner
+    # ...and with no endpgm at or past the target there is no program.
+    assert R.carve_program(pack(sopp(2, 2) + sopp(1)), 0) is None
+
+
+def test_carve_program_refuses_a_target_just_after_the_last_endpgm():
+    # +2 targets byte 12, not the endpgm at byte 8. Its end is not a branch target.
+    assert R.carve_program(pack(sopp(2, 2) + sopp(1) + sopp(1)), 0) is None
+
+
+@pytest.mark.parametrize("limit", [0, 1, 2, 3])
+def test_carve_program_does_not_decode_past_the_byte_limit(limit):
+    end = pack(sopp(1))
+    assert R.carve_program(end, 0, limit=limit) is None
+    assert R.carve_program(end, 0, limit=len(end)) == end
+
+
+def test_carve_orbshdr_at_default_header():
+    prog = prog_mov_end()
+    blob = b"OrbShdr" + bytes(0x40 - 7) + prog
+    assert R.carve_orbshdr(blob) == [prog]
+
+
+def test_carve_orbshdr_without_marker_is_empty():
+    assert R.carve_orbshdr(b"nothing here") == []
+
+
+def test_carve_orbshdr_falls_back_to_short_headers():
+    prog = prog_mov_end()
+    blob = b"OrbShdr" + bytes(0x20 - 7) + prog
+    assert R.carve_orbshdr(blob) == [prog]
+
+
+def test_carve_orbshdr_skips_undecodable_markers_and_keeps_both_programs():
+    prog = prog_mov_end()
+    blob = (
+        b"OrbShdr"
+        + bytes(64)
+        + b"OrbShdr"
+        + bytes(0x40 - 7)
+        + prog
+        + b"OrbShdr"
+        + bytes(0x40 - 7)
+        + prog
+    )
+    # The first marker sits in front of zeros, which never carve; the other two do.
+    assert R.carve_orbshdr(blob) == [prog, prog]
+
+
+def test_store_and_census_readers_are_sorted_and_routed(tmp_path):
+    (tmp_path / "b.bin").write_bytes(b"\x01")
+    (tmp_path / "a.bin").write_bytes(b"\x02")
+    assert R.eboot_programs(tmp_path) == [b"\x02", b"\x01"]
+    assert R.firmware_programs(tmp_path, store=tmp_path) == [b"\x02", b"\x01"]
+    ok = tmp_path / "shaders-ok"
+    ok.mkdir()
+    (ok / "s.bin").write_bytes(b"\x03")
+    refused = tmp_path / "shaders-refused"
+    refused.mkdir()
+    (refused / "s.bin").write_bytes(b"\x04")
+    assert R.census_programs(tmp_path) == [b"\x03"]
+    assert R.census_programs(tmp_path, refused=True) == [b"\x04"]
+
+
+def test_firmware_carve_deduplicates_across_libraries(tmp_path):
+    prog = prog_mov_end()
+    (tmp_path / "libSceGnmDriver-a.sprx").write_bytes(b"OrbShdr" + bytes(0x40 - 7) + prog)
+    (tmp_path / "libSceGnmDriver-b.sprx").write_bytes(b"OrbShdr" + bytes(0x40 - 7) + prog)
+    other = pack(sop1(3, 0, LIT) + [200] + sopp(1))
+    (tmp_path / "other.sprx").write_bytes(b"OrbShdr" + bytes(0x40 - 7) + other)
+    assert R.firmware_programs(tmp_path) == [prog]

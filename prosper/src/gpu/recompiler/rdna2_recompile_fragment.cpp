@@ -5,6 +5,7 @@
 #include "gpu/diagnostics/fragment_arithmetic.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_fragment_terminal_tail.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
@@ -492,6 +493,15 @@ static std::vector<uint32_t> recompile_fragment_impl(
     const uint32_t effective_wave_size = effective_fragment_wave_size(
         wave_size, program_dwords, shader_program_hash(code, program_dwords));
     SpirvCompute b;
+    if (pcrel_dispatch_target == UINT32_MAX) {
+        const auto tails = rdna2_fragment_terminal_tail(code, dwords, ins);
+        if (!tails.instructions.empty()) {
+            b.saved_mask_liveness_instructions = ins;
+            b.saved_mask_liveness_instructions.insert(b.saved_mask_liveness_instructions.end(),
+                                                      tails.instructions.begin(),
+                                                      tails.instructions.end());
+        }
+    }
     b.diagnostic = diagnostic;
     b.fragment_float_mode = float_mode;
     b.fragment_float_flags = float_flags;

@@ -114,3 +114,52 @@ TEST(Wave64ExchangeExecution, ControlArmTheOrdinaryLoweringIsWrongOnANarrowHost)
     ASSERT_EQ(compute_spirv_min_subgroup_size(module), 64u);
     EXPECT_NE(run(c, module), fx::expected(c));
 }
+
+// ADR 0037 decision 6, test-harness form: the exchange route must agree with the exact
+// (route-off) path on the same inputs. Each leg is checked against the hand-derived oracle
+// rather than against each other, so a comparison that cannot see values cannot pass: a route
+// divergence fails at least one leg (and TheOracleRejectsAWrongLane above proves the oracle
+// itself discriminates). A host too narrow for the exact path skips -- parity is only checkable
+// for pairs whose exact path exists, which is the decision's own scope. This is the control
+// that lets a route be trusted for a default flip; the live diagnostic-switch variant stays
+// future work.
+void expect_exchange_matches_exact(const fx::Case& c) {
+    const auto host = prosper::test::default_compute_subgroup_properties();
+    if (!host.size || host.size < 64)
+        GTEST_SKIP() << "the exact path needs a 64-lane subgroup; parity is uncheckable on a "
+                     << host.size << "-lane host";
+    const auto exact = fx::compile(c, /*exchange_width=*/0);
+    ASSERT_FALSE(exact.empty()) << "the exact path must exist for the pair to compare";
+    const auto exchange = fx::compile(c, /*exchange_width=*/32);
+    ASSERT_FALSE(exchange.empty());
+    ASSERT_TRUE(compute_spirv_wave64_exchange(exchange)) << "the arm must exercise the exchange";
+    expect_exact(c, run(c, exact));
+    expect_exact(c, run(c, exchange));
+}
+
+TEST(Wave64ExchangeSelfCheck, UniformLoopOverTwoGuestWaves) {
+    expect_exchange_matches_exact(fx::Case{128, fx::Trips::Constant3});
+}
+
+TEST(Wave64ExchangeSelfCheck, LoopWhoseTripCountDiffersPerGuestWave) {
+    expect_exchange_matches_exact(fx::Case{256, fx::Trips::PerWave});
+}
+
+TEST(Wave64ExchangeSelfCheck, SingleGuestWave) {
+    expect_exchange_matches_exact(fx::Case{64, fx::Trips::Constant3});
+}
+
+TEST(Wave64ExchangeSelfCheck, BarrierInsideTheLoop) {
+    fx::Case c{128, fx::Trips::Constant3};
+    c.barrier_in_loop = true;
+    expect_exchange_matches_exact(c);
+}
+
+TEST(Wave64ExchangeSelfCheck, HighLaneAndSgprSelector) {
+    fx::Case c{128, fx::Trips::Constant3};
+    c.lane = 40;
+    for (bool sgpr : {false, true}) {
+        c.sgpr_lane = sgpr;
+        expect_exchange_matches_exact(c);
+    }
+}
