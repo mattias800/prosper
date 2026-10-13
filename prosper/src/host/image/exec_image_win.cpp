@@ -19,6 +19,7 @@
 
 #include "host/image/exec_image.hpp"
 #include "host/image/module_start_params.hpp"
+#include "host/image/guest_executable.hpp"
 #include "host/image/runtime_module_load.hpp"
 #include "host/image/stub_append_batch.hpp"
 #include "host/image/win_data_watch.hpp"
@@ -1648,12 +1649,7 @@ BootResult run_entry(const LoadedImage& img) {
     trace_guest_thread_lifecycle(true, (uint64_t)pthread_self(), cur_tid(), stk, STK);
 
     uint64_t top = ((uint64_t)(uintptr_t)stk + STK) & ~(uint64_t)0xf;
-    std::vector<std::string> args = { "/app0/eboot.bin" };
-    if (const char* extra = getenv("PROSPER_GUEST_ARGS")) {
-        const char* p = extra;
-        while (*p) { while (*p == ' ') p++; if (!*p) break; const char* s = p;
-                     while (*p && *p != ' ') p++; args.emplace_back(s, (size_t)(p - s)); }
-    }
+    std::vector<std::string> args = guest_entry_arguments(getenv("PROSPER_GUEST_ARGS"));
     std::vector<uint64_t> argptrs;
     for (const auto& a : args) { size_t n = a.size() + 1; top -= n; memcpy((void*)(uintptr_t)top, a.c_str(), n); argptrs.push_back(top); }
     std::vector<uint64_t> envptrs;

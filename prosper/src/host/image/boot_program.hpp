@@ -188,10 +188,12 @@ inline void format_guest_module_label(char* buf, size_t n, uint64_t a) {
 // The loader's actual link set for a dump root (#2199). boot_program() calls this, so a second
 // consumer -- nid_census, whose cross-module exclusions are only sound over the set the loader
 // really links -- cannot drift from it. Prints auto-link and case-correction lines as it works.
-std::vector<LinkInput> boot_link_inputs(const std::string& dump_root, bool verbose = true);
+std::vector<LinkInput> boot_link_inputs(const std::string& dump_root, bool verbose = true,
+                                        const std::string& executable = "/app0/eboot.bin");
 
 bool boot_program(const std::string& dump_root, Program& out, std::string* err,
-                  const std::function<void()>& after_hle_registered = {});
+                  const std::function<void()>& after_hle_registered = {},
+                  const std::string& executable = "/app0/eboot.bin");
 
 // Resolve `want` to the real on-disk entry, correcting case-only mismatches component by component
 // (#1006). The PS5's filesystem namespace is case-insensitive (see the runtime basename compare in

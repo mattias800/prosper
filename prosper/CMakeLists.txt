@@ -2487,6 +2487,18 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_syssvc_usersvc
     SOURCES tests/hle/service/test_syssvc_usersvc.cpp
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_loadexec
+    SOURCES tests/hle/service/test_loadexec.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_process_replace
+    SOURCES tests/host/platform/test_process_replace.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_loadexec_options
+    SOURCES tests/host/platform/test_loadexec_frontend.cpp frontends/prosper-app/loadexec.cpp
+    INCLUDES tests frontends/prosper-app
+    LIBRARIES prosper_core)
 
   # Includes a shared fixture, which resolves from the `tests` root.
   prosper_add_gtest(test_translate_sandbox
@@ -7147,6 +7159,7 @@ if(PROSPER_APP AND TARGET SDL3::SDL3)
     endif()
 
     add_executable(prosper-app frontends/prosper-app/main.cpp frontends/prosper-app/library_ui.cpp
+                               frontends/prosper-app/loadexec.cpp
                                frontends/prosper-app/library_media.cpp
                                frontends/prosper-app/fps_overlay.cpp)
     prosper_hosts_a_guest(prosper-app)
