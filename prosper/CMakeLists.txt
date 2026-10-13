@@ -718,6 +718,9 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME compare_runs_logic
            COMMAND "${Python3_EXECUTABLE}"
                    -m pytest -q "${CMAKE_SOURCE_DIR}/tools/perf/test_compare_runs.py")
+  add_test(NAME rdna2_reference_logic
+           COMMAND "${Python3_EXECUTABLE}" -m pytest -q
+                   "${CMAKE_SOURCE_DIR}/tests/tools/test_rdna2_ref.py")
   add_test(NAME report_bundle_logic
            COMMAND "${Python3_EXECUTABLE}"
                    -m pytest -q "${CMAKE_SOURCE_DIR}/tools/report/test_read_bundle.py")
