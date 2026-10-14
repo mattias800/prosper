@@ -1488,7 +1488,7 @@ bool emit_cfg_state_machine(
     if (!analyze_wave32_dispatch_words(
             b, ins, initial, starts, successors, direct_descriptor_sregs, wave32_words,
             static_mask_keys, proven_saved_mask_pair_compare_pcs, saved_mask_pair_compare_sources,
-            native_b32_mask_scc_vote_pcs))
+            native_b32_mask_scc_vote_pcs, barrier_half_phase))
         return false;
 
     // Which Wave64 mask half each spill slot and reloaded SGPR holds (rdna2_mask_half_alias.hpp).
@@ -3203,6 +3203,9 @@ bool emit_cfg_state_machine(
         state.exec_narrowed = true; // state-machine joins may carry a narrowed EXEC edge
         if (track_active_vectors && dispatch != UINT32_MAX && entry_wave64_b64)
             restore_active_vector_words(halves_in.active_vectors.current, state);
+        if (wave32_words.tracks_active_data && dispatch != UINT32_MAX &&
+            entry_block < wave32_words.reachable.size() && wave32_words.reachable[entry_block])
+            restore_active_vector_words(wave32_words.active_data[entry_block].current, state);
         state.mubuf_pcrel_tables = initial.mubuf_pcrel_tables;
         state.smem_pcrel_tables = initial.smem_pcrel_tables;
         state.mtbuf_pcrel_tables = initial.mtbuf_pcrel_tables;

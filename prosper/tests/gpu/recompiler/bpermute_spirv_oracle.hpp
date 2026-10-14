@@ -42,7 +42,7 @@ struct Lane {
   std::map<uint32_t, Pointer> p;
   std::map<uint32_t, Memory> memory;
   size_t pc = 0, steps = 0;
-  uint32_t label = 0, from = 0;
+  uint32_t label = 0, from = 0, invocation_index = 0;
   bool done = false;
 };
 struct Interpreter {
@@ -75,6 +75,10 @@ struct Interpreter {
   // Fixture-supplied dispatch extent. Nonzero opts into exact (32,1,1) workgroups;
   // the module's own entrypoint LocalSize must agree before any builtin is supplied.
   uint32_t native32_workgroup_count = 0;
+  // Opt-in, store-only evaluation of one native32 subgroup in an actual Local64 workgroup.
+  // No shared memory, barriers, atomics or storage reads: the other subgroup cannot affect it.
+  bool native32_isolated_local64 = false;
+  uint32_t native32_subgroup_index = 0;
   std::map<uint32_t, std::vector<uint32_t>> local_sizes;
   std::set<uint32_t> specialized_local_sizes;
   std::vector<uint32_t> push_constants;
@@ -196,16 +200,17 @@ struct Interpreter {
     return it->second;
   }
   Value read(Lane &l, Pointer p) {
-    auto &m = memory(l, p.root);
-    const uint32_t n = size(p.type);
-    if (p.offset > m.words.size() || n > m.words.size() - p.offset)
-      fail("load out of bounds");
-    std::vector<uint32_t> v;
-    bool defined = true;
-    for (uint32_t i = 0; i < n; ++i) {
-      defined &= m.valid[p.offset + i];
-      v.push_back(m.words[p.offset + i]);
-    }
+      if (native32_isolated_local64 && shared.contains(p.root))
+          fail("isolated native32 storage read");
+      auto& m = memory(l, p.root);
+      const uint32_t n = size(p.type);
+      if (p.offset > m.words.size() || n > m.words.size() - p.offset) fail("load out of bounds");
+      std::vector<uint32_t> v;
+      bool defined = true;
+      for (uint32_t i = 0; i < n; ++i) {
+          defined &= m.valid[p.offset + i];
+          v.push_back(m.words[p.offset + i]);
+      }
     // A bounded OpLoad may produce an undefined value. Track it explicitly;
     // a known OpSelect can discard it, but it cannot steer control/indexing
     // or reach the live storage sink. Never invent a zero for poison.
@@ -214,6 +219,10 @@ struct Interpreter {
   void write(Lane &l, Pointer p, Value v) {
     if (p.type != v.type)
       fail("store type mismatch");
+    if (native32_isolated_local64 && shared.contains(p.root) &&
+        (p.root != storage || p.offset != native32_subgroup_index * 32 + l.invocation_index ||
+         v.words.size() != 1))
+        fail("isolated native32 cross-subgroup store");
     if (p.root == storage && !v.defined)
       fail("poison live storage write");
     if (readonly_storage.contains(p.root))
@@ -703,6 +712,25 @@ struct Interpreter {
       try {
           if (!error.empty()) fail(error);
           if (!count || count > 1024) fail("invalid invocation count");
+          if (native32_isolated_local64) {
+              const auto local = local_sizes.find(main);
+              if (native_subgroup_width != 32 || count != 32 || native32_workgroup_count ||
+                  native32_subgroup_index >= 2 || workgroup_x || local == local_sizes.end() ||
+                  local->second != std::vector<uint32_t>{64, 1, 1} ||
+                  specialized_local_sizes.contains(main) || buffers.size() != 1 ||
+                  !extra_writable_bindings.empty() || !supplied_push_constants.empty() ||
+                  !sampled_images.empty() ||
+                  std::any_of(builtins.begin(), builtins.end(),
+                              [](const auto& builtin) { return builtin.second == 25; }))
+                  fail("unproved isolated native32 Local64 instance");
+              for (const auto& g : globals)
+                  if (g.a.size() >= 3 && g.a[2] == 4) fail("isolated native32 shared storage");
+              for (const auto& i : ins)
+                  if (i.op == 224 || i.op == 225 || (i.op >= 227 && i.op <= 242))
+                      fail("isolated native32 barrier or atomic");
+          } else if (native32_subgroup_index) {
+              fail("missing isolated native32 opt-in");
+          }
           if (native_subgroup_width == 32) {
               if (count != 32) fail("unproved native32 instance");
               if (native32_workgroup_count) {
@@ -727,6 +755,7 @@ struct Interpreter {
           std::map<uint32_t, bool> seen_bindings;
           std::map<uint32_t, bool> seen_sampled_bindings;
           std::vector<Lane> lanes(count);
+          for (uint32_t lane = 0; lane < count; ++lane) lanes[lane].invocation_index = lane;
           for (const auto& g : globals) {
               const auto& a = g.a;
               if (a.size() < 3) fail("malformed global Variable");
@@ -835,15 +864,23 @@ struct Interpreter {
                       if (b->second == 26)
                           v = {workgroup_x, 0, 0};
                       else if (b->second == 28)
-                          v = {workgroup_x * (native_subgroup_width == 32 ? 32 : 64) + lane, 0, 0};
+                          v = {workgroup_x * (native_subgroup_width == 32 ? 32 : 64) +
+                                   (native32_isolated_local64 ? native32_subgroup_index * 32 : 0) +
+                                   lane,
+                               0, 0};
                       else if (b->second == 27)
-                          v = {lane, 0, 0};
+                          v = {(native32_isolated_local64 ? native32_subgroup_index * 32 : 0) +
+                                   lane,
+                               0, 0};
                       else if (b->second == 29)
-                          v = {lane};
+                          v = {(native32_isolated_local64 ? native32_subgroup_index * 32 : 0) +
+                               lane};
                       else if ((b->second == 40 || b->second == 41) &&
                                (native_subgroup_width == 32 || native_subgroup_width == 64) &&
                                count == native_subgroup_width)
-                          v = {b->second == 40 ? 0u : lane};
+                          v = {b->second == 40
+                                   ? (native32_isolated_local64 ? native32_subgroup_index : 0u)
+                                   : lane};
                       else
                           fail("unsupported builtin");
                       if (size(t) != v.size()) fail("Input shape mismatch");
