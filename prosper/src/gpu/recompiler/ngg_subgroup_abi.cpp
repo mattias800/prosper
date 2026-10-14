@@ -249,22 +249,21 @@ uint32_t ds_full_result_dwords(uint32_t opcode) {
 
 bool vop_rmw_destination(const Rdna2Inst& in) {
     // Operations that read their own destination: MAC/FMAC/DOT accumulators, lane writes, permlane
-    // (preserves out-of-row lanes), swaps, DPP (masked rows/banks keep the old value), SDWA with a
-    // partial destination, and VOP3 f16 results selecting the high half.
+    // (preserves out-of-row lanes), swaps, 16-bit results (the other half), DPP (masked rows/banks
+    // keep the old value), SDWA with a partial destination and VOP3 results selecting the high
+    // half (OPSEL[3]). The opcode facts are the effects table's; VOP3P is not tabulated yet.
     if (in.has_dpp) return true;
     if (in.has_sdwa && (in.sdwa_dst_sel != 6 || in.sdwa_dst_unused == 2)) return true;
-    const uint32_t vop2 = in.fmt == Rdna2Format::VOP2 ? in.opcode
-                          : in.fmt == Rdna2Format::VOP3 && in.opcode >= 0x100 && in.opcode < 0x140
-                              ? in.opcode - 0x100
-                              : UINT32_MAX;
-    if (vop2 == 0x02 || vop2 == 0x06 || vop2 == 0x0d || vop2 == 0x1f || vop2 == 0x2b ||
-        vop2 == 0x36 || vop2 == 0x37 || vop2 == 0x3c)
+    if (in.fmt == Rdna2Format::VOP3P) return false;
+    if (in.fmt == Rdna2Format::VOP3 && (in.vop3p_opsel & 0x8u)) return true;
+    const Rdna2InstructionEffects& effects = rdna2_instruction_effects(in);
+    if (!effects.describes_vector_result()) return true;   // fail closed: charge the read
+    if (effects.lane_flow == Rdna2LaneFlow::CrossLane || effects.lane_flow == Rdna2LaneFlow::Swap ||
+        effects.writes_src0)
         return true;
-    if (in.fmt == Rdna2Format::VOP3 &&
-        (in.opcode == 0x361 || in.opcode == 0x377 || in.opcode == 0x378 || (in.vop3p_opsel & 0x8u)))
-        return true;
-    if (in.fmt == Rdna2Format::VOP1 && (in.opcode == 0x65 || in.opcode == 0x68)) return true;
-    return false;
+    // A 16-bit result through the zero-filling SDWA DWORD + UNUSED_PAD form defines the word.
+    if (effects.vdst_half && !effects.accumulates && in.has_sdwa) return false;
+    return rdna2_valu_result_keeps_old_vdst(in.fmt, in.opcode) == Rdna2Answer::Yes;
 }
 
 // Number of VGPRs a vector source names, classified per form; 0 means "not classified", and the
@@ -352,13 +351,23 @@ uint32_t definite_vgpr_results(const Rdna2Inst& in) {
         case Rdna2Format::VOP3:
         case Rdna2Format::VOP3P:
             // Partial results: DPP (masked rows/banks keep the old value), SDWA sub-dword or
-            // preserving destinations, single-lane/permuted lane writes and f16 high-half results.
+            // preserving destinations, single-lane/permuted lane writes, M0-relative
+            // destinations and f16 high-half results. Every other VALU result writes all of VDST
+            // in each EXEC lane; the part an accumulator or a 16-bit result keeps is charged as a
+            // read by vop_rmw_destination, so the word is definite once that read is.
             if (in.has_dpp || (in.has_sdwa && (in.sdwa_dst_sel != 6 || in.sdwa_dst_unused == 2)) ||
-                (in.fmt == Rdna2Format::VOP3 && (in.opcode == 0x361 || in.opcode == 0x377 ||
-                                                 in.opcode == 0x378 || (in.vop3p_opsel & 0x8u))) ||
-                dynamic_vgpr_destination(in))
+                (in.fmt == Rdna2Format::VOP3 && (in.vop3p_opsel & 0x8u)))
                 return 0;
-            return rdna2_vgpr_write_count(in);
+            if (in.fmt == Rdna2Format::VOP3P) return rdna2_vgpr_write_count(in);
+            {
+                const Rdna2InstructionEffects& effects = rdna2_instruction_effects(in);
+                if (!effects.describes_vector_result()) return 0;
+                if (effects.lane_flow != Rdna2LaneFlow::LaneWise &&
+                    effects.lane_flow != Rdna2LaneFlow::LaneIndex &&
+                    effects.lane_flow != Rdna2LaneFlow::Swap)
+                    return 0;
+                return effects.vdst_dwords;
+            }
         case Rdna2Format::DS: return ds_full_result_dwords(in.opcode);
         case Rdna2Format::MUBUF:
             if (in.mubuf_lds || in.opcode > 0x0f || (in.opcode > 0x03 && in.opcode < 0x08))
@@ -513,10 +522,8 @@ Reads instruction_reads(const Rdna2Inst& in, bool wave32) {
                 add_vgpr(reads, in.src[k], std::max(1u, span));
             }
             // Implicit VCC: VOP2 cndmask and carry-in in every encoding that has no src2 (e32,
-            // SDWA, DPP), and v_div_fmas_f32/f64.
-            if ((in.fmt == Rdna2Format::VOP2 &&
-                 (in.opcode == 0x01 || (in.opcode >= 0x28 && in.opcode <= 0x2a))) ||
-                (in.fmt == Rdna2Format::VOP3 && (in.opcode == 0x16f || in.opcode == 0x170))) {
+            // SDWA, DPP), and v_div_fmas_f32/f64 (the effects table's implicit reads).
+            if (rdna2_instruction_effects(in).implicit_reads & kRdna2ImplicitVcc) {
                 reads.scalar.push_back({kVcc, 0xffffffffu});
                 reads.scalar.push_back({kVcc + 1, 0xffffffffu});
             }
@@ -739,8 +746,7 @@ NggSubgroupAbiFacts analyze_ngg_subgroup_abi(const std::vector<Rdna2Inst>& ins,
             return facts;
         }
         if (rdna2_escapes_decoded_effects(in) ||
-            (in.fmt == Rdna2Format::VOP1 && ((in.opcode >= 0x42 && in.opcode <= 0x44) ||
-                                             in.opcode == 0x48 || in.opcode == 0x68))) {
+            rdna2_instruction_effects(in).lane_flow == Rdna2LaneFlow::Relative) {
             refuse(facts, "ngg-abi-control-transfer", in.pc);
             return facts;
         }

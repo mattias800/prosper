@@ -19,18 +19,27 @@
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 
 #include "gpu/recompiler/indirect/rdna2_indirect_scalar_writes.hpp"
+#include "gpu/recompiler/rdna2_active_vector_words.hpp"
+#include "gpu/recompiler/rdna2_cfg_registers.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_dead_wave_masks.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_scalar_condition_marks.hpp"
+#include "gpu/recompiler/rdna2_recompile_shared.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include "gpu/recompiler/rdna2_vector_old_word.hpp"
+#include "gpu/recompiler/rdna2_vector_word_marks.hpp"
+#include "gpu/recompiler/rdna2_vgpr_word_definitions.hpp"
 
 #include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
+#include <map>
 #include <set>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -195,6 +204,420 @@ constexpr LlvmOpcode kLlvmSopp[] = {
     {0x28, "s_ttracedata_imm"},
 };
 
+// The VALU opcode spaces: the UNION of llvm-mc -mcpu=gfx1030 and -mcpu=gfx1013 (PS5 code uses
+// gfx10.1-era encodings ISA 70648 dropped; see the table's comment), VOP3 without its VOPC band.
+// Each encoding was disassembled with SGPR sources and again with no operands, so an instruction
+// with no operands (v_nop, v_pipeflush, v_clrexcp) is named, not mistaken for a reserved slot.
+// Where the two targets name one opcode differently (VOP2/VOP3 0x06, VOP3 0x140), gfx1030's name.
+constexpr LlvmOpcode kLlvmVop2[] = {
+    {0x001, "v_cndmask_b32"},    {0x002, "v_dot2c_f32_f16"},    {0x003, "v_add_f32"},
+    {0x004, "v_sub_f32"},        {0x005, "v_subrev_f32"},       {0x006, "v_fmac_legacy_f32"},
+    {0x007, "v_mul_legacy_f32"}, {0x008, "v_mul_f32"},          {0x009, "v_mul_i32_i24"},
+    {0x00a, "v_mul_hi_i32_i24"}, {0x00b, "v_mul_u32_u24"},      {0x00c, "v_mul_hi_u32_u24"},
+    {0x00d, "v_dot4c_i32_i8"},   {0x00f, "v_min_f32"},          {0x010, "v_max_f32"},
+    {0x011, "v_min_i32"},        {0x012, "v_max_i32"},          {0x013, "v_min_u32"},
+    {0x014, "v_max_u32"},        {0x016, "v_lshrrev_b32"},      {0x018, "v_ashrrev_i32"},
+    {0x01a, "v_lshlrev_b32"},    {0x01b, "v_and_b32"},          {0x01c, "v_or_b32"},
+    {0x01d, "v_xor_b32"},        {0x01e, "v_xnor_b32"},         {0x01f, "v_mac_f32"},
+    {0x020, "v_madmk_f32"},      {0x021, "v_madak_f32"},        {0x025, "v_add_nc_u32"},
+    {0x026, "v_sub_nc_u32"},     {0x027, "v_subrev_nc_u32"},    {0x028, "v_add_co_ci_u32"},
+    {0x029, "v_sub_co_ci_u32"},  {0x02a, "v_subrev_co_ci_u32"}, {0x02b, "v_fmac_f32"},
+    {0x02c, "v_fmamk_f32"},      {0x02d, "v_fmaak_f32"},        {0x02f, "v_cvt_pkrtz_f16_f32"},
+    {0x032, "v_add_f16"},        {0x033, "v_sub_f16"},          {0x034, "v_subrev_f16"},
+    {0x035, "v_mul_f16"},        {0x036, "v_fmac_f16"},         {0x037, "v_fmamk_f16"},
+    {0x038, "v_fmaak_f16"},      {0x039, "v_max_f16"},          {0x03a, "v_min_f16"},
+    {0x03b, "v_ldexp_f16"},      {0x03c, "v_pk_fmac_f16"},
+};
+constexpr LlvmOpcode kLlvmVop1[] = {
+    {0x000, "v_nop"},
+    {0x001, "v_mov_b32"},
+    {0x002, "v_readfirstlane_b32"},
+    {0x003, "v_cvt_i32_f64"},
+    {0x004, "v_cvt_f64_i32"},
+    {0x005, "v_cvt_f32_i32"},
+    {0x006, "v_cvt_f32_u32"},
+    {0x007, "v_cvt_u32_f32"},
+    {0x008, "v_cvt_i32_f32"},
+    {0x00a, "v_cvt_f16_f32"},
+    {0x00b, "v_cvt_f32_f16"},
+    {0x00c, "v_cvt_rpi_i32_f32"},
+    {0x00d, "v_cvt_flr_i32_f32"},
+    {0x00e, "v_cvt_off_f32_i4"},
+    {0x00f, "v_cvt_f32_f64"},
+    {0x010, "v_cvt_f64_f32"},
+    {0x011, "v_cvt_f32_ubyte0"},
+    {0x012, "v_cvt_f32_ubyte1"},
+    {0x013, "v_cvt_f32_ubyte2"},
+    {0x014, "v_cvt_f32_ubyte3"},
+    {0x015, "v_cvt_u32_f64"},
+    {0x016, "v_cvt_f64_u32"},
+    {0x017, "v_trunc_f64"},
+    {0x018, "v_ceil_f64"},
+    {0x019, "v_rndne_f64"},
+    {0x01a, "v_floor_f64"},
+    {0x01b, "v_pipeflush"},
+    {0x020, "v_fract_f32"},
+    {0x021, "v_trunc_f32"},
+    {0x022, "v_ceil_f32"},
+    {0x023, "v_rndne_f32"},
+    {0x024, "v_floor_f32"},
+    {0x025, "v_exp_f32"},
+    {0x027, "v_log_f32"},
+    {0x02a, "v_rcp_f32"},
+    {0x02b, "v_rcp_iflag_f32"},
+    {0x02e, "v_rsq_f32"},
+    {0x02f, "v_rcp_f64"},
+    {0x031, "v_rsq_f64"},
+    {0x033, "v_sqrt_f32"},
+    {0x034, "v_sqrt_f64"},
+    {0x035, "v_sin_f32"},
+    {0x036, "v_cos_f32"},
+    {0x037, "v_not_b32"},
+    {0x038, "v_bfrev_b32"},
+    {0x039, "v_ffbh_u32"},
+    {0x03a, "v_ffbl_b32"},
+    {0x03b, "v_ffbh_i32"},
+    {0x03c, "v_frexp_exp_i32_f64"},
+    {0x03d, "v_frexp_mant_f64"},
+    {0x03e, "v_fract_f64"},
+    {0x03f, "v_frexp_exp_i32_f32"},
+    {0x040, "v_frexp_mant_f32"},
+    {0x041, "v_clrexcp"},
+    {0x042, "v_movreld_b32"},
+    {0x043, "v_movrels_b32"},
+    {0x044, "v_movrelsd_b32"},
+    {0x048, "v_movrelsd_2_b32"},
+    {0x050, "v_cvt_f16_u16"},
+    {0x051, "v_cvt_f16_i16"},
+    {0x052, "v_cvt_u16_f16"},
+    {0x053, "v_cvt_i16_f16"},
+    {0x054, "v_rcp_f16"},
+    {0x055, "v_sqrt_f16"},
+    {0x056, "v_rsq_f16"},
+    {0x057, "v_log_f16"},
+    {0x058, "v_exp_f16"},
+    {0x059, "v_frexp_mant_f16"},
+    {0x05a, "v_frexp_exp_i16_f16"},
+    {0x05b, "v_floor_f16"},
+    {0x05c, "v_ceil_f16"},
+    {0x05d, "v_trunc_f16"},
+    {0x05e, "v_rndne_f16"},
+    {0x05f, "v_fract_f16"},
+    {0x060, "v_sin_f16"},
+    {0x061, "v_cos_f16"},
+    {0x062, "v_sat_pk_u8_i16"},
+    {0x063, "v_cvt_norm_i16_f16"},
+    {0x064, "v_cvt_norm_u16_f16"},
+    {0x065, "v_swap_b32"},
+    {0x068, "v_swaprel_b32"},
+};
+constexpr LlvmOpcode kLlvmVopc[] = {
+    {0x000, "v_cmp_f_f32"},     {0x001, "v_cmp_lt_f32"},     {0x002, "v_cmp_eq_f32"},
+    {0x003, "v_cmp_le_f32"},    {0x004, "v_cmp_gt_f32"},     {0x005, "v_cmp_lg_f32"},
+    {0x006, "v_cmp_ge_f32"},    {0x007, "v_cmp_o_f32"},      {0x008, "v_cmp_u_f32"},
+    {0x009, "v_cmp_nge_f32"},   {0x00a, "v_cmp_nlg_f32"},    {0x00b, "v_cmp_ngt_f32"},
+    {0x00c, "v_cmp_nle_f32"},   {0x00d, "v_cmp_neq_f32"},    {0x00e, "v_cmp_nlt_f32"},
+    {0x00f, "v_cmp_tru_f32"},   {0x010, "v_cmpx_f_f32"},     {0x011, "v_cmpx_lt_f32"},
+    {0x012, "v_cmpx_eq_f32"},   {0x013, "v_cmpx_le_f32"},    {0x014, "v_cmpx_gt_f32"},
+    {0x015, "v_cmpx_lg_f32"},   {0x016, "v_cmpx_ge_f32"},    {0x017, "v_cmpx_o_f32"},
+    {0x018, "v_cmpx_u_f32"},    {0x019, "v_cmpx_nge_f32"},   {0x01a, "v_cmpx_nlg_f32"},
+    {0x01b, "v_cmpx_ngt_f32"},  {0x01c, "v_cmpx_nle_f32"},   {0x01d, "v_cmpx_neq_f32"},
+    {0x01e, "v_cmpx_nlt_f32"},  {0x01f, "v_cmpx_tru_f32"},   {0x020, "v_cmp_f_f64"},
+    {0x021, "v_cmp_lt_f64"},    {0x022, "v_cmp_eq_f64"},     {0x023, "v_cmp_le_f64"},
+    {0x024, "v_cmp_gt_f64"},    {0x025, "v_cmp_lg_f64"},     {0x026, "v_cmp_ge_f64"},
+    {0x027, "v_cmp_o_f64"},     {0x028, "v_cmp_u_f64"},      {0x029, "v_cmp_nge_f64"},
+    {0x02a, "v_cmp_nlg_f64"},   {0x02b, "v_cmp_ngt_f64"},    {0x02c, "v_cmp_nle_f64"},
+    {0x02d, "v_cmp_neq_f64"},   {0x02e, "v_cmp_nlt_f64"},    {0x02f, "v_cmp_tru_f64"},
+    {0x030, "v_cmpx_f_f64"},    {0x031, "v_cmpx_lt_f64"},    {0x032, "v_cmpx_eq_f64"},
+    {0x033, "v_cmpx_le_f64"},   {0x034, "v_cmpx_gt_f64"},    {0x035, "v_cmpx_lg_f64"},
+    {0x036, "v_cmpx_ge_f64"},   {0x037, "v_cmpx_o_f64"},     {0x038, "v_cmpx_u_f64"},
+    {0x039, "v_cmpx_nge_f64"},  {0x03a, "v_cmpx_nlg_f64"},   {0x03b, "v_cmpx_ngt_f64"},
+    {0x03c, "v_cmpx_nle_f64"},  {0x03d, "v_cmpx_neq_f64"},   {0x03e, "v_cmpx_nlt_f64"},
+    {0x03f, "v_cmpx_tru_f64"},  {0x080, "v_cmp_f_i32"},      {0x081, "v_cmp_lt_i32"},
+    {0x082, "v_cmp_eq_i32"},    {0x083, "v_cmp_le_i32"},     {0x084, "v_cmp_gt_i32"},
+    {0x085, "v_cmp_ne_i32"},    {0x086, "v_cmp_ge_i32"},     {0x087, "v_cmp_t_i32"},
+    {0x088, "v_cmp_class_f32"}, {0x089, "v_cmp_lt_i16"},     {0x08a, "v_cmp_eq_i16"},
+    {0x08b, "v_cmp_le_i16"},    {0x08c, "v_cmp_gt_i16"},     {0x08d, "v_cmp_ne_i16"},
+    {0x08e, "v_cmp_ge_i16"},    {0x08f, "v_cmp_class_f16"},  {0x090, "v_cmpx_f_i32"},
+    {0x091, "v_cmpx_lt_i32"},   {0x092, "v_cmpx_eq_i32"},    {0x093, "v_cmpx_le_i32"},
+    {0x094, "v_cmpx_gt_i32"},   {0x095, "v_cmpx_ne_i32"},    {0x096, "v_cmpx_ge_i32"},
+    {0x097, "v_cmpx_t_i32"},    {0x098, "v_cmpx_class_f32"}, {0x099, "v_cmpx_lt_i16"},
+    {0x09a, "v_cmpx_eq_i16"},   {0x09b, "v_cmpx_le_i16"},    {0x09c, "v_cmpx_gt_i16"},
+    {0x09d, "v_cmpx_ne_i16"},   {0x09e, "v_cmpx_ge_i16"},    {0x09f, "v_cmpx_class_f16"},
+    {0x0a0, "v_cmp_f_i64"},     {0x0a1, "v_cmp_lt_i64"},     {0x0a2, "v_cmp_eq_i64"},
+    {0x0a3, "v_cmp_le_i64"},    {0x0a4, "v_cmp_gt_i64"},     {0x0a5, "v_cmp_ne_i64"},
+    {0x0a6, "v_cmp_ge_i64"},    {0x0a7, "v_cmp_t_i64"},      {0x0a8, "v_cmp_class_f64"},
+    {0x0a9, "v_cmp_lt_u16"},    {0x0aa, "v_cmp_eq_u16"},     {0x0ab, "v_cmp_le_u16"},
+    {0x0ac, "v_cmp_gt_u16"},    {0x0ad, "v_cmp_ne_u16"},     {0x0ae, "v_cmp_ge_u16"},
+    {0x0b0, "v_cmpx_f_i64"},    {0x0b1, "v_cmpx_lt_i64"},    {0x0b2, "v_cmpx_eq_i64"},
+    {0x0b3, "v_cmpx_le_i64"},   {0x0b4, "v_cmpx_gt_i64"},    {0x0b5, "v_cmpx_ne_i64"},
+    {0x0b6, "v_cmpx_ge_i64"},   {0x0b7, "v_cmpx_t_i64"},     {0x0b8, "v_cmpx_class_f64"},
+    {0x0b9, "v_cmpx_lt_u16"},   {0x0ba, "v_cmpx_eq_u16"},    {0x0bb, "v_cmpx_le_u16"},
+    {0x0bc, "v_cmpx_gt_u16"},   {0x0bd, "v_cmpx_ne_u16"},    {0x0be, "v_cmpx_ge_u16"},
+    {0x0c0, "v_cmp_f_u32"},     {0x0c1, "v_cmp_lt_u32"},     {0x0c2, "v_cmp_eq_u32"},
+    {0x0c3, "v_cmp_le_u32"},    {0x0c4, "v_cmp_gt_u32"},     {0x0c5, "v_cmp_ne_u32"},
+    {0x0c6, "v_cmp_ge_u32"},    {0x0c7, "v_cmp_t_u32"},      {0x0c8, "v_cmp_f_f16"},
+    {0x0c9, "v_cmp_lt_f16"},    {0x0ca, "v_cmp_eq_f16"},     {0x0cb, "v_cmp_le_f16"},
+    {0x0cc, "v_cmp_gt_f16"},    {0x0cd, "v_cmp_lg_f16"},     {0x0ce, "v_cmp_ge_f16"},
+    {0x0cf, "v_cmp_o_f16"},     {0x0d0, "v_cmpx_f_u32"},     {0x0d1, "v_cmpx_lt_u32"},
+    {0x0d2, "v_cmpx_eq_u32"},   {0x0d3, "v_cmpx_le_u32"},    {0x0d4, "v_cmpx_gt_u32"},
+    {0x0d5, "v_cmpx_ne_u32"},   {0x0d6, "v_cmpx_ge_u32"},    {0x0d7, "v_cmpx_t_u32"},
+    {0x0d8, "v_cmpx_f_f16"},    {0x0d9, "v_cmpx_lt_f16"},    {0x0da, "v_cmpx_eq_f16"},
+    {0x0db, "v_cmpx_le_f16"},   {0x0dc, "v_cmpx_gt_f16"},    {0x0dd, "v_cmpx_lg_f16"},
+    {0x0de, "v_cmpx_ge_f16"},   {0x0df, "v_cmpx_o_f16"},     {0x0e0, "v_cmp_f_u64"},
+    {0x0e1, "v_cmp_lt_u64"},    {0x0e2, "v_cmp_eq_u64"},     {0x0e3, "v_cmp_le_u64"},
+    {0x0e4, "v_cmp_gt_u64"},    {0x0e5, "v_cmp_ne_u64"},     {0x0e6, "v_cmp_ge_u64"},
+    {0x0e7, "v_cmp_t_u64"},     {0x0e8, "v_cmp_u_f16"},      {0x0e9, "v_cmp_nge_f16"},
+    {0x0ea, "v_cmp_nlg_f16"},   {0x0eb, "v_cmp_ngt_f16"},    {0x0ec, "v_cmp_nle_f16"},
+    {0x0ed, "v_cmp_neq_f16"},   {0x0ee, "v_cmp_nlt_f16"},    {0x0ef, "v_cmp_tru_f16"},
+    {0x0f0, "v_cmpx_f_u64"},    {0x0f1, "v_cmpx_lt_u64"},    {0x0f2, "v_cmpx_eq_u64"},
+    {0x0f3, "v_cmpx_le_u64"},   {0x0f4, "v_cmpx_gt_u64"},    {0x0f5, "v_cmpx_ne_u64"},
+    {0x0f6, "v_cmpx_ge_u64"},   {0x0f7, "v_cmpx_t_u64"},     {0x0f8, "v_cmpx_u_f16"},
+    {0x0f9, "v_cmpx_nge_f16"},  {0x0fa, "v_cmpx_nlg_f16"},   {0x0fb, "v_cmpx_ngt_f16"},
+    {0x0fc, "v_cmpx_nle_f16"},  {0x0fd, "v_cmpx_neq_f16"},   {0x0fe, "v_cmpx_nlt_f16"},
+    {0x0ff, "v_cmpx_tru_f16"},
+};
+constexpr LlvmOpcode kLlvmVop3[] = {
+    {0x101, "v_cndmask_b32"},
+    {0x103, "v_add_f32"},
+    {0x104, "v_sub_f32"},
+    {0x105, "v_subrev_f32"},
+    {0x106, "v_fmac_legacy_f32"},
+    {0x107, "v_mul_legacy_f32"},
+    {0x108, "v_mul_f32"},
+    {0x109, "v_mul_i32_i24"},
+    {0x10a, "v_mul_hi_i32_i24"},
+    {0x10b, "v_mul_u32_u24"},
+    {0x10c, "v_mul_hi_u32_u24"},
+    {0x10f, "v_min_f32"},
+    {0x110, "v_max_f32"},
+    {0x111, "v_min_i32"},
+    {0x112, "v_max_i32"},
+    {0x113, "v_min_u32"},
+    {0x114, "v_max_u32"},
+    {0x116, "v_lshrrev_b32"},
+    {0x118, "v_ashrrev_i32"},
+    {0x11a, "v_lshlrev_b32"},
+    {0x11b, "v_and_b32"},
+    {0x11c, "v_or_b32"},
+    {0x11d, "v_xor_b32"},
+    {0x11e, "v_xnor_b32"},
+    {0x11f, "v_mac_f32"},
+    {0x125, "v_add_nc_u32"},
+    {0x126, "v_sub_nc_u32"},
+    {0x127, "v_subrev_nc_u32"},
+    {0x128, "v_add_co_ci_u32"},
+    {0x129, "v_sub_co_ci_u32"},
+    {0x12a, "v_subrev_co_ci_u32"},
+    {0x12b, "v_fmac_f32"},
+    {0x12f, "v_cvt_pkrtz_f16_f32"},
+    {0x132, "v_add_f16"},
+    {0x133, "v_sub_f16"},
+    {0x134, "v_subrev_f16"},
+    {0x135, "v_mul_f16"},
+    {0x136, "v_fmac_f16"},
+    {0x139, "v_max_f16"},
+    {0x13a, "v_min_f16"},
+    {0x13b, "v_ldexp_f16"},
+    {0x140, "v_fma_legacy_f32"},
+    {0x141, "v_mad_f32"},
+    {0x142, "v_mad_i32_i24"},
+    {0x143, "v_mad_u32_u24"},
+    {0x144, "v_cubeid_f32"},
+    {0x145, "v_cubesc_f32"},
+    {0x146, "v_cubetc_f32"},
+    {0x147, "v_cubema_f32"},
+    {0x148, "v_bfe_u32"},
+    {0x149, "v_bfe_i32"},
+    {0x14a, "v_bfi_b32"},
+    {0x14b, "v_fma_f32"},
+    {0x14c, "v_fma_f64"},
+    {0x14d, "v_lerp_u8"},
+    {0x14e, "v_alignbit_b32"},
+    {0x14f, "v_alignbyte_b32"},
+    {0x150, "v_mullit_f32"},
+    {0x151, "v_min3_f32"},
+    {0x152, "v_min3_i32"},
+    {0x153, "v_min3_u32"},
+    {0x154, "v_max3_f32"},
+    {0x155, "v_max3_i32"},
+    {0x156, "v_max3_u32"},
+    {0x157, "v_med3_f32"},
+    {0x158, "v_med3_i32"},
+    {0x159, "v_med3_u32"},
+    {0x15a, "v_sad_u8"},
+    {0x15b, "v_sad_hi_u8"},
+    {0x15c, "v_sad_u16"},
+    {0x15d, "v_sad_u32"},
+    {0x15e, "v_cvt_pk_u8_f32"},
+    {0x15f, "v_div_fixup_f32"},
+    {0x160, "v_div_fixup_f64"},
+    {0x164, "v_add_f64"},
+    {0x165, "v_mul_f64"},
+    {0x166, "v_min_f64"},
+    {0x167, "v_max_f64"},
+    {0x168, "v_ldexp_f64"},
+    {0x169, "v_mul_lo_u32"},
+    {0x16a, "v_mul_hi_u32"},
+    {0x16b, "v_mul_lo_i32"},
+    {0x16c, "v_mul_hi_i32"},
+    {0x16d, "v_div_scale_f32"},
+    {0x16e, "v_div_scale_f64"},
+    {0x16f, "v_div_fmas_f32"},
+    {0x170, "v_div_fmas_f64"},
+    {0x171, "v_msad_u8"},
+    {0x172, "v_qsad_pk_u16_u8"},
+    {0x173, "v_mqsad_pk_u16_u8"},
+    {0x174, "v_trig_preop_f64"},
+    {0x175, "v_mqsad_u32_u8"},
+    {0x176, "v_mad_u64_u32"},
+    {0x177, "v_mad_i64_i32"},
+    {0x178, "v_xor3_b32"},
+    {0x180, "v_nop"},
+    {0x181, "v_mov_b32"},
+    {0x183, "v_cvt_i32_f64"},
+    {0x184, "v_cvt_f64_i32"},
+    {0x185, "v_cvt_f32_i32"},
+    {0x186, "v_cvt_f32_u32"},
+    {0x187, "v_cvt_u32_f32"},
+    {0x188, "v_cvt_i32_f32"},
+    {0x18a, "v_cvt_f16_f32"},
+    {0x18b, "v_cvt_f32_f16"},
+    {0x18c, "v_cvt_rpi_i32_f32"},
+    {0x18d, "v_cvt_flr_i32_f32"},
+    {0x18e, "v_cvt_off_f32_i4"},
+    {0x18f, "v_cvt_f32_f64"},
+    {0x190, "v_cvt_f64_f32"},
+    {0x191, "v_cvt_f32_ubyte0"},
+    {0x192, "v_cvt_f32_ubyte1"},
+    {0x193, "v_cvt_f32_ubyte2"},
+    {0x194, "v_cvt_f32_ubyte3"},
+    {0x195, "v_cvt_u32_f64"},
+    {0x196, "v_cvt_f64_u32"},
+    {0x197, "v_trunc_f64"},
+    {0x198, "v_ceil_f64"},
+    {0x199, "v_rndne_f64"},
+    {0x19a, "v_floor_f64"},
+    {0x19b, "v_pipeflush"},
+    {0x1a0, "v_fract_f32"},
+    {0x1a1, "v_trunc_f32"},
+    {0x1a2, "v_ceil_f32"},
+    {0x1a3, "v_rndne_f32"},
+    {0x1a4, "v_floor_f32"},
+    {0x1a5, "v_exp_f32"},
+    {0x1a7, "v_log_f32"},
+    {0x1aa, "v_rcp_f32"},
+    {0x1ab, "v_rcp_iflag_f32"},
+    {0x1ae, "v_rsq_f32"},
+    {0x1af, "v_rcp_f64"},
+    {0x1b1, "v_rsq_f64"},
+    {0x1b3, "v_sqrt_f32"},
+    {0x1b4, "v_sqrt_f64"},
+    {0x1b5, "v_sin_f32"},
+    {0x1b6, "v_cos_f32"},
+    {0x1b7, "v_not_b32"},
+    {0x1b8, "v_bfrev_b32"},
+    {0x1b9, "v_ffbh_u32"},
+    {0x1ba, "v_ffbl_b32"},
+    {0x1bb, "v_ffbh_i32"},
+    {0x1bc, "v_frexp_exp_i32_f64"},
+    {0x1bd, "v_frexp_mant_f64"},
+    {0x1be, "v_fract_f64"},
+    {0x1bf, "v_frexp_exp_i32_f32"},
+    {0x1c0, "v_frexp_mant_f32"},
+    {0x1c1, "v_clrexcp"},
+    {0x1c2, "v_movreld_b32"},
+    {0x1c3, "v_movrels_b32"},
+    {0x1c4, "v_movrelsd_b32"},
+    {0x1c8, "v_movrelsd_2_b32"},
+    {0x1d0, "v_cvt_f16_u16"},
+    {0x1d1, "v_cvt_f16_i16"},
+    {0x1d2, "v_cvt_u16_f16"},
+    {0x1d3, "v_cvt_i16_f16"},
+    {0x1d4, "v_rcp_f16"},
+    {0x1d5, "v_sqrt_f16"},
+    {0x1d6, "v_rsq_f16"},
+    {0x1d7, "v_log_f16"},
+    {0x1d8, "v_exp_f16"},
+    {0x1d9, "v_frexp_mant_f16"},
+    {0x1da, "v_frexp_exp_i16_f16"},
+    {0x1db, "v_floor_f16"},
+    {0x1dc, "v_ceil_f16"},
+    {0x1dd, "v_trunc_f16"},
+    {0x1de, "v_rndne_f16"},
+    {0x1df, "v_fract_f16"},
+    {0x1e0, "v_sin_f16"},
+    {0x1e1, "v_cos_f16"},
+    {0x1e2, "v_sat_pk_u8_i16"},
+    {0x1e3, "v_cvt_norm_i16_f16"},
+    {0x1e4, "v_cvt_norm_u16_f16"},
+    {0x200, "v_interp_p1_f32"},
+    {0x201, "v_interp_p2_f32"},
+    {0x202, "v_interp_mov_f32"},
+    {0x2ff, "v_lshlrev_b64"},
+    {0x300, "v_lshrrev_b64"},
+    {0x301, "v_ashrrev_i64"},
+    {0x303, "v_add_nc_u16"},
+    {0x304, "v_sub_nc_u16"},
+    {0x305, "v_mul_lo_u16"},
+    {0x307, "v_lshrrev_b16"},
+    {0x308, "v_ashrrev_i16"},
+    {0x309, "v_max_u16"},
+    {0x30a, "v_max_i16"},
+    {0x30b, "v_min_u16"},
+    {0x30c, "v_min_i16"},
+    {0x30d, "v_add_nc_i16"},
+    {0x30e, "v_sub_nc_i16"},
+    {0x30f, "v_add_co_u32"},
+    {0x310, "v_sub_co_u32"},
+    {0x311, "v_pack_b32_f16"},
+    {0x312, "v_cvt_pknorm_i16_f16"},
+    {0x313, "v_cvt_pknorm_u16_f16"},
+    {0x314, "v_lshlrev_b16"},
+    {0x319, "v_subrev_co_u32"},
+    {0x340, "v_mad_u16"},
+    {0x342, "v_interp_p1ll_f16"},
+    {0x343, "v_interp_p1lv_f16"},
+    {0x344, "v_perm_b32"},
+    {0x345, "v_xad_u32"},
+    {0x346, "v_lshl_add_u32"},
+    {0x347, "v_add_lshl_u32"},
+    {0x34b, "v_fma_f16"},
+    {0x351, "v_min3_f16"},
+    {0x352, "v_min3_i16"},
+    {0x353, "v_min3_u16"},
+    {0x354, "v_max3_f16"},
+    {0x355, "v_max3_i16"},
+    {0x356, "v_max3_u16"},
+    {0x357, "v_med3_f16"},
+    {0x358, "v_med3_i16"},
+    {0x359, "v_med3_u16"},
+    {0x35a, "v_interp_p2_f16"},
+    {0x35e, "v_mad_i16"},
+    {0x35f, "v_div_fixup_f16"},
+    {0x360, "v_readlane_b32"},
+    {0x361, "v_writelane_b32"},
+    {0x362, "v_ldexp_f32"},
+    {0x363, "v_bfm_b32"},
+    {0x364, "v_bcnt_u32_b32"},
+    {0x365, "v_mbcnt_lo_u32_b32"},
+    {0x366, "v_mbcnt_hi_u32_b32"},
+    {0x368, "v_cvt_pknorm_i16_f32"},
+    {0x369, "v_cvt_pknorm_u16_f32"},
+    {0x36a, "v_cvt_pk_u16_u32"},
+    {0x36b, "v_cvt_pk_i16_i32"},
+    {0x36d, "v_add3_u32"},
+    {0x36f, "v_lshl_or_b32"},
+    {0x371, "v_and_or_b32"},
+    {0x372, "v_or3_b32"},
+    {0x373, "v_mad_u32_u16"},
+    {0x375, "v_mad_i32_i16"},
+    {0x376, "v_sub_nc_i32"},
+    {0x377, "v_permlane16_b32"},
+    {0x378, "v_permlanex16_b32"},
+    {0x37f, "v_add_nc_i32"},
+};
+
 const char* fmt_name(Rdna2Format fmt) {
     switch (fmt) {
         case Rdna2Format::SOP2: return "SOP2";
@@ -256,6 +679,10 @@ std::vector<LlvmOpcode> llvm_set(Rdna2Format fmt) {
         case Rdna2Format::SOPK: return {std::begin(kLlvmSopk), std::end(kLlvmSopk)};
         case Rdna2Format::SOPC: return {std::begin(kLlvmSopc), std::end(kLlvmSopc)};
         case Rdna2Format::SOPP: return {std::begin(kLlvmSopp), std::end(kLlvmSopp)};
+        case Rdna2Format::VOP2: return {std::begin(kLlvmVop2), std::end(kLlvmVop2)};
+        case Rdna2Format::VOP1: return {std::begin(kLlvmVop1), std::end(kLlvmVop1)};
+        case Rdna2Format::VOPC: return {std::begin(kLlvmVopc), std::end(kLlvmVopc)};
+        case Rdna2Format::VOP3: return {std::begin(kLlvmVop3), std::end(kLlvmVop3)};
         default: return {};
     }
 }
@@ -315,13 +742,39 @@ TEST(Rdna2InstructionEffects, RowsAreUniqueAndWellFormed) {
             EXPECT_EQ(e.exec != Rdna2ExecEffect::None,
                       (e.implicit_writes & kRdna2ImplicitExec) != 0)
                 << e.name;
-        } else if (e.status == Rdna2EffectsStatus::SourcesOnly) {
+        } else if (e.status == Rdna2EffectsStatus::Valu) {
             EXPECT_NE(e.name, nullptr);
             EXPECT_TRUE(row.fmt == Rdna2Format::VOP1 || row.fmt == Rdna2Format::VOP2 ||
                         row.fmt == Rdna2Format::VOPC || row.fmt == Rdna2Format::VOP3);
-            // Nothing but the sources is described.
-            EXPECT_EQ(e.sdst_dwords, 0u);
-            EXPECT_EQ(e.implicit_reads | e.implicit_writes, 0u);
+            // The scalar-ALU fields are not described for a VALU row.
+            EXPECT_EQ(e.sdst_dwords, 0u) << e.name;
+            EXPECT_EQ(e.implicit_writes, 0u) << e.name;
+            EXPECT_EQ(e.scc_read, Rdna2SccRead::None) << e.name;
+            EXPECT_EQ(e.exec, Rdna2ExecEffect::None) << e.name;
+            EXPECT_EQ(
+                e.implicit_reads & ~(kRdna2ImplicitVcc | kRdna2ImplicitExec | kRdna2ImplicitM0), 0u)
+                << e.name;
+            // The vector-result fields state one fact each; these pairs must agree.
+            EXPECT_EQ(e.m0_relative != Rdna2M0Relative::None,
+                      e.lane_flow == Rdna2LaneFlow::Relative)
+                << e.name;
+            EXPECT_EQ((e.implicit_reads & kRdna2ImplicitM0) != 0,
+                      e.lane_flow == Rdna2LaneFlow::Relative ||
+                          e.lane_flow == Rdna2LaneFlow::Interpolate)
+                << e.name;
+            if (row.fmt == Rdna2Format::VOPC) {
+                EXPECT_EQ(e.lane_flow, Rdna2LaneFlow::LaneWise) << e.name;
+                EXPECT_EQ(e.vdst_dwords, 0u) << e.name << ": a compare writes a lane mask";
+            }
+            EXPECT_EQ(e.vdst_dwords == 0, row.fmt == Rdna2Format::VOPC ||
+                                              e.lane_flow == Rdna2LaneFlow::None ||
+                                              e.lane_flow == Rdna2LaneFlow::ReadLane)
+                << e.name;
+            if (e.accumulates) EXPECT_EQ(e.lane_flow, Rdna2LaneFlow::LaneWise) << e.name;
+            if (e.writes_src0)
+                EXPECT_TRUE(e.lane_flow == Rdna2LaneFlow::Swap ||
+                            e.lane_flow == Rdna2LaneFlow::Relative)
+                    << e.name;
         } else {
             EXPECT_EQ(e.status, Rdna2EffectsStatus::Reserved);
             EXPECT_EQ(e.name, nullptr);
@@ -332,14 +785,16 @@ TEST(Rdna2InstructionEffects, RowsAreUniqueAndWellFormed) {
 }
 
 TEST(Rdna2InstructionEffects, NamedOpcodesAreExactlyLlvmGfx1030) {
-    for (Rdna2Format fmt : kTabulated) {
+    for (Rdna2Format fmt : kEveryTabulated) {
         const std::vector<LlvmOpcode> llvm = llvm_set(fmt);
+        ASSERT_FALSE(llvm.empty()) << fmt_name(fmt);
         std::set<uint32_t> llvm_ops;
         for (const LlvmOpcode& entry : llvm) {
             llvm_ops.insert(entry.opcode);
             const Rdna2InstructionEffects& e = rdna2_instruction_effects(fmt, entry.opcode);
-            ASSERT_TRUE(e.known()) << fmt_name(fmt) << " op=0x" << std::hex << entry.opcode
-                                   << " is " << entry.name << " in llvm-mc";
+            ASSERT_TRUE(e.known() || e.describes_vector_result())
+                << fmt_name(fmt) << " op=0x" << std::hex << entry.opcode << " is " << entry.name
+                << " in llvm-mc";
             EXPECT_STREQ(e.name, entry.name)
                 << fmt_name(fmt) << " op=0x" << std::hex << entry.opcode;
         }
@@ -357,9 +812,9 @@ TEST(Rdna2InstructionEffects, UntabulatedLookupsAreUnknownNotNoEffect) {
     // VOP3 0x000-0x0FF decode as VOPC, so they are not VOP3 entries.
     EXPECT_EQ(rdna2_instruction_effects(Rdna2Format::VOP3, 0x50).status,
               Rdna2EffectsStatus::Unknown);
-    // A VALU entry describes its sources only: it is not "known" for the other questions.
-    EXPECT_EQ(rdna2_instruction_effects(Rdna2Format::VOP3, 0x16d).status,
-              Rdna2EffectsStatus::SourcesOnly);
+    // A VALU entry describes its sources and vector result: it is not "known" for the scalar
+    // questions (its SDST and implicit writes are not described).
+    EXPECT_EQ(rdna2_instruction_effects(Rdna2Format::VOP3, 0x16d).status, Rdna2EffectsStatus::Valu);
     EXPECT_FALSE(rdna2_instruction_effects(Rdna2Format::VOP3, 0x16d).known());
     EXPECT_EQ(rdna2_instruction_effects(Rdna2Format::Unknown, 0).status,
               Rdna2EffectsStatus::Unknown);
@@ -704,7 +1159,7 @@ TEST(Rdna2InstructionEffectsValu, PairSourcesFollowTheMnemonic) {
     };
     size_t rows = 0;
     for (const Rdna2InstructionEffectsRow& row : rdna2_instruction_effects_rows()) {
-        if (row.effects.status != Rdna2EffectsStatus::SourcesOnly) continue;
+        if (row.effects.status != Rdna2EffectsStatus::Valu) continue;
         ++rows;
         const std::string name = row.effects.name;
         bool any_pair = false;
@@ -771,4 +1226,241 @@ TEST(Rdna2InstructionEffectsRegression, ValuSourceWidthsComeFromTheIsaNotAnAllow
     // VOP1 e32 with an SGPR source: v_cvt_f32_f64 v4, s[2:3].
     const uint32_t cvt_e32[1] = {0x7E000000u | (4u << 17) | (0x0fu << 9) | 2u};
     EXPECT_EQ(scalar_alu_source_words(rdna2_decode_one(cvt_e32, 1), 0), 2u) << "v_cvt_f32_f64_e32";
+}
+
+// ---- VALU vector results -----------------------------------------------------------------------
+
+// ISA-side checks of the vector-result fields, each against a list or rule stated here
+// independently of the generator that wrote the rows (which read VDST's register class from
+// llvm-mc): the 16-bit results are the ISA 70648 rows whose pseudo-code assigns D.f16, D.f16_lo,
+// D.u16, D.i16 or D.u/i[15:0]; the pair results are the mnemonics whose first type (AMD names the
+// destination type first) is 64-bit; the accumulators are the rows whose pseudo-code reads D.
+TEST(Rdna2InstructionEffectsValu, VectorResultFactsMatchTheIsa) {
+    const std::set<std::string> half_results = {
+        "v_cvt_f16_f32",      "v_cvt_f16_u16", "v_cvt_f16_i16",    "v_cvt_u16_f16",
+        "v_cvt_i16_f16",      "v_rcp_f16",     "v_sqrt_f16",       "v_rsq_f16",
+        "v_log_f16",          "v_exp_f16",     "v_frexp_mant_f16", "v_frexp_exp_i16_f16",
+        "v_floor_f16",        "v_ceil_f16",    "v_trunc_f16",      "v_rndne_f16",
+        "v_fract_f16",        "v_sin_f16",     "v_cos_f16",        "v_cvt_norm_i16_f16",
+        "v_cvt_norm_u16_f16", "v_add_f16",     "v_sub_f16",        "v_subrev_f16",
+        "v_mul_f16",          "v_fmac_f16",    "v_fmamk_f16",      "v_fmaak_f16",
+        "v_max_f16",          "v_min_f16",     "v_ldexp_f16",      "v_add_nc_u16",
+        "v_sub_nc_u16",       "v_mul_lo_u16",  "v_lshrrev_b16",    "v_ashrrev_i16",
+        "v_max_u16",          "v_max_i16",     "v_min_u16",        "v_min_i16",
+        "v_add_nc_i16",       "v_sub_nc_i16",  "v_lshlrev_b16",    "v_mad_u16",
+        "v_fma_f16",          "v_min3_f16",    "v_min3_i16",       "v_min3_u16",
+        "v_max3_f16",         "v_max3_i16",    "v_max3_u16",       "v_med3_f16",
+        "v_med3_i16",         "v_med3_u16",    "v_interp_p2_f16",  "v_mad_i16",
+        "v_div_fixup_f16",
+    };
+    const std::set<std::string> accumulators = {
+        "v_mac_f32",     "v_fmac_f32",      "v_fmac_legacy_f32", "v_fmac_f16",
+        "v_pk_fmac_f16", "v_dot2c_f32_f16", "v_dot4c_i32_i8"};
+    const std::map<std::string, Rdna2LaneFlow> flows = {
+        {"v_nop", Rdna2LaneFlow::None},
+        {"v_pipeflush", Rdna2LaneFlow::None},
+        {"v_clrexcp", Rdna2LaneFlow::None},
+        {"v_readfirstlane_b32", Rdna2LaneFlow::ReadLane},
+        {"v_readlane_b32", Rdna2LaneFlow::ReadLane},
+        {"v_writelane_b32", Rdna2LaneFlow::WriteLane},
+        {"v_permlane16_b32", Rdna2LaneFlow::CrossLane},
+        {"v_permlanex16_b32", Rdna2LaneFlow::CrossLane},
+        {"v_mbcnt_lo_u32_b32", Rdna2LaneFlow::LaneIndex},
+        {"v_mbcnt_hi_u32_b32", Rdna2LaneFlow::LaneIndex},
+        {"v_swap_b32", Rdna2LaneFlow::Swap},
+        {"v_movreld_b32", Rdna2LaneFlow::Relative},
+        {"v_movrels_b32", Rdna2LaneFlow::Relative},
+        {"v_movrelsd_b32", Rdna2LaneFlow::Relative},
+        {"v_movrelsd_2_b32", Rdna2LaneFlow::Relative},
+        {"v_swaprel_b32", Rdna2LaneFlow::Relative},
+        {"v_interp_p1_f32", Rdna2LaneFlow::Interpolate},
+        {"v_interp_p2_f32", Rdna2LaneFlow::Interpolate},
+        {"v_interp_mov_f32", Rdna2LaneFlow::Interpolate},
+        {"v_interp_p1ll_f16", Rdna2LaneFlow::Interpolate},
+        {"v_interp_p1lv_f16", Rdna2LaneFlow::Interpolate},
+        {"v_interp_p2_f16", Rdna2LaneFlow::Interpolate},
+    };
+    // VDST is not a VGPR for these; for the rest the first type token names D's width, except
+    // the SAD forms whose packed or 128-bit results the mnemonic does not type.
+    const std::map<std::string, uint32_t> width_exceptions = {
+        {"v_readfirstlane_b32", 0u}, {"v_readlane_b32", 0u}, {"v_nop", 0u},
+        {"v_pipeflush", 0u},         {"v_clrexcp", 0u},      {"v_qsad_pk_u16_u8", 2u},
+        {"v_mqsad_pk_u16_u8", 2u},   {"v_mqsad_u32_u8", 4u},
+    };
+    const auto first_type_bits = [](const std::string& name) -> uint32_t {
+        size_t at = name.find('_');
+        while (at != std::string::npos) {
+            const size_t next = name.find('_', at + 1);
+            const std::string token =
+                name.substr(at + 1, next == std::string::npos ? std::string::npos : next - at - 1);
+            if (token.size() >= 2 && std::strchr("fuib", token[0]) &&
+                token.find_first_not_of("0123456789", 1) == std::string::npos)
+                return static_cast<uint32_t>(std::stoul(token.substr(1)));
+            at = next;
+        }
+        return 32;
+    };
+    size_t rows = 0, halves = 0, pairs = 0;
+    for (const Rdna2InstructionEffectsRow& row : rdna2_instruction_effects_rows()) {
+        const Rdna2InstructionEffects& e = row.effects;
+        if (!e.describes_vector_result()) continue;
+        ++rows;
+        const std::string name = e.name;
+        if (row.fmt == Rdna2Format::VOPC) continue;   // lane-mask results; pinned in RowsAre...
+        EXPECT_EQ(e.vdst_half, half_results.contains(name)) << name;
+        EXPECT_EQ(e.accumulates, accumulators.contains(name)) << name;
+        const auto flow = flows.find(name);
+        EXPECT_EQ(e.lane_flow, flow == flows.end() ? Rdna2LaneFlow::LaneWise : flow->second)
+            << name;
+        const auto width = width_exceptions.find(name);
+        const uint32_t expected = width != width_exceptions.end() ? width->second
+                                  : first_type_bits(name) == 64   ? 2u
+                                                                  : 1u;
+        EXPECT_EQ(e.vdst_dwords, expected) << name;
+        halves += e.vdst_half;
+        pairs += e.vdst_dwords == 2;
+    }
+    EXPECT_GT(rows, 550u);
+    EXPECT_EQ(halves, 86u);   // every encoding of every 16-bit result
+    EXPECT_GT(pairs, 30u);
+    // Implicit reads: VCC only where no SRC2 names the mask, M0 for the relative/interp forms,
+    // EXEC for v_readfirstlane (it reads the first ACTIVE lane).
+    EXPECT_EQ(rdna2_instruction_effects(Rdna2Format::VOP2, 0x01).implicit_reads, kRdna2ImplicitVcc);
+    EXPECT_EQ(rdna2_instruction_effects(Rdna2Format::VOP3, 0x101).implicit_reads, 0u)
+        << "v_cndmask_b32_e64 names its mask as SRC2";
+    EXPECT_EQ(rdna2_instruction_effects(Rdna2Format::VOP3, 0x16f).implicit_reads, kRdna2ImplicitVcc)
+        << "v_div_fmas_f32";
+    EXPECT_EQ(rdna2_instruction_effects(Rdna2Format::VOP1, 0x02).implicit_reads,
+              kRdna2ImplicitExec);
+    EXPECT_TRUE(rdna2_instruction_effects(Rdna2Format::VOP1, 0x65).writes_src0) << "v_swap_b32";
+}
+
+// The question helpers combine the opcode's facts with the encoding's modifiers.
+TEST(Rdna2InstructionEffectsValu, CompleteResultsHonourTheEncoding) {
+    Rdna2Inst add3 = decode(Rdna2Format::VOP3, kVop3OpcodeAdd3U32);
+    EXPECT_EQ(rdna2_valu_complete_result_dwords(add3), 1u);
+    EXPECT_EQ(rdna2_valu_lane_mapped(Rdna2Format::VOP3, kVop3OpcodeAdd3U32), Rdna2Answer::Yes);
+    // A 16-bit result defines its word only through SDWA DWORD + UNUSED_PAD.
+    Rdna2Inst add_f16 = decode(Rdna2Format::VOP2, 0x32);
+    EXPECT_EQ(rdna2_valu_complete_result_dwords(add_f16), 0u);
+    add_f16.has_sdwa = true;
+    add_f16.sdwa_dst_sel = 6;
+    add_f16.sdwa_dst_unused = 0;
+    EXPECT_EQ(rdna2_valu_complete_result_dwords(add_f16), 1u);
+    add_f16.sdwa_dst_unused = 2;
+    EXPECT_EQ(rdna2_valu_complete_result_dwords(add_f16), 0u) << "UNUSED_PRESERVE";
+    // DPP keeps masked rows/banks.
+    Rdna2Inst mov = decode(Rdna2Format::VOP1, 0x01);
+    EXPECT_EQ(rdna2_valu_complete_result_dwords(mov), 1u);
+    mov.has_dpp = true;
+    EXPECT_EQ(rdna2_valu_complete_result_dwords(mov), 0u);
+    // An accumulator's result is not one of its explicit operands alone.
+    EXPECT_EQ(rdna2_valu_complete_result_dwords(decode(Rdna2Format::VOP2, 0x2b)), 0u);
+    EXPECT_EQ(rdna2_valu_result_keeps_old_vdst(Rdna2Format::VOP2, 0x2b), Rdna2Answer::Yes);
+    // A reserved slot answers Unknown, and the complete-result count fails closed to 0.
+    EXPECT_EQ(rdna2_valu_lane_mapped(Rdna2Format::VOP3, 0x13c), Rdna2Answer::Unknown);
+    EXPECT_EQ(rdna2_valu_complete_result_dwords(decode(Rdna2Format::VOP3, 0x13c)), 0u);
+    EXPECT_EQ(rdna2_valu_lane_mapped(Rdna2Format::SOP2, 0), Rdna2Answer::Unknown);
+}
+
+// Each case below was answered wrongly by a private opcode list the table replaced (#5143,
+// #5146 step 4). The old answer is in the comment; every assertion fails against it.
+TEST(Rdna2InstructionEffectsRegression, ValuResultQuestionsComeFromTheTable) {
+    // v_add3_u32 and every other lane-wise VOP3-only operation: the active-word lists stopped at
+    // VOP3 0x300 with one hand-added exception (v_lshl_add_u32), so a genuine ADD3 address never
+    // became current DATA (#5143). Old: false.
+    EXPECT_TRUE(vector_write_completes_active_word(decode(Rdna2Format::VOP3, kVop3OpcodeAdd3U32)));
+    EXPECT_TRUE(vector_write_completes_active_word(decode(Rdna2Format::VOP3, 0x372)))
+        << "v_or3_b32";
+    EXPECT_TRUE(vector_write_completes_active_word(decode(Rdna2Format::VOP3, 0x36f)))
+        << "v_lshl_or_b32";
+    // v_frexp_mant_f32 sat inside a VOP1 "0x40-0x47" exclusion meant for v_movrel*. Old: false.
+    EXPECT_TRUE(vector_write_completes_active_word(decode(Rdna2Format::VOP1, 0x40)));
+    // M0-relative moves outside that range were counted lane-wise and complete. Old: true.
+    EXPECT_FALSE(vector_write_completes_active_word(decode(Rdna2Format::VOP1, 0x48)))
+        << "v_movrelsd_2_b32";
+    EXPECT_FALSE(vector_write_completes_active_word(decode(Rdna2Format::VOP1, 0x68)))
+        << "v_swaprel_b32";
+    EXPECT_FALSE(vector_write_completes_active_word(decode(Rdna2Format::VOP3, 0x1c3)))
+        << "v_movrels_b32_e64";
+    EXPECT_FALSE(vector_write_completes_active_word(decode(Rdna2Format::VOP3, 0x200)))
+        << "v_interp_p1_f32_e64 reads LDS";
+    // Accumulators and 16-bit results the old-word list did not name. Old: false.
+    for (const auto& [fmt, op, name] :
+         std::initializer_list<std::tuple<Rdna2Format, uint32_t, const char*>>{
+             {Rdna2Format::VOP2, 0x02, "v_dot2c_f32_f16"},
+             {Rdna2Format::VOP2, 0x06, "v_fmac_legacy_f32"},
+             {Rdna2Format::VOP2, 0x0d, "v_dot4c_i32_i8"},
+             {Rdna2Format::VOP2, 0x36, "v_fmac_f16"},
+             {Rdna2Format::VOP3, 0x106, "v_fmac_legacy_f32_e64"},
+             {Rdna2Format::VOP3, 0x136, "v_fmac_f16_e64"},
+             {Rdna2Format::VOP3, 0x132, "v_add_f16_e64"},
+             {Rdna2Format::VOP3, 0x18a, "v_cvt_f16_f32_e64"},
+             {Rdna2Format::VOP2, 0x3b, "v_ldexp_f16"},
+             {Rdna2Format::VOP3, 0x1c2, "v_movreld_b32_e64"},
+         })
+        EXPECT_TRUE(vector_write_depends_on_old_word(decode(fmt, op), true)) << name;
+    // VGPR destination widths: every F64 result is a pair; v_nop writes nothing. Old: 1.
+    EXPECT_EQ(rdna2_vgpr_write_count(decode(Rdna2Format::VOP3, 0x164)), 2u) << "v_add_f64";
+    EXPECT_EQ(rdna2_vgpr_write_count(decode(Rdna2Format::VOP1, 0x10)), 2u) << "v_cvt_f64_f32";
+    EXPECT_EQ(rdna2_vgpr_write_count(decode(Rdna2Format::VOP3, 0x301)), 2u) << "v_ashrrev_i64";
+    EXPECT_EQ(rdna2_vgpr_write_count(decode(Rdna2Format::VOP1, 0x00)), 0u) << "v_nop";
+    // Unchanged answers the table must keep.
+    EXPECT_EQ(rdna2_vgpr_write_count(decode(Rdna2Format::VOP3, 0x176)), 2u) << "v_mad_u64_u32";
+    EXPECT_EQ(rdna2_vgpr_write_count(decode(Rdna2Format::VOP1, 0x02)), 0u) << "v_readfirstlane";
+    EXPECT_TRUE(vector_write_depends_on_old_word(decode(Rdna2Format::VOP3, 0x361), true))
+        << "v_writelane_b32";
+    EXPECT_TRUE(vector_write_depends_on_old_word(decode(Rdna2Format::VOP3, 0x13c), true))
+        << "0x13c is not an architectural e64 form; it keeps the old word conservatively";
+    // Complete-word results the hand list omitted (old: 0), and an F64 result's pair.
+    EXPECT_EQ(ordinary_vgpr_complete_results(decode(Rdna2Format::VOP3, 0x11b)), 1u)
+        << "v_and_b32_e64";
+    EXPECT_EQ(ordinary_vgpr_complete_results(decode(Rdna2Format::VOP3, 0x16b)), 1u)
+        << "v_mul_lo_i32";
+    EXPECT_EQ(ordinary_vgpr_complete_results(decode(Rdna2Format::VOP3, 0x164)), 2u) << "v_add_f64";
+    EXPECT_EQ(ordinary_vgpr_complete_results(decode(Rdna2Format::VOP3, 0x11f)), 0u)
+        << "v_mac_f32_e64 reads the old VDST";
+    // Storage inventories: an M0-relative destination in any encoding may reach every VGPR above
+    // the encoded one, and a swap also writes SRC0. Old: only VOP1 v_movreld_b32; no SRC0 write.
+    const Rdna2Inst movreld_e64 = decode(Rdna2Format::VOP3, 0x1c2);
+    EXPECT_TRUE(dynamic_vgpr_destination(movreld_e64));
+    std::vector<int> written;
+    for_each_possible_vector_write(movreld_e64, 7, [&](int reg) { written.push_back(reg); });
+    EXPECT_EQ(written, (std::vector<int>{4, 5, 6, 7}));
+    const Rdna2Inst swap = decode(Rdna2Format::VOP1, 0x65);   // v_swap_b32 v4, v1
+    written.clear();
+    for_each_possible_vector_write(swap, 255, [&](int reg) { written.push_back(reg); });
+    EXPECT_EQ(written, (std::vector<int>{4, 1}));
+    EXPECT_TRUE(writes_vgpr(swap, 1));
+}
+
+// active_vector_sources_defined decides whether a VALU result is current DATA. Accumulators need
+// their old VDST in every encoding (old: only v_mac_f32; v_fmac_f32 was refused outright and the
+// v_dot*c / legacy / f16 forms were admitted without it), and implicit VCC comes from the table.
+TEST(Rdna2InstructionEffectsRegression, ActiveVectorSourcesFollowTheTable) {
+    ActiveVectorWords with_dst, without_dst;
+    for (int reg = 0; reg < 8; ++reg) {
+        with_dst.current.insert(reg);
+        if (reg != 4) without_dst.current.insert(reg);
+    }
+    std::set<int> relayed;
+    for (int reg = 0; reg < 8; ++reg) relayed.insert(reg);
+    const std::set<int> vcc = {106}, none;
+    const auto defined = [&](const ActiveVectorWords& state, Rdna2Format fmt, uint32_t op,
+                             const std::set<int>& masks) {
+        return active_vector_sources_defined(state, decode(fmt, op), relayed, masks, {}, {}, true);
+    };
+    EXPECT_TRUE(defined(with_dst, Rdna2Format::VOP3, kVop3OpcodeAdd3U32, none)) << "old: false";
+    EXPECT_TRUE(defined(with_dst, Rdna2Format::VOP2, 0x2b, none)) << "v_fmac_f32; old: false";
+    EXPECT_FALSE(defined(without_dst, Rdna2Format::VOP2, 0x2b, none)) << "v_fmac_f32";
+    EXPECT_FALSE(defined(without_dst, Rdna2Format::VOP2, 0x02, none)) << "v_dot2c; old: true";
+    EXPECT_FALSE(defined(without_dst, Rdna2Format::VOP3, 0x12b, none)) << "fmac_e64; old: true";
+    EXPECT_FALSE(defined(with_dst, Rdna2Format::VOP1, 0x48, none)) << "movrelsd_2; old: true";
+    EXPECT_FALSE(defined(with_dst, Rdna2Format::VOP3, 0x16f, none)) << "div_fmas; old: true";
+    EXPECT_TRUE(defined(with_dst, Rdna2Format::VOP3, 0x16f, vcc)) << "v_div_fmas_f32";
+    // Unchanged: v_mac_f32 needs its VDST; v_cndmask_b32 (VOP2) needs VCC.
+    EXPECT_FALSE(defined(without_dst, Rdna2Format::VOP2, 0x1f, none));
+    EXPECT_TRUE(defined(with_dst, Rdna2Format::VOP2, 0x1f, none));
+    EXPECT_FALSE(defined(with_dst, Rdna2Format::VOP2, 0x01, none));
+    EXPECT_TRUE(defined(with_dst, Rdna2Format::VOP2, 0x01, vcc));
 }

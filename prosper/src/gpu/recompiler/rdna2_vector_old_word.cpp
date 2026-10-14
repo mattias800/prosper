@@ -1,5 +1,6 @@
 #include "gpu/recompiler/rdna2_vector_old_word.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_instruction_effects.hpp"
 
 #include <cstdint>
 
@@ -96,30 +97,32 @@ bool vector_write_depends_on_old_word(const Rdna2Inst& in, bool full_exec) {
         return true;
     switch (in.fmt) {
         case Rdna2Format::VOP1:
-            return in.opcode == kVop1OpcodeMovreldB32 ||
-                   (!in.has_sdwa &&
-                    (in.opcode == 0x0a || (in.opcode >= 0x50 && in.opcode <= 0x53) ||
-                     vop1_is_f16_unary(in.opcode))) ||
-                   (in.sdwa_dst_sel != 6 &&
-                    (in.opcode == 1 || in.opcode == 7 || in.opcode == 8 || in.opcode == 0x0a ||
-                     (in.opcode >= 0x50 && in.opcode <= 0x53) || vop1_is_f16_unary(in.opcode)));
         case Rdna2Format::VOP2:
-            if (in.opcode == 0x1f || in.opcode == 0x2b || in.opcode == 0x3c) return true;
-            return (in.opcode == 1 && in.sdwa_dst_sel != 6) ||
-                   ((!in.has_sdwa || in.sdwa_dst_sel != 6) &&
-                    (in.opcode == 0x32 || in.opcode == 0x33 || in.opcode == 0x35 ||
-                     in.opcode == 0x39 || in.opcode == 0x3a));
+        case Rdna2Format::VOP3: {
+            // The opcode's own answer is the effects table's: an accumulator, a selected-lane or
+            // M0-relative destination, or a 16-bit result (which leaves the other half). An
+            // encoding the table does not describe -- 0x13c, which prosper lowers through its
+            // packed FMAC accumulator service although it is no architectural e64 form -- keeps
+            // the old word conservatively.
+            const Rdna2Answer keeps = rdna2_valu_result_keeps_old_vdst(in.fmt, in.opcode);
+            if (keeps == Rdna2Answer::Unknown) return true;
+            const Rdna2InstructionEffects& effects = rdna2_instruction_effects(in);
+            // Only SDWA DWORD + UNUSED_PAD (PRESERVE returned above) zero-fills a 16-bit result's
+            // other half; the plain and sub-dword forms keep it.
+            if (effects.vdst_half && !effects.accumulates)
+                return !(in.has_sdwa && in.sdwa_dst_sel == 6);
+            if (keeps == Rdna2Answer::Yes) return true;
+            // CONFIDENCE: HIGH -- the remaining sub-dword SDWA destinations are those whose
+            // prosper lowering inserts the selected field into the old word even under
+            // UNUSED_PAD: v_mov_b32 and v_cvt_u32/i32_f32 (VOP1) and v_cndmask_b32 (VOP2). This
+            // is a property of prosper's SDWA lowering, not of the instruction, so it stays here.
+            if (in.sdwa_dst_sel != 6)
+                return in.fmt == Rdna2Format::VOP1
+                           ? in.opcode == 1 || in.opcode == 7 || in.opcode == 8
+                           : in.fmt == Rdna2Format::VOP2 && in.opcode == 1;
+            return false;
+        }
         case Rdna2Format::VOP3P: return in.opcode == 0x21 || in.opcode == 0x22;
-        case Rdna2Format::VOP3:
-            // FMAC_F32 (0x12b) reads the old destination, as does MAC_F32 (0x11f). Prosper also
-            // lowers the decoder-admitted 0x13c through its packed FMAC accumulator service;
-            // this dependency does not establish that form as an architectural e64 encoding.
-            return in.opcode == 0x361 || in.opcode == 0x11f || in.opcode == 0x12b ||
-                   in.opcode == 0x13c ||
-                   (in.opcode >= 0x303 && in.opcode <= 0x30e && in.opcode != 0x306) ||
-                   in.opcode == 0x314 || in.opcode == 0x340 || in.opcode == 0x34b ||
-                   in.opcode == 0x351 || (in.opcode >= 0x352 && in.opcode <= 0x359) ||
-                   in.opcode == 0x35e;
         case Rdna2Format::MIMG:
             // The compute image-atomic service preserves VDST for out-of-bounds coordinates.
             // Keeping its old-word dependency is conservative for the native fragment service.

@@ -2733,6 +2733,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_flat_active_word.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_add3_active_word
+    SOURCES tests/gpu/recompiler/test_add3_active_word.cpp
+    INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_active_image_word_definedness
     SOURCES tests/gpu/recompiler/test_active_image_word_definedness.cpp
     INCLUDES tests
@@ -3558,6 +3562,7 @@ if(TARGET prosper_core)
   # (same pattern as test_workgroup_uniformity above).
   prosper_add_gtest(test_rdna2_closed_tail
     SOURCES tests/gpu/recompiler/test_rdna2_closed_tail.cpp src/gpu/recompiler/rdna2_decode.cpp
+            src/gpu/recompiler/rdna2_instruction_effects.cpp
     INCLUDES src)
 
   # SOP2 destination widths are decoder-only facts checked against LLVM's SOP2 classes.
@@ -3569,11 +3574,13 @@ if(TARGET prosper_core)
   # Mandatory-literal capture is a decoder-only fact: K/data must be captured, not just counted.
   prosper_add_gtest(test_rdna2_literal_capture
     SOURCES tests/gpu/recompiler/test_rdna2_literal_capture.cpp src/gpu/recompiler/rdna2_decode.cpp
+            src/gpu/recompiler/rdna2_instruction_effects.cpp
     INCLUDES src)
 
   # Memory-writer classification is a decoder-only predicate checked against the ISA tables.
   prosper_add_gtest(test_may_write_memory
     SOURCES tests/gpu/recompiler/test_may_write_memory.cpp src/gpu/recompiler/rdna2_decode.cpp
+            src/gpu/recompiler/rdna2_instruction_effects.cpp
     INCLUDES src)
 
   # Structural RDNA2->SPIR-V validation that does not require Vulkan runtime support.

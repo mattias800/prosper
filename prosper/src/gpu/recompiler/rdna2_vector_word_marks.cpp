@@ -3,6 +3,7 @@
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_vector_old_word.hpp"
 
@@ -22,17 +23,10 @@ namespace {
 // Accumulators (VOP2/VOP3 mac/fmac) qualify: they read the old destination, but only their own
 // lane's. SDWA field-select qualifies for the same reason. Memory result marks do not
 // authenticate their addresses; their dedicated source proofs must grant confinement.
+// The opcode half of the answer is the effects table's (#5143: this used to be "VOP3 below
+// 0x300", which left v_add3_u32 and every other VOP3-only lane-wise operation out).
 bool lane_mapped_vector_write(const Rdna2Inst& in) {
-    if (in.has_dpp) return false;
-    switch (in.fmt) {
-        case Rdna2Format::VOP1:
-            return in.opcode != 0x02 && in.opcode != kVop1OpcodeMovreldB32 &&
-                   !(in.opcode >= 0x40 && in.opcode <= 0x47);
-        case Rdna2Format::VOP2: return true;
-        case Rdna2Format::VOPC: return true;
-        case Rdna2Format::VOP3: return in.opcode < 0x300;
-        default: return false;
-    }
+    return !in.has_dpp && rdna2_valu_lane_mapped(in.fmt, in.opcode) == Rdna2Answer::Yes;
 }
 
 // True only for plain lane-mapped arithmetic without SDWA partial destinations: DPP and
@@ -58,8 +52,6 @@ bool complete_full_word_write(const Rdna2Inst& in) {
     // A DWORD SDWA destination still replaces all 32 bits, but an accumulator still needs its
     // old destination. Apply the shared old-word check below even for a full SDWA destination.
     if (!lane_wise_vector_op(in) || (in.has_sdwa && in.sdwa_dst_sel != 6)) return false;
-    if (in.fmt == Rdna2Format::VOP1 && (in.opcode == 0x02 || in.opcode == kVop1OpcodeMovreldB32))
-        return false;
     return !vector_write_depends_on_old_word(in, /*full_exec=*/true);
 }
 
@@ -167,8 +159,6 @@ bool relative_constant_offset(const SpirvCompute& b, uint32_t value, uint32_t& o
 
 bool vector_write_completes_active_word(const Rdna2Inst& in) {
     return complete_full_word_write(in) ||
-           (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x346 && !in.has_modifier && !in.has_dpp &&
-            !vector_write_depends_on_old_word(in, true)) ||
            (in.fmt == Rdna2Format::FLAT && in.opcode >= 0x08 && in.opcode <= 0x0f &&
             (in.flat_segment == 0 || in.flat_segment == 2) && !in.flat_lds &&
             in.src[0].kind == OperandKind::VGPR && in.src[0].value >= 0 && in.src[0].value < 255 &&

@@ -1,5 +1,6 @@
 // rdna2_decode.cpp — see rdna2_decode.hpp.
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_instruction_effects.hpp"
 
 #include <algorithm>
 #include <unordered_set>
@@ -170,17 +171,18 @@ uint32_t rdna2_vgpr_write_count(const Rdna2Inst& in) {
     if (in.dst.kind != OperandKind::VGPR) return 0;
     switch (in.fmt) {
         case Rdna2Format::VOP1:
-            return in.opcode == 0x02u ? 0u : 1u; // v_readfirstlane writes the decoded SGPR.
         case Rdna2Format::VOP2:
+        case Rdna2Format::VOP3: {
+            // The effects table's VDST width (ISA 70648 12.7-12.12, checked against the register
+            // class llvm-mc prints): a pair for every 64-bit result, four VGPRs for
+            // v_mqsad_u32_u8, none for v_readfirstlane/v_readlane (an SGPR) or v_nop. This used
+            // to list five pair writers and charge one VGPR to every other F64 result. An
+            // encoding the table does not describe keeps a conservative one-register clobber.
+            const Rdna2InstructionEffects& effects = rdna2_instruction_effects(in);
+            return effects.describes_vector_result() ? effects.vdst_dwords : 1u;
+        }
         case Rdna2Format::VOP3P:
             return 1;
-        case Rdna2Format::VOP3:
-            if (in.opcode == 0x360u) return 0; // v_readlane_b32 writes an SGPR.
-            // v_div_scale_f64, the two integer MAD64 forms, and the 64-bit reversed shifts write a
-            // consecutive VGPR pair.
-            return in.opcode == 0x16eu || in.opcode == 0x176u || in.opcode == 0x177u ||
-                   in.opcode == kVop3OpcodeLshlrevB64 ||
-                   in.opcode == kVop3OpcodeLshrrevB64 ? 2u : 1u;
         case Rdna2Format::DS:
             // Keep this aligned with the DS result opcodes admitted by the emitter. Other DS
             // encodings in that subset are stores or no-return atomics whose VDST field is a source.
