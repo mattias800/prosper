@@ -296,6 +296,72 @@ TiledVolumeTailLayout tiled_volume_tail_layout(uint32_t width, uint32_t height, 
                                                uint32_t bytes_per_texel, uint32_t tile_mode,
                                                uint32_t max_mip, uint32_t mip_level);
 
+// UNPROVEN general SW_64KB_S thick-3D chain derivation (issue #4842 R3 remainder).
+// Computes per-level allocation offsets plus shared-block tail coordinates for a whole
+// 3D mip chain, including chains whose level zero is NOT in the tail. CARVE-UNPROVEN
+// versus hardware: no measured bytes cover a non-tail thick chain, so this must not be
+// wired into image_base_level_view, the backend, or the recompiler, and must not merge
+// before a carve proves it. It exists beside tiled_volume_tail_layout so tests can pin
+// the derivation's internal consistency (round-trip, monotonic offsets, span) and its
+// agreement with the proven all-in-tail path, without admitting a single new view.
+// Derivation notes, all UNPROVEN beyond the all-in-tail proof. Checked 2026-10-12
+// against Mesa main src/amd/addrlib/src/gfx10/gfx10addrlib.cpp Gfx10Lib::
+// HwlComputeSurfaceInfoTiled (the data-surface walk), the GFX11 five-argument
+// IsInMipTail, and the GFX12 CalcMipInTail/CalcMipOffset pair:
+// - Tail dims follow AddrLib GetMipTailDim's thick branch (log2(64KiB) % 3 == 1 halves
+//   the width): tail = (block_w >> 1, block_h, block_d), at most 10 tail levels
+//   (GetMaxNumMipsInTail, identical formula).
+// - firstMipInTail scans L0 down for the first level the tail takes, matching GFX10's
+//   walk shape (dims + remaining-level count). One deliberate strictness beyond GFX10's
+//   walk as recovered: this also requires the level depth to fit the tail depth (GFX9
+//   gated depth per level; GFX10's five-argument predicate gates width/height/count
+//   only). The strict form fails SAFE: a chain AddrLib would tail-pack is predicted
+//   disjoint instead, and the carve comparison falsifies loudly rather than binding
+//   wrong bytes. The carve recipe on #4842 settles which form hardware takes.
+// - Tail origins reuse tiled_volume_tail_layout's alternating-bit mipOffset walk with
+//   (mip - firstMipInTail) in place of mip, scaled by the first tail level's depth:
+//   exactly GFX10's `m = maxMipsInTail - 1 - (i - firstMipInTail)`, same shuffle,
+//   coordZ 0, no X/Y swap at even blockSizeLog2. Verified, not derived, against the
+//   source (and cross-generationally against GFX12's identical restart indexing).
+// - Non-tail ordering is GFX10 data-surface order: the shared tail block first, then
+//   remaining levels smallest-first (largest last) -- GFX10's
+//   `for (i = firstMipInTail - 1; i >= 0; i--)` accumulating mipSize, not GFX9's
+//   largest-first. The per-level size is the padded macroblock count
+//   (sw64kb_s3_volume_bytes: ceil dims x 64 KiB blocks, identical to AddrLib's
+//   PowTwoAlign-to-block pitch/height/depth times bytes-per-texel).
+// - Depth slabs: AddrLib (Mesa 26.2.0 Addr2ComputeSurfaceInfo / ComputeSurfaceAddrFromCoord,
+//   run for the PS5's 16-pipe config) repeats the whole chain once per block-depth slab
+//   instead of laying levels out at full depth. For 128^3 at 1 B (block 64x32x32, four
+//   slabs): tail at 0, L1 at 0x10000, L0 at 0x30000 inside a 0xb0000-byte slab chain;
+//   L0 texel (0,0,32) is at 0xe0000 and (0,0,64) at 0x190000; total 0x2c0000. Chains no
+//   deeper than one block (every shape the earlier hand tests used) are one slab and
+//   identical to a flat layout. This is an AddrLib MODEL result, not hardware.
+// - OPEN: the tail is assumed to occupy exactly one 64 KiB block (AddrLib reserves
+//   blockSize * PowTwoAlign(firstTailDepth, blockSlices) / blockSlices, which is one
+//   block whenever the first tail depth fits the block depth -- guaranteed here by the
+//   strict depth gate above). A deeper first tail would shift every non-tail offset by
+//   whole blocks: an unmistakable signature at carve time, not a silent drift.
+// - Overflow or an unmodelled shape yields an empty vector / zero bytes, never a
+//   partial chain.
+struct TiledVolumeChainLevelUnproven {
+    size_t byte_offset = 0;
+    size_t level_bytes = 0;
+    uint32_t tail_x = 0, tail_y = 0;
+    uint32_t width = 0, height = 0, depth = 0;
+    // One chain copy per block-depth slab: byte_offset and level_bytes are within ONE copy, and
+    // texel (x, y, z) of a level lives at (z / block_depth) * slab_stride + byte_offset + ...
+    size_t slab_stride = 0;
+    size_t slab_count = 0;
+    bool in_tail = false;
+    bool supported = false;
+};
+std::vector<TiledVolumeChainLevelUnproven>
+tiled_volume_chain_layout_unproven(uint32_t width, uint32_t height, uint32_t depth,
+                                   uint32_t bytes_per_texel, uint32_t tile_mode, uint32_t max_mip);
+size_t tiled_volume_chain_bytes_unproven(uint32_t width, uint32_t height, uint32_t depth,
+                                         uint32_t bytes_per_texel, uint32_t tile_mode,
+                                         uint32_t max_mip);
+
 // Detile one tail-packed level through the coordinates above. `src` names the shared
 // block base; bytes outside this level are never read. Mirrors detile_surface_level's
 // contract for the volume case.
