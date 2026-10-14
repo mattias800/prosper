@@ -2666,6 +2666,9 @@ if(TARGET prosper_core)
             tests/gpu/capture/test_front_face_compile_inputs.cpp
     INCLUDES src tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_launch_vgprs
+    SOURCES tests/gpu/recompiler/test_launch_vgprs.cpp
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_fragment_scalar_vcc_pair
     SOURCES tests/gpu/recompiler/test_fragment_scalar_vcc_pair.cpp
     INCLUDES src tests

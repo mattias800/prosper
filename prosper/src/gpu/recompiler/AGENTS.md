@@ -45,6 +45,12 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   `s_cbranch_execz` guard around or inside the loop may be linearized (the `s_and_saveexec` form
   and UE4's `s_mov sN, exec … v_cmpx` form). A shape it does not prove is left to `emit_alu`,
   which refuses the branch under narrowed EXEC.
+- `rdna2_launch_vgprs` — the one inventory of VGPRs a wave starts with: pixel `SPI_PS_INPUT_ENA`/`ADDR`
+  fields and compute `TIDIG_COMP_CNT` thread ids, each word marked supplied, unsupplied (hardware
+  loads it, this backend has no value) or reserved. The fragment and compute shells bind exactly
+  the supplied words, so vector-word seeding treats only those as defined; `shader_inspect
+  --inputs` prints the same inventory. A new system-value binding changes this file and its shell
+  together.
 - `rdna2_smem_pointer_provenance` — the once-per-program SMEM pointer and raw-data provenance seed
   every compute and fragment shell runs before emission; it only fills `RegState` facts.
 - `rdna2_dead_wave_masks` — the liveness proof that lets the CFG emitter elide a 64-bit VCC mask
