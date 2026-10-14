@@ -764,4 +764,8 @@ const char* build_revision() {
     return ::prosper::embedded_build_revision();
 }
 
+const char* build_source_identity() {
+    return ::prosper::embedded_build_source_identity();
+}
+
 } // namespace prosper::perf

@@ -237,6 +237,12 @@ tuning one; leave it unset for normal use.
 - `--set-games-dir <path>` — record that directory for future launches, then exit. An empty path
   (`--set-games-dir ""`) clears the stored setting; a missing one is an error (exit 2).
 - `--list-games` — print the library as plain text and exit, with no window, no Vulkan and no guest.
+- `--report <dir>` — write one versioned bug-report bundle (`report.json`: tool, build revision +
+  source identity, host OS, title id, switches) and exit, with no window, no Vulkan and
+  no guest. Path-bearing switch values are replaced by `<redacted-path>`; this static report
+  does not carry complete reproduction configuration. A missing or empty directory is an error
+  (exit 2). Static slice of proposed ADR 0021; perf-alarm
+  summary, unimplemented NIDs, log tail and fault backtraces arrive as later sections.
 - **Exit status.** 0 clean; 1 `--frames N` not reached; 3 the guest faulted (entry thread ended with a
   fault, or on Windows a guest worker thread / host exception went unhandled and was reported with
   module+offset and a backtrace). 3 outranks 1, including on a startup failure after a fault. See

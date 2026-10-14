@@ -45,7 +45,8 @@
 #include "present_policy.hpp"           // bounded-acquire present classification (#1182), pure seam
 #include "window_controls.hpp"           // debounced app-window shortcuts, pure regression seam
 #include "game_path.hpp"                 // dropped/picked path -> app0 root + open action, pure seam
-#include "game_library.hpp"              // scan a games dir -> titles + metadata, pure seam
+#include "game_library.hpp"   // scan a games dir -> titles + metadata, pure seam
+#include "report_bundle.hpp"   // ADR 0021 --report bundle writer, pure seam
 #include "frame_grab_naming.hpp"         // one stamp + exclusively claimed F9 artifact names
 #include "frame_grab_match.hpp"          // completed producer and frame-boundary join for F9
 #include "shared/perf/performance_capture.hpp"        // bounded F8 pre/post performance artifact
@@ -120,6 +121,8 @@ static int g_volume_percent = kDefaultVolumePercent;   // set by --volume before
 #include <vector>
 #include <string>
 #include <optional>
+#include <utility>
+#include <system_error>
 #include <unordered_map>
 #include <algorithm>
 #include <cmath>
@@ -1786,6 +1789,7 @@ int main(int argc, char** argv) {
     bool setGamesDirSeen = false;
     bool listGames = false;
     bool showFps = false;   // --fps
+    std::string reportDir;   // --report <dir>: write one bug-report bundle and exit, no window
     // Whether to offer the host folder picker at startup (#1469); resolved by should_pick_at_startup.
     prosper::frontend::StartupPickInputs pick{};
     pick.bare_launch = (argc <= 1);
@@ -1840,25 +1844,29 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "prosper-app: failed to set PROSPER_CAPTURE_DIR\n");
                 return 2;
             }
-        }
-        else if (a == "--list-games") listGames = true;      // print the library and exit (headless)
-        else if (a == "--set-games-dir") {                   // persist and exit
+        } else if (a == "--list-games")
+            listGames = true;   // print the library and exit (headless)
+        else if (a == "--report") {
+            if (i + 1 >= argc || argv[i + 1][0] == '\0') {
+                std::fprintf(stderr, "prosper-app: --report requires a directory\n");
+                return 2;
+            }
+            reportDir = argv[++i];
+        } else if (a == "--set-games-dir") {   // persist and exit
             if (i + 1 >= argc) {
                 fprintf(stderr, "prosper-app: --set-games-dir requires a path (\"\" clears it)\n");
                 return 2;
             }
             setGamesDir = argv[++i];
             setGamesDirSeen = true;   // an empty value is meaningful here: it clears the setting
-        }
-        else if (a == "--present-mode") {
+        } else if (a == "--present-mode") {
             if (i + 1 >= argc ||
                 !prosper::frontend::parse_present_mode(argv[++i], requestedPresentMode)) {
                 fprintf(stderr, "prosper-app: --present-mode requires fifo, mailbox, or immediate\n");
                 return 2;
             }
             presentModeSeen = true;
-        }
-        else if (a == "--record") {
+        } else if (a == "--record") {
             if (i + 1 >= argc) {
                 fprintf(stderr, "prosper-app: --record requires a path\n");
                 return 2;
@@ -1867,8 +1875,7 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "prosper-app: failed to set PROSPER_PAD_RECORD\n");
                 return 2;
             }
-        }
-        else if (a == "--record-axis") {
+        } else if (a == "--record-axis") {
             if (i + 1 >= argc) {
                 fprintf(stderr, "prosper-app: --record-axis requires flip or pad-read\n");
                 return 2;
@@ -1882,8 +1889,7 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "prosper-app: failed to set PROSPER_PAD_RECORD_AXIS\n");
                 return 2;
             }
-        }
-        else if (a == "--hdr") {
+        } else if (a == "--hdr") {
             // Advertise an HDR-capable display to the guest (sceVideoOut capability + output
             // status). Default is SDR — the mode most users' displays and captures expect, and
             // the path where titles apply their own tonemapping. Presentation itself is
@@ -1893,8 +1899,7 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "prosper-app: failed to set PROSPER_HDR\n");
                 return 2;
             }
-        }
-        else if (a == "--display-mode" && i + 1 < argc) {
+        } else if (a == "--display-mode" && i + 1 < argc) {
             // Which display prosper tells the guest it is attached to (#3017). `legacy` (the
             // default, so this flag is never needed to keep today's behaviour) always advertises
             // 1920x1080 @ 59.94. `host` derives resolution and refresh from the real display.
@@ -1913,8 +1918,8 @@ int main(int argc, char** argv) {
                 return 2;
             }
             displayModeSeen = true;
-        }
-        else if (a[0] != '-' && dump.empty()) dump = a;                          // positional dump path
+        } else if (a[0] != '-' && dump.empty())
+            dump = a;   // positional dump path
     }
     pick.has_dump = !dump.empty();
     pick.test_pattern = testPattern;
@@ -1992,6 +1997,55 @@ int main(int argc, char** argv) {
         fprintf(stderr, "prosper-app: %zu title(s) in %zu folder(s)\n", games.size(),
                 dirs.available.size());
         return prosper::frontend::list_games_exit_code(dirs, games.size());
+    }
+
+    // --report <dir>: write one versioned bug-report bundle and exit, with no window, no
+    // Vulkan and no guest. Static slice (ADR 0021): identity of tool, build, host, title
+    // and switches. Perf-alarm summary, unimplemented NIDs, log tail and fault backtraces
+    // arrive as later sections under a bumped schema version. The bundle carries no paths,
+    // only the title id; path-bearing switch values are visibly redacted.
+    if (!reportDir.empty()) {
+        prosper::frontend::ReportBundle bundle;
+        bundle.build_revision = prosper::perf::build_revision();
+        bundle.build_source_identity = prosper::perf::build_source_identity();
+        bundle.os = prosper::frontend::report_host_os();
+        if (!dump.empty())
+            bundle.title_id = prosper::frontend::parse_param_title_id(
+                host_library_io().read_file(dump + "/sce_sys/param.json"));
+        if (!prosper::frontend::report_title_id(bundle.title_id)) {
+            std::fprintf(stderr, "prosper-app: report title identity is malformed\n");
+            return 2;
+        }
+        auto switches = prosper::frontend::collect_report_switches();
+        if (!switches) {
+            std::fprintf(stderr, "prosper-app: cannot collect readable report switches\n");
+            return 2;
+        }
+        bundle.switches = std::move(*switches);
+        std::error_code dir_ec;
+        std::filesystem::create_directories(reportDir, dir_ec);
+        if (dir_ec) {
+            std::fprintf(stderr, "prosper-app: cannot create report directory '%s': %s\n",
+                         reportDir.c_str(), dir_ec.message().c_str());
+            return 1;
+        }
+        const std::string path = reportDir + "/report.json";
+        FILE* out = std::fopen(path.c_str(), "wb");
+        if (!out) {
+            std::fprintf(stderr, "prosper-app: cannot open '%s': %s\n", path.c_str(),
+                         std::error_code(errno, std::generic_category()).message().c_str());
+            return 1;
+        }
+        const std::string line = prosper::frontend::report_bundle_json(bundle);
+        const bool written = std::fprintf(out, "%s\n", line.c_str()) >= 0;
+        const bool closed = std::fclose(out) == 0;
+        if (!written || !closed) {
+            std::fprintf(stderr, "prosper-app: cannot write '%s': %s\n", path.c_str(),
+                         std::error_code(errno, std::generic_category()).message().c_str());
+            return 1;
+        }
+        std::printf("prosper-app: report written -> %s\n", path.c_str());
+        return 0;
     }
 
     // Persisted host settings: savedata dir, present mode, display mode, volume. These apply ONLY
