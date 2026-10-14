@@ -3532,6 +3532,12 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_rdna2_predicate_tables.cpp
     LIBRARIES prosper_core)
 
+  # The shared instruction-effects table (#5146): every decodable scalar opcode has an entry, the
+  # named ones match llvm-mc gfx1030, and the old private lists' bugs stay fixed.
+  prosper_add_gtest(test_rdna2_instruction_effects
+    SOURCES tests/gpu/recompiler/test_rdna2_instruction_effects.cpp
+    LIBRARIES prosper_core)
+
   # Exhaustive per-family opcode/length sweep of the walker (words built from the encoding layout).
   prosper_add_gtest(test_rdna2_decode_sweep
     SOURCES tests/gpu/recompiler/test_rdna2_decode_sweep.cpp
