@@ -17,6 +17,51 @@ Use this document with:
   snapshot routes;
 - [`VERIFICATION.md`](../process/VERIFICATION.md) and `tools/snapshot/AGENTS.md` for merge verification.
 
+## 2026-10-11 rendering regression (#3984)
+
+The July rendering statement below is historical. On main `5ce2659ec5af`, both unchanged Evergate
+snapshot routes lose the background/world: title and gameplay each have zero qualifying structural
+frames. The same harness and routes at v0.2.4 (`642e8a4dd1f3`) pass title 9/9 and gameplay 8/8.
+The current failure is an admission regression, not a measured performance loss.
+
+Four retained compiler invocations cover two fragment programs (2032 and 2036 dwords) from the title
+and gameplay captures. Their recorded resource, launch, dispatch-selection and float arguments are
+unchanged in the private replay. At the exact parent `0a53e2a1f0b6`, all four produce Vulkan 1.3-valid
+modules; child `7d3d498d6456` (#4890) and current main refuse the saved-mask copy at PC1905. The
+original whole-program Bool-copy proof exists, but the selected PC-relative dispatch stream is a
+different initializer input and revokes it. This transition is recorded in
+[#3984](https://github.com/mattias800/prosper/issues/3984#issuecomment-6109411151).
+
+The repair binds the actual validated selection to the original proof and intersects original and
+selected demand, including authenticated closed raw tails. It transfers Bool-copy authority only.
+A dropped mask branch additionally needs a genuine saved-EXEC survivor generation, SCC0 polarity,
+the same generation at the final EXEC/export gate, and a terminal zero-EXEC tail with no enabled
+export channels. Stores, tail reentry, stale replacement and a path bypassing that gate cannot borrow
+the permit. Physical-word participation retains its existing expiry rules.
+
+Compiler admission and SPIR-V validation do not establish repaired title pictures. Paired title and
+gameplay images, actual draw/drop counts and the complete snapshot matrix remain required before
+claiming the rendering regression fixed.
+
+## Ruled out
+
+- **Pure shading plus a final kill gate proves the omitted early-out terminates:** falsified by the
+  current-main composition of the draft's own repair. A project-owned zero-survivor variant kept
+  its scalar counter at zero; the admitted 316-word Vulkan-valid module looped on `0 < 3`, with
+  `OpKill` reachable only after that loop. The private continuation now additionally requires a
+  dominating zero induction word, an invariant signed/unsigned LT bound and an unconditional unit
+  increment on every backedge path. Replaced, skipped, zero, nonunit and wrong-sign induction cannot
+  borrow this new permit. Established classifiers and emitter routes are unchanged. The bounded
+  killed control remains separate; no GPU execution of the nonterminating module occurred.
+- **A counted-loop prelude revoked this proof first:** falsified on the retained invocations. The
+  first revocation is the initial body initializer receiving the specialized stream; the next is its
+  counted postlude. No earlier recursive prelude emission caused the initial mismatch.
+- **The emitter's mask-branch classification proves semantic closure:** falsified by project-owned
+  synthetic programs. Missing or replaced survivors, opposite SCC polarity, ordinary numeric logical
+  operations, raw-tail reentry and skipped stores produced valid modules under the first diagnostic
+  draft. The private transfer therefore authenticates the narrower survivor/export and raw-tail
+  recipe; ordinary branch classification alone is insufficient.
+
 ## Executive status
 
 Evergate renders correctly at native resolution on both Windows and Linux. The title/menu is much

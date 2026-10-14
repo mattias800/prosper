@@ -5,6 +5,7 @@
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_complementary_exec_data.hpp"
 #include "gpu/recompiler/rdna2_saved_exec_data.hpp"
+#include "gpu/recompiler/rdna2_exec_spill_equality.hpp"
 
 #include <map>
 #include <set>
@@ -28,6 +29,7 @@ struct ActiveVectorWords {
     std::map<int, std::set<int>> masks;
     ComplementaryExecData complement;
     SavedExecDataEquality saved_exec;
+    ExecSpillEquality exec_spill;
     bool operator==(const ActiveVectorWords&) const = default;
 };
 

@@ -33,14 +33,14 @@ bool native_wave32_vote_launch(const SpirvCompute& b) {
 } // namespace
 Wave32DispatchWords::Wave32DispatchWords(std::size_t count)
     : masks(count), ambiguous(count), pairs(count), ambiguous_pairs(count), scalar_words(count),
-      marks(count), reachable(count, false), scalar_scc(count, false) {}
+      marks(count), active_data(count), reachable(count, false), scalar_scc(count, false) {}
 bool analyze_wave32_dispatch_words(
     SpirvCompute& b, const std::vector<Rdna2Inst>& ins, const RegState& initial,
     const std::vector<uint32_t>& starts, const std::vector<std::vector<uint32_t>>& successors,
     const std::set<int>& direct_descriptor_sregs, Wave32DispatchWords& words,
     std::set<int>& static_mask_keys, std::unordered_set<uint32_t>& proven_pair_compares,
     const std::function<std::array<int, 2>(const Rdna2Inst&)>& pair_compare_sources,
-    const std::unordered_set<uint32_t>& native_mask_scc_vote_pcs) {
+    const std::unordered_set<uint32_t>& native_mask_scc_vote_pcs, bool barrier_half_phase) {
     auto& b32_mask_in = words.masks;
     auto& b32_mask_ambiguous_in = words.ambiguous;
     auto& b64_mask_in = words.pairs;
@@ -52,6 +52,13 @@ bool analyze_wave32_dispatch_words(
     const int max_vgpr = shader_max_vgpr(ins);
     const bool track_words = (b.is_compute || b.is_fragment) && b.wave_size == 32;
     const bool complete_native_vote_launch = native_wave32_vote_launch(b);
+    // READFIRST outside an exact common-phase service remains an approximate scalar route.
+    // Decline only this new DATA recovery; no ordinary admission or old mask fact is changed.
+    const bool approximate_readfirst = std::any_of(ins.begin(), ins.end(), [](const auto& in) {
+        return in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02;
+    });
+    words.tracks_active_data =
+        tracks_wave32_active_data(b) && !barrier_half_phase && !approximate_readfirst;
     if (b.allow_b32_masks && !starts.empty()) {
         b32_mask_in.front().insert(initial.sreg_bool_b32.begin(), initial.sreg_bool_b32.end());
         for (const auto& mask : initial.sreg_bool) {
@@ -66,6 +73,16 @@ bool analyze_wave32_dispatch_words(
         if (initial.vcc) b32_mask_in.front().insert(106);
         if (track_words) {
             seed_native_logical_entry_marks(words.marks.front(), initial);
+            if (words.tracks_active_data)
+                for (int reg = 0; reg < 3; ++reg) {
+                    const auto input = initial.vreg.find(reg);
+                    // Only actual compute local-ID Inputs published by this shell, not a
+                    // register map's default storage or a guessed launch profile.
+                    if (input != initial.vreg.end() && b.localid_comp[reg] &&
+                        input->second == b.localid_comp[reg] &&
+                        !words.marks.front().relayed_vectors.contains(reg))
+                        words.active_data.front().current.insert(reg);
+                }
             for (const auto& value : initial.sreg) words.scalar_words.front().insert(value.first);
             for (const auto& value : initial.sreg_input)
                 words.scalar_words.front().insert(value.first);
@@ -105,6 +122,7 @@ bool analyze_wave32_dispatch_words(
             std::set<int> b64_ambiguous = b64_mask_ambiguous_in[block];
             auto scalar_words = words.scalar_words[block];
             auto marks = words.marks[block];
+            auto active_data = words.active_data[block];
             bool scalar_scc = words.scalar_scc[block];
             const uint32_t lo = starts[block];
             const uint32_t hi = block + 1 < starts.size() ? starts[block + 1] : UINT32_MAX;
@@ -115,6 +133,7 @@ bool analyze_wave32_dispatch_words(
                 std::set<int> source_words;
                 SpilledVectorSourceMarks source;
                 bool definite_scc = false;
+                bool genuine_active_sources = false;
                 if (track_words) {
                     source_words = scalar_words;
                     source_words.insert(masks.begin(), masks.end());
@@ -125,6 +144,20 @@ bool analyze_wave32_dispatch_words(
                     definite_scc = scalar_scc && !marks.relayed_words.contains(kRelayedScc);
                     source =
                         spilled_vector_source_marks(marks, in, {}, source_words, definite_scc, 32);
+                    if (words.tracks_active_data) {
+                        ActiveVectorWords view;
+                        view.current = active_data.current;
+                        auto numeric = scalar_words;
+                        for (int mask : masks) numeric.erase(mask);
+                        for (int mask : b64_masks) {
+                            numeric.erase(mask);
+                            numeric.erase(mask + 1);
+                        }
+                        for (int descriptor : direct_descriptor_sregs) numeric.erase(descriptor);
+                        genuine_active_sources = active_vector_sources_defined(
+                            view, in, marks.relayed_vectors, masks, numeric, marks.relayed_words,
+                            definite_scc);
+                    }
                     if (in.fmt == Rdna2Format::SOPP && (in.opcode == 4 || in.opcode == 5)) {
                         if (definite_scc)
                             words.scalar_scc_branches.insert(in.pc);
@@ -330,6 +363,11 @@ bool analyze_wave32_dispatch_words(
                     std::vector<int> vector_writes;
                     for_each_possible_vector_write(in, max_vgpr,
                                                    [&](int reg) { vector_writes.push_back(reg); });
+                    if (words.tracks_active_data) {
+                        const int mask_write = b32_write_reg >= 0 ? b32_write_reg : b64_write_reg;
+                        advance_wave32_active_data(active_data, in, scalar_writes, vector_writes,
+                                                   mask_write, genuine_active_sources);
+                    }
                     advance_defined_slots(marks, in, {}, source_words, scalar_writes, vector_writes,
                                           source, definite_scc, 32);
                     for (const auto& [base, width] : scalar_writes)
@@ -368,6 +406,7 @@ bool analyze_wave32_dispatch_words(
                 if (!b32_mask_reachable[successor]) {
                     words.scalar_words[successor] = scalar_words;
                     words.marks[successor] = marks;
+                    words.active_data[successor] = active_data;
                     words.scalar_scc[successor] = scalar_scc;
                     b32_mask_reachable[successor] = true;
                     b32_mask_in[successor] = masks;
@@ -402,10 +441,13 @@ bool analyze_wave32_dispatch_words(
                     auto joined_words = words.scalar_words[successor];
                     std::erase_if(joined_words,
                                   [&](int reg) { return !scalar_words.contains(reg); });
+                    auto joined_active = words.active_data[successor];
+                    meet_wave32_active_data(joined_active, active_data);
                     auto joined_marks = words.marks[successor];
                     meet_spilled_mask_halves(joined_marks, marks);
                     const bool joined_scc = words.scalar_scc[successor] && scalar_scc;
-                    if (joined_words != words.scalar_words[successor] ||
+                    if (joined_active != words.active_data[successor] ||
+                        joined_words != words.scalar_words[successor] ||
                         joined_marks != words.marks[successor] ||
                         joined_scc != words.scalar_scc[successor] ||
                         joined_masks != b32_mask_in[successor] ||
@@ -414,6 +456,7 @@ bool analyze_wave32_dispatch_words(
                         joined_b64_ambiguous != b64_mask_ambiguous_in[successor]) {
                         words.scalar_words[successor] = std::move(joined_words);
                         words.marks[successor] = std::move(joined_marks);
+                        words.active_data[successor] = std::move(joined_active);
                         words.scalar_scc[successor] = joined_scc;
                         b32_mask_in[successor] = std::move(joined_masks);
                         b32_mask_ambiguous_in[successor] = std::move(joined_ambiguous);

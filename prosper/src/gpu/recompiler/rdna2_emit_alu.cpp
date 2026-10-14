@@ -45,6 +45,7 @@
 #include "gpu/recompiler/rdna2_native_launch.hpp"
 #include "gpu/recompiler/rdna2_saved_mask_words.hpp"
 #include "gpu/recompiler/rdna2_mask_write.hpp"
+#include "gpu/recompiler/rdna2_partial_vcc_word.hpp"
 
 namespace prosper::gpu {
 
@@ -228,6 +229,7 @@ static bool instruction_reads_scc_as_scalar_data(const Rdna2Inst& in) {
 bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool allow_exec_update,
               const std::unordered_set<uint32_t>* safe_execz, bool allow_smem,
               const ShaderResourceTable* rt, bool allow_wave) {
+    rs.native_interpolation_publication = {};
     if (b.is_fragment && instruction_reads_scc_as_scalar_data(in))
         b.mark_fragment_wave_scalar_use(rs.scc);
     auto& vreg = rs.vreg; uint32_t& vcc = rs.vcc;
@@ -1456,6 +1458,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // A write of anything else ends this register's entry-M0 lifetime.
             rs.sreg_entry_m0.erase(in.dst.value);
             uint32_t a = val(in.src[0]); uint32_t& d = rs.sreg[in.dst.value];
+            const uint32_t partial_vcc = partial_vcc_word_predicate(b, rs, in, a);
             // An ordinary scalar-data write starts a new lifetime for this physical word.  Do not
             // let an earlier Wave32 mask save alias that new value in later mask-domain moves.
             // A numeric half starts a new physical generation. A complete VCC self-copy must
@@ -1464,19 +1467,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             retire_scalar_data_word_mask(rs, in.dst.value);
             switch (in.opcode) {
                 case 0x03: {                                // s_mov_b32
-                    d = a;
-                    // Descriptor provenance is part of the scalar value. Shader compilers commonly
-                    // load several V#s into separate SGPR ranges and copy the selected four words into
-                    // one reused SRSRC range before each MUBUF. Keeping that range's OLD tag makes all
-                    // subsequent buffer loads resolve to the first descriptor (DOLL scene VS: the four
-                    // transform rows became one row, degenerating every triangle).
-                    auto tag = rs.sreg_srt.find(in.src[0].value);
-                    if ((in.src[0].kind == OperandKind::SGPR ||
-                         (in.src[0].kind == OperandKind::Special && in.src[0].value >= 106 && in.src[0].value <= 123)) &&
-                        tag != rs.sreg_srt.end())
-                        rs.sreg_srt[in.dst.value] = tag->second;
-                    else
-                        rs.sreg_srt.erase(in.dst.value);
+                    publish_s_mov_b32_word(rs, in, a, partial_vcc);
                     break;
                 }
                 case 0x07:                                  // s_not_b32 changes the descriptor word
@@ -9367,6 +9358,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 rs.vreg[in.dst.value] = b.interp_read(in.vintrp_attr, in.vintrp_chan);
             }
             predicate_write(b, rs, in.dst.value, old);
+            record_native_interpolation_publication(b, rs, in);
             return true;
         }
         default: return false;   // not a VALU format

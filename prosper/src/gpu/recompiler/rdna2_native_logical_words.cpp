@@ -199,20 +199,20 @@ bool is_native_b64_logical(const SpirvCompute& b, const Rdna2Inst& in) {
            in.opcode <= 0x1d && (in.opcode & 1u) && in.dst.value >= 0 && in.dst.value <= 107;
 }
 
-void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rdna2Inst>& original,
-                                           const RegState* initial) {
+namespace {
+struct LogicalDataDemand {
+    std::set<uint32_t> logical_data, native_copies, fragment_copies, fragment_survivors;
+    std::set<uint32_t> fragment_saved_masks, ngg_copies;
+};
+
+LogicalDataDemand analyze_logical_data_demand(const SpirvCompute& b,
+                                              const std::vector<Rdna2Inst>& original,
+                                              const RegState* initial) {
     // Backward MAY liveness follows physical word generations. A later use after a definite
     // overwrite cannot certify an earlier Bool-only logical, and either branch/loop successor
     // can demand the current generation. The finite lattice has 128 bits per instruction.
     using Words = std::bitset<128>;
-    b.native_bool_only_vcc_copy_pcs.clear();
-    b.fragment_bool_only_vcc_copy_pcs.clear();
-    b.fragment_bool_only_saved_mask_pcs.clear();
-    b.ngg_bool_only_vcc_copy_pcs.clear();
-    b.native_vcc_copy_entry_domain = copy_entry_domain(b);
-    b.native_vcc_copy_entry_masks = copy_entry_masks(initial);
-    b.native_vcc_copy_entry_b32_masks =
-        initial ? initial->sreg_bool_b32 : std::unordered_set<int>{};
+    LogicalDataDemand result;
     const size_t count = original.size();
     std::map<uint32_t, size_t> at_pc;
     for (size_t i = 0; i < count; ++i) at_pc.emplace(original[i].pc, i);
@@ -483,17 +483,67 @@ void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rd
             for_each_scalar_write(original[i], [&](int root, uint32_t width) {
                 if (width == 2 && root >= 0 && root <= 104 && masks_after[i].test(root) &&
                     scalar_write_is_b64_mask(original[i], root))
-                    b.fragment_bool_only_saved_mask_pcs.insert(original[i].pc);
+                    result.fragment_saved_masks.insert(original[i].pc);
             });
+        const auto& in = original[i];
+        if (reachable[i] && fragment_copy_domain(b) && in.fmt == Rdna2Format::SOP2 &&
+            in.opcode == 0x15 && in.dst.kind == OperandKind::SGPR && in.dst.value >= 0 &&
+            in.dst.value <= 104 && in.src[0].kind == OperandKind::SGPR &&
+            in.src[0].value == in.dst.value && in.src[1].value == 106 &&
+            mask_source(masks_before[i], in.src[0], in) &&
+            mask_source(masks_before[i], in.src[1], in))
+            result.fragment_survivors.insert(in.pc);
         if (is_native_b64_logical(b, original[i]) && (after[i] & kills[i]).any())
-            b.native_logical_data_demand_pcs.insert(original[i].pc);
+            result.logical_data.insert(original[i].pc);
         else if (native_vcc_copy(b, original[i]) && relays[i] && !(after[i] & kills[i]).any())
-            b.native_bool_only_vcc_copy_pcs.insert(original[i].pc);
+            result.native_copies.insert(original[i].pc);
         else if (fragment_vcc_copy(b, original[i]) && relays[i] && !(after[i] & kills[i]).any())
-            b.fragment_bool_only_vcc_copy_pcs.insert(original[i].pc);
+            result.fragment_copies.insert(original[i].pc);
         else if (ngg_vcc_copy(b, original[i]) && relays[i] && !(after[i] & kills[i]).any())
-            b.ngg_bool_only_vcc_copy_pcs.insert(original[i].pc);
+            result.ngg_copies.insert(original[i].pc);
     }
+    return result;
+}
+}   // namespace
+
+void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rdna2Inst>& original,
+                                           const RegState* initial) {
+    b.native_bool_only_vcc_copy_pcs.clear();
+    b.fragment_bool_only_vcc_copy_pcs.clear();
+    b.fragment_bool_only_saved_mask_pcs.clear();
+    b.ngg_bool_only_vcc_copy_pcs.clear();
+    b.native_vcc_copy_entry_domain = copy_entry_domain(b);
+    b.native_vcc_copy_entry_masks = copy_entry_masks(initial);
+    b.native_vcc_copy_entry_b32_masks =
+        initial ? initial->sreg_bool_b32 : std::unordered_set<int>{};
+    const auto result = analyze_logical_data_demand(b, original, initial);
+    b.native_logical_data_demand_pcs.insert(result.logical_data.begin(), result.logical_data.end());
+    b.native_bool_only_vcc_copy_pcs = result.native_copies;
+    b.fragment_bool_only_vcc_copy_pcs = result.fragment_copies;
+    b.fragment_bool_only_saved_mask_pcs = result.fragment_saved_masks;
+    b.ngg_bool_only_vcc_copy_pcs = result.ngg_copies;
+}
+
+void retain_fragment_copy_demand_intersection(SpirvCompute& b,
+                                              const std::vector<Rdna2Inst>& selected,
+                                              const RegState* original_entry) {
+    if (!fragment_copy_domain(b) || !native_vcc_copy_entry_masks_match(b, original_entry)) {
+        b.fragment_bool_only_vcc_copy_pcs.clear();
+        return;
+    }
+    // Specialization removes setup, alternatives and some edges. Its current generation must
+    // remain Bool-only under BOTH CFGs: SETPC/unknown original effects observe every word,
+    // while the selected analysis also charges newly adjacent paths and removed DATA kills.
+    // This helper can only retire original PCs. It neither reseeds entry facts nor grants words.
+    const auto selected_demand = analyze_logical_data_demand(b, selected, original_entry);
+    std::erase_if(b.fragment_bool_only_vcc_copy_pcs,
+                  [&](uint32_t pc) { return !selected_demand.fragment_copies.contains(pc); });
+}
+
+std::set<uint32_t> fragment_survivor_mask_producers(const SpirvCompute& b,
+                                                    const std::vector<Rdna2Inst>& instructions,
+                                                    const RegState* entry) {
+    return analyze_logical_data_demand(b, instructions, entry).fragment_survivors;
 }
 
 void initialize_native_logical_uniform_entry_proof(SpirvCompute& b,
