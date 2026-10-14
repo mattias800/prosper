@@ -266,6 +266,13 @@ constexpr uint64_t kGpuDeviceTimeCoverageMinWaits = 100;
 constexpr uint64_t kRttColorlessPublicationsPerWindow = 1;
 constexpr uint32_t kRttColorlessPublicationSustainWindows = 1;
 
+// frame-flicker (#5152): CORRECTNESS class. Any presented frame inside a SUSTAINED alternation
+// episode -- the picture looks like the frame two back and not the frame before, in >= 6 of 8
+// consecutive distinct frames, for >= 1 s (frame_flicker.hpp holds those thresholds and why). The
+// sustain lives in the detector, so the rule needs no further window sustain, and a correctness
+// alarm has no sensitivity to scale: either the picture alternated for a second or it did not.
+constexpr uint64_t kFlickerSustainedFramesPerWindow = 1;
+
 // SUSTAIN: consecutive windows a rule's condition must hold before the engine reports it. A cost
 // that lasts one window is usually a load, and a steady-state alarm should not fire on it; a
 // correctness alarm fires on the first window.

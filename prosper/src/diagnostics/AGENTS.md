@@ -420,3 +420,22 @@ reporting the window minimized, hidden or occluded -- the gauge stays set across
 this it read a hidden window as a stall), and it needs two windows. A skipped or out-of-date present
 on a VISIBLE window deliberately does not count: that is a broken present path, which is exactly
 what the rule is for.
+
+**A picture that alternates** (#5152). `frame-flicker` fires when the PRESENTED picture alternates:
+each frame looks like the one two back and not the one before (`d2 <= 0.5 * d1`, `d1 >= 3` luma
+levels, mean |difference| over a 32x18 grid of cell mean luma), in >= 6 of 8 consecutive distinct
+frames, sustained >= 1 s. `perf/frame_flicker.{hpp,cpp}` is the detector (pure, with the thresholds
+and why) plus the process-wide feed; prosper-app signs every presented frame -- on the GPU present
+path from the `--fps` NEAREST sample grid it already copied to host memory under the fence the next
+present waits on anyway (so no new wait, PERF-P1), on the CPU paths from the published pixels.
+Repeats (`d1 < 0.25`) are not votes, so 30 fps content shown twice is compared frame to distinct frame.
+A pan (`d2 >= d1`), a fade, a cut (one spike) and a sub-second strobe stay quiet; each is a test arm in
+`tests/diagnostics/test_frame_flicker.cpp`. The line names `period=2`, the window's and the episode's
+flicker share, the episode's mean `d1`/`d2`, the guest flip it became sustained at, and `region=` --
+the grid cells that flickered in at least half the episode, as a screen box, which separates a broken
+3D layer from a broken UI. It is a CORRECTNESS-class rule (sustain is the detector's 1 s; the threshold
+knob does not scale it). NO DATA in a frontend that presents nothing (`tools/screenshot`, `boot_trace`)
+and under `PROSPER_NO_PERF_ALARMS=1`, which also returns the GPU present path to its `--fps`-only
+sample. The next instruments are burst captures (Shift+F9, `PROSPER_SNAP_AT_FLIPS=a-b`,
+`PROSPER_FLICKER_CAPTURE_DIR`) and `PROSPER_FLICKER_TRACE` for per-frame `d1`/`d2`;
+`tools/AGENTS.md` has them next to F9.

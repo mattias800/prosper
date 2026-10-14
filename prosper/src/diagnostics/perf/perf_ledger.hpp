@@ -169,6 +169,13 @@ enum class Counter : uint8_t {
     TextureDirectValidationBytesDiffer,
     TextureDirectValidationExpectedMissing,
     TextureDirectValidationIncompletePrefix,
+    // frame-flicker (#5152, frame_flicker.hpp): presented frames signed by a frontend that has a
+    // presenter, those compared against two predecessors, the ones that looked like the frame two
+    // back rather than the one before, and those inside a sustained (>= 1 s) alternation episode.
+    FlickerPresentedFrames,
+    FlickerComparedFrames,
+    FlickerFrames,
+    FlickerSustainedFrames,
     Count
 };
 
@@ -186,6 +193,15 @@ enum class Gauge : uint8_t {
     // Frontends without one (tools/screenshot, boot_trace) present nothing by design, so a window
     // with no presents there is not a stall (gpu-present-stalled).
     GpuPresentActive,
+    // frame-flicker's latest sustained episode (frame_flicker.hpp): mean d1/d2 over its flicker
+    // frames in thousandths of a luma level, its flicker share in thousandths, its length, its
+    // screen region (pack_flicker_region) and the guest flip it became sustained at.
+    FlickerEpisodeD1Milli,
+    FlickerEpisodeD2Milli,
+    FlickerEpisodeShareMilli,
+    FlickerEpisodeMs,
+    FlickerEpisodeRegion,
+    FlickerOnsetSourceFlip,
     Count
 };
 

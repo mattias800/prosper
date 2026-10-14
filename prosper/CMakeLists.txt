@@ -2646,6 +2646,11 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_frame_breakdown
     SOURCES tests/diagnostics/test_frame_breakdown.cpp
     LIBRARIES prosper_core)
+  # frame-flicker (#5152): the alternation detector over synthetic signature sequences (alternation
+  # fires; steady, pans, fades, cuts, 30-at-60 and sub-second strobes do not) and its rule.
+  prosper_add_gtest(test_frame_flicker
+    SOURCES tests/diagnostics/test_frame_flicker.cpp
+    LIBRARIES prosper_core)
   # The wording of the Wave64 host line and of a refusal line: a recompile refusal must not read
   # as a GPU limitation, and a narrow-subgroup device must be told what it will be missing.
   prosper_add_gtest(test_wave64_host_line
