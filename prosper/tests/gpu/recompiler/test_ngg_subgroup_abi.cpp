@@ -4,6 +4,7 @@
 // must be admitted with its real user-SGPR count and refused with one fewer.
 #include "gpu/recompiler/ngg_subgroup_abi.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/rdna2_local_vcc_data.hpp"
 #include "fixtures/test_data.h"
@@ -483,10 +484,16 @@ TEST(NggSubgroupAbi, Xor3ReadsThirtyTwoBitSources) {
 // as s0. Without a known user-data address s0 is not a launch value, so counting that phantom read
 // refused programs that never touch s0.
 TEST(NggSubgroupAbi, UnusedVop3SourceFieldsAreNotReads) {
-    EXPECT_EQ(vop3_architectural_source_count(0x181), 1u) << "VOP3-encoded VOP1";
-    EXPECT_EQ(vop3_architectural_source_count(0x125), 2u) << "VOP3-encoded VOP2";
-    EXPECT_EQ(vop3_architectural_source_count(0x101), 3u) << "cndmask reads its mask from SRC2";
-    EXPECT_EQ(vop3_architectural_source_count(0x14b), 3u) << "v_fma_f32";
+    EXPECT_EQ(rdna2_valu_source_count(Rdna2Format::VOP3, 0x181), 1u) << "VOP3-encoded VOP1";
+    EXPECT_EQ(rdna2_valu_source_count(Rdna2Format::VOP3, 0x125), 2u) << "VOP3-encoded VOP2";
+    EXPECT_EQ(rdna2_valu_source_count(Rdna2Format::VOP3, 0x101), 3u)
+        << "cndmask reads its mask from SRC2";
+    EXPECT_EQ(rdna2_valu_source_count(Rdna2Format::VOP3, 0x14b), 3u) << "v_fma_f32";
+    // The two-source VOP3-only forms the old opcode-band rule left at three (#5146 step 4).
+    EXPECT_EQ(rdna2_valu_source_count(Rdna2Format::VOP3, 0x376), 2u) << "v_sub_nc_i32";
+    EXPECT_EQ(rdna2_valu_source_count(Rdna2Format::VOP3, 0x164), 2u) << "v_add_f64";
+    EXPECT_EQ(rdna2_valu_source_count(Rdna2Format::VOP3, 0x11f), 3u)
+        << "v_mac_f32_e64 encodes its accumulator in SRC2";
     // v_mov_b32_e64 v10, v0: SRC1 and SRC2 are zero fields, i.e. s0.
     EXPECT_TRUE(analyze(program({0xd581000au, 0x00000100u})).ok());
     // v_add_nc_u32_e64 v10, v0, v1: SRC2 is a zero field.

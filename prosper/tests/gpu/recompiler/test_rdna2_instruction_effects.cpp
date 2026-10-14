@@ -618,6 +618,108 @@ constexpr LlvmOpcode kLlvmVop3[] = {
     {0x37f, "v_add_nc_i32"},
 };
 
+// SMEM over its 8-bit opcode field and VOP3P over its 7-bit field: the same gfx1030 UNION gfx1013
+// sweep (SMEM with and without operands). gfx1013 adds the scalar stores and atomics, s_scratch_*,
+// s_dcache_wb/discard and s_get_waveid_in_workgroup; gfx1030 adds the VOP3P v_dot* forms.
+constexpr LlvmOpcode kLlvmSmem[] = {
+    {0x000, "s_load_dword"},
+    {0x001, "s_load_dwordx2"},
+    {0x002, "s_load_dwordx4"},
+    {0x003, "s_load_dwordx8"},
+    {0x004, "s_load_dwordx16"},
+    {0x005, "s_scratch_load_dword"},
+    {0x006, "s_scratch_load_dwordx2"},
+    {0x007, "s_scratch_load_dwordx4"},
+    {0x008, "s_buffer_load_dword"},
+    {0x009, "s_buffer_load_dwordx2"},
+    {0x00a, "s_buffer_load_dwordx4"},
+    {0x00b, "s_buffer_load_dwordx8"},
+    {0x00c, "s_buffer_load_dwordx16"},
+    {0x010, "s_store_dword"},
+    {0x011, "s_store_dwordx2"},
+    {0x012, "s_store_dwordx4"},
+    {0x015, "s_scratch_store_dword"},
+    {0x016, "s_scratch_store_dwordx2"},
+    {0x017, "s_scratch_store_dwordx4"},
+    {0x018, "s_buffer_store_dword"},
+    {0x019, "s_buffer_store_dwordx2"},
+    {0x01a, "s_buffer_store_dwordx4"},
+    {0x01f, "s_gl1_inv"},
+    {0x020, "s_dcache_inv"},
+    {0x021, "s_dcache_wb"},
+    {0x024, "s_memtime"},
+    {0x025, "s_memrealtime"},
+    {0x026, "s_atc_probe"},
+    {0x027, "s_atc_probe_buffer"},
+    {0x028, "s_dcache_discard"},
+    {0x029, "s_dcache_discard_x2"},
+    {0x02a, "s_get_waveid_in_workgroup"},
+    {0x040, "s_buffer_atomic_swap"},
+    {0x041, "s_buffer_atomic_cmpswap"},
+    {0x042, "s_buffer_atomic_add"},
+    {0x043, "s_buffer_atomic_sub"},
+    {0x044, "s_buffer_atomic_smin"},
+    {0x045, "s_buffer_atomic_umin"},
+    {0x046, "s_buffer_atomic_smax"},
+    {0x047, "s_buffer_atomic_umax"},
+    {0x048, "s_buffer_atomic_and"},
+    {0x049, "s_buffer_atomic_or"},
+    {0x04a, "s_buffer_atomic_xor"},
+    {0x04b, "s_buffer_atomic_inc"},
+    {0x04c, "s_buffer_atomic_dec"},
+    {0x060, "s_buffer_atomic_swap_x2"},
+    {0x061, "s_buffer_atomic_cmpswap_x2"},
+    {0x062, "s_buffer_atomic_add_x2"},
+    {0x063, "s_buffer_atomic_sub_x2"},
+    {0x064, "s_buffer_atomic_smin_x2"},
+    {0x065, "s_buffer_atomic_umin_x2"},
+    {0x066, "s_buffer_atomic_smax_x2"},
+    {0x067, "s_buffer_atomic_umax_x2"},
+    {0x068, "s_buffer_atomic_and_x2"},
+    {0x069, "s_buffer_atomic_or_x2"},
+    {0x06a, "s_buffer_atomic_xor_x2"},
+    {0x06b, "s_buffer_atomic_inc_x2"},
+    {0x06c, "s_buffer_atomic_dec_x2"},
+    {0x080, "s_atomic_swap"},
+    {0x081, "s_atomic_cmpswap"},
+    {0x082, "s_atomic_add"},
+    {0x083, "s_atomic_sub"},
+    {0x084, "s_atomic_smin"},
+    {0x085, "s_atomic_umin"},
+    {0x086, "s_atomic_smax"},
+    {0x087, "s_atomic_umax"},
+    {0x088, "s_atomic_and"},
+    {0x089, "s_atomic_or"},
+    {0x08a, "s_atomic_xor"},
+    {0x08b, "s_atomic_inc"},
+    {0x08c, "s_atomic_dec"},
+    {0x0a0, "s_atomic_swap_x2"},
+    {0x0a1, "s_atomic_cmpswap_x2"},
+    {0x0a2, "s_atomic_add_x2"},
+    {0x0a3, "s_atomic_sub_x2"},
+    {0x0a4, "s_atomic_smin_x2"},
+    {0x0a5, "s_atomic_umin_x2"},
+    {0x0a6, "s_atomic_smax_x2"},
+    {0x0a7, "s_atomic_umax_x2"},
+    {0x0a8, "s_atomic_and_x2"},
+    {0x0a9, "s_atomic_or_x2"},
+    {0x0aa, "s_atomic_xor_x2"},
+    {0x0ab, "s_atomic_inc_x2"},
+    {0x0ac, "s_atomic_dec_x2"},
+};
+constexpr LlvmOpcode kLlvmVop3p[] = {
+    {0x000, "v_pk_mad_i16"},     {0x001, "v_pk_mul_lo_u16"},  {0x002, "v_pk_add_i16"},
+    {0x003, "v_pk_sub_i16"},     {0x004, "v_pk_lshlrev_b16"}, {0x005, "v_pk_lshrrev_b16"},
+    {0x006, "v_pk_ashrrev_i16"}, {0x007, "v_pk_max_i16"},     {0x008, "v_pk_min_i16"},
+    {0x009, "v_pk_mad_u16"},     {0x00a, "v_pk_add_u16"},     {0x00b, "v_pk_sub_u16"},
+    {0x00c, "v_pk_max_u16"},     {0x00d, "v_pk_min_u16"},     {0x00e, "v_pk_fma_f16"},
+    {0x00f, "v_pk_add_f16"},     {0x010, "v_pk_mul_f16"},     {0x011, "v_pk_min_f16"},
+    {0x012, "v_pk_max_f16"},     {0x013, "v_dot2_f32_f16"},   {0x014, "v_dot2_i32_i16"},
+    {0x015, "v_dot2_u32_u16"},   {0x016, "v_dot4_i32_i8"},    {0x017, "v_dot4_u32_u8"},
+    {0x018, "v_dot8_i32_i4"},    {0x019, "v_dot8_u32_u4"},    {0x020, "v_fma_mix_f32"},
+    {0x021, "v_fma_mixlo_f16"},  {0x022, "v_fma_mixhi_f16"},
+};
+
 const char* fmt_name(Rdna2Format fmt) {
     switch (fmt) {
         case Rdna2Format::SOP2: return "SOP2";
@@ -629,6 +731,8 @@ const char* fmt_name(Rdna2Format fmt) {
         case Rdna2Format::VOP2: return "VOP2";
         case Rdna2Format::VOPC: return "VOPC";
         case Rdna2Format::VOP3: return "VOP3";
+        case Rdna2Format::VOP3P: return "VOP3P";
+        case Rdna2Format::SMEM: return "SMEM";
         default: return "other";
     }
 }
@@ -653,6 +757,15 @@ Rdna2Inst decode(Rdna2Format fmt, uint32_t op, uint32_t ssrc0 = 2u) {
             code[0] = 0xD4000000u | (op << 16) | 4u;
             code[1] = 257u | (258u << 9) | (259u << 18);
             break;
+        case Rdna2Format::VOP3P:
+            code[0] = 0xCC000000u | (op << 16) | 4u;
+            code[1] = 257u | (258u << 9) | (259u << 18);
+            break;
+        // SMEM: SDATA s4, SBASE s[8:9] (the field holds the pair index), SOFFSET null.
+        case Rdna2Format::SMEM:
+            code[0] = 0xF4000000u | (op << 18) | (4u << 6) | (8u >> 1);
+            code[1] = 0x7Du << 25;
+            break;
         default: break;
     }
     return rdna2_decode_one(code, 2);
@@ -668,9 +781,10 @@ const Rdna2Format kTabulated[] = {Rdna2Format::SOP2, Rdna2Format::SOP1, Rdna2For
                                   Rdna2Format::SOPC, Rdna2Format::SOPP};
 const Rdna2Format kValu[] = {Rdna2Format::VOP2, Rdna2Format::VOP1, Rdna2Format::VOPC,
                              Rdna2Format::VOP3};
-const Rdna2Format kEveryTabulated[] = {Rdna2Format::SOP2, Rdna2Format::SOP1, Rdna2Format::SOPK,
-                                       Rdna2Format::SOPC, Rdna2Format::SOPP, Rdna2Format::VOP2,
-                                       Rdna2Format::VOP1, Rdna2Format::VOPC, Rdna2Format::VOP3};
+const Rdna2Format kEveryTabulated[] = {Rdna2Format::SOP2,  Rdna2Format::SOP1, Rdna2Format::SOPK,
+                                       Rdna2Format::SOPC,  Rdna2Format::SOPP, Rdna2Format::VOP2,
+                                       Rdna2Format::VOP1,  Rdna2Format::VOPC, Rdna2Format::VOP3,
+                                       Rdna2Format::VOP3P, Rdna2Format::SMEM};
 
 std::vector<LlvmOpcode> llvm_set(Rdna2Format fmt) {
     switch (fmt) {
@@ -683,6 +797,8 @@ std::vector<LlvmOpcode> llvm_set(Rdna2Format fmt) {
         case Rdna2Format::VOP1: return {std::begin(kLlvmVop1), std::end(kLlvmVop1)};
         case Rdna2Format::VOPC: return {std::begin(kLlvmVopc), std::end(kLlvmVopc)};
         case Rdna2Format::VOP3: return {std::begin(kLlvmVop3), std::end(kLlvmVop3)};
+        case Rdna2Format::VOP3P: return {std::begin(kLlvmVop3p), std::end(kLlvmVop3p)};
+        case Rdna2Format::SMEM: return {std::begin(kLlvmSmem), std::end(kLlvmSmem)};
         default: return {};
     }
 }
@@ -745,7 +861,8 @@ TEST(Rdna2InstructionEffects, RowsAreUniqueAndWellFormed) {
         } else if (e.status == Rdna2EffectsStatus::Valu) {
             EXPECT_NE(e.name, nullptr);
             EXPECT_TRUE(row.fmt == Rdna2Format::VOP1 || row.fmt == Rdna2Format::VOP2 ||
-                        row.fmt == Rdna2Format::VOPC || row.fmt == Rdna2Format::VOP3);
+                        row.fmt == Rdna2Format::VOPC || row.fmt == Rdna2Format::VOP3 ||
+                        row.fmt == Rdna2Format::VOP3P);
             // The scalar-ALU fields are not described for a VALU row.
             EXPECT_EQ(e.sdst_dwords, 0u) << e.name;
             EXPECT_EQ(e.implicit_writes, 0u) << e.name;
@@ -807,8 +924,7 @@ TEST(Rdna2InstructionEffects, NamedOpcodesAreExactlyLlvmGfx1030) {
 }
 
 TEST(Rdna2InstructionEffects, UntabulatedLookupsAreUnknownNotNoEffect) {
-    EXPECT_EQ(rdna2_instruction_effects(Rdna2Format::VOP3P, 0x10).status,
-              Rdna2EffectsStatus::Unknown);
+    EXPECT_EQ(rdna2_instruction_effects(Rdna2Format::DS, 0x10).status, Rdna2EffectsStatus::Unknown);
     // VOP3 0x000-0x0FF decode as VOPC, so they are not VOP3 entries.
     EXPECT_EQ(rdna2_instruction_effects(Rdna2Format::VOP3, 0x50).status,
               Rdna2EffectsStatus::Unknown);
@@ -1165,8 +1281,8 @@ TEST(Rdna2InstructionEffectsValu, PairSourcesFollowTheMnemonic) {
         bool any_pair = false;
         for (uint32_t source = 0; source < 3; ++source) {
             const uint32_t width = row.effects.ssrc_dwords[source];
-            EXPECT_LE(width, 2u) << name;
-            if (width != 2) continue;
+            EXPECT_LE(width, name == "v_mqsad_u32_u8" && source == 2 ? 4u : 2u) << name;
+            if (width < 2) continue;
             any_pair = true;
             EXPECT_TRUE(names_64bit(name) || untyped_pairs.contains({name, source}))
                 << name << " source " << source << " is a pair but its name has no 64-bit type";
@@ -1238,21 +1354,21 @@ TEST(Rdna2InstructionEffectsRegression, ValuSourceWidthsComeFromTheIsaNotAnAllow
 // destination type first) is 64-bit; the accumulators are the rows whose pseudo-code reads D.
 TEST(Rdna2InstructionEffectsValu, VectorResultFactsMatchTheIsa) {
     const std::set<std::string> half_results = {
-        "v_cvt_f16_f32",      "v_cvt_f16_u16", "v_cvt_f16_i16",    "v_cvt_u16_f16",
-        "v_cvt_i16_f16",      "v_rcp_f16",     "v_sqrt_f16",       "v_rsq_f16",
-        "v_log_f16",          "v_exp_f16",     "v_frexp_mant_f16", "v_frexp_exp_i16_f16",
-        "v_floor_f16",        "v_ceil_f16",    "v_trunc_f16",      "v_rndne_f16",
-        "v_fract_f16",        "v_sin_f16",     "v_cos_f16",        "v_cvt_norm_i16_f16",
-        "v_cvt_norm_u16_f16", "v_add_f16",     "v_sub_f16",        "v_subrev_f16",
-        "v_mul_f16",          "v_fmac_f16",    "v_fmamk_f16",      "v_fmaak_f16",
-        "v_max_f16",          "v_min_f16",     "v_ldexp_f16",      "v_add_nc_u16",
-        "v_sub_nc_u16",       "v_mul_lo_u16",  "v_lshrrev_b16",    "v_ashrrev_i16",
-        "v_max_u16",          "v_max_i16",     "v_min_u16",        "v_min_i16",
-        "v_add_nc_i16",       "v_sub_nc_i16",  "v_lshlrev_b16",    "v_mad_u16",
-        "v_fma_f16",          "v_min3_f16",    "v_min3_i16",       "v_min3_u16",
-        "v_max3_f16",         "v_max3_i16",    "v_max3_u16",       "v_med3_f16",
-        "v_med3_i16",         "v_med3_u16",    "v_interp_p2_f16",  "v_mad_i16",
-        "v_div_fixup_f16",
+        "v_cvt_f16_f32",      "v_cvt_f16_u16",   "v_cvt_f16_i16",    "v_cvt_u16_f16",
+        "v_cvt_i16_f16",      "v_rcp_f16",       "v_sqrt_f16",       "v_rsq_f16",
+        "v_log_f16",          "v_exp_f16",       "v_frexp_mant_f16", "v_frexp_exp_i16_f16",
+        "v_floor_f16",        "v_ceil_f16",      "v_trunc_f16",      "v_rndne_f16",
+        "v_fract_f16",        "v_sin_f16",       "v_cos_f16",        "v_cvt_norm_i16_f16",
+        "v_cvt_norm_u16_f16", "v_add_f16",       "v_sub_f16",        "v_subrev_f16",
+        "v_mul_f16",          "v_fmac_f16",      "v_fmamk_f16",      "v_fmaak_f16",
+        "v_max_f16",          "v_min_f16",       "v_ldexp_f16",      "v_add_nc_u16",
+        "v_sub_nc_u16",       "v_mul_lo_u16",    "v_lshrrev_b16",    "v_ashrrev_i16",
+        "v_max_u16",          "v_max_i16",       "v_min_u16",        "v_min_i16",
+        "v_add_nc_i16",       "v_sub_nc_i16",    "v_lshlrev_b16",    "v_mad_u16",
+        "v_fma_f16",          "v_min3_f16",      "v_min3_i16",       "v_min3_u16",
+        "v_max3_f16",         "v_max3_i16",      "v_max3_u16",       "v_med3_f16",
+        "v_med3_i16",         "v_med3_u16",      "v_interp_p2_f16",  "v_mad_i16",
+        "v_div_fixup_f16",    "v_fma_mixlo_f16", "v_fma_mixhi_f16",
     };
     const std::set<std::string> accumulators = {
         "v_mac_f32",     "v_fmac_f32",      "v_fmac_legacy_f32", "v_fmac_f16",
@@ -1322,7 +1438,7 @@ TEST(Rdna2InstructionEffectsValu, VectorResultFactsMatchTheIsa) {
         pairs += e.vdst_dwords == 2;
     }
     EXPECT_GT(rows, 550u);
-    EXPECT_EQ(halves, 86u);   // every encoding of every 16-bit result
+    EXPECT_EQ(halves, 88u);   // every encoding of every 16-bit result
     EXPECT_GT(pairs, 30u);
     // Implicit reads: VCC only where no SRC2 names the mask, M0 for the relative/interp forms,
     // EXEC for v_readfirstlane (it reads the first ACTIVE lane).
@@ -1500,4 +1616,86 @@ TEST(Rdna2InstructionEffectsRegression, MissingHighVectorWordCannotAuthenticateW
     const auto shift = decode(Rdna2Format::VOP3, kVop3OpcodeLshrrevB64);
     EXPECT_EQ(rdna2_vgpr_source_span(shift, 0), 1u) << "the shift count remains one word";
     EXPECT_EQ(rdna2_vgpr_source_span(shift, 1), 2u);
+}
+
+// ---- SMEM and VOP3P --------------------------------------------------------------------------
+
+// Each case was answered wrongly by a private SMEM width list (#5146 step 4): they knew the loads
+// only, so s_memtime's pair was not a write, cache control was a one-register write, and a buffer
+// load's SBASE read stopped at the pair. The old answer is in the comment.
+TEST(Rdna2InstructionEffectsRegression, ScalarMemoryWidthsComeFromTheTable) {
+    const Rdna2Inst memtime = decode(Rdna2Format::SMEM, 0x24);   // s_memtime s[4:5]
+    EXPECT_EQ(scalar_write_width(memtime), 2u) << "old: 0";
+    EXPECT_EQ(scalar_write_width(decode(Rdna2Format::SMEM, 0x25)), 2u) << "s_memrealtime; old: 0";
+    std::set<int> vgprs, sgprs;
+    loop_written_regs({memtime}, 0, 2, vgprs, sgprs);
+    EXPECT_EQ(sgprs, (std::set<int>{4, 5})) << "old: {4}";
+    sgprs.clear();
+    loop_written_regs({decode(Rdna2Format::SMEM, 0x20)}, 0, 2, vgprs, sgprs);
+    EXPECT_TRUE(sgprs.empty()) << "s_dcache_inv writes nothing; old: {4}";
+    // A gfx10.1 scalar atomic returns its old value only with GLC.
+    Rdna2Inst atomic = decode(Rdna2Format::SMEM, 0xa2);   // s_atomic_add_x2
+    EXPECT_EQ(scalar_write_width(atomic), 0u);
+    atomic.smem_glc = true;
+    EXPECT_EQ(scalar_write_width(atomic), 2u);
+    EXPECT_EQ(rdna2_smem_destination_dwords(decode(Rdna2Format::SMEM, 0x81)), 0u)
+        << "s_atomic_cmpswap without GLC";
+    // Unchanged answers.
+    EXPECT_EQ(scalar_write_width(decode(Rdna2Format::SMEM, 0x0b)), 8u) << "s_buffer_load_dwordx8";
+    EXPECT_EQ(scalar_write_width(decode(Rdna2Format::SMEM, 0x26)), 0u) << "s_atc_probe";
+    EXPECT_EQ(rdna2_smem_load_dwords(0x24), 0u) << "s_memtime is not a load";
+    EXPECT_EQ(rdna2_smem_address_dwords(0x08), 4u) << "s_buffer_load_dword reads a V#";
+    EXPECT_EQ(rdna2_smem_address_dwords(0x24), 0u) << "s_memtime has no address";
+    EXPECT_EQ(rdna2_smem_address_dwords(0x30), 4u) << "a reserved encoding is charged the quad";
+}
+
+// sgpr_dead_at_merge read only the first two words of a buffer load's V#, so a merge-dead claim
+// held for a register the load still reads. s_buffer_load_dword s20, s[8:11] reads s10. Old: dead.
+TEST(Rdna2InstructionEffectsRegression, BufferLoadReadsItsWholeDescriptor) {
+    const uint32_t code[] = {0xF4000000u | (0x08u << 18) | (20u << 6) | (8u >> 1), 0x7Du << 25,
+                             0xBF810000u};
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(code, 3, ins);
+    ASSERT_EQ(ins.size(), 2u);
+    ASSERT_EQ(ins[0].fmt, Rdna2Format::SMEM);
+    EXPECT_FALSE(sgpr_dead_at_merge(ins, 0, 10)) << "old: true";
+    EXPECT_FALSE(sgpr_dead_at_merge(ins, 0, 11)) << "old: true";
+    EXPECT_FALSE(sgpr_dead_at_merge(ins, 0, 8));
+    EXPECT_TRUE(sgpr_dead_at_merge(ins, 0, 20)) << "SDATA is redefined";
+    EXPECT_TRUE(sgpr_dead_at_merge(ins, 0, 12)) << "past the V#";
+}
+
+// VOP3P rows: v_fma_mixlo/mixhi_f16 write one half, every other form a whole word.
+TEST(Rdna2InstructionEffectsRegression, PackedResultsComeFromTheTable) {
+    // The NGG launch inventory did not charge v_fma_mixlo_f16's kept half as a VDST read.
+    EXPECT_TRUE(vector_write_depends_on_old_word(decode(Rdna2Format::VOP3P, 0x21), true));
+    EXPECT_FALSE(vector_write_depends_on_old_word(decode(Rdna2Format::VOP3P, 0x0f), true))
+        << "v_pk_add_f16";
+    // A packed result is a complete lane-wise word. Old: not lane-mapped, so never complete.
+    EXPECT_TRUE(vector_write_completes_active_word(decode(Rdna2Format::VOP3P, 0x0e)))
+        << "v_pk_fma_f16";
+    EXPECT_FALSE(vector_write_completes_active_word(decode(Rdna2Format::VOP3P, 0x22)))
+        << "v_fma_mixhi_f16";
+    // v_dot2_f32_f16 writes a whole word too. Old: absent from the complete-result list.
+    EXPECT_EQ(ordinary_vgpr_complete_results(decode(Rdna2Format::VOP3P, 0x13)), 1u);
+    EXPECT_EQ(ordinary_vgpr_complete_results(decode(Rdna2Format::VOP3P, 0x21)), 0u);
+    // A reserved VOP3P slot fails closed.
+    EXPECT_TRUE(vector_write_depends_on_old_word(decode(Rdna2Format::VOP3P, 0x40), true))
+        << "old: false";
+}
+
+// The SOP1 SCC predicates are the table's "Sets SCC?" fact. The "leaves SCC unmodified" list named
+// 12 of the 27 non-writers, so a compare's SCC lifetime ended at s_brev_b64 or s_sext_i32_i8.
+TEST(Rdna2InstructionEffectsRegression, Sop1SccPredicatesComeFromTheTable) {
+    EXPECT_TRUE(sop1_opcode_leaves_scc_unmodified(0x0c)) << "s_brev_b64; old: false";
+    EXPECT_TRUE(sop1_opcode_leaves_scc_unmodified(0x19)) << "s_sext_i32_i8; old: false";
+    EXPECT_TRUE(sop1_opcode_leaves_scc_unmodified(0x11)) << "s_ff0_i32_b32; old: false";
+    // Unchanged: writers, and a reserved encoding on neither list.
+    EXPECT_FALSE(sop1_opcode_leaves_scc_unmodified(0x10)) << "s_bcnt1_i32_b64 writes SCC";
+    EXPECT_TRUE(sop1_opcode_writes_scc(0x10));
+    EXPECT_FALSE(sop1_opcode_leaves_scc_unmodified(0x00));
+    EXPECT_FALSE(sop1_opcode_writes_scc(0x00));
+    EXPECT_TRUE(sop1_opcode_is_wrexec_b64(0x3a)) << "s_andn2_wrexec_b64";
+    EXPECT_TRUE(sop1_opcode_is_saveexec_b32(0x45)) << "s_orn1_saveexec_b32";
+    EXPECT_FALSE(sop1_opcode_is_saveexec_b64(0x2c)) << "s_quadmask_b32";
 }

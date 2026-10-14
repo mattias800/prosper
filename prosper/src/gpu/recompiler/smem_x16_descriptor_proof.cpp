@@ -14,6 +14,7 @@
 
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/resources/shader_resources.hpp"
 
 namespace prosper::gpu {
@@ -379,7 +380,7 @@ std::unordered_set<uint32_t> proven_smem_x16_descriptor_loads(const std::vector<
             // Bound implicit descriptor/address reads before the generic decoded operands. These
             // packet formats encode a base SGPR while consuming a wider range.
             if (in.fmt == Rdna2Format::SMEM) {
-                const uint32_t base_words = in.opcode >= 0x08u ? 4u : 2u;
+                const uint32_t base_words = rdna2_smem_address_dwords(in.opcode);
                 if (scalar_operand(in.src[0]) && live_overlap(in.src[0].value, base_words)) {
                     valid = false;
                     break;

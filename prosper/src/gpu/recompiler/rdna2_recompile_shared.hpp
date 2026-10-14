@@ -195,12 +195,7 @@ inline std::unordered_set<uint32_t> safe_execz_branches(const std::vector<Rdna2I
             // lighting/fog block's `s_buffer_load_dwordx2 vcc, …` scratch-load shape (DOLL VS, #273);
             // sgpr_dead_at_merge understands VCC's implicit readers, so vcc-targeted loads qualify.
             if (in.fmt == Rdna2Format::SMEM) {
-                uint32_t n = 0;
-                switch (in.opcode) {
-                    case 0x0: case 0x8: n = 1;  break;   case 0x1: case 0x9: n = 2;  break;
-                    case 0x2: case 0xA: n = 4;  break;   case 0x3: case 0xB: n = 8;  break;
-                    case 0x4: case 0xC: n = 16; break;   default: break;
-                }
+                const uint32_t n = rdna2_smem_load_dwords(in.opcode);
                 if (n) {
                     bool all_dead = true;
                     for (uint32_t k = 0; k < n && all_dead; k++)

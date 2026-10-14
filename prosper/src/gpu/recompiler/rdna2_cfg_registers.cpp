@@ -82,18 +82,10 @@ void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t 
                         sregs.insert(in.dst.value + static_cast<int>(word));
                 }
                 break;
-            case Rdna2Format::SMEM: {   // s_load/s_buffer_load: N consecutive SGPRs
-                uint32_t n = 1;
-                switch (in.opcode) {
-                    case 0x1:
-                    case 0x9: n = 2; break;
-                    case 0x2:
-                    case 0xA: n = 4; break;
-                    case 0x3:
-                    case 0xB: n = 8; break;
-                    case 0x4:
-                    case 0xC: n = 16; break;
-                }
+            case Rdna2Format::SMEM: {   // the SGPRs SDATA may receive (the effects table)
+                // A reserved encoding keeps the old conservative one-register clobber.
+                const uint32_t n =
+                    rdna2_instruction_effects(in).known() ? rdna2_smem_destination_dwords(in) : 1u;
                 for (uint32_t k = 0; k < n; k++) sregs.insert(in.dst.value + (int)k);
                 break;
             }

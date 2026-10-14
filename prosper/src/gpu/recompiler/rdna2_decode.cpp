@@ -172,7 +172,8 @@ uint32_t rdna2_vgpr_write_count(const Rdna2Inst& in) {
     switch (in.fmt) {
         case Rdna2Format::VOP1:
         case Rdna2Format::VOP2:
-        case Rdna2Format::VOP3: {
+        case Rdna2Format::VOP3:
+        case Rdna2Format::VOP3P: {
             // The effects table's VDST width (ISA 70648 12.7-12.12, checked against the register
             // class llvm-mc prints): a pair for every 64-bit result, four VGPRs for
             // v_mqsad_u32_u8, none for v_readfirstlane/v_readlane (an SGPR) or v_nop. This used
@@ -181,7 +182,6 @@ uint32_t rdna2_vgpr_write_count(const Rdna2Inst& in) {
             const Rdna2InstructionEffects& effects = rdna2_instruction_effects(in);
             return effects.describes_vector_result() ? effects.vdst_dwords : 1u;
         }
-        case Rdna2Format::VOP3P: return 1;
         case Rdna2Format::DS:
             // Keep this aligned with the DS result opcodes admitted by the emitter. Other DS
             // encodings in that subset are stores or no-return atomics whose VDST field is a source.
@@ -272,16 +272,16 @@ uint32_t rdna2_vgpr_source_span(const Rdna2Inst& in, uint32_t source_index) {
     if ((in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF) && source_index == 0)
         return ((in.literal >> 12) & 1u) + ((in.literal >> 13) & 1u);
     if (in.fmt == Rdna2Format::VOP1 || in.fmt == Rdna2Format::VOP2 || in.fmt == Rdna2Format::VOPC ||
-        in.fmt == Rdna2Format::VOP3) {
-        // Register operand widths do not depend on the scalar/vector register spelling.
-        // Charge every physical half before a lane-wise result can become genuine DATA.
-        // The ISA-derived table also distinguishes a B64 shift's one-word count from its pair.
-        const Rdna2InstructionEffects& effects = rdna2_instruction_effects(in);
-        if (!effects.describes_sources()) return 2;
-        if (source_index < 3 && effects.ssrc_dwords[source_index])
-            return effects.ssrc_dwords[source_index];
-        // Preserve conservative storage accounting for an unused encoded source field.
-        return 1;
+        in.fmt == Rdna2Format::VOP3 || in.fmt == Rdna2Format::VOP3P) {
+        // Register operand widths do not depend on the register file (the effects table, ISA
+        // 70648 12.7-12.12): every F64/B64 source is a pair, so a lane-wise result can become
+        // genuine DATA only when both halves are; a B64 shift's count stays one word. This used
+        // to know two pair sources (v_lshrrev_b64 SRC1, v_mad_u64/i64 SRC2). An encoding the
+        // table does not describe is charged a pair; an unused encoded field keeps the
+        // conservative one-word storage accounting.
+        if (!rdna2_instruction_effects(in).describes_sources()) return 2;
+        const uint32_t span = rdna2_valu_vgpr_source_span(in, source_index);
+        return span ? span : 1u;
     }
     // Dispatcher discovery historically treats every admitted DS source as a conservative four
     // dword range because read/write2 and 64/96/128-bit packets encode only the base register.
@@ -922,6 +922,7 @@ void decode_operands(Rdna2Inst& i) {
             // decoded now (#149): SOFFSET into src[1] so a register-offset load can be recognized (and
             // rejected until supported) instead of silently translating with the immediate alone.
             i.opcode = (w >> 18) & 0xFFu;
+            i.smem_glc = ((w >> 16) & 1u) != 0;
             i.dst    = sgpr(w >> 6);                 // SDATA
             i.src[0] = sgpr((w & 0x3Fu) << 1);       // SBASE (pair base)
             uint32_t off21 = i.words[1] & 0x1FFFFFu;

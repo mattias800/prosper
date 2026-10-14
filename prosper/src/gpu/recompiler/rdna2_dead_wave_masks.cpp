@@ -70,20 +70,9 @@ std::unordered_set<uint32_t> dead_wave_mask_writes(const std::vector<Rdna2Inst>&
             if (in.dst.value == 107) return 2;
         }
         if (in.fmt == Rdna2Format::SMEM) {
-            uint32_t n = 0;
-            switch (in.opcode) {
-                case 0x0:
-                case 0x8: n = 1; break;
-                case 0x1:
-                case 0x9: n = 2; break;
-                case 0x2:
-                case 0xa: n = 4; break;
-                case 0x3:
-                case 0xb: n = 8; break;
-                case 0x4:
-                case 0xc: n = 16; break;
-                default: break;
-            }
+            // Every SGPR SDATA receives, from the effects table: loads, and the s_memtime /
+            // s_memrealtime pair (`s_memtime vcc` defines VCC; this list used to know loads only).
+            const uint32_t n = rdna2_smem_destination_dwords(in);
             uint8_t bits = 0;
             if (n && in.dst.value <= 106 && 106 < in.dst.value + static_cast<int>(n)) bits |= 1;
             if (n && in.dst.value <= 107 && 107 < in.dst.value + static_cast<int>(n)) bits |= 2;
