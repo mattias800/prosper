@@ -463,6 +463,16 @@ TEST(Rdna2InstructionEffectsRegression, ConservativeWidthChargesEveryPairDestina
     carry.sdst = {OperandKind::SGPR, 4};
     EXPECT_FALSE(scalar_range_unchanged({carry}, 1u, 3u, 5u, 1u, IndirectWave::Wave64));
     EXPECT_TRUE(scalar_range_unchanged({carry}, 1u, 3u, 5u, 1u, IndirectWave::Wave32));
+    // v_readfirstlane_b32 s9, v0: the decoder files s9 as a VGPR-kind operand, and both old
+    // copies charged it nothing, so a live range at s9 looked untouched.
+    const uint32_t readfirstlane[] = {0x7E000000u | (9u << 17) | (0x02u << 9) | 256u};
+    Rdna2Inst lane = rdna2_decode_one(readfirstlane, 1);
+    ASSERT_EQ(lane.fmt, Rdna2Format::VOP1);
+    ASSERT_EQ(lane.dst.kind, OperandKind::VGPR);
+    lane.pc = 2;
+    EXPECT_EQ(conservative_scalar_write_width(lane, IndirectWave::Wave32), 1u);
+    EXPECT_FALSE(scalar_range_unchanged({lane}, 1u, 3u, 9u, 1u, IndirectWave::Wave32));
+    EXPECT_EQ(scalar_write_width(lane), 1u);
 }
 
 // rdna2_recompile_fragment.cpp's shader_reads_scc listed SOP1 0x02/0x03 as s_cmov. 0x03 is

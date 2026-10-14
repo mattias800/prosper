@@ -9,6 +9,9 @@
 namespace prosper::gpu {
 
 uint32_t conservative_scalar_write_width(const Rdna2Inst& instruction, IndirectWave wave) {
+    // A lane read writes one SGPR through a destination the decoder files as a VGPR operand, so it
+    // must be counted before the operand-kind filter below (both old copies returned 0 for it).
+    if (rdna2_lane_read_writes_sgpr(instruction)) return 1u;
     if (instruction.dst.kind != OperandKind::SGPR && instruction.dst.kind != OperandKind::Special)
         return 0u;
     if (instruction.fmt == Rdna2Format::SMEM) {

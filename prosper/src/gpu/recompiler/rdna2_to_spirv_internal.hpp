@@ -3774,8 +3774,8 @@ inline uint32_t scalar_write_width(const Rdna2Inst& in) {
                 case 0x4: case 0xc: return 16;
                 default: return 0;
             }
-        case Rdna2Format::VOP1: return in.opcode == 0x02 ? 1u : 0u; // v_readfirstlane
-        case Rdna2Format::VOP3: return in.opcode == 0x360 ? 1u : 0u; // v_readlane
+        case Rdna2Format::VOP1:
+        case Rdna2Format::VOP3: return rdna2_lane_read_writes_sgpr(in) ? 1u : 0u;
         default: return 0;
     }
 }
