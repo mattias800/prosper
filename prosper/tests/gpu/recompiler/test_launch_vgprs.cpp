@@ -30,13 +30,13 @@ std::vector<uint32_t> fragment_compare(uint32_t vgpr, std::vector<uint32_t> pref
     std::vector<uint32_t> code = std::move(prefix);
     for (const uint32_t word : {
              0x7d040080u | (vgpr << 9),   // v_cmp_eq_i32 vcc, 0, v<vgpr>
-             0x7e120280u,                 // v_mov_b32 v9, 0
-             0x021012f2u,                 // v_cndmask_b32 v8, 1.0, v9, vcc
-             0x7e140280u,                 // v_mov_b32 v10, 0
-             0x7e1602f2u,                 // v_mov_b32 v11, 1.0
+             0x7e120280u,   // v_mov_b32 v9, 0
+             0x021012f2u,   // v_cndmask_b32 v8, 1.0, v9, vcc
+             0x7e140280u,   // v_mov_b32 v10, 0
+             0x7e1602f2u,   // v_mov_b32 v11, 1.0
              0xf800180fu,
-             0x0b0a0908u,    // exp mrt0 v8, v9, v10, v11 done vm
-             0xbf810000u,                 // s_endpgm
+             0x0b0a0908u,   // exp mrt0 v8, v9, v10, v11 done vm
+             0xbf810000u,   // s_endpgm
          })
         code.push_back(word);
     return code;
@@ -52,9 +52,9 @@ std::vector<uint32_t> compile_fragment(const std::vector<uint32_t>& code,
 std::vector<uint32_t> compute_compare(uint32_t vgpr) {
     return {
         0x7d880084u | (vgpr << 9),   // v_cmp_gt_u32 vcc, 4, v<vgpr>
-        0x7e080281u,                 // v_mov_b32 v4, 1
-        0x02060880u,                 // v_cndmask_b32 v3, 0, v4, vcc
-        0xbf810000u,                 // s_endpgm
+        0x7e080281u,   // v_mov_b32 v4, 1
+        0x02060880u,   // v_cndmask_b32 v3, 0, v4, vcc
+        0xbf810000u,   // s_endpgm
     };
 }
 
