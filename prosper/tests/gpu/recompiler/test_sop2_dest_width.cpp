@@ -2,10 +2,10 @@
 //
 // Under-counting a destination is silent: control-flow discovery, scalar liveness and the
 // register file then reason about a stale SGPR while the instruction overwrote its neighbour.
-// Over-counting only wastes a register. So this pins the UNSOUND direction exactly — every
-// 64-bit SOP2 opcode must report a pair — over the full opcode domain, while the B32 side is
-// pinned one-way (a reported single dword must really be B32; LLVM-B32 ops the function leaves
-// at the fail-closed pair width stay conservative and are documented, not forced).
+// Over-counting refuses proofs it should not (an analysis then believes s_lshl2_add_u32 s4 also
+// clobbered s5). Since #5146 the width comes from the shared instruction-effects table, so both
+// directions are pinned exactly: every 64-bit SOP2 opcode reports a pair, every 32-bit one a single
+// dword, and only the unassigned gaps fail closed to a pair.
 //
 // Oracle: llvm-project/llvm/lib/Target/AMDGPU/SOPInstructions.td, independent of prosper.
 // Width comes from each pseudo's class — SOP2_64 / SOP2_64_32 / SOP2_64_32_32 (pair) versus
@@ -35,10 +35,7 @@ constexpr uint32_t kLlvmPair[] = {
     0x29u, 0x2Au,                                           // S_BFE_U64/I64
 };
 
-// [LLVM] Every gfx10 SOP2 opcode whose pseudo writes a 32-bit SDST. A superset of what the
-// function reports as single: S_ABSDIFF_I32, the S_LSHLn_ADD_U32 row, the S_PACK row and the
-// S_MUL_HI pair stay at the fail-closed pair width today (conservative: a missed narrow proof,
-// never a stale register), so they are documented here but not forced.
+// [LLVM] Every gfx10 SOP2 opcode whose pseudo writes a 32-bit SDST.
 constexpr uint32_t kLlvmSingle[] = {
     0x00u, 0x01u, 0x02u, 0x03u, 0x04u, 0x05u, 0x06u, 0x07u, 0x08u, 0x09u, 0x0Au,
     0x0Eu, 0x10u, 0x12u, 0x14u, 0x16u, 0x18u, 0x1Au, 0x1Cu,  // B32 logic family
@@ -84,4 +81,10 @@ TEST(Rdna2Sop2Width, GapsStayFailClosedToAPair) {
         if (!isSop2Gap(op)) continue;
         EXPECT_EQ(rdna2_sop2_dest_dwords(op), 2u) << "gap op=" << op;
     }
+}
+
+TEST(Rdna2Sop2Width, LlvmSinglesAreReportedSingle) {
+    // Until #5146 S_ABSDIFF_I32, the S_LSHLn_ADD_U32 row, the S_PACK row and the S_MUL_HI pair
+    // were reported as pairs here while scalar_write_width said one dword for the same opcodes.
+    for (uint32_t op : kLlvmSingle) EXPECT_EQ(rdna2_sop2_dest_dwords(op), 1u) << "SOP2 op=" << op;
 }

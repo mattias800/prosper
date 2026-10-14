@@ -553,9 +553,8 @@ bool state_liveness_matches(const std::vector<Rdna2Inst>& instructions,
             return false;
     }
     for (const ScalarLiveRange& live : shape.scalar_liveness)
-        if (!scalar_range_unchanged(
-                instructions, live.begin_pc, live.end_pc,
-                live.first_sgpr, live.count, IndirectWave::Wave32))
+        if (!scalar_range_unchanged(instructions, live.begin_pc, live.end_pc, live.first_sgpr,
+                                    live.count, IndirectWave::Wave32))
             return false;
     return true;
 }

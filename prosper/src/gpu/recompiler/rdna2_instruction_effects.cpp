@@ -487,6 +487,12 @@ Rdna2Answer rdna2_reads_scc_as_data(Rdna2Format fmt, uint32_t opcode) {
     return e.scc_read == Rdna2SccRead::Data ? Rdna2Answer::Yes : Rdna2Answer::No;
 }
 
+// Declared in rdna2_decode.hpp, where its callers already look for it.
+uint32_t rdna2_sop2_dest_dwords(uint32_t opcode) {
+    const Rdna2InstructionEffects& e = rdna2_instruction_effects(Rdna2Format::SOP2, opcode);
+    return e.known() ? e.sdst_dwords : 2u;   // fail closed: a reserved encoding counts as a pair
+}
+
 bool rdna2_operand_reads_scc(const Rdna2Inst& in) {
     for (uint32_t source = 0; source < in.n_src && source < 4; ++source)
         if (in.src[source].kind == OperandKind::Special && in.src[source].value == 253) return true;

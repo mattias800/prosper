@@ -1,29 +1,18 @@
 #include "gpu/recompiler/rdna2_scalar_condition_marks.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include <cstdint>
 namespace prosper::gpu {
+// Both answers come from the instruction-effects table. An instruction it cannot classify (a
+// reserved scalar encoding, an undecodable word) is neither a writer nor a preserver, which
+// record_wave32_scalar_condition below treats as "may add a dependency, cannot refresh one".
 bool scalar_instruction_writes_scc(const Rdna2Inst& in) {
-    if (in.fmt == Rdna2Format::SOPC) return true;
-    if (in.fmt == Rdna2Format::SOP2)
-        return in.opcode <= 0x09 || (in.opcode >= 0x0e && in.opcode <= 0x23) ||
-               (in.opcode >= 0x27 && in.opcode <= 0x2a) || in.opcode == 0x2c ||
-               (in.opcode >= 0x2e && in.opcode <= 0x31);
-    if (in.fmt == Rdna2Format::SOP1) return sop1_opcode_writes_scc(in.opcode);
-    return in.fmt == Rdna2Format::SOPK &&
-           ((in.opcode >= kSopkOpcodeCmpkFirst && in.opcode <= kSopkOpcodeCmpkLast) ||
-            in.opcode == kSopkOpcodeAddkI32);
+    return rdna2_writes_scc(in.fmt, in.opcode) == Rdna2Answer::Yes;
 }
 bool scalar_instruction_preserves_scc(const Rdna2Inst& in) {
-    if (in.fmt == Rdna2Format::SOP1)
-        return sop1_opcode_leaves_scc_unmodified(in.opcode) || in.opcode == 0x13 ||
-               in.opcode == kSop1OpcodeMovrelsB32;
-    if (in.fmt == Rdna2Format::SOP2)
-        return in.opcode == 0x0a || in.opcode == 0x0b || in.opcode == kSop2OpcodeBfmB32 ||
-               in.opcode == kSop2OpcodeBfmB64 || in.opcode == 0x26 ||
-               (in.opcode >= 0x32 && in.opcode <= 0x36);
-    return !scalar_instruction_writes_scc(in) && in.fmt != Rdna2Format::SOPC;
+    return rdna2_writes_scc(in.fmt, in.opcode) == Rdna2Answer::No;
 }
 void record_wave32_scalar_condition(RegState& rs, const Rdna2Inst& in,
                                     const ScalarSourceMarks& source) {

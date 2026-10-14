@@ -2,6 +2,7 @@
 #include "gpu/recompiler/ngg_subgroup_abi.hpp"
 
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
@@ -444,36 +445,18 @@ void add_vgpr(Reads& reads, const Operand& op, uint32_t span) {
     for (uint32_t w = 0; w < span; ++w) reads.vgpr.push_back(op.value + static_cast<int>(w));
 }
 
-// SCC as an implicit input: s_cbranch_scc0/1, s_addc/s_subb, s_cselect, s_cmov, s_cmovk, and any
-// operand naming SCC (253).
+// SCC as an input: an operand naming SCC (253), or an implicit read (s_cbranch_scc0/1, s_addc/
+// s_subb, s_cselect, s_cmov, s_cmovk -- the instruction-effects table). An opcode the table cannot
+// classify counts as a reader, which only refuses more programs.
 bool reads_scc(const Rdna2Inst& in) {
-    for (uint32_t k = 0; k < in.n_src; ++k)
-        if (in.src[k].kind == OperandKind::Special && in.src[k].value == 253) return true;
-    switch (in.fmt) {
-        case Rdna2Format::SOPP: return in.opcode == 0x04 || in.opcode == 0x05;
-        case Rdna2Format::SOP2:
-            return in.opcode == 0x04 || in.opcode == 0x05 || in.opcode == 0x0a || in.opcode == 0x0b;
-        case Rdna2Format::SOP1:
-            return in.opcode == kSop1OpcodeCmovB32 || in.opcode == kSop1OpcodeCmovB64;
-        case Rdna2Format::SOPK: return in.opcode == kSopkOpcodeCmovkI32;
-        default: return false;
-    }
+    return rdna2_operand_reads_scc(in) ||
+           rdna2_reads_scc_implicitly(in.fmt, in.opcode) != Rdna2Answer::No;
 }
 
-// SCC as a definite output. Under-reporting a writer only refuses more programs.
+// SCC as a definite output. Under-reporting a writer only refuses more programs, so an opcode the
+// table cannot classify is not a writer.
 bool writes_scc(const Rdna2Inst& in) {
-    switch (in.fmt) {
-        case Rdna2Format::SOPC: return true;
-        case Rdna2Format::SOP1: return sop1_opcode_writes_scc(in.opcode);
-        case Rdna2Format::SOP2:
-            // add/sub/min/max, the bitwise forms, shifts, bfe, absdiff and lshlN_add write SCC;
-            // cselect, bfm, mul_i32, pack and mul_hi do not.
-            return in.opcode <= 0x09 || (in.opcode >= 0x0e && in.opcode <= 0x23) ||
-                   (in.opcode >= 0x27 && in.opcode <= 0x2a) || in.opcode == 0x2c ||
-                   (in.opcode >= 0x2e && in.opcode <= 0x31);
-        case Rdna2Format::SOPK: return in.opcode >= 0x03 && in.opcode <= 0x0f;   // cmpk, addk
-        default: return false;
-    }
+    return rdna2_writes_scc(in.fmt, in.opcode) == Rdna2Answer::Yes;
 }
 
 Reads instruction_reads(const Rdna2Inst& in, bool wave32) {
