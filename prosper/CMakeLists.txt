@@ -723,6 +723,11 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME rdna2_reference_logic
            COMMAND "${Python3_EXECUTABLE}" -m pytest -q
                    "${CMAKE_SOURCE_DIR}/tests/tools/test_rdna2_ref.py")
+  # fragment_compile_replay/corpus.py (ADR 0006): compares two builds over recorded fragment cases.
+  # Pure logic over a faked replay; needs no corpus and no binary.
+  add_test(NAME fragment_corpus_logic
+           COMMAND "${Python3_EXECUTABLE}" -m pytest -q
+                   "${CMAKE_SOURCE_DIR}/tools/fragment_compile_replay/test_corpus.py")
   add_test(NAME recompile_corpus_logic
            COMMAND "${Python3_EXECUTABLE}" -m pytest -q
                    "${CMAKE_SOURCE_DIR}/tools/shader_inspect/test_recompile_corpus.py")

@@ -94,3 +94,27 @@ it was removed because it could not detect a new reader, only that some file cha
 
 These files contain private shader bytes. Do not commit or publish them. SOURCE reproduction does
 not establish buffer immutability, Wave64 admission, draw execution, or pixel correctness.
+
+## Comparing two builds over a corpus
+
+`corpus.py` is the before/after check ADR 0006 asks of each recompiler migration step. Record a
+directory of cases once with the build you trust, then replay it on both builds and compare:
+
+```text
+corpus.py run <CASE_DIR> --replay <recording-build>/fragment_compile_replay --mode baseline  --out BASE.json
+corpus.py run <CASE_DIR> --replay <build-under-test>/fragment_compile_replay --mode candidate --out CAND.json
+corpus.py compare BASE.json CAND.json
+```
+
+A result records the case's SHA256, its SPIR-V sha256 (none for a refusal), and the replay's verdict
+with its actual refusing pc. A refusal that moves, a changed input, or a missing/new case is a
+difference. Baseline mode matches only on the build that recorded the case; candidate mode replays
+the same inputs on any build, which is why the two runs use different binaries.
+
+Exactly one recognized status is required. The exit, produced word count and module size must agree;
+a refusal needs its actual diagnostic and writes no module. Missing/duplicate status, contradictory
+outputs, changed input during replay, or invalid result fields mean "could not run" (exit 2), never
+a recorded equal answer. Regenerate both result files after upgrading the driver; older files without
+input hashes are unevaluated. For the control, run both modes on the recording build and require them
+to agree. Cases remain local; result files contain names, hashes and refusal text rather than shader
+bytes. Inspect those fields before sharing them.
