@@ -64,6 +64,9 @@ struct Interpreter {
   // Default compute fixtures stay strict set 0. Actual NGG modules explicitly select their
   // separate set-2 launch/export ABI; no module words or resource ownership are rewritten.
   uint32_t storage_descriptor_set = 0;
+  // Explicit legacy shell fixture ABI: binding 0/1 may carry raw bits in scalar float32 slots.
+  // This permits loads, stores and bitcasts only; unsupported float arithmetic still fails.
+  bool legacy_float_word_storage = false;
   void use_ngg_shell_storage() { storage_descriptor_set = 2; }
   size_t entry = 0;
   std::string error;
@@ -780,9 +783,15 @@ struct Interpreter {
                           fail("unsupported live storage ABI");
                       const auto array = structure.a[0];
                       const auto stride = decorations.find({array, 6});
-                      if (ty(array).op != 29 || ty(array).a.size() != 1 ||
-                          !uint_type(ty(array).a[0]) || stride == decorations.end() ||
-                          stride->second != std::vector<uint32_t>{4})
+                      if (ty(array).op != 29 || ty(array).a.size() != 1)
+                          fail("unsupported live storage ABI");
+                      const auto& element = ty(ty(array).a.at(0));
+                      const bool float_word = legacy_float_word_storage &&
+                                              storage_descriptor_set == 0 && binding->second <= 1 &&
+                                              element.op == 22 &&
+                                              element.a == std::vector<uint32_t>{32};
+                      if ((!uint_type(ty(array).a[0]) && !float_word) ||
+                          stride == decorations.end() || stride->second != std::vector<uint32_t>{4})
                           fail("unsupported live storage ABI");
                       if (binding->second == sink_binding)
                           storage = a[1];
