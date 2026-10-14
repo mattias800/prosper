@@ -331,7 +331,10 @@ std::vector<uint32_t> live_select_then_merge(bool redefine_at_merge) {
         0xf800180fu, 0x03020100u,   // exp mrt0 v0, v1, v2, v3 done vm
         0xbf810000u,   // s_endpgm
     };
-    if (!redefine_at_merge) code.erase(code.begin() + 13);
+    // The VOPC is the merge instruction the pc6 branch targets; without it the target is the
+    // following move and the merge block's first VCC reader is the implicit v_cndmask.
+    constexpr std::size_t kMergeRedefinition = 13;
+    if (!redefine_at_merge) code.erase(code.begin() + kMergeRedefinition);
     return code;
 }
 }   // namespace
@@ -346,9 +349,12 @@ TEST(FragmentScalarVccPair, UniformBranchScalarScratchNeedsNoMaskAtTheMerge) {
 TEST(FragmentScalarVccPair, ALiveArmMaskDeadAtTheMergeNeedsNoSkipEdgeMask) {
     const auto result = compile(live_select_then_merge(true), 0x51680002u);
     ASSERT_FALSE(result.module.empty()) << result.reason;
-    // The in-arm read makes the select a live mask (lane identity), so this exercises the
-    // structured join's liveness rather than the scalar-only route above.
+    // The in-arm read makes the select a live mask (lane identity) rather than scalar-only data.
+    // That the join then admits it through dead-at-merge liveness is pinned by the refused twin
+    // below, which reaches the same join and differs only in reading VCC after the merge.
     EXPECT_EQ(fragment_spirv_required_subgroup_size(result.module), 64u);
+    EXPECT_TRUE(fragment_spirv_required_subgroup_reasons(result.module) &
+                kFragmentWaveReasonLaneId);
 }
 
 TEST(FragmentScalarVccPair, AnArmMaskLiveAfterTheMergeStillRequiresEveryEdge) {
