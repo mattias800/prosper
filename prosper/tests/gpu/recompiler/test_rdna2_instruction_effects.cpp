@@ -726,7 +726,8 @@ TEST(Rdna2InstructionEffectsValu, PairSourcesFollowTheMnemonic) {
 // scalar_alu_source_words charged every VOP3 opcode missing from a hand-kept B32 allowlist TWO
 // SGPRs per source, so a B32 read of s9 also demanded s10 and a fresh-mask guard refused valid
 // shaders (#5148 added V_BCNT_U32_B32 one opcode at a time). It also charged one SGPR for the pair
-// read of F64 VOP1/VOP2/VOPC operands. Each case below was answered wrongly by that code.
+// read of F64 VOP1/VOPC operands. The cases below include corrected answers and unchanged
+// answers that the table must retain.
 TEST(Rdna2InstructionEffectsRegression, ValuSourceWidthsComeFromTheIsaNotAnAllowlist) {
     struct Case {
         Rdna2Format fmt;
@@ -744,7 +745,7 @@ TEST(Rdna2InstructionEffectsRegression, ValuSourceWidthsComeFromTheIsaNotAnAllow
         {Rdna2Format::VOP3, 0x149, 0, 1, "v_bfe_i32"},
         {Rdna2Format::VOP3, 0x158, 0, 1, "v_med3_i32"},
         {Rdna2Format::VOP3, 0x103, 0, 1, "v_add_f32_e64"},
-        // Pair reads the old code charged one SGPR.
+        // These VOP3 pair reads already used the conservative two-word default.
         {Rdna2Format::VOP3, 0x18f, 0, 2, "v_cvt_f32_f64_e64"},
         {Rdna2Format::VOP3, 0x164, 1, 2, "v_add_f64"},
         // Unchanged answers the table must keep.
