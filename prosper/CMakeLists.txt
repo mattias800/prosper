@@ -2008,6 +2008,12 @@ if(TARGET prosper_core)
   target_include_directories(test_prosper_app_snap_author PRIVATE frontends/prosper-app)
   add_test(NAME prosper_app_snap_author COMMAND test_prosper_app_snap_author)
 
+  # Consecutive-frame capture (#5152): PROSPER_SNAP_AT_FLIPS ranges and the Shift+F9 / frame-flicker
+  # burst. Header-only and SDL-free, so it runs in the core suite on every host.
+  prosper_add_gtest(test_burst_capture
+    SOURCES tests/frontend/test_burst_capture.cpp
+    INCLUDES frontends/prosper-app)
+
   # Exit status + fault wording for a dead guest (#4140); no SDL/Vulkan.
   add_executable(test_prosper_app_guest_end_status frontends/prosper-app/test_guest_end_status.cpp)
   target_include_directories(test_prosper_app_guest_end_status PRIVATE frontends/prosper-app)
@@ -2645,6 +2651,11 @@ if(TARGET prosper_core)
   # it needs none of test_perf_alarms' HLE-dispatcher fixtures.
   prosper_add_gtest(test_frame_breakdown
     SOURCES tests/diagnostics/test_frame_breakdown.cpp
+    LIBRARIES prosper_core)
+  # frame-flicker (#5152): the alternation detector over synthetic signature sequences (alternation
+  # fires; steady, pans, fades, cuts, 30-at-60 and sub-second strobes do not) and its rule.
+  prosper_add_gtest(test_frame_flicker
+    SOURCES tests/diagnostics/test_frame_flicker.cpp
     LIBRARIES prosper_core)
   # The wording of the Wave64 host line and of a refusal line: a recompile refusal must not read
   # as a GPU limitation, and a narrow-subgroup device must be told what it will be missing.

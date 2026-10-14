@@ -1,4 +1,5 @@
 #include "diagnostics/perf/perf_alarm_rules.hpp"
+#include "diagnostics/perf/frame_flicker.hpp"
 #include "diagnostics/perf/wave64_refusal.hpp"
 
 #include <algorithm>
@@ -99,18 +100,33 @@ RuleThresholds RuleThresholds::scaled(double percent) {
 
 const std::vector<const char*>& rule_names() {
     static const std::vector<const char*> names = {
-        "texture-cache-thrash", "surface-readback", "texture-reference-cost",
-        "hle-blocking-wait",    "present-cpu-overhead", "dropped-draws",
-        "skipped-dispatches",   "host-copy-pressure",   "shader-compile",
-        "gpu-memory-off-device", "unaccounted-draws",   "unimplemented-hle-calls",
-        "diagnostic-path-active", "present-path-fallback", "pipeline-cache-thrash",
-        "texture-validation-churn", "host-copy-per-flip", "present-slot-trouble",
-        "rtt-destination-refused", "color-target-count-ceiling", "gpu-sync-wait",
+        "texture-cache-thrash",
+        "surface-readback",
+        "texture-reference-cost",
+        "hle-blocking-wait",
+        "present-cpu-overhead",
+        "dropped-draws",
+        "skipped-dispatches",
+        "host-copy-pressure",
+        "shader-compile",
+        "gpu-memory-off-device",
+        "unaccounted-draws",
+        "unimplemented-hle-calls",
+        "diagnostic-path-active",
+        "present-path-fallback",
+        "pipeline-cache-thrash",
+        "texture-validation-churn",
+        "host-copy-per-flip",
+        "present-slot-trouble",
+        "rtt-destination-refused",
+        "color-target-count-ceiling",
+        "gpu-sync-wait",
         "gpu-present-stalled",
         "gpu-device-time-coverage",
         "rtt-colorless-publication",
         "unsupported-wave64-shaders",
         "unverified-fragment-f32-arithmetic",
+        "frame-flicker",
     };
     return names;
 }
@@ -127,6 +143,11 @@ bool rule_has_data(const char* rule, const WindowSample& w) {
             if (w.count(counter)) return true;
         return false;
     }
+    // A sustained frame already carries the detector's full vote, possibly formed in an earlier
+    // window. Sparse presentations must not fire an alarm while being reported as NO DATA.
+    if (r == "frame-flicker")
+        return w.count(Counter::FlickerSustainedFrames) != 0 ||
+               w.count(Counter::FlickerComparedFrames) >= kFlickerWindowFrames;
     if (r == "present-cpu-overhead") return w.events(Cost::PresentCpu) != 0;
     if (r == "texture-reference-cost") return w.events(Cost::TextureRefSample) != 0;
     // Presents of either kind: a frontend without GPU present has no data for this rule.
@@ -165,7 +186,7 @@ uint32_t sustain_windows(const char* rule) {
     if (r == "dropped-draws" || r == "skipped-dispatches" || r == "gpu-memory-off-device" ||
         r == "unaccounted-draws" || r == "unimplemented-hle-calls" ||
         r == "diagnostic-path-active" || r == "unsupported-wave64-shaders" ||
-        r == "unverified-fragment-f32-arithmetic")
+        r == "unverified-fragment-f32-arithmetic" || r == "frame-flicker")
         return kCorrectnessSustainWindows;
     if (r == "shader-compile") return kShaderCompileSustainWindows;
     if (r == "texture-reference-cost") return kTextureReferenceSustainWindows;
@@ -941,6 +962,41 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
                      "PRESENT DECLINED line, PROSPER_PRESENT_HANDOFF_TRACE=1; cf. #3951";
             out.push_back(std::move(a));
         }
+    }
+
+    // frame-flicker (CORRECTNESS: the presented picture alternates, #5152). The 1 s sustain and the
+    // 6-of-8 vote are the detector's; the episode figures are its latest sustained episode.
+    if (w.count(Counter::FlickerSustainedFrames) >= kFlickerSustainedFramesPerWindow) {
+        const uint64_t compared = w.count(Counter::FlickerComparedFrames);
+        const uint64_t flicker = w.count(Counter::FlickerFrames);
+        AlarmFiring a;
+        a.rule = "frame-flicker";
+        a.value = static_cast<double>(w.count(Counter::FlickerSustainedFrames));
+        a.unit = "sustained-flicker-frames";
+        a.threshold = static_cast<double>(kFlickerSustainedFramesPerWindow);
+        a.detail = format(
+            "period=2 window-flicker=%llu/%llu-compared(%.0f%%) presented=%llu "
+            "episode: share=%.0f%% d1=%.2f d2=%.2f (mean |luma diff| 0-255 on a 32x18 grid, "
+            "d1 to the previous frame, d2 to the one before) length=%.1fs onset-guest-flip=%llu "
+            "region=%s",
+            (unsigned long long)flicker, (unsigned long long)compared,
+            compared ? 100.0 * static_cast<double>(flicker) / static_cast<double>(compared) : 0.0,
+            (unsigned long long)w.count(Counter::FlickerPresentedFrames),
+            w.gauge(Gauge::FlickerEpisodeShareMilli) / 10.0,
+            w.gauge(Gauge::FlickerEpisodeD1Milli) / 1000.0,
+            w.gauge(Gauge::FlickerEpisodeD2Milli) / 1000.0,
+            w.gauge(Gauge::FlickerEpisodeMs) / 1000.0,
+            (unsigned long long)w.gauge(Gauge::FlickerOnsetSourceFlip),
+            format_flicker_region_packed(w.gauge(Gauge::FlickerEpisodeRegion)).c_str());
+        a.hint = "the presented picture alternates frame to frame (each frame matches the one two "
+                 "back, not the one before) -- a single screenshot of this run is good or broken "
+                 "by parity, so never judge it from one frame. Usually a resource that ping-pongs "
+                 "per frame with one parity unwritten or read before written (TAA history, a "
+                 "double-buffered target, a ring index); `region=` says which part of the screen "
+                 "(3D layer vs UI). next: a burst of consecutive frames -- Shift+F9, "
+                 "PROSPER_SNAP_AT_FLIPS=<first>-<last>, or PROSPER_FLICKER_CAPTURE_DIR -- then an "
+                 "F9 bundle on each parity; per-frame d1/d2: PROSPER_FLICKER_TRACE; cf. #5152";
+        out.push_back(std::move(a));
     }
 
     // A pass with no slot-0 colour writer actually replaced the CPU colour cache (#3907).

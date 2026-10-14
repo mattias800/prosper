@@ -92,6 +92,7 @@ PROSPER_BUFVERIFY  unclassified
 PROSPER_BUFVERIFY_MUTATE  unclassified
 PROSPER_BUFVERIFY_MUTATE_BINDING  unclassified
 PROSPER_BUFVERIFY_MUTATE_MINBYTES  unclassified
+PROSPER_BURST_FRAMES  diagnostic  # #5152: frames per Shift+F9 / flicker burst; observes only
 PROSPER_CAPTION_DIAG  unclassified
 PROSPER_CAPTURE_ALLOW_UNPROVEN_INDIRECT  unclassified
 PROSPER_CAPTURE_BLOB_MAX_MB  unclassified
@@ -308,6 +309,8 @@ PROSPER_FAULT_SKIP  unclassified
 PROSPER_FIBERLOG  unclassified
 PROSPER_FIBER_DUMP_MS  unclassified
 PROSPER_FILELOG  unclassified
+PROSPER_FLICKER_CAPTURE_DIR  diagnostic  # #5152: where the frame-flicker alarm saves its one burst; observes only
+PROSPER_FLICKER_TRACE  diagnostic  # #5152: per-presented-frame d1/d2 CSV; observes only
 PROSPER_FLIP_FRONT_FACE  unclassified
 PROSPER_FLIP_GUEST_SCANOUT  unclassified
 PROSPER_FLIP_PACE_FPS  unclassified

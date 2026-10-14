@@ -1155,12 +1155,13 @@ void test_engine() {
     const std::string quiet = slurp(logp);
     check("...saying no rule fired", quiet.find("no rule fired in 1 windows") != std::string::npos);
     check("...and listing the rules that had no data as NOT quiet",
-          quiet.find("15 of 26 rules had data") != std::string::npos &&
+          quiet.find("15 of 27 rules had data") != std::string::npos &&
               quiet.find("NO DATA (not measured in any window, so not quiet): "
                          "texture-reference-cost,present-cpu-overhead,present-path-fallback,"
                          "present-slot-trouble,color-target-count-ceiling,gpu-sync-wait,"
                          "gpu-present-stalled,gpu-device-time-coverage,rtt-colorless-publication,"
-                         "unsupported-wave64-shaders,unverified-fragment-f32-arithmetic") != std::string::npos);
+                         "unsupported-wave64-shaders,unverified-fragment-f32-arithmetic,"
+                         "frame-flicker") != std::string::npos);
     std::fclose(s);
     std::remove(jsonl.c_str());
     std::remove(logp.c_str());
@@ -2228,7 +2229,8 @@ TEST(PerfAlarms, Contract) {
           "2026-09-29 ones (host-copy-per-flip, present-slot-trouble, rtt-destination-refused, "
           "color-target-count-ceiling), gpu-sync-wait (#3948), gpu-present-stalled (#3951) "
           "gpu-device-time-coverage and rtt-colorless-publication (#3891), "
-          "unsupported-wave64-shaders (#3992) and unverified-fragment-f32-arithmetic (#4062)",
-          rule_names().size() == 26);
+          "unsupported-wave64-shaders (#3992), unverified-fragment-f32-arithmetic (#4062) and "
+          "frame-flicker (#5152)",
+          rule_names().size() == 27);
     EXPECT_EQ(g_failures, 0);
 }

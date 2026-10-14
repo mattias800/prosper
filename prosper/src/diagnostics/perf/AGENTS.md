@@ -51,3 +51,8 @@ only actual retained-pixel/complete-encoded-prefix comparison invocations at the
 Completed-window JSONL/exit reporting excludes boot and trailing partial data. Native mapped-source
 checks establish helper/ledger/window behavior; live cold/changed/warm, scratch and write-watch
 checks separately constrain the caller's publication scope and unchanged pixels/cache policy.
+
+`frame_flicker.{hpp,cpp}` (#5152) is the one observer here fed per PRESENTED frame rather than per
+guest flip or event: a 32x18 mean-luma signature and an alternation detector (pure, unit-tested over
+synthetic sequences), whose counters and last-episode gauges the `frame-flicker` rule reads at window
+close. The frontend supplies the pixels; nothing here reads GPU memory or waits.

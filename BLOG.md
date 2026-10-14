@@ -19,6 +19,15 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-10-14
+
+### A new alarm catches a picture that flickers
+
+prosper now raises a `frame-flicker` alarm when the presented picture alternates from frame to frame, and saves a burst of consecutive frames as evidence. Here it caught *Kena*'s title screen at commit `e0b0e24c`: the world on even guest flips and noise on odd ones, so any single screenshot of that build was good or broken by chance ([#5152](https://github.com/mattias800/prosper/issues/5152)).
+
+<p align="center"><img src="assets/screenshots/kena-flicker-burst-flip168-world.webp" alt="Kena: Bridge of Spirits title menu over the 3D forest, guest flip 168; Linux RADV prosper-app, PROSPER_NULL_PAGE=1 and -force-gfx-direct, build e0b0e24c plus the flicker branch, frame-flicker auto burst frame 1 of 8"></p>
+<p align="center"><img src="assets/screenshots/kena-flicker-burst-flip169-noise.webp" alt="The very next frame, guest flip 169: the 3D layer is coloured noise under the menu; same run and burst, frame 2 of 8"></p>
+
 ## 2026-10-12
 
 ### Two Metal Gear Solid collection titles reach their first screens
