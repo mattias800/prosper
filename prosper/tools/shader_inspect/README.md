@@ -410,6 +410,23 @@ bounded descriptor-level counter. Repeats use owner-local counting; saturation s
 When a shader contains the fully proven bounded scalar `s_setpc_b64` jump-table idiom, the header also
 prints its constant-buffer selector, adjustment/clamp, complete target list, merge PC, and owning span.
 
+`inputs-launch` lists the VGPRs the wave starts with, as `src/gpu/recompiler/rdna2_launch_vgprs`
+derives them from the recorded launch registers (pixel `SPI_PS_INPUT_ENA`/`ADDR`, compute
+`TIDIG_COMP_CNT`), so the inspector and the recompiler cannot disagree about the contract:
+
+```
+inputs-launch stage=ps ps_input_ena=0x1002 ps_input_addr=0x1002 interpolation_geometry=0 front_face=unavailable vgprs=v0:persp_center.0/unsupplied,v1:persp_center.1/unsupplied,v2:front_face.0/unsupplied
+inputs-launch stage=cs tidig_comp_cnt=1 vgprs=v0:thread_id.x/supplied,v1:thread_id.y/supplied
+```
+
+`supplied` words are bound before emission; `unsupplied` ones are loaded by hardware but have no
+value in this backend, and `reserved` ones are ADDR-only slots hardware leaves untouched. A
+`fabricated-fresh-mask-source` refusal that traces back to an `unsupplied` word is the backend
+lacking an input, not the guest reading garbage. Read `front_face=` before believing one: a
+fragment compile-case sidecar older than schema 7 (#5072) cannot record the `SPI_BARYC_CNTL`
+encoding, so its replay always reports FRONT_FACE `unavailable` even where the live draw had it
+(#5146).
+
 The input is bounded to 16 MiB and decoding stops at the first `s_endpgm` or unknown instruction.
 Raw and SPIR-V dumps contain title-derived code, are local-only, and must not be committed.
 

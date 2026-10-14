@@ -6,6 +6,7 @@
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
+#include "gpu/recompiler/rdna2_launch_vgprs.hpp"
 #include "gpu/recompiler/rdna2_fragment_terminal_tail.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
@@ -554,39 +555,31 @@ std::vector<uint32_t> recompile_fragment_impl(
     // exact-wave-vote's subgroup-size requirement.
     rs.reads_scc = shader_reads_scc(ins);
     if (system_inputs) {
-        // RDNA2 PS system values are packed in field order. ADDR reserves each field's documented
-        // width even when ENA is clear, allowing a driver to keep later VGPR numbers stable. Vulkan
+        // Bind exactly the launch words this backend supplies (rdna2_launch_vgprs). Reserved,
+        // and loaded-but-unsupplied, words stay absent so seeding marks them placeholders. Vulkan
         // exposes the four floating-point position terms as FragCoord.xyzw, except that the
         // guest's W is FragCoord.w's reciprocal (guest_pixel_position_component).
-        static constexpr uint8_t widths[16] = {2, 2, 2, 3, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1};
-        uint32_t vgpr = 0;
-        for (uint32_t field = 0; field < 16; ++field) {
-            const uint32_t bit = 1u << field;
-            if (!(system_inputs->addr & bit)) continue;
-            if (system_inputs->ena & bit) {
-                if (field <= 6 && derived_interpolation.requires_geometry) {
-                    for (uint32_t component = 0; component < widths[field]; ++component) {
-                        const uint32_t value = b.system_interpolation_component(field, component);
-                        if (!value) {
-                            log_recompile_diagnostic(
-                                diagnostic, "recompile-reject", "terminal",
-                                "missing fragment system interpolation field=%u component=%u",
-                                field, component);
-                            return {};
-                        }
-                        rs.vreg[(int)(vgpr + component)] = value;
-                    }
-                } else if (field >= 8 && field <= 11) {
-                    rs.vreg[(int)vgpr] = b.guest_pixel_position_component(field - 8);
-                } else if (field == 12) {
-                    const uint32_t value =
-                        b.fragment_front_face_word(system_inputs->front_face_encoding);
-                    if (value) rs.vreg[(int)vgpr] = value;
-                } else if (field == 13) {
-                    rs.vreg[(int)vgpr] = b.fragment_ancillary_layer_bits();
+        for (const auto& launch :
+             pixel_launch_vgprs(*system_inputs, derived_interpolation.requires_geometry)) {
+            if (launch.state != LaunchVgprState::Supplied) continue;
+            uint32_t value = 0;
+            if (launch.field <= 6) {
+                value = b.system_interpolation_component(launch.field, launch.component);
+                if (!value) {
+                    log_recompile_diagnostic(
+                        diagnostic, "recompile-reject", "terminal",
+                        "missing fragment system interpolation field=%u component=%u", launch.field,
+                        launch.component);
+                    return {};
                 }
+            } else if (launch.field >= 8 && launch.field <= 11) {
+                value = b.guest_pixel_position_component(launch.field - 8);
+            } else if (launch.field == 12) {
+                value = b.fragment_front_face_word(system_inputs->front_face_encoding);
+            } else if (launch.field == 13) {
+                value = b.fragment_ancillary_layer_bits();
             }
-            vgpr += widths[field];
+            if (value) rs.vreg[static_cast<int>(launch.vgpr)] = value;
         }
     }
     auto safe_branches = safe_execz_branches(ins);

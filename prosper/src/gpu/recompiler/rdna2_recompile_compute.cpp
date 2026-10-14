@@ -8,6 +8,7 @@
 #include "gpu/recompiler/compute_dispatch_launch.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_diagnostic_attempt.hpp"
+#include "gpu/recompiler/rdna2_launch_vgprs.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
@@ -1045,9 +1046,10 @@ recompile_compute_once(const uint32_t* code, size_t dwords, const ShaderResource
             rs.sreg[static_cast<int>(i)] = value;
     }
 
-    rs.vreg[0] = b.localid_comp[0];
-    if (config.tidig_comp_cnt >= 1) rs.vreg[1] = b.localid_comp[1];
-    if (config.tidig_comp_cnt >= 2) rs.vreg[2] = b.localid_comp[2];
+    // TIDIG_COMP_CNT decides which thread-id VGPRs the wave starts with (rdna2_launch_vgprs). A
+    // component it does not load stays absent, so seeding marks that VGPR a placeholder.
+    for (const auto& launch : compute_launch_vgprs(config.tidig_comp_cnt))
+        rs.vreg[static_cast<int>(launch.vgpr)] = b.localid_comp[launch.field];
 
     int system_sgpr = static_cast<int>(config.user_sgprs.size());
     if (config.tgid_x_en) rs.sreg[system_sgpr++] = b.groupid[0];
