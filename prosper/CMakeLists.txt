@@ -2008,6 +2008,12 @@ if(TARGET prosper_core)
   target_include_directories(test_prosper_app_snap_author PRIVATE frontends/prosper-app)
   add_test(NAME prosper_app_snap_author COMMAND test_prosper_app_snap_author)
 
+  # Consecutive-frame capture (#5152): PROSPER_SNAP_AT_FLIPS ranges and the Shift+F9 / frame-flicker
+  # burst. Header-only and SDL-free, so it runs in the core suite on every host.
+  prosper_add_gtest(test_burst_capture
+    SOURCES tests/frontend/test_burst_capture.cpp
+    INCLUDES frontends/prosper-app)
+
   # Exit status + fault wording for a dead guest (#4140); no SDL/Vulkan.
   add_executable(test_prosper_app_guest_end_status frontends/prosper-app/test_guest_end_status.cpp)
   target_include_directories(test_prosper_app_guest_end_status PRIVATE frontends/prosper-app)

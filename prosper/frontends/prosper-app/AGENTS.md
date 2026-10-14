@@ -17,3 +17,8 @@ RenderDoc's `PROSPER_RENDERDOC_AT_FRAME` uses a host-present ordinal. For a scri
 `PROSPER_RENDERDOC_AT_PAD_FLIP=<positive ordinal>` to aim at the guest pad-flip ordinal established
 by the route's first pad poll. It is a one-shot guest-input axis; unavailable pad state leaves it
 pending, and it still captures through the renderer Vulkan instance and guest-present closure.
+
+`burst_capture.hpp` (#5152) is the pure half of Shift+F9 and the frame-flicker auto-capture:
+N consecutive presented frames held in memory and written once complete, named by guest flip, with
+a continuity line that names any skipped flip (a skip can hide a period-2 flicker). Plain F9 stays a
+single-frame grab. Range anchors for `PROSPER_SNAP_AT_FLIPS` live in `snap_author.hpp`.

@@ -988,6 +988,24 @@ renderer: the capture **seeds** the renderer-owned RTTs the frame *samples* (def
 temporal-AA history) with their live pixels (#1291), so a single submit no longer replays black. Drill
 into one submit with `--bundle-extract-submit K sub.prgcap`, then `--draw-steps` / `--inspect-only` /
 `--dump-resource`.
+
+**Shift+F9: a burst of consecutive frames, for a picture that flickers** (#5152). F9 and every other
+picture instrument take ONE frame, and one frame of a good / broken / good alternation lands on one
+parity: the build reads as good or broken by chance, and a bisect over that oracle converges on the
+wrong commit. **Shift+F9** captures the next `PROSPER_BURST_FRAMES` presented frames (default 8,
+2-32; a malformed value disables the burst and says so) as BMPs in `PROSPER_CAPTURE_DIR`, named
+`burst_<titleId>_<stamp>_<NN>_flip<guest flip>.bmp`. They are held in memory and written when the
+burst completes, so writing does not make the presenter skip the flips it is recording; the closing
+`[burst] ... wrote N of N frames` line says `consecutive guest flips a-b`, or names the gaps -- a burst
+that skipped every other flip cannot show a period-2 flicker. Plain F9 is unchanged. Two headless ways
+to the same evidence:
+- `PROSPER_SNAP_AT_FLIPS` accepts ranges: `1200-1207` (inclusive) or `1200+8`, mixed freely with single
+  pad-flip anchors (`400-407,1000`). At most 256 anchors in total; a reversed range, `+0`, an overflow or
+  a list over the cap voids the WHOLE list (logged), like any malformed entry.
+- `PROSPER_FLICKER_CAPTURE_DIR=<dir>`: the first time the always-on `frame-flicker` `[perf-alarm]`
+  detects a sustained alternation, a burst is saved there automatically (once per run).
+  `PROSPER_FLICKER_TRACE=<path.csv>` writes the detector's per-presented-frame `d1`/`d2` for calibration.
+  The rule itself is described in `src/diagnostics/AGENTS.md`.
 For a scripted route with a stable guest phase line, set
 `PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG='exact complete line'` together with the existing
 `PROSPER_CAPTURE_BUNDLE=/path/frame.prgbundle` and optional `PROSPER_CAPTURE_BUNDLE_MAX_MB=N` settings.
