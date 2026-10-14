@@ -2,6 +2,7 @@
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_vgpr_word_definitions.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <algorithm>
@@ -141,19 +142,30 @@ ngg_row_sources_without_live_spills(const std::vector<Rdna2Inst>& instructions,
                     ordinary_sources = false;
             }
         }
-        const bool relative_write =
-            in.fmt == Rdna2Format::VOP1 && in.opcode == kVop1OpcodeMovreldB32;
-        const bool relative_read = in.fmt == Rdna2Format::VOP1 && in.opcode == 0x43u;
-        const bool lane_write = in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361u;
+        // M0-relative reads and writes, and v_writelane's single selected lane, are the effects
+        // table's (every encoding of v_movrel*/v_swaprel, not only the VOP1 movreld/movrels).
+        const Rdna2InstructionEffects& effects = rdna2_instruction_effects(in);
+        const bool valu = effects.describes_vector_result();
+        const bool relative_write = rdna2_writes_m0_relative_vgpr(in);
+        const bool relative_read = valu && (effects.m0_relative == Rdna2M0Relative::Source ||
+                                            effects.m0_relative == Rdna2M0Relative::Both);
+        const bool lane_write = valu && effects.lane_flow == Rdna2LaneFlow::WriteLane;
         const uint32_t clobbers = rdna2_vgpr_write_count(in);
         for (uint32_t word = 0; word < clobbers; ++word) {
             const int reg = in.dst.value + static_cast<int>(word);
             if (reg >= 0 && reg < 256 && (!ordinary_sources || lane_write || relative_read))
                 out.reset(static_cast<size_t>(reg));
         }
+        // A swap also writes SRC0's VGPR (relative to M0 for v_swaprel_b32).
+        const int swapped =
+            effects.writes_src0 && in.src[0].kind == OperandKind::VGPR ? in.src[0].value : -1;
         if (relative_write)
-            for (int reg = std::max(0, in.dst.value); reg < 256; ++reg)
+            for (int reg =
+                     std::max(0, swapped >= 0 ? std::min(swapped, in.dst.value) : in.dst.value);
+                 reg < 256; ++reg)
                 out.reset(static_cast<size_t>(reg));
+        else if (swapped >= 0 && swapped < 256)
+            out.reset(static_cast<size_t>(swapped));
         if (ordinary_sources && full_exec[i]) {
             const uint32_t complete = ordinary_vgpr_complete_results(in);
             for (uint32_t word = 0; word < complete; ++word) {

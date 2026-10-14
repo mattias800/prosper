@@ -1,5 +1,6 @@
 #pragma once
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include <cstdint>
 
 namespace prosper::gpu {
@@ -86,157 +87,14 @@ inline uint32_t ordinary_vgpr_complete_results(const Rdna2Inst& in) {
         return 0;
     switch (in.fmt) {
         case Rdna2Format::VOP1:
-            switch (in.opcode) {
-                case 0x01u:   // MOV_B32
-                case 0x05u:
-                case 0x06u:
-                case 0x07u:
-                case 0x08u:   // full-word numeric converts
-                case 0x0bu:
-                case 0x0cu:
-                case 0x0du:
-                case 0x0eu:
-                case 0x11u:
-                case 0x12u:
-                case 0x13u:
-                case 0x14u:
-                case 0x20u:
-                case 0x21u:
-                case 0x22u:
-                case 0x23u:
-                case 0x24u:
-                case 0x25u:
-                case 0x27u:
-                case 0x2au:
-                case 0x2bu:
-                case 0x2eu:
-                case 0x33u:
-                case 0x35u:
-                case 0x36u:   // full F32 unary results
-                case 0x37u:
-                case 0x38u:
-                case kVop1OpcodeFfbhU32:
-                case kVop1OpcodeFfblB32: return 1;
-                case 0x0au:   // CVT_F16_F32: plain form preserves the high half; SDWA PAD clears it.
-                    return in.has_sdwa ? 1u : 0u;
-                default: return 0;
-            }
         case Rdna2Format::VOP2:
-            switch (in.opcode) {
-                case 0x01u:   // CNDMASK selects complete explicit source words.
-                case 0x03u:
-                case 0x04u:
-                case 0x05u:
-                case 0x08u:
-                case 0x0fu:
-                case 0x10u:
-                case 0x20u:
-                case 0x21u:
-                case 0x2cu:
-                case 0x2du:   // F32; literal-K is explicit.
-                case 0x0bu:
-                case 0x11u:
-                case 0x12u:
-                case 0x13u:
-                case 0x14u:
-                case 0x16u:
-                case 0x18u:
-                case 0x1au:
-                case 0x1bu:
-                case 0x1cu:
-                case 0x1du:
-                case 0x1eu:
-                case 0x25u:
-                case 0x26u:
-                case 0x27u:
-                case 0x28u:
-                case 0x29u:
-                case 0x2au:
-                case 0x2fu:   // PKRTZ writes both halves; carry forms consume VCC, not old VDST.
-                    return 1;
-                case 0x32u:
-                case 0x33u:
-                case 0x35u:
-                case 0x39u:
-                case 0x3au:
-                    return in.has_sdwa ? 1u
-                                       : 0u;   // scalar F16: only full-destination PAD is complete.
-                default: return 0;   // MAC/FMAC and packed FMAC implicitly consume old VDST.
-            }
         case Rdna2Format::VOP3:
-            // This follows the actual VOP3 lowering, not architectural VOP2/VOP1 normalization:
-            // several valid extended opcodes have no emitter. Scalar 16-bit forms preserve a half;
-            // PACK_B32_F16 below explicitly assembles both halves instead.
-            switch (in.opcode) {
-                case 0x101u:
-                case 0x103u:
-                case 0x104u:
-                case 0x105u:
-                case 0x107u:
-                case 0x108u:
-                case 0x10fu:
-                case 0x110u:
-                case 0x128u:
-                case 0x129u:
-                case 0x12au:
-                case 0x12fu:
-                case 0x141u:
-                case 0x143u:
-                case 0x144u:
-                case 0x145u:
-                case 0x146u:
-                case 0x147u:
-                case 0x148u:
-                case 0x149u:
-                case 0x14au:
-                case 0x14bu:
-                case kVop3OpcodeAlignbitB32:
-                case kVop3OpcodeAlignbyteB32:
-                case 0x151u:
-                case 0x152u:
-                case 0x153u:
-                case 0x154u:
-                case 0x155u:
-                case 0x156u:
-                case 0x157u:
-                case 0x158u:
-                case 0x159u:
-                case 0x15au:
-                case 0x15bu:
-                case 0x15cu:
-                case 0x15du:
-                case 0x15fu:
-                case 0x169u:
-                case 0x16au:
-                case 0x16cu:
-                case 0x171u:
-                case 0x178u:
-                case 0x30fu:
-                case 0x310u:
-                case 0x311u:
-                case 0x319u:
-                case 0x344u:
-                case 0x345u:
-                case 0x346u:
-                case 0x347u:
-                case 0x362u:
-                case 0x363u:
-                case 0x364u:
-                case 0x365u:
-                case 0x366u:
-                case 0x368u:
-                case 0x369u:
-                case 0x36au:
-                case kVop3OpcodeAdd3U32:
-                case 0x36fu:
-                case kVop3OpcodeAndOrB32:
-                case 0x372u: return 1;
-                case 0x176u:
-                case 0x177u:
-                case kVop3OpcodeLshlrevB64:
-                case kVop3OpcodeLshrrevB64: return 2;
-                default: return 0;
-            }
+            // The effects table: a lane-wise result of the explicit operands alone, in every
+            // VGPR VDST receives. Accumulators (MAC/FMAC/DOT*C read the old VDST), 16-bit results
+            // outside the zero-filling SDWA PAD form, and cross-lane, selected-lane, relative and
+            // interpolation results supply no such effect. A valid opcode with no emitter is
+            // refused at emission, so naming it here grants nothing.
+            return rdna2_valu_complete_result_dwords(in);
         case Rdna2Format::VOP3P:
             // Packed arithmetic/dot results write both halves or a full F32 word; MIXLO/MIXHI
             // preserve the opposite half and are deliberately absent.

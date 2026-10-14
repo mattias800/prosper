@@ -1,5 +1,6 @@
 #include "gpu/recompiler/rdna2_active_vector_words.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_vector_old_word.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
@@ -150,26 +151,19 @@ bool active_vector_sources_defined(const ActiveVectorWords& state, const Rdna2In
                in.src[0].kind == OperandKind::VGPR && in.src[0].value >= 0 &&
                in.src[0].value < 255 && in.src[1].kind == OperandKind::Special &&
                in.src[1].value == 125 && vector(in.src[0].value) && vector(in.src[0].value + 1);
-    // The emitted plain F32 MAC reads its implicit old VDST before writing the complete result.
-    // Genuine explicit sources cannot repair a missing accumulator. Retain existing DATA only;
-    // this does not classify the operation as an independent full-word writer.
-    const bool mac =
-        !in.has_sdwa && ((in.fmt == Rdna2Format::VOP2 && in.opcode == 0x1f) ||
-                         (in.fmt == Rdna2Format::VOP3 && in.opcode == kVop3OpcodeMacF32));
-    if (mac && !state.current.contains(in.dst.value)) return false;
-    // Neither a peer operation nor a relative/selected-slot read may borrow lane-wise ownership.
-    if (in.has_dpp || in.has_modifier ||
-        (in.fmt == Rdna2Format::VOP1 &&
-         (in.opcode == 0x02 || (in.opcode >= 0x40 && in.opcode <= 0x47))) ||
-        (in.fmt == Rdna2Format::VOP2 &&
-         ((!mac && in.opcode == 0x1f) || in.opcode == 0x2b || in.opcode == 0x3c)) ||
-        (in.fmt == Rdna2Format::VOP3 && in.opcode >= 0x300 && in.opcode != 0x346) ||
-        (in.fmt != Rdna2Format::VOP1 && in.fmt != Rdna2Format::VOP2 &&
-         in.fmt != Rdna2Format::VOP3 && in.fmt != Rdna2Format::VOPC))
+    // Only a lane-wise VALU result is a function of the lane's own operands (the effects table,
+    // ISA 70648 12.7-12.12). Neither a peer operation nor a relative/selected-slot read may borrow
+    // lane-wise ownership; neither may an encoding the table does not describe.
+    const Rdna2InstructionEffects& effects = rdna2_instruction_effects(in);
+    if (!effects.describes_vector_result() || in.has_dpp || in.has_modifier ||
+        (effects.lane_flow != Rdna2LaneFlow::LaneWise &&
+         effects.lane_flow != Rdna2LaneFlow::LaneIndex))
         return false;
-    const bool implicit_vcc = in.fmt == Rdna2Format::VOP2 &&
-                              (in.opcode == 0x01 || (in.opcode >= 0x28 && in.opcode <= 0x2a));
-    if (implicit_vcc && !masks.contains(106)) return false;
+    // An accumulator (v_mac/v_fmac/v_dot*c) reads its implicit old VDST before writing the
+    // complete result. Genuine explicit sources cannot repair a missing accumulator. Retain
+    // existing DATA only; this does not classify the operation as an independent full-word writer.
+    if (effects.accumulates && (in.has_sdwa || !state.current.contains(in.dst.value))) return false;
+    if ((effects.implicit_reads & kRdna2ImplicitVcc) && !masks.contains(106)) return false;
     for (uint32_t source = 0; source < in.n_src; ++source) {
         const auto& operand = in.src[source];
         if (operand.kind == OperandKind::VGPR) {

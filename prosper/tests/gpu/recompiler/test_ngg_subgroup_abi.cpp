@@ -190,6 +190,23 @@ TEST(NggSubgroupAbi, UnsuppliedLaunchVgprsMustBeWrittenOnTheLaneFirst) {
     EXPECT_TRUE(analyze(program({0x7e120305u, 0x7e120308u})).ok()) << "v5 and v8 are supplied";
 }
 
+TEST(NggSubgroupAbi, MixHalfResultsRequireTheirPreservedDestination) {
+    // MIXLO/MIXHI produce only one half of v7; their other half is an actual old-VDST read.
+    for (uint32_t opcode : {0x21u, 0x22u}) {
+        const uint32_t first = 0xcc000007u | (opcode << 16u);
+        const uint32_t sources = 256u | (257u << 9u) | (258u << 18u);
+        const auto refused = analyze(program({first, sources, 0x7e120307u}));
+        EXPECT_EQ(refused.reason, "ngg-abi-read-v6-v7");
+        EXPECT_NE(refused.refusal.find("pc=2"), std::string::npos)
+            << "the preserving writer itself must refuse: " << refused.refusal;
+        const auto supplied = analyze(program({0x7e0e0280u, first, sources, 0x7e120307u}));
+        EXPECT_TRUE(supplied.ok()) << supplied.refusal;
+    }
+    const uint32_t full_mix = 0xcc200007u;
+    EXPECT_TRUE(analyze(program({full_mix, 256u | (257u << 9u) | (258u << 18u), 0x7e120307u})).ok())
+        << "full-word MIX_F32 does not require the old destination";
+}
+
 TEST(NggSubgroupAbi, AVgprWrittenUnderNarrowEXECIsDefinedOnlyWhileEXECStaysNarrow) {
     // s_mov_b64 exec, 1; v_mov v6, 0; v_mov v9, v6: the read sees the lanes the write covered.
     EXPECT_TRUE(analyze(program({0xbefe0481u, 0x7e0c0280u, 0x7e120306u})).ok());

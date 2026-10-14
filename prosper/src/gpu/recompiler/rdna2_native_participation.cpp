@@ -1,6 +1,7 @@
 #include "gpu/recompiler/rdna2_native_participation.hpp"
 #include "gpu/recompiler/rdna2_native_launch.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
@@ -455,16 +456,22 @@ Facts transfer(const Facts& before, const SpirvCompute& b, const Rdna2Inst& in) 
         }
         genuine = 0;
     } else {
-        // This is a semantic proof inventory, not decoder storage accounting. Operations with
-        // implicit old VDST, carry, interpolation, spill or mask inputs need their own transfer.
-        const bool supported =
-            (in.fmt == Rdna2Format::VOP1 && (in.opcode == 1 || in.opcode == kVop1OpcodeFfbhU32)) ||
-            (in.fmt == Rdna2Format::VOP2 &&
-             (in.opcode == 1 || in.opcode == 0x25 || in.opcode == 0x26)) ||
-            (in.fmt == Rdna2Format::VOP3 &&
-             (in.opcode == 0x169 || in.opcode == 0x36d || in.opcode == 0x378));
-        if (!supported) genuine = 0;
-        if (in.fmt == Rdna2Format::VOP2 && in.opcode == 1 && !before.mask[106].genuine) genuine = 0;
+        // This is a semantic proof inventory, not decoder storage accounting. A lane-wise VALU
+        // result (the effects table, ISA 70648 12.7-12.12) is genuine in exactly the lanes where
+        // every operand it reads is: its explicit sources, an accumulator's or a 16-bit result's
+        // old VDST, and an implicit VCC mask. Cross-lane, selected-lane, M0-relative and
+        // interpolation results need their own transfer; v_permlanex16 has one below. This
+        // replaces an allowlist of seven opcodes extended one title at a time (#5143).
+        const Rdna2InstructionEffects& effects = rdna2_instruction_effects(in);
+        const bool lane_wise = in.fmt != Rdna2Format::VOPC && effects.describes_vector_result() &&
+                               (effects.lane_flow == Rdna2LaneFlow::LaneWise ||
+                                effects.lane_flow == Rdna2LaneFlow::LaneIndex);
+        if (!lane_wise && !(in.fmt == Rdna2Format::VOP3 && in.opcode == 0x378)) genuine = 0;
+        if (lane_wise && (effects.accumulates ||
+                          (effects.vdst_half &&
+                           !(in.has_sdwa && in.sdwa_dst_sel == 6 && in.sdwa_dst_unused != 2))))
+            genuine &= vector_source(before, in, in.dst);
+        if ((effects.implicit_reads & kRdna2ImplicitVcc) && !before.mask[106].genuine) genuine = 0;
     }
     if (in.has_dpp || (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x378))
         genuine = genuine == full ? full : 0;
