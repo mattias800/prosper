@@ -80,7 +80,8 @@ host_test(loader_synth_reject "${PROSPER_ROOT}/tests/misc/test_loader_synth_reje
 target_include_directories(loader_synth_reject PRIVATE "${PROSPER_ROOT}/tests")
 target_link_libraries(loader_synth_reject PRIVATE GTest::gtest GTest::gtest_main)
 host_test(rdna2_decode "${PROSPER_ROOT}/tests/gpu/recompiler/test_rdna2_decode.cpp"
-                      "${PROSPER_ROOT}/src/gpu/recompiler/rdna2_decode.cpp")
+                      "${PROSPER_ROOT}/src/gpu/recompiler/rdna2_decode.cpp"
+                      "${PROSPER_ROOT}/src/gpu/recompiler/rdna2_instruction_effects.cpp")
 target_link_libraries(rdna2_decode PRIVATE GTest::gtest GTest::gtest_main)
 host_test(bc_decode "${PROSPER_ROOT}/tests/gpu/texture/test_bc_decode.cpp"
                    "${PROSPER_ROOT}/src/gpu/texture/bc_decode.cpp")

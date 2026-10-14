@@ -10,6 +10,7 @@
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
@@ -995,11 +996,14 @@ inline bool scalar_instruction_writes_anything(const Rdna2Inst& in) {
 }
 
 inline bool dynamic_vgpr_destination(const Rdna2Inst& in) {
-    return in.fmt == Rdna2Format::VOP1 && in.opcode == kVop1OpcodeMovreldB32;
+    return rdna2_writes_m0_relative_vgpr(in);
 }
 
 inline bool writes_vgpr(const Rdna2Inst& in, int vgpr) {
     if (dynamic_vgpr_destination(in)) return true;
+    if (rdna2_instruction_effects(in).writes_src0 && in.src[0].kind == OperandKind::VGPR &&
+        in.src[0].value == vgpr)
+        return true;   // v_swap_b32 writes SRC0's VGPR too
     const uint32_t words = rdna2_vgpr_write_count(in);
     if (words && in.dst.kind == OperandKind::VGPR && in.dst.value <= vgpr &&
         vgpr < in.dst.value + static_cast<int>(words))

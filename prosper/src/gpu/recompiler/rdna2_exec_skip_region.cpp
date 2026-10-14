@@ -1,5 +1,6 @@
 #include "gpu/recompiler/rdna2_exec_skip_region.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/rdna2_instruction_effects.hpp"
 
 namespace prosper::gpu {
 namespace {
@@ -25,20 +26,14 @@ bool scalar_destination_dead(const std::vector<Rdna2Inst>& ins, uint32_t target_
 // Cross-lane and lane-addressed VALU: its result depends on which lanes of the 64-lane guest wave
 // are active, and the fragment emitter lowers it per invocation (v_readfirstlane returns the
 // invocation's own lane), so it is wrong on a narrower host even when its destination is dead.
+// The effects table names them: v_readfirstlane, v_readlane, v_writelane, v_mbcnt_lo/hi and
+// v_permlane16/x16, in every encoding that exists. A reserved slot in a tabulated VALU format (VOP3
+// 0x182, which no gfx10 target assigns to v_readfirstlane_b32_e64) fails closed.
 bool is_cross_lane_valu(const Rdna2Inst& in) {
-    if (in.fmt == Rdna2Format::VOP1) return in.opcode == 0x02;          // v_readfirstlane_b32
-    if (in.fmt != Rdna2Format::VOP3) return false;
-    switch (in.opcode) {
-        case 0x182:   // readfirstlane (VOP3 form)
-        case 0x360:
-        case 0x361:   // v_readlane / v_writelane
-        case 0x365:
-        case 0x366:   // v_mbcnt_lo / v_mbcnt_hi
-        case 0x377:
-        case 0x378:   // v_permlane16 / x16
-            return true;
-        default: return false;
-    }
+    const bool valu = in.fmt == Rdna2Format::VOP1 || in.fmt == Rdna2Format::VOP2 ||
+                      in.fmt == Rdna2Format::VOP3 || in.fmt == Rdna2Format::VOPC;
+    const Rdna2Answer answer = rdna2_valu_lane_dependent(in.fmt, in.opcode);
+    return answer == Rdna2Answer::Yes || (valu && answer == Rdna2Answer::Unknown);
 }
 
 int smem_load_dwords(uint32_t opcode) {

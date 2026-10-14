@@ -2736,6 +2736,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_flat_active_word.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_add3_active_word
+    SOURCES tests/gpu/recompiler/test_add3_active_word.cpp
+    INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_active_image_word_definedness
     SOURCES tests/gpu/recompiler/test_active_image_word_definedness.cpp
     INCLUDES tests
@@ -3314,6 +3318,7 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_workgroup_uniformity
     SOURCES tests/gpu/test_workgroup_uniformity.cpp src/gpu/recompiler/rdna2_decode.cpp
             src/gpu/recompiler/rdna2_instruction_effects.cpp
+            src/gpu/recompiler/rdna2_scalar_source_words.cpp
     INCLUDES src)
 
   # ADR 0028: compute cross-lane operation inventory and Wave64 route selection (CPU only).
@@ -3569,6 +3574,7 @@ if(TARGET prosper_core)
   # (same pattern as test_workgroup_uniformity above).
   prosper_add_gtest(test_rdna2_closed_tail
     SOURCES tests/gpu/recompiler/test_rdna2_closed_tail.cpp src/gpu/recompiler/rdna2_decode.cpp
+            src/gpu/recompiler/rdna2_instruction_effects.cpp
     INCLUDES src)
 
   # SOP2 destination widths are decoder-only facts checked against LLVM's SOP2 classes.
@@ -3580,11 +3586,13 @@ if(TARGET prosper_core)
   # Mandatory-literal capture is a decoder-only fact: K/data must be captured, not just counted.
   prosper_add_gtest(test_rdna2_literal_capture
     SOURCES tests/gpu/recompiler/test_rdna2_literal_capture.cpp src/gpu/recompiler/rdna2_decode.cpp
+            src/gpu/recompiler/rdna2_instruction_effects.cpp
     INCLUDES src)
 
   # Memory-writer classification is a decoder-only predicate checked against the ISA tables.
   prosper_add_gtest(test_may_write_memory
     SOURCES tests/gpu/recompiler/test_may_write_memory.cpp src/gpu/recompiler/rdna2_decode.cpp
+            src/gpu/recompiler/rdna2_instruction_effects.cpp
     INCLUDES src)
 
   # Structural RDNA2->SPIR-V validation that does not require Vulkan runtime support.
@@ -3869,18 +3877,21 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_raw_wide_flat_read_effects.cpp
             src/gpu/recompiler/rdna2_decode.cpp
             src/gpu/recompiler/rdna2_instruction_effects.cpp
+            src/gpu/recompiler/rdna2_scalar_source_words.cpp
             src/gpu/recompiler/rdna2_raw_wide_data.cpp
     INCLUDES src)
   prosper_add_gtest(test_raw_wide_vop3_source_width
     SOURCES tests/gpu/recompiler/test_raw_wide_vop3_source_width.cpp
             src/gpu/recompiler/rdna2_decode.cpp
             src/gpu/recompiler/rdna2_instruction_effects.cpp
+            src/gpu/recompiler/rdna2_scalar_source_words.cpp
             src/gpu/recompiler/rdna2_raw_wide_data.cpp
     INCLUDES src)
   prosper_add_gtest(test_raw_wide_replayed_load
     SOURCES tests/gpu/recompiler/test_raw_wide_replayed_load.cpp
             src/gpu/recompiler/rdna2_decode.cpp
             src/gpu/recompiler/rdna2_instruction_effects.cpp
+            src/gpu/recompiler/rdna2_scalar_source_words.cpp
             src/gpu/recompiler/rdna2_raw_wide_data.cpp
     INCLUDES src)
   prosper_add_gtest(test_raw_wide_disjoint_paths
@@ -3890,6 +3901,7 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_raw_wide_loop_after_load.cpp
             src/gpu/recompiler/rdna2_decode.cpp
             src/gpu/recompiler/rdna2_instruction_effects.cpp
+            src/gpu/recompiler/rdna2_scalar_source_words.cpp
             src/gpu/recompiler/rdna2_raw_wide_data.cpp
     INCLUDES src)
   prosper_add_gtest(test_graphics_raw_register_wide_data
