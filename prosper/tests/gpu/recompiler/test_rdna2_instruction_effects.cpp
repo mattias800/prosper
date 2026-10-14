@@ -18,6 +18,7 @@
 //   * REGRESSIONS for the old-list bugs the table exposed, each against the old wrong answer.
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 
+#include "gpu/recompiler/indirect/rdna2_indirect_scalar_writes.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 
 #include <gtest/gtest.h>
@@ -424,4 +425,38 @@ TEST(Rdna2InstructionEffects, ExecAndM0Effects) {
     for (const LlvmOpcode& entry : kLlvmSopp)
         EXPECT_EQ(rdna2_instruction_effects(Rdna2Format::SOPP, entry.opcode).implicit_writes, 0u)
             << entry.name;
+}
+
+// ---- Regressions: each of these was answered wrongly by a private list -------------------------
+
+// The two copies of conservative_scalar_write_width "disagreed" about a VOPC destination (1 SGPR
+// in the descriptor-range proof, 2 in the pointer analysis). Both were right for the one wave size
+// their own proof requires, so the shared copy takes the wave size; charging a Wave32 proof a pair
+// refuses its exact shape. Both copies charged s_call_b64 one SGPR, but it writes a pair, and
+// both charged a Wave64 VOP3B carry-out one SGPR, but it is a pair too.
+TEST(Rdna2InstructionEffectsRegression, ConservativeWidthChargesEveryPairDestination) {
+    Rdna2Inst compare;
+    compare.fmt = Rdna2Format::VOPC;
+    compare.opcode = 0xc1;   // v_cmp_lt_u32, e64 form writing s[8:9] (Wave64) or s8 (Wave32)
+    compare.dst = {OperandKind::SGPR, 8};
+    EXPECT_EQ(conservative_scalar_write_width(compare, IndirectWave::Wave64), 2u);
+    EXPECT_EQ(conservative_scalar_write_width(compare, IndirectWave::Wave32), 1u);
+    const Rdna2Inst call = decode(Rdna2Format::SOPK, 0x16);
+    EXPECT_EQ(conservative_scalar_write_width(call, IndirectWave::Wave32), 2u)
+        << "s_call_b64 writes a pair";
+    const Rdna2Inst movk = decode(Rdna2Format::SOPK, 0x00);
+    EXPECT_EQ(conservative_scalar_write_width(movk, IndirectWave::Wave64), 1u);
+    // So a Wave64 compare writing s[8:9] clobbers a live range starting at s9; in Wave32 it does not.
+    compare.pc = 2;
+    EXPECT_FALSE(scalar_range_unchanged({compare}, 1u, 3u, 9u, 1u, IndirectWave::Wave64));
+    EXPECT_TRUE(scalar_range_unchanged({compare}, 1u, 3u, 9u, 1u, IndirectWave::Wave32));
+    // A Wave64 v_add_co_u32's carry-out s[4:5] clobbers s5.
+    Rdna2Inst carry;
+    carry.fmt = Rdna2Format::VOP3;
+    carry.opcode = kVop3OpcodeAddCoU32;
+    carry.pc = 2;
+    carry.dst = {OperandKind::VGPR, 0};
+    carry.sdst = {OperandKind::SGPR, 4};
+    EXPECT_FALSE(scalar_range_unchanged({carry}, 1u, 3u, 5u, 1u, IndirectWave::Wave64));
+    EXPECT_TRUE(scalar_range_unchanged({carry}, 1u, 3u, 5u, 1u, IndirectWave::Wave32));
 }
