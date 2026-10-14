@@ -30,6 +30,7 @@
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/rdna2_copy_continuation.hpp"
 #include "gpu/recompiler/rdna2_recompile_shared.hpp"
 
 namespace prosper::gpu {
@@ -186,8 +187,8 @@ inline bool shader_reads_scc(const std::vector<Rdna2Inst>& ins) {
 // line) exactly like a forward s_cbranch_execz. Recognize it by the mask op IMMEDIATELY preceding the
 // branch (hints ignored). Returns the pc of each such branch. This is the shape of every Unity cutout /
 // text draw; rejecting the branch dropped all of them (The Messenger's missing cutscene text, #102).
-std::unordered_set<uint32_t> mask_test_branches(const std::vector<Rdna2Inst>& ins,
-                                                bool allow_b32_masks = false) {
+std::unordered_set<uint32_t> fragment_mask_test_branches(const std::vector<Rdna2Inst>& ins,
+                                                         bool allow_b32_masks = false) {
     std::unordered_set<uint32_t> out;
     std::unordered_set<uint32_t> b32_mask_writer_pcs;
     std::unordered_set<uint32_t> block_entries;
@@ -371,7 +372,7 @@ std::vector<uint32_t> mask_test_branches_for_test(const uint32_t* code, size_t d
                                                   bool wave32) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
-    const auto branches = mask_test_branches(ins, wave32);
+    const auto branches = fragment_mask_test_branches(ins, wave32);
     return std::vector<uint32_t>(branches.begin(), branches.end());
 }
 
@@ -399,7 +400,7 @@ bool rdna2_fragment_compiles_wave64(const uint32_t* code, size_t program_dwords)
                                         shader_program_hash(code, program_dwords)) == 64;
 }
 
-static std::vector<uint32_t> recompile_fragment_impl(
+std::vector<uint32_t> recompile_fragment_impl(
     const uint32_t* code, size_t dwords, const ShaderResourceTable* rt,
     const PixelSystemInputMapping* system_inputs, uint32_t pcrel_dispatch_target,
     const FragmentInterpolationLayout* interpolation, uint32_t wave_size,
@@ -626,7 +627,8 @@ static std::vector<uint32_t> recompile_fragment_impl(
     // cutout + text draws). Merged into the same set so emit_alu drops the branch and detect_forward_if
     // skips it; the block's EXEC narrow + the export's OpKill do the per-invocation discard (#102). This is
     // NOT added for the vertex/compute shells (their scc branches are real uniform-ifs / NGG culling).
-    for (uint32_t pc : mask_test_branches(ins, b.allow_b32_masks)) safe_branches.insert(pc);
+    for (uint32_t pc : fragment_mask_test_branches(ins, b.allow_b32_masks))
+        safe_branches.insert(pc);
     std::array<bool, kFragmentColorOutputs> exported{};
     auto exp_fn = [&](RegState& state, const Rdna2Inst& in) -> bool { // EXP MRT0/MRT1 -> matching output
         // An export while EXEC is narrowed (lanes killed by an alpha test / v_cmpx and not restored to
@@ -699,6 +701,8 @@ static std::vector<uint32_t> recompile_fragment_impl(
     // is handled by EXEC predication like compute, and the export is guarded above. Memory ops need a
     // resource table. Loops (if any) are reconstructed by emit_body.
     seed_vector_word_definedness(rs, ins, /*native_interpolation=*/true, b.wave_size);
+    SavedMaskCopyFragmentDispatchScope copy_dispatch_scope(b, rs, ins, code, dwords,
+                                                           pcrel_dispatch_target);
     if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true, /*allow_smem*/rt != nullptr, exp_fn, code, dwords)) {
         if (getenv("PROSPER_DBG") && pcrel_dispatch_target != UINT32_MAX)
             log_recompile_diagnostic(diagnostic, "recompile-reject", "consequent",

@@ -127,6 +127,7 @@ static int g_volume_percent = kDefaultVolumePercent;   // set by --volume before
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <utility>
 #include <sys/stat.h>                  // the host filesystem probe behind resolve_app0_root()
 #include <filesystem>                  // directory listing behind the library scan
 
@@ -158,6 +159,7 @@ static void note_present_window_unavailable(SDL_Window* win, bool zero_extent = 
 #else
 #include <unistd.h>
 #include <spawn.h>                     // posix_spawn: reports exec failure without forking the guest
+#include <sys/wait.h>   // reap only the game children this frontend starts
 extern char** environ;                 // the child inherits this process's environment
 #ifdef __APPLE__
 #include <mach-o/dyld.h>               // _NSGetExecutablePath (macOS has no /proc/self/exe)
@@ -1683,7 +1685,8 @@ static std::string this_executable(const char* argv0) {
 // selects the new game without having to filter what the user originally passed.
 //
 // A second in-process boot is not available: the app cannot tear down a running guest (#352). Until
-// that lands, a fresh process is the honest way to switch titles.
+// that lands, a fresh process is the honest way to switch titles — and the way the library opens
+// a title while staying up itself (the caller then keeps running instead of exiting).
 static bool relaunch_with_dump(int argc, char** argv, const std::string& app0_root) {
     const std::string exe = this_executable(argc > 0 ? argv[0] : nullptr);
     if (exe.empty()) return false;
@@ -1716,6 +1719,7 @@ static bool relaunch_with_dump(int argc, char** argv, const std::string& app0_ro
     }
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
+    return true;
 #else
     std::vector<char*> cargv;
     cargv.reserve(args.size() + 1);
@@ -1728,12 +1732,25 @@ static bool relaunch_with_dump(int argc, char** argv, const std::string& app0_ro
     // the user instead of this process quitting into nothing. POSIX permits an implementation to
     // return 0 and let the child exit 127 instead; there the relaunch would degrade to the old
     // silent behaviour rather than misbehave.
+    //
+    // The library session keeps the Game Log capture installed while a game it launched may
+    // outlive it: without actions the child inherits fds 1/2 pointing at pipes whose readers die
+    // with this process, and its later writes die of SIGPIPE once the library is closed. Hand it
+    // the console instead. After the old path's uninstall there is nothing to rescue, so the same
+    // helper covers both: after uninstall it adds no descriptor replacements. Setup errors
+    // fail the launch visibly instead of falling back to the capture pipes.
     pid_t child = 0;
-    const int rc = ::posix_spawn(&child, cargv[0], nullptr, nullptr, cargv.data(), environ);
+    const int rc = g_log_capture.spawn_child(child, cargv.data(), environ);
     if (rc != 0) {
         fprintf(stderr, "[app] could not start %s: %s\n", cargv[0], strerror(rc));
         return false;
     }
+    // The library remains alive after the game exits. Reap this exact PID so repeated Play/Open
+    // does not accumulate zombies; never consume children owned by SDL or another subsystem.
+    std::thread([child] {
+        int status = 0;
+        while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    }).detach();
     return true;
 #endif
 }
@@ -3071,6 +3088,32 @@ int main(int argc, char** argv) {
             libraryStatus = std::to_string(unavailable) + " games folders are unavailable.";
         libraryUi.set_games(found, gamesDirs);
     };
+    // Used at startup and after each successful interactive launch, while the library stays up.
+    auto refresh_recent = [&](const prosper::frontend::AppConfig& cfg) {
+        if (!wantLibrary) return;
+        std::vector<prosper::frontend::LibraryUi::RecentGame> recents;
+        for (const std::string& root : cfg.recent_games) {
+            const std::string json = host_library_io().read_file(root + "/sce_sys/param.json");
+            const std::string name = prosper::frontend::parse_param_title_name(json);
+            const std::string id = prosper::frontend::parse_param_title_id(json);
+            std::string label;
+            if (!name.empty() && !id.empty()) {
+                label = name;
+                label += "  (";
+                label += id;
+                label += ')';
+            } else if (!name.empty())
+                label = name;
+            else if (!id.empty())
+                label = id;
+            else {
+                const std::string folder = prosper::frontend::path_basename(root);
+                label = folder.empty() ? root : folder;
+            }
+            recents.push_back({root, label});
+        }
+        libraryUi.set_recent(std::move(recents));
+    };
     if (wantLibrary) {
         // Game Log capture starts here and only here: a library session is the only run with a
         // panel to feed, so scripted runs, guest execution and crash reports never pass through
@@ -3082,28 +3125,7 @@ int main(int argc, char** argv) {
         // same way the library scan does (no boot, no guest). Unreadable roots keep their
         // basename so a removed dump still says which entry died; a drive root has no
         // basename, so there the root itself is the name.
-        {
-            std::vector<prosper::frontend::LibraryUi::RecentGame> recents;
-            for (const std::string& root : appConfig.recent_games) {
-                const std::string json =
-                    host_library_io().read_file(root + "/sce_sys/param.json");
-                const std::string name = prosper::frontend::parse_param_title_name(json);
-                const std::string id = prosper::frontend::parse_param_title_id(json);
-                std::string label;
-                if (!name.empty() && !id.empty())
-                    label = name + "  (" + id + ")";
-                else if (!name.empty())
-                    label = name;
-                else if (!id.empty())
-                    label = id;
-                else {
-                    const std::string folder = prosper::frontend::path_basename(root);
-                    label = folder.empty() ? root : folder;
-                }
-                recents.push_back({root, label});
-            }
-            libraryUi.set_recent(std::move(recents));
-        }
+        refresh_recent(appConfig);
         // The panel edits the run's EFFECTIVE policy (the apply block above already folded the
         // file into these), so what it shows is what the next boot gets — never a stale default.
         libraryUi.set_host_settings(
@@ -3130,11 +3152,16 @@ int main(int argc, char** argv) {
 
     // Remember an interactive open in File > Recent games. Best-effort and interactive-only:
     // argv boots never pass through here, so scripted and agent runs leave no trace in the menu.
-    auto record_recent = [](const std::string& root) {
-        prosper::frontend::AppConfig cfg = load_app_config();
-        prosper::frontend::note_recent_game(cfg, root);
-        if (!save_app_config(cfg))
-            fprintf(stderr, "[app] could not record the recent game\n");
+    auto record_recent = [&](const std::string& root) {
+        const bool saved = prosper::frontend::record_recent_game(
+            load_app_config(), root, save_app_config, [&](const prosper::frontend::AppConfig& cfg) {
+#ifdef PROSPER_HAVE_LIBRARY_UI
+                refresh_recent(cfg);
+#else
+                (void)cfg;
+#endif
+            });
+        if (!saved) fprintf(stderr, "[app] could not record the recent game\n");
     };
 
     // Returns true when the path actually started something (booted here, or handed off to a new
@@ -3142,6 +3169,26 @@ int main(int argc, char** argv) {
     // path from a consumed one.
     auto open_game = [&](const std::string& picked) -> bool {
         const std::string root = prosper::frontend::resolve_app0_root(picked, pathProbe);
+#ifdef PROSPER_HAVE_LIBRARY_UI
+        // The library stays up: Play/Open spawns the title in its own process (its own window),
+        // so closing the game window ends only the game and this library can open another title.
+        // The capture pipes stay installed for this library. A child gets the original output
+        // destinations, independently of our readers and this window's lifetime.
+        if (!root.empty() && libraryUi.ready() && !g_guest_started && !g_boot_attempted) {
+            fprintf(stderr, "[app] opening %s in a new window\n", root.c_str());
+            if (relaunch_with_dump(argc, argv, root)) {
+                record_recent(root);
+                fprintf(stderr, "[app] game started in a new window; the library stays open\n");
+                return true;
+            }
+            fprintf(stderr, "[app] could not start the new process\n");
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "prosper",
+                                     "Could not open the game in a new window.\n\n"
+                                     "Quit and start prosper again with the other game.",
+                                     win);
+            return false;
+        }
+#endif
         switch (prosper::frontend::decide_open_action(root, g_boot_attempted)) {
         case prosper::frontend::GameOpenAction::ignore:
             fprintf(stderr, "[app] not a PS5 title: %s\n", picked.c_str());
@@ -3708,8 +3755,9 @@ int main(int argc, char** argv) {
                 }
                 switch (act.kind) {
                 case prosper::frontend::LibraryAction::Kind::open:
-                    // Straight through the same start_guest() path argv, the drop target and the
-                    // picker all use — the library chooses a title, it does not boot one differently.
+                    // Through open_game like argv, the drop target and the picker — while the
+                    // library is up that spawns a separate game window and stays here, so the
+                    // library chooses a title, it does not host one.
                     if (!open_game(act.app0_root)) libraryStatus = "Could not start that game.";
                     break;
                 case prosper::frontend::LibraryAction::Kind::browse:

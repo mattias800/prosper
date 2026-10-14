@@ -5,6 +5,27 @@
 
 namespace prosper::gpu {
 class SavedMaskCopyFrame;
+// Shared classification; it grants no lineage or scalar-word authority.
+std::unordered_set<uint32_t> fragment_mask_test_branches(const std::vector<Rdna2Inst>&,
+                                                         bool wave32);
+
+// Only the fragment entry which actually validates and applies a PC-relative
+// dispatch may bind the original Bool-copy proof to its selected instruction stream.
+class SavedMaskCopyFragmentDispatchScope {
+    friend std::vector<uint32_t> recompile_fragment_impl(
+        const uint32_t*, size_t, const ShaderResourceTable*, const PixelSystemInputMapping*,
+        uint32_t, const FragmentInterpolationLayout*, uint32_t, RecompileDiagnosticContext,
+        FragmentFloatMode, FragmentArithmeticObservation*, FloatTransportConfig, FragmentFloatFlags,
+        FragmentExportFormats);
+    SpirvCompute& builder_;
+    std::shared_ptr<SavedMaskCopyFrame> frame_, previous_;
+    SavedMaskCopyFragmentDispatchScope(SpirvCompute&, RegState&, const std::vector<Rdna2Inst>&,
+                                       const uint32_t*, size_t, uint32_t);
+    ~SavedMaskCopyFragmentDispatchScope();
+    SavedMaskCopyFragmentDispatchScope(const SavedMaskCopyFragmentDispatchScope&) = delete;
+    SavedMaskCopyFragmentDispatchScope&
+    operator=(const SavedMaskCopyFragmentDispatchScope&) = delete;
+};
 
 // Only the actual body selector can manufacture this scoped lineage. Original full-program
 // initialization remains public; a caller-supplied slice cannot manufacture a continuation.
