@@ -2159,36 +2159,29 @@ bool emit_cfg_state_machine(
                 halves.relayed_vectors.erase(in.dst.value);
                 halves.memory_vectors.erase(in.dst.value);
             }
-            // A constant-lane V_READLANE of a slot that holds one known half of a saved-mask
-            // INSTANCE (rdna2_spilled_mask_halves) from a Bool spill (MaskLo for the low half,
-            // MaskHi for the high one) reloads that exact half, like an EXEC half the alias
-            // analysis proves: emit_alu publishes its ballot word and, once both halves of one
-            // instance are in sN/sN+1, the pair's Bool.
-            int instance_half = -1;
-            if (track_spilled_halves && in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360 &&
-                in.src[1].kind == OperandKind::InlineInt && in.src[1].value >= 0 &&
-                in.src[1].value <= 63) {
-                const auto reloaded = halves.sregs.find(in.dst.value);
-                const auto slot = slot_domains.find({in.src[0].value, in.src[1].value});
-                if (reloaded != halves.sregs.end() && slot != slot_domains.end() &&
-                    slot->second == (reloaded->second.half == 0 ? SpillSlotDomain::MaskLo
-                                                                : SpillSlotDomain::MaskHi))
-                    instance_half = reloaded->second.half;
-            }
-            if (record_compare && instance_half >= 0)
-                proven_instance_half_readlane_pcs[in.pc] = static_cast<uint32_t>(instance_half);
+            // The #5175 retry spills a half of a saved-mask instance as the pair's Bool: the high
+            // half is typed MaskHi, and a reload of either half from such a slot is a proven half
+            // published on emit_alu's EXEC-half alias route (below).
+            const int half = track_spilled_halves && b.spilled_mask_bool_halves
+                                 ? spilled_slot_half(halves, in)
+                                 : -1;
+            const int slot_vgpr = in.opcode == 0x361 ? in.dst.value : in.src[0].value;
+            const auto slot = slot_domains.find({slot_vgpr, in.src[1].value});
+            const bool proven_reload =
+                half >= 0 && in.opcode == 0x360 && slot != slot_domains.end() &&
+                slot->second == (half ? SpillSlotDomain::MaskHi : SpillSlotDomain::MaskLo);
+            if (record_compare && proven_reload) proven_instance_half_readlane_pcs[in.pc] = half;
             if (b.is_compute)
                 advance_spill_slot_domains(slot_domains, in,
                                            {masks, ambiguous, scalar_words, readlane_words},
                                            slot_context, vector_writes,
                                            record_compare ? &proven_mask_writelane_pcs : nullptr,
-                                           instance_half >= 0);
-            if (record_compare && b.is_compute && in.fmt == Rdna2Format::VOP3 &&
-                in.opcode == 0x361 && in.src[1].kind == OperandKind::InlineInt) {
-                const auto slot = slot_domains.find({in.dst.value, in.src[1].value});
-                if (slot != slot_domains.end() && slot->second == SpillSlotDomain::MaskHi &&
-                    in.src[0].kind == OperandKind::SGPR)
-                    b.wave64_mask_high_half_writelane_pcs.insert(in.pc);
+                                           proven_reload);
+            if (half == 1 && in.opcode == 0x361 &&
+                slot_domains[{in.dst.value, in.src[1].value}] == SpillSlotDomain::Other) {
+                slot_domains[{in.dst.value, in.src[1].value}] = SpillSlotDomain::MaskHi;
+                if (record_compare) proven_mask_writelane_pcs.insert(in.pc);
+                if (record_compare) b.wave64_mask_high_half_writelane_pcs.insert(in.pc);
             }
             refine_portable_mask_dispatch(b, in, writes_exact_wave_scc, relay_sources, halves,
                                           slot_domains);
@@ -2308,9 +2301,6 @@ bool emit_cfg_state_machine(
             }
         }
     }
-    // Publish the instance-half reloads beside the EXEC-half aliases: the same emit_alu route
-    // (sreg_wave64_mask_half, its ballot word, and the pair's Bool once both halves are present)
-    // serves both. An alias fact for the same pc is left as it is.
     for (const auto& [pc, half] : proven_instance_half_readlane_pcs)
         b.wave64_mask_readlane_half_for_pc.emplace(pc, half);
 

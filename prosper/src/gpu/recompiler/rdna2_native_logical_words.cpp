@@ -659,10 +659,11 @@ bool native_logical_data_demanded(const SpirvCompute& b, const Rdna2Inst& in) {
     if (!b.native_logical_data_demand_pcs.contains(in.pc) ||
         in.pc >= b.saved_mask_original_words.size())
         return false;
-    // DATA read only by mask-half spills is not demanded from a producer that cannot ballot it:
-    // those spills then store the pair's Bool, and each proven reload publishes its own word
-    // (#5175). A participating producer keeps supplying the words it always did.
-    if (!b.native_logical_data_beyond_mask_spill_pcs.contains(in.pc) &&
+    // In the #5175 retry, DATA read only by mask-half spills is not demanded from a producer that
+    // cannot ballot it: those spills store the pair's Bool, and each proven reload publishes its
+    // own word. A participating producer keeps supplying the words it always did.
+    if (b.spilled_mask_bool_halves &&
+        !b.native_logical_data_beyond_mask_spill_pcs.contains(in.pc) &&
         !native_logical_producer_has_full_participation(b, in))
         return false;
     auto original = rdna2_decode_one(b.saved_mask_original_words.data() + in.pc,

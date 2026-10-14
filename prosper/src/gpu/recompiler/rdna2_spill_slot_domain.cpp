@@ -57,13 +57,6 @@ SpillSlotDomain written_domain(const Rdna2Inst& in, const SpillSlotMustSets& set
         // was defined in the same case. Which one the write sees is not decidable here.
         return context.mask_keys.contains(source.value) ? SpillSlotDomain::MaskLo
                                                         : SpillSlotDomain::Conflict;
-    // The HIGH dword of a MUST mask pair. With an exact native Wave64 subgroup emit_alu stores the
-    // pair's Bool (the high dword is that Bool's upper ballot word), so a reload proven to be this
-    // half rebuilds the dword exactly. Without that subgroup there is no exact ballot: keep Other.
-    if (source.kind == OperandKind::SGPR && source.value > 0 && source.value <= 105 &&
-        context.native_wave64 && sets.masks.contains(source.value - 1) &&
-        context.mask_keys.contains(source.value - 1))
-        return SpillSlotDomain::MaskHi;
     return SpillSlotDomain::Other;
 }
 

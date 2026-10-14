@@ -329,6 +329,15 @@ bool reassembles_spilled_mask_pair(const SpilledMaskHalves& state, const Rdna2In
            low->second.def_pc == high->second.def_pc;
 }
 
+int spilled_slot_half(const SpilledMaskHalves& state, const Rdna2Inst& in) {
+    if (in.fmt != Rdna2Format::VOP3 || (in.opcode != kOpWritelane && in.opcode != kOpReadlane) ||
+        !constant_lane(in))
+        return -1;
+    const int vgpr = in.opcode == kOpWritelane ? in.dst.value : in.src[0].value;
+    const auto slot = state.slots.find({vgpr, in.src[1].value});
+    return slot == state.slots.end() ? -1 : slot->second.half;
+}
+
 void advance_spilled_mask_halves(SpilledMaskHalves& state, const Rdna2Inst& in,
                                  const std::set<int>& masks, const std::set<int>& mask_slot_keys,
                                  const std::vector<std::pair<int, uint32_t>>& scalar_writes,

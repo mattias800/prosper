@@ -198,11 +198,10 @@ TEST(CfgSpilledMaskHalves, HostSubgroupWidthDoesNotSupplyGuestLaunchWords) {
     ASSERT_FALSE(compile(kReassembled, 64, true, true, 0x50610003u).empty())
         << last_terminal_reject_reason(0x50610003u);
     EXPECT_TRUE(compile(kReassembled, 64, true, false, 0x50610004u).empty());
-    // Without the launch the producer has no participation proof, so its words are demanded only
-    // by its own spill and the spill stores the Bool (#5175). The first reload then has no
-    // authenticated launch to ballot its word from, and the program is refused there.
     const std::string reason = last_terminal_reject_reason(0x50610004u);
-    EXPECT_NE(reason.find("pc=9 words=d7600002,00010d12"), std::string::npos) << reason;
+    EXPECT_NE(reason.find("reason=native-logical-data-words-unavailable pc=2 words=87946a7e"),
+              std::string::npos)
+        << reason;
 }
 
 TEST(CfgSpilledMaskHalves, AMaskRebuiltFromBothSpilledHalvesRestoresExecAcrossTheEdge) {
@@ -317,9 +316,11 @@ TEST(CfgSpilledMaskHalves, AReloadedHalfWithoutTheOriginalLaunchStaysRefused) {
 }
 
 TEST(CfgSpilledMaskHalves, SwappedReloadedHalvesAreNotTheSpilledMask) {
-    // s2 holds the high half and s3 the low one: no B64 predicate is rebuilt from them, and the
-    // logical that consumes s[2:3] as a mask stays refused.
+    // s2 holds the high half and s3 the low one: no B64 predicate is rebuilt from them, so even
+    // the Bool-half retry refuses, while the same program with the reloads in order compiles. The
+    // recorded reason stays the first attempt's: a failed retry never replaces it.
     EXPECT_TRUE(compile(kSwappedHalvesIntoLogical, 64, true, true, 0x50610016u).empty());
+    ASSERT_FALSE(compile(kVopcHalvesIntoLogical, 64, true, true, 0x50610017u).empty());
     const std::string reason = last_terminal_reject_reason(0x50610016u);
-    EXPECT_NE(reason.find("words=87ea027e"), std::string::npos) << reason;
+    EXPECT_NE(reason.find("pc=9 words=d7610012,00010e15"), std::string::npos) << reason;
 }

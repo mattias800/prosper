@@ -747,6 +747,9 @@ struct SpirvCompute {
     // dispatcher persists as a Bool (SpillSlotDomain::MaskHi). The slot stores the pair's Bool, so
     // a reload proven to be that half (wave64_mask_readlane_half_for_pc) rebuilds it exactly.
     std::unordered_set<uint32_t> wave64_mask_high_half_writelane_pcs;
+    // recompile_compute's #5175 retry: spill each half of a saved-mask instance as the pair's
+    // Bool and reload it as a proven half, so a producer without physical words need not have them.
+    bool spilled_mask_bool_halves = false;
     bool     declared_subgroup=0, declared_subgroup_vote=0, declared_subgroup_arithmetic=0;
     // When non-zero, the backend promises to create this compute pipeline with an exact required
     // subgroup size equal to the PS5 wave. Native votes/scans are then architecture-exact.

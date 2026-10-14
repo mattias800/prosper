@@ -90,6 +90,10 @@ void mark_relayed_words(const SpilledMaskHalves& entry, RegState& rs);
 // saved-mask instance. Evaluated BEFORE `in`'s own transfer.
 bool reassembles_spilled_mask_pair(const SpilledMaskHalves& state, const Rdna2Inst& in);
 
+// For a constant-lane V_WRITELANE (after its transfer) or V_READLANE: which half (0 low, 1 high) of
+// a saved-mask instance its slot holds; -1 when not known.
+int spilled_slot_half(const SpilledMaskHalves& state, const Rdna2Inst& in);
+
 // The transfer for one instruction. `masks` is the MUST-mask set before `in` (a V_WRITELANE never
 // changes it), `mask_slot_keys` the pairs whose spills the dispatcher persists as mask slots,
 // `scalar_writes` the (base, width) SGPR ranges `in` writes, `vector_writes` the VGPRs it may
