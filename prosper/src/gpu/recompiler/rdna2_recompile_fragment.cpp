@@ -555,13 +555,15 @@ std::vector<uint32_t> recompile_fragment_impl(
     // exact-wave-vote's subgroup-size requirement.
     rs.reads_scc = shader_reads_scc(ins);
     if (system_inputs) {
-        // Bind exactly the launch words this backend supplies (rdna2_launch_vgprs). Reserved,
+        // Retain supplied and partial launch bindings (rdna2_launch_vgprs). Reserved,
         // and loaded-but-unsupplied, words stay absent so seeding marks them placeholders. Vulkan
         // exposes the four floating-point position terms as FragCoord.xyzw, except that the
         // guest's W is FragCoord.w's reciprocal (guest_pixel_position_component).
         for (const auto& launch :
              pixel_launch_vgprs(*system_inputs, derived_interpolation.requires_geometry)) {
-            if (launch.state != LaunchVgprState::Supplied) continue;
+            if (launch.state != LaunchVgprState::Supplied &&
+                launch.state != LaunchVgprState::Partial)
+                continue;
             uint32_t value = 0;
             if (launch.field <= 6) {
                 value = b.system_interpolation_component(launch.field, launch.component);

@@ -3,8 +3,9 @@
 // instruction, and which of those the recompiler's backend actually supplies a value for.
 //
 // One inventory per stage, derived only from the producing launch registers. The stage shells bind
-// exactly the SUPPLIED words into RegState::vreg before seed_vector_word_definedness runs, so the
-// fresh-mask proof treats as defined exactly the registers the backend initializes. Every other
+// the SUPPLIED and PARTIAL words into RegState::vreg before seed_vector_word_definedness runs.
+// PARTIAL reports the existing incomplete ANCILLARY binding; it does not claim a complete
+// architectural word or repair that backend gap (#5160). Every other
 // VGPR -- never loaded, reserved by ADDR only, or loaded by hardware but not supplied here -- keeps
 // its placeholder mark, and a predicate formed from it is refused instead of reading a zero.
 //
@@ -26,6 +27,9 @@ enum class LaunchVgprState : uint8_t {
     Unsupplied,
     // Hardware loads the word and the stage shell binds the same value.
     Supplied,
+    // The shell binds only part of the hardware word (ANCILLARY layer bits, #5160).
+    // Preserve that existing binding while reporting its incomplete coverage honestly.
+    Partial,
 };
 
 struct LaunchVgpr {

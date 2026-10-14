@@ -420,7 +420,10 @@ inputs-launch stage=cs tidig_comp_cnt=1 vgprs=v0:thread_id.x/supplied,v1:thread_
 ```
 
 `supplied` words are bound before emission; `unsupplied` ones are loaded by hardware but have no
-value in this backend, and `reserved` ones are ADDR-only slots hardware leaves untouched. A
+value in this backend, and `reserved` ones are ADDR-only slots hardware leaves untouched.
+`partial` identifies ANCILLARY: the shell currently binds only Layer bits16..26, not the complete
+hardware word (#5160). Its existing binding and seeding stay unchanged; the inventory does not
+assert that the missing fields are zero or grant them new authority. A
 `fabricated-fresh-mask-source` refusal that traces back to an `unsupplied` word is the backend
 lacking an input, not the guest reading garbage. Read `front_face=` before believing one: a
 fragment compile-case sidecar older than schema 7 (#5072) cannot record the `SPI_BARYC_CNTL`

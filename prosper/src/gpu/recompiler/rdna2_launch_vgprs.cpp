@@ -27,15 +27,16 @@ bool pixel_field_supplied(const PixelSystemInputMapping& inputs, uint32_t field,
 std::vector<LaunchVgpr> pixel_launch_vgprs(const PixelSystemInputMapping& inputs,
                                            bool interpolation_geometry) {
     std::vector<LaunchVgpr> out;
-    out.reserve(32);   // the sixteen fields total 25 words
+    out.reserve(32);   // the sixteen fields total 24 words
     uint32_t vgpr = 0;
     for (uint32_t field = 0; field < kPixelLaunchFields; ++field) {
         const uint32_t bit = 1u << field;
         if (!(inputs.addr & bit)) continue;
-        const LaunchVgprState state = !(inputs.ena & bit) ? LaunchVgprState::Reserved
-                                      : pixel_field_supplied(inputs, field, interpolation_geometry)
-                                          ? LaunchVgprState::Supplied
-                                          : LaunchVgprState::Unsupplied;
+        LaunchVgprState state = !(inputs.ena & bit) ? LaunchVgprState::Reserved
+                                : pixel_field_supplied(inputs, field, interpolation_geometry)
+                                    ? LaunchVgprState::Supplied
+                                    : LaunchVgprState::Unsupplied;
+        if (state == LaunchVgprState::Supplied && field == 13) state = LaunchVgprState::Partial;
         for (uint32_t component = 0; component < kPixelLaunchFieldWidths[field]; ++component)
             out.push_back({vgpr + component, field, component, state});
         vgpr += kPixelLaunchFieldWidths[field];
@@ -67,6 +68,7 @@ const char* launch_vgpr_state_name(LaunchVgprState state) {
         case LaunchVgprState::Reserved: return "reserved";
         case LaunchVgprState::Unsupplied: return "unsupplied";
         case LaunchVgprState::Supplied: return "supplied";
+        case LaunchVgprState::Partial: return "partial";
     }
     return "unknown";
 }

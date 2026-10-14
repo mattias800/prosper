@@ -156,3 +156,17 @@ TEST(LaunchVgprCompare, InterpolatedValueCompareIsAcceptedButRawBarycentricIsNot
     EXPECT_TRUE(compile_fragment(fragment_compare(0), center, 0x51462001u).empty());
     EXPECT_TRUE(refused_as_fresh_mask(0x51462001u));
 }
+
+TEST(LaunchVgprInventory, AncillaryReportsPartialWhileKeepingItsExistingBinding) {
+    // The shell currently publishes Layer[10:0] in bits16..26 only (#5160).
+    // An inventory must not describe the whole hardware ANCILLARY word as supplied.
+    const PixelSystemInputMapping ancillary{1u << 13, 1u << 13};
+    const auto launch = pixel_launch_vgprs(ancillary, false);
+    ASSERT_EQ(launch.size(), 1u);
+    EXPECT_EQ(launch[0].vgpr, 0u);
+    EXPECT_EQ(launch[0].field, 13u);
+    EXPECT_STREQ(launch_vgpr_state_name(launch[0].state), "partial");
+    // A reporting refactor must still bind the existing layer value into v0.
+    EXPECT_FALSE(compile_fragment(fragment_compare(0), ancillary, 0x51463000u).empty())
+        << last_terminal_reject_reason(0x51463000u);
+}

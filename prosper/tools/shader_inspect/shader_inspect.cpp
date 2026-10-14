@@ -278,7 +278,8 @@ int replay_recorded_inputs(const std::string& code_path, const std::string& inpu
             inputs.incomplete.empty() ? "" : " incomplete=", inputs.incomplete.c_str());
     // The recorded wave-launch contract (#5146): every VGPR the hardware loads before the first
     // instruction, and whether this build supplies it. A refusal that reads an `unsupplied` or
-    // `reserved` VGPR is the recompiler declining an input it does not have, not a code defect.
+    // `reserved` VGPR has no supplied launch value. `partial` exposes the existing incomplete
+    // ANCILLARY binding rather than claiming that its other hardware fields are supplied.
     const auto launch_vgprs = [](const std::vector<LaunchVgpr>& launch, bool pixel) {
         std::string out;
         for (const auto& word : launch) {
