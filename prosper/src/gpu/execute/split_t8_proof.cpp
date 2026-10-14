@@ -2,7 +2,7 @@
 #include "gpu/execute/split_t8_proof.hpp"
 #include "gpu/agc/agc_shader_layout.hpp"
 
-#include "gpu/execute/sopp_cfg.hpp"
+#include "gpu/recompiler/sopp_cfg.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/texture/tile.hpp"
 

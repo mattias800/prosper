@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""Recompile a directory of raw RDNA2 shader blobs and record or compare what came out.
+
+ADR 0006 (spec GPU-1) migrates the shader recompiler to a pure function one entry point at a time,
+and checks each step by recompiling a corpus before and after and comparing the output. This is that
+check for raw blobs: `shader_inspect --stage` is run on every `cs_*`/`ps_*`/`vs_*` file, and the
+verdict (stage-recompile status, SPIR-V word count, each recompile-reject line) is recorded. For
+vertex and fragment blobs it also runs `--synthetic-table --spirv-out` and records the SPIR-V
+sha256, so those are compared byte for byte. Compute blobs carry no descriptors in a raw dump, so
+shader_inspect reports a verdict but writes no SPIR-V; that half compares verdicts only.
+
+  recompile_corpus.py record <corpus-dir> --inspect <shader_inspect> --out BASELINE.json
+  recompile_corpus.py check  <corpus-dir> --inspect <shader_inspect> --baseline BASELINE.json
+  recompile_corpus.py dumps  <before-dir> <after-dir>
+
+`dumps` compares two PROSPER_SHADER_DUMP_SUCCESS directories from live runs. Each `.spv` file name is
+`success_<stage>_at_<addr>_<spirv-hash>_<raw-hash>` (only the raw `.bin` of a chained vertex program
+also carries a `_main_...` continuation, so the `.spv` names do not), so the SPIR-V hash is in the
+name: for every (stage, address, raw-hash) present in both, the SPIR-V hash must be equal. Shaders present
+in only one run are reported but are not a failure, since a run may not reach the same programs.
+
+The corpus is local (Sony or title bytes are never committed); only the hash file may be shared.
+`check` exits 1 on any difference, 2 when it could not run.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+STAGES = {"cs": "compute", "ps": "fragment", "vs": "vertex"}
+VERDICT_PREFIXES = ("stage-recompile stage=", "[recompile-reject]")
+
+
+def stage_of(path: Path):
+    return STAGES.get(path.name.split("_", 1)[0])
+
+
+def verdict_lines(text: str) -> list[str]:
+    """Lines that state what the recompiler decided, in order. Addresses are not normalised: the
+    corpus is fixed bytes, so a changed line is a changed answer."""
+    return [ln.strip() for ln in text.splitlines() if ln.startswith(VERDICT_PREFIXES)]
+
+
+class InspectorError(Exception):
+    """shader_inspect could not run, as opposed to running and refusing a shader."""
+
+
+def run(cmd: list[str], env: dict[str, str]) -> str:
+    """Run shader_inspect and return its output. A refusal is an answer (it prints a
+    `stage-recompile` line); an inspector that crashes, times out or prints no such line is not."""
+    try:
+        done = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as err:
+        raise InspectorError(f"{cmd[0]} did not run: {err}") from err
+    # shader_inspect: 0/1/3 are ordinary verdicts; 4/5 are synthetic probes.
+    # Exit 2 is IO/usage failure, even after a verdict was flushed; signals and
+    # Windows exception exits must likewise never become a baseline answer.
+    verdict_exits = (4, 5) if "--synthetic-table" in cmd else (0, 1, 3)
+    if done.returncode not in verdict_exits:
+        raise InspectorError(f"inspector failed for {Path(cmd[1]).name} (exit {done.returncode})")
+    text = done.stdout + done.stderr
+    if not any(ln.startswith("stage-recompile stage=") for ln in text.splitlines()):
+        raise InspectorError(
+            f"no stage-recompile verdict from {Path(cmd[1]).name} (exit {done.returncode})"
+        )
+    return text
+
+
+def recompile(inspect: str, blob: Path, stage: str) -> dict:
+    # PROSPER_DBG is fixed on so the reject lines exist; it only logs, so it never varies the output.
+    env = {**os.environ, "PROSPER_DBG": "1"}
+    entry = {
+        "stage": stage,
+        "verdict": verdict_lines(run([inspect, str(blob), "--stage", stage], env)),
+    }
+    if stage in ("vertex", "fragment"):
+        with tempfile.TemporaryDirectory() as tmp:
+            spv = Path(tmp) / "out.spv"
+            text = run(
+                [
+                    inspect,
+                    str(blob),
+                    "--stage",
+                    stage,
+                    "--synthetic-table",
+                    "--spirv-out",
+                    str(spv),
+                ],
+                env,
+            )
+            entry["synthetic_verdict"] = verdict_lines(text)
+            module = spv.read_bytes() if spv.exists() else b""
+            if "status=ok-synthetic-table" in text and not module:
+                raise InspectorError(f"missing SPIR-V output for {blob.name}")
+            entry["spirv_sha256"] = hashlib.sha256(module).hexdigest() if module else None
+    return entry
+
+
+def collect(corpus: Path, inspect: str) -> dict:
+    blobs = sorted(p for p in corpus.rglob("*.bin") if stage_of(p))
+    if not blobs:
+        raise InspectorError(f"no cs_/ps_/vs_ blobs under {corpus}")
+    # Keyed by the path under the corpus: two subdirectories may hold the same basename.
+    return {p.relative_to(corpus).as_posix(): recompile(inspect, p, stage_of(p)) for p in blobs}
+
+
+def diff(base: dict, now: dict) -> list[str]:
+    out = [f"missing from run: {n}" for n in sorted(base.keys() - now.keys())]
+    out += [f"not in baseline: {n}" for n in sorted(now.keys() - base.keys())]
+    out += [f"changed: {n}" for n in sorted(base.keys() & now.keys()) if base[n] != now[n]]
+    return out
+
+
+def dump_keys(directory: Path) -> dict:
+    """{(stage, address, raw-hash): {spirv-hash}} from success_*.spv names, which carry no chain
+    continuation. One program can compile in several contexts, so a key holds every SPIR-V hash
+    seen for it."""
+    out: dict = {}
+    for f in directory.glob("success_*.spv"):
+        parts = f.stem.split("_")
+        if len(parts) < 6 or parts[2] != "at":
+            continue
+        out.setdefault((parts[1], parts[3], "_".join(parts[5:])), set()).add(parts[4])
+    return out
+
+
+def compare_dumps(before: dict, after: dict) -> tuple[list[str], int]:
+    """(differences, shared count): a shared key is a difference when a SPIR-V hash seen before is
+    gone after. A hash only in the after run is a context the run reached and the other did not
+    (measured: a second boot of one title reached one extra context), so it is not a difference."""
+    shared = before.keys() & after.keys()
+    bad = [
+        f"spirv differs: {k[0]} at {k[1]} raw {k[2]}: {sorted(before[k] - after[k])} gone, after has {sorted(after[k])}"
+        for k in sorted(shared)
+        if before[k] - after[k]
+    ]
+    return bad, len(shared)
+
+
+def json_path(path: Path) -> Path | None:
+    """The resolved path of a baseline argument, or None unless it names a `.json` file. The tool
+    reads and writes only baseline JSON, never an arbitrary file a bad argument points at; whether
+    the file exists or can be written stays with the callers' own error handling."""
+    resolved = path.resolve()
+    return resolved if resolved.suffix == ".json" else None
+
+
+def run_dumps(args) -> int:
+    if not args.after or not args.corpus.is_dir() or not args.after.is_dir():
+        print("dumps needs two existing directories", file=sys.stderr)
+        return 2
+    before, after = dump_keys(args.corpus), dump_keys(args.after)
+    bad, shared = compare_dumps(before, after)
+    for line in bad:
+        print(line)
+    print(
+        f"{shared} shared programs, {len(bad)} differ, "
+        f"{len(before.keys() - after.keys())} only before, {len(after.keys() - before.keys())} only after"
+    )
+    if shared == 0:
+        print("no program in common: nothing was compared", file=sys.stderr)
+        return 2
+    return 1 if bad else 0
+
+
+def run_record(args, results: dict) -> int:
+    out = json_path(args.out) if args.out else None
+    if out is None:
+        print("record needs --out naming a .json file", file=sys.stderr)
+        return 2
+    try:
+        out.write_text(json.dumps(results, indent=1, sort_keys=True) + "\n")
+    except OSError as err:
+        print(f"could not write baseline: {err}", file=sys.stderr)
+        return 2
+    print(f"recorded {len(results)} blobs -> {out}")
+    return 0
+
+
+def run_check(args, results: dict) -> int:
+    path = json_path(args.baseline) if args.baseline else None
+    if path is None or not path.exists():
+        print("check needs an existing --baseline .json file", file=sys.stderr)
+        return 2
+    try:
+        baseline = json.loads(path.read_text())
+        if not isinstance(baseline, dict):
+            raise ValueError("baseline must contain a JSON object")
+    except (OSError, ValueError) as err:
+        print(f"could not read baseline: {err}", file=sys.stderr)
+        return 2
+    problems = diff(baseline, results)
+    for line in problems:
+        print(line)
+    print(f"{len(results)} blobs, {len(problems)} differences")
+    return 1 if problems else 0
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("mode", choices=("record", "check", "dumps"))
+    ap.add_argument("corpus", type=Path)
+    ap.add_argument("after", nargs="?", type=Path, help="dumps: the second directory")
+    ap.add_argument("--inspect", help="path to the shader_inspect binary (record/check)")
+    ap.add_argument("--out", type=Path, help="record: baseline file to write")
+    ap.add_argument("--baseline", type=Path, help="check: baseline file to compare against")
+    args = ap.parse_args(argv)
+    if args.mode == "dumps":
+        return run_dumps(args)
+    if not args.inspect or not args.corpus.is_dir() or not Path(args.inspect).exists():
+        print("corpus directory or shader_inspect binary not found", file=sys.stderr)
+        return 2
+    # Absolute: Windows CreateProcess does not resolve a relative, forward-slashed executable path.
+    try:
+        results = collect(args.corpus.resolve(), str(Path(args.inspect).resolve()))
+    except (InspectorError, OSError) as err:
+        print(err, file=sys.stderr)
+        return 2
+    return run_record(args, results) if args.mode == "record" else run_check(args, results)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

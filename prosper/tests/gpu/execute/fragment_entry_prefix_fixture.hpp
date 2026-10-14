@@ -1,4 +1,5 @@
 #pragma once
+#include "gpu/execute/fragment_packet_preparation.hpp"
 #include "gpu/recompiler/raster_quad_collector.hpp"
 #include <algorithm>
 #include <iterator>

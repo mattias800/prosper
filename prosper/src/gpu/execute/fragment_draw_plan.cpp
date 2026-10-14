@@ -1,4 +1,5 @@
 #include "gpu/execute/fragment_draw_plan.hpp"
+#include "gpu/execute/fragment_packet_preparation.hpp"
 #include "gpu/execute/fragment_scalar_bank.hpp"
 #include "gpu/recompiler/original_fragment_producer.hpp"
 #include "gpu/recompiler/rdna2_waitcnt.hpp"

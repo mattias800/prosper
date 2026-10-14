@@ -2,6 +2,10 @@
 
 Takes a guest shader's instruction bytes and emits a SPIR-V module.
 
+- `fragment_entry_facts` / `raster_launch_facts` / `fragment_packet_resources` / `sopp_cfg` — plain data and
+  direct-branch helpers the recompiler consumes. They live here, not in `gpu/state` or `gpu/execute`, because
+  the recompiler is a pure function of its request (ADR 0006, spec GPU-1) and may include nothing from the
+  code that calls it. `ratchet:recompiler-include` counts what is left.
 - `rdna2_decode` — instruction decode: formats, opcodes, operands. Pure and side-effect free, which
   makes it the cheapest thing in the stack to unit-test.
 - `rdna2_to_spirv` (+ `_internal`, `emit_alu`, `emit_cfg`, `alu_support`, `cfg_support`) — the

@@ -40,7 +40,7 @@
 #include "gpu/resources/mip_chain_plan.hpp"  // shader_resource_compute_mip_chain_levels (#3048)
 #include "gpu/pm4/pm4_registers.hpp"      // SPI_SHADER_USER_DATA_* offsets
 #include "gpu/recompiler/rdna2_decode.hpp"       // rdna2_walk (for the vertex-fetch const-eval)
-#include "gpu/execute/sopp_cfg.hpp"            // direct-branch CFG helpers
+#include "gpu/recompiler/sopp_cfg.hpp"   // direct-branch CFG helpers
 #include "gpu/execute/skippable_instruction.hpp"   // SkippableInstructionQuery (#4796)
 #include "gpu/execute/split_t8_proof.hpp"      // mapped_split_t8_reaches_use
 #include "gpu/execute/oversize_buffer_window.hpp"   // resolve_oversized_buffer_windows

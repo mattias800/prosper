@@ -1,4 +1,4 @@
-#include "gpu/execute/sopp_cfg.hpp"
+#include "gpu/recompiler/sopp_cfg.hpp"
 
 namespace prosper::gpu {
 

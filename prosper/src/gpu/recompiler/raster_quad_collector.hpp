@@ -1,15 +1,16 @@
 #pragma once
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/fragment_packet_vgpr_requirements.hpp"
-#include "gpu/state/raster_launch_facts.hpp"
-#include "gpu/state/fragment_entry_facts.hpp"
-#include "gpu/execute/fragment_packet_preparation.hpp"
+#include "gpu/recompiler/raster_launch_facts.hpp"
+#include "gpu/recompiler/fragment_entry_facts.hpp"
+#include "gpu/recompiler/fragment_packet_resources.hpp"
 #include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
 
 namespace prosper::gpu {
+struct FragmentPacketPreparation;   // built by gpu/execute from these inputs; held by pointer only
 class FragmentScalarBank;
 class OriginalFragmentDrawProducer;
 // An owned real draw's input contract, not initialized guest registers or a logical Wave64.

@@ -102,6 +102,11 @@ class OnePositivePerRule(unittest.TestCase):
             "layer-include|prosper/src/host/image/a.cpp|hle",
             1,
         ),
+        "recompiler-include": (
+            {"prosper/src/gpu/recompiler/a.cpp": '#include "gpu/state/fragment_entry_facts.hpp"\n'},
+            "recompiler-include|prosper/src/gpu/recompiler/a.cpp|gpu/state",
+            1,
+        ),
         "fixture-include": (
             {"prosper/frontends/shared/live/a.cpp": '#include "fixtures/render_runner.h"\n'},
             "fixture-include|prosper/frontends/shared/live/a.cpp",

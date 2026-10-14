@@ -1,7 +1,7 @@
 #pragma once
 
 #include "gpu/recompiler/fragment_packet_scalar_reads.hpp"
-#include "gpu/state/fragment_entry_facts.hpp"
+#include "gpu/recompiler/fragment_entry_facts.hpp"
 #include "host/memory/guest_direct_allocation.hpp"
 #include <array>
 #include <cstdint>

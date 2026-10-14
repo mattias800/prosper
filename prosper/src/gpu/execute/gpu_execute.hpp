@@ -29,6 +29,7 @@
 #include "diagnostics/perf/perf_ledger.hpp"   // #3951: shader-recompile draw drops
 #include "gpu/recompiler/rdna2_to_spirv.hpp"      // recompile_vertex / recompile_fragment
 #include "gpu/recompiler/raster_quad_collector.hpp"
+#include "gpu/execute/fragment_packet_preparation.hpp"   // FragmentPacketPreparation: complete type for executor users
 #include "gpu/execute/dcc_helper_program.hpp"   // AGC colour-block utility program
 #include "gpu/execute/efc_helper_program.hpp"   // AGC eliminate-fast-clear rectangle (#1588)
 #include "gpu/execute/graphics_nested_wide_reader.hpp"

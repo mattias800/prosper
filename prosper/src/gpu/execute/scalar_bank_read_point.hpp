@@ -1,6 +1,6 @@
 #pragma once
 #include "gpu/execute/graphics_nested_wide_reader.hpp"
-#include "gpu/state/fragment_entry_facts.hpp"
+#include "gpu/recompiler/fragment_entry_facts.hpp"
 #include "host/memory/guest_direct_allocation.hpp"
 
 namespace prosper::gpu {

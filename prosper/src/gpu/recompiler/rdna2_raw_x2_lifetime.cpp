@@ -5,7 +5,7 @@
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/compiler_resource_access.hpp"
 #include "gpu/resources/shader_resources.hpp"
-#include "gpu/execute/sopp_cfg.hpp"
+#include "gpu/recompiler/sopp_cfg.hpp"
 #include <algorithm>
 #include <array>
 #include <bitset>

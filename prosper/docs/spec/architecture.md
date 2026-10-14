@@ -158,7 +158,7 @@ returns SPIR-V plus a binding layout. It reads no environment switch, owns no ca
 and includes nothing from `gpu/execute`, `gpu/state`, the backend or a frontend. Caching and
 diagnostics wrap it from outside.
 Status: accepted
-Enforcement: adr:0006
+Enforcement: ratchet:getenv, ratchet:recompiler-include, adr:0006
 
 ### VER-1 -- renderer changes are replayed against recorded frames before merge
 
