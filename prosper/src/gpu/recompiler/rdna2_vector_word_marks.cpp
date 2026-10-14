@@ -55,6 +55,28 @@ bool complete_full_word_write(const Rdna2Inst& in) {
     return !vector_write_depends_on_old_word(in, /*full_exec=*/true);
 }
 
+// True for the ordinary memory reads, beyond the buffer loads complete_full_word_write already
+// names, whose admitted lowering writes every result dword in each EXEC lane from that lane's own
+// address and predicates only inactive lanes back to the old word (rdna2_emit_alu.cpp): the plain
+// LDS reads, and the typed buffer loads that share the untyped format-load path. Their address
+// inputs are the source marks, as for a buffer load. GDS, swizzle, bpermute, append/consume, the
+// M0/TID-addressed forms, D16 packing and TFE status writes are excluded: their result depends on
+// other lanes, on state these marks do not describe, or keeps part of the old word.
+bool memory_read_completes_active_word(const Rdna2Inst& in) {
+    if (in.fmt == Rdna2Format::MTBUF) return in.opcode <= 0x03 && !in.mtbuf_tfe;
+    if (in.fmt != Rdna2Format::DS || in.ds_gds) return false;
+    switch (in.opcode) {
+        case 0x36:   // ds_read_b32
+        case 0x37:   // ds_read2_b32
+        case 0x38:   // ds_read2st64_b32
+        case 0x76:   // ds_read_b64
+        case 0x77:   // ds_read2_b64
+        case 0xfe:   // ds_read_b96
+        case 0xff: return true;   // ds_read_b128
+        default: return false;
+    }
+}
+
 // True when the EXEC value named by reader is the owner value or a subset of it, by the derivation
 // facts recorded at v_cmpx. A placeholder confined outside owner is then also outside reader.
 bool exec_within(const RegState& rs, uint32_t reader, uint32_t owner) {
@@ -69,7 +91,7 @@ bool exec_within(const RegState& rs, uint32_t reader, uint32_t owner) {
 }
 
 void union_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other,
-                 const RegState* current = nullptr) {
+                 const RegState* current = nullptr, bool explicit_sources = false) {
     const uint32_t into_side = into.hard || into.scoped_complete_word ? into.outside_exec : 0u;
     const uint32_t other_side = other.hard || other.scoped_complete_word ? other.outside_exec : 0u;
     auto scoped = into.placeholder && !into.hard ? into.scoped_blanket_roots : into.blanket_roots;
@@ -78,14 +100,35 @@ void union_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other,
     scoped.insert(other_scoped.begin(), other_scoped.end());
     if (into.placeholder && other.placeholder) {
         // CONFIDENCE: HIGH -- outside A union outside B is outside B when B is a proved
-        // subset of A. Only current instruction sources share these immutable EXEC SSA facts;
-        // predecessor and loop joins retain the equality-only meet below.
+        // subset of A. Each subset fact is about two immutable EXEC SSA values, so it holds on
+        // every path reaching them: current instruction sources and the structured merges that
+        // pass their state use it. A merge that passes no state keeps the equality-only meet. An
+        // owner defined on one arm only cannot match any reader after the merge, which sees a
+        // phi instead.
         uint32_t owner = into_side == other_side ? into_side : 0u;
         if (!owner && current && into_side && other_side) {
             if (exec_within(*current, into_side, other_side))
                 owner = into_side;
             else if (exec_within(*current, other_side, into_side))
                 owner = other_side;
+        }
+        // CONFIDENCE: HIGH -- a soft side with roots has a global proof that covers every lane:
+        // its placeholder is only the loop-header assumption those blanket_roots name, which the
+        // back edge checks (vector_word_defined_in_exec treats a soft mark the same way). It
+        // therefore restricts no confined side's domain; it adds those global roots to the
+        // obligation of that domain. Without this, a complete load or relay confined under a
+        // narrowed EXEC lost its owner the first time it met an ordinary loop-carried word. A
+        // soft mark without roots proves nothing and still vetoes the owner.
+        if (!owner && explicit_sources) {
+            if (!other.hard && !other.blanket_roots.empty() && into_side) {
+                owner = into_side;
+                scoped = into.hard ? into.blanket_roots : into.scoped_blanket_roots;
+                scoped.insert(other.blanket_roots.begin(), other.blanket_roots.end());
+            } else if (!into.hard && !into.blanket_roots.empty() && other_side) {
+                owner = other_side;
+                scoped = other.hard ? other.blanket_roots : other.scoped_blanket_roots;
+                scoped.insert(into.blanket_roots.begin(), into.blanket_roots.end());
+            }
         }
         into.outside_exec = owner;
     } else if (other.placeholder) {
@@ -182,6 +225,11 @@ void record_exec_mask_subset(RegState& rs, uint32_t result, uint32_t left, uint3
             parent = left;
     }
     if (parent && result && result != parent) rs.exec_subset_of[result] = parent;
+    // CONFIDENCE: HIGH -- when B is a proved subset of A, A&~B and B partition A: their union is
+    // exactly A. An if/else lowering's second arm (S_ANDN2 EXEC, saved, EXEC) runs under this.
+    if (opcode == 0x15 && result && result != left && result != right && left != right &&
+        exec_within(rs, right, left))
+        rs.exec_complement_in[result] = {left, right};
 }
 
 void seed_vector_word_definedness(RegState& rs, const std::vector<Rdna2Inst>& instructions,
@@ -291,7 +339,8 @@ ScalarSourceMarks vector_source_marks(const RegState& rs, const Rdna2Inst& in) {
     }
     for (uint32_t source = 0; source < in.n_src; ++source)
         for (uint32_t word = 0; word < vector_provenance_source_span(in, source); ++word)
-            union_marks(marks, vector_word(rs, in.src[source].value + static_cast<int>(word)), &rs);
+            union_marks(marks, vector_word(rs, in.src[source].value + static_cast<int>(word)), &rs,
+                        true);
     // Relative indexing can select an absent word beyond the decoder's storage inventory. A
     // constant current M0 may refine this at the actual emission boundary; maps alone cannot.
     if (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x43) {
@@ -411,7 +460,10 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
     if (!width) return;
     const bool relative = in.fmt == Rdna2Format::VOP1 && in.opcode == kVop1OpcodeMovreldB32;
     const bool preserve = vector_write_depends_on_old_word(in, full_exec);
-    const bool complete = published_interpolation || complete_full_word_write(in);
+    // CONFIDENCE: HIGH -- these reads are complete in their active lanes exactly as a buffer
+    // load is; only this transfer function uses that fact (CFG DATA facts keep their own).
+    const bool complete = published_interpolation || complete_full_word_write(in) ||
+                          memory_read_completes_active_word(in);
     const int end = relative ? rs.max_vgpr + 1 : in.dst.value + static_cast<int>(width);
     for (int reg = in.dst.value; reg < end; ++reg) {
         const auto old = vector_word(rs, reg);
@@ -448,8 +500,17 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
                 if (image_proof)
                     result.blanket_roots.insert(rs.mimg_sources.roots.begin(),
                                                 rs.mimg_sources.roots.end());
-                if (keep_wider) {
-                    result.outside_exec = old.outside_exec;
+                // CONFIDENCE: HIGH -- the second arm of a partition: EXEC = whole & ~part with
+                // part a proved subset of whole. An old word confined within part (its missing
+                // lanes lie outside a superset of part) misses no lane of part, and this write
+                // completes the rest of whole, so the result misses lanes only outside whole.
+                const auto partition = rs.exec_complement_in.find(rs.exec);
+                const bool completes_partition =
+                    !keep_wider && old.hard && old.outside_exec != 0 &&
+                    partition != rs.exec_complement_in.end() &&
+                    exec_within(rs, partition->second.second, old.outside_exec);
+                if (keep_wider || completes_partition) {
+                    result.outside_exec = keep_wider ? old.outside_exec : partition->second.first;
                     result.blanket_roots.insert(old.blanket_roots.begin(), old.blanket_roots.end());
                 }
             }
@@ -461,8 +522,9 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
     }
 }
 
-void join_vector_word_marks(VectorWordMarks& into, const VectorWordMarks& other) {
-    for (const auto& [reg, source] : other) union_source_marks(into[reg], source);
+void join_vector_word_marks(VectorWordMarks& into, const VectorWordMarks& other,
+                            const RegState* current) {
+    for (const auto& [reg, source] : other) union_marks(into[reg], source, current);
 }
 
 void retire_vector_word_roots(ScalarSourceMarks& marks, const std::set<uint64_t>& violated) {

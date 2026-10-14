@@ -72,7 +72,10 @@ bool fresh_mask_sources_defined(SpirvCompute& b, const RegState& rs, const Rdna2
 void record_native_interpolation_publication(const SpirvCompute& b, RegState& rs,
                                              const Rdna2Inst& in);
 void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSourceMarks& source);
-void join_vector_word_marks(VectorWordMarks& into, const VectorWordMarks& other);
+// With `current`, a nested pair of owners meets at the narrower one, by the immutable EXEC facts
+// `current` holds (exec_subset_of); without it, owners must be equal.
+void join_vector_word_marks(VectorWordMarks& into, const VectorWordMarks& other,
+                            const RegState* current = nullptr);
 void retire_vector_word_roots(ScalarSourceMarks& marks, const std::set<uint64_t>& violated);
 bool vector_word_defined_in_exec(const RegState& rs, const ScalarSourceMarks& marks, uint32_t exec);
 void begin_mimg_source_proof(RegState& rs, uint32_t pc);

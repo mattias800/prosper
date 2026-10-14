@@ -3176,6 +3176,10 @@ struct RegState {
     // EXEC = EXEC & cmp). Each entry is a fact about one immutable SSA value, so it holds on every
     // path that reaches that value.
     std::map<uint32_t, uint32_t> exec_subset_of;
+    // Complement facts about EXEC SSA values: child -> {whole, part} when the child was computed as
+    // whole & ~part and part was already proved a subset of whole, so part | child == whole. An
+    // if/else lowering's second arm runs under such a child of the saved outer mask.
+    std::map<uint32_t, std::pair<uint32_t, uint32_t>> exec_complement_in;
     // PC-relative EMBEDDED TABLES (#273): load pc -> the table's dwords, resolved by
     // detect_pcrel_tables (an s_getpc_b64-derived V# whose num_records is a known constant). The
     // shader BLOB carries the table; the recompiler folds it into a compile-time constant lookup.
@@ -3487,7 +3491,7 @@ inline void join_merge_edge(RegState& rs, int r, const MergeEdgeMarks& other) {
 // Join SCC and the spill slots at the same merge (a poisoned SCC edge merges as bfalse, which is
 // fabricated too; a slot marked on either edge is marked after it).
 inline void join_merge_scc_and_slots(RegState& rs, const MergeEdgeMarks& other) {
-    join_vector_word_marks(rs.vreg_source_marks, other.vectors);
+    join_vector_word_marks(rs.vreg_source_marks, other.vectors, &rs);
     rs.vector_full_exec = rs.vector_full_exec && other.vector_full_exec;
     rs.unavailable_saved_mask_words.insert(other.unavailable_saved_mask_words.begin(),
                                            other.unavailable_saved_mask_words.end());

@@ -315,16 +315,28 @@ TEST(ConfinedSourceUnion, NestedOwnerUnionKeepsBothActualLoopCarryObligations) {
     }
 }
 
-TEST(ConfinedSourceUnion, AnUnconfinedLoopAssumptionCannotSupplyANestedHardOwner) {
+// #5167 reversed this case's expectation. v7 is a loop assumption: the guard itself admits a
+// predicate on v7 alone, recording its root for the backedge check, and admits v6 alone under B.
+// Their lane-wise combination is no less defined, so refusing it was an over-refusal. The
+// assumption still adds its root to v6's owner, and a poisoned backedge still fails the check.
+TEST(ConfinedSourceUnion, ALoopAssumptionAddsItsRootToANestedHardOwner) {
     Emitter e;
-    ASSERT_TRUE(e.emit({mov7, cmpx_a, mov6, cmpx_b}));
+    ASSERT_TRUE(e.emit({mov7, cmpx_a, mov6}));
+    const uint32_t a = e.rs.exec;
+    ASSERT_TRUE(e.emit({cmpx_b}));
     LoopBlanketCheck check(e.rs, std::set<int>{}, 0);
     mark_vector_loop_carried(e.rs, decode({mov7}), 0, 1, check.carried, check.confined);
     EXPECT_TRUE(e.rs.vreg_source_marks.at(7).placeholder);
     EXPECT_FALSE(e.rs.vreg_source_marks.at(7).hard);
-    EXPECT_EQ(e.source().outside_exec, 0u);
+    const uint64_t root = blanket_root(0, kVectorBlanketBase + 7);
+    EXPECT_EQ(e.source().outside_exec, a);
+    EXPECT_TRUE(e.source().blanket_roots.contains(root));
     ASSERT_TRUE(e.emit({xor8}));
-    EXPECT_FALSE(e.defined());
+    ASSERT_TRUE(e.defined());
+    EXPECT_TRUE(e.b.loop_blanket_roots_read.contains(root));
+    ASSERT_TRUE(e.emit({0x7e0e0314u}));   // the backedge rewrites v7 from absent v20
+    auto exits = loop_check_marks(e.rs);
+    EXPECT_FALSE(check.holds(e.b, e.rs, exits));
 }
 
 TEST(ConfinedSourceUnion, PublicCompilerProducesTheNestedExplicitSourceModule) {
