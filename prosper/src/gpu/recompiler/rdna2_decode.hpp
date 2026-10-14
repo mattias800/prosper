@@ -606,6 +606,14 @@ inline bool rdna2_escapes_decoded_effects(const Rdna2Inst& in) {
     return false;
 }
 
+// v_readfirstlane_b32 (VOP1 0x02) and v_readlane_b32 (VOP3 0x360) write ONE SGPR, although the
+// decoder files their destination field as a VGPR operand (`dst.kind == VGPR`). A scalar-write
+// inventory that filters on the operand kind first misses them; ask this instead.
+inline bool rdna2_lane_read_writes_sgpr(const Rdna2Inst& in) {
+    return (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02u) ||
+           (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360u);
+}
+
 // The subset an analysis cannot model through its operands alone: everything above except
 // s_movrels_b32. That one reads SGPR[src + M0] and writes the destination it names. Its write is
 // ordinary, and its read is modelled where reads matter: scalar_alu_source_words() charges it
