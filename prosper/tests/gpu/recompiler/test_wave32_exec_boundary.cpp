@@ -324,12 +324,12 @@ std::vector<uint32_t> scalar_relay_loop(bool readfirst) {
     // the empty-prefix fixture. READFIRST has no exact native32 service on this route.
     std::fill(code.begin() + 2, code.begin() + 9, 0xbf800000u);
     code[2] = readfirst ? 0x7e400500u : 0xbea00381u;   // s32 = selected first / genuine1
-    code[3] = 0x7dea0080u;   // EXEC &= local-ID !=0
+    code[3] = 0x7daa0080u;   // EXEC &= local-ID !=0
     code[4] = 0xbe800380u;   // genuine s0=0 for the original s0/v1 comparison
     code[10] = 0xbf800000u;   // retain genuine local-ID, do not replace it with0
     code[11] = 0x7e020220u;   // masked v1 = s32
     *std::find(code.begin(), code.end(), 0x7d020200u) = 0x7d840200u;   // exact integer comparison
-    *std::find(code.begin(), code.end(), 0x7da40080u) = 0x7dea0080u;
+    *std::find(code.begin(), code.end(), 0x7da40080u) = 0x7daa0080u;
     *std::find(code.begin(), code.end(), 0xbf860004u) = 0xbf860006u;   // VCCZ skips the store
     return code;
 }
@@ -448,7 +448,7 @@ namespace {
 std::vector<uint32_t> vcc_control_code(bool produced) {
     // CMPX_NE0 narrows EXEC without producing VCC; literal writers retain distinct branch arms.
     std::vector<uint32_t> result{
-        0xbe840380u, 0x7e0602a5u, 0x7e100300u, 0xbe800380u, 0x7dea0080u, 0xbf860002u, 0x7e020281u,
+        0xbe840380u, 0x7e0602a5u, 0x7e100300u, 0xbe800380u, 0x7daa0080u, 0xbf860002u, 0x7e020281u,
         0xbf820001u, 0x7e020280u, 0xd7610013u, 0x00014a7eu, 0xd7610013u, 0x0001507fu, 0xd760000eu,
         0x00014b13u, 0xd760000fu, 0x00015113u, 0xbefe040eu, 0x7d840200u, 0xbf860006u, 0x80048104u,
         0xbf0a8204u, 0xbf850001u, 0xbf82fffau, 0xe0702000u, 0x80020308u, 0xbf810000u};
