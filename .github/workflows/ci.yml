@@ -128,6 +128,14 @@ jobs:
         with:
           fetch-depth: 2   # HEAD^1 is the PR's base for the C++ lint step
 
+      # The full Debug suite exhausted the hosted runner during linking (#5176).
+      # Reclaim SDKs this C++/Python job does not use; keep its debug information and tests.
+      - name: Reclaim unused hosted-runner SDK space
+        run: |
+          df -h /
+          sudo rm -rf -- /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
       # spirv-tools is what makes the `spv_validate` test a validation gate rather than a
       # recompile smoke test. It is on no GitHub runner image, and this workflow never installed
       # it, so that test reported "PASS (recompiled; spirv-val not found)" with status 0 on every
