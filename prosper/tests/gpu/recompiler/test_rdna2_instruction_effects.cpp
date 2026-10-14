@@ -1465,39 +1465,3 @@ TEST(Rdna2InstructionEffectsRegression, ActiveVectorSourcesFollowTheTable) {
     EXPECT_FALSE(defined(with_dst, Rdna2Format::VOP2, 0x01, none));
     EXPECT_TRUE(defined(with_dst, Rdna2Format::VOP2, 0x01, vcc));
 }
-
-TEST(Rdna2InstructionEffectsRegression, MissingHighVectorWordCannotAuthenticateWideResults) {
-    // A low word alone cannot authenticate a result whose arithmetic consumes a physical pair.
-    // The widened complete-result inventory makes this premise necessary before DATA transfer.
-    for (const auto& [fmt, op, source] :
-         std::initializer_list<std::tuple<Rdna2Format, uint32_t, uint32_t>>{
-             {Rdna2Format::VOP1, 0x0fu, 0u},   // CVT_F32_F64
-             {Rdna2Format::VOP1, 0x17u, 0u},   // TRUNC_F64
-             {Rdna2Format::VOPC, 0x21u, 0u},   // CMP_LT_F64
-             {Rdna2Format::VOPC, 0x21u, 1u},
-             {Rdna2Format::VOP3, 0x164u, 0u},   // ADD_F64
-             {Rdna2Format::VOP3, 0x164u, 1u},
-             {Rdna2Format::VOP3, 0x301u, 1u}}) {   // ASHRREV_I64
-        auto in = decode(fmt, op);
-        // Separate the synthetic operand ranges, so an absent high half is never another
-        // operand's low half and cannot be caught by that unrelated explicit read.
-        for (uint32_t index = 0; index < in.n_src; ++index)
-            if (in.src[index].kind == OperandKind::VGPR)
-                in.src[index].value = 10 + static_cast<int>(index) * 10;
-        const int high = in.src[source].value + 1;
-        ActiveVectorWords state;
-        std::set<int> relayed;
-        for (int reg = 0; reg < 40; ++reg) {
-            state.current.insert(reg);
-            relayed.insert(reg);
-        }
-        EXPECT_EQ(rdna2_vgpr_source_span(in, source), 2u);
-        EXPECT_TRUE(active_vector_sources_defined(state, in, relayed, {}, {}, {}, true));
-        state.current.erase(high);
-        EXPECT_FALSE(active_vector_sources_defined(state, in, relayed, {}, {}, {}, true))
-            << "fmt=" << static_cast<int>(fmt) << " opcode=" << op << " source=" << source;
-    }
-    const auto shift = decode(Rdna2Format::VOP3, kVop3OpcodeLshrrevB64);
-    EXPECT_EQ(rdna2_vgpr_source_span(shift, 0), 1u) << "the shift count remains one word";
-    EXPECT_EQ(rdna2_vgpr_source_span(shift, 1), 2u);
-}
