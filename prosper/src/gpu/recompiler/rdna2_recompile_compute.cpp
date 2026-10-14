@@ -638,7 +638,8 @@ std::vector<uint32_t>
 recompile_compute_once(const uint32_t* code, size_t dwords, const ShaderResourceTable* rt,
                        const ComputeShaderConfig& config, RecompileDiagnosticContext diagnostic,
                        const PortableEntryExecRoot& entry, bool fold_constants = true,
-                       ComputeConstantFoldAttempt* fold_attempt = nullptr);
+                       ComputeConstantFoldAttempt* fold_attempt = nullptr,
+                       std::vector<uint32_t>* store_loop_data_retry = nullptr);
 }   // namespace
 
 std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
@@ -648,8 +649,31 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     const PortableEntryExecRoot entry(code, dwords, config);
     RecompileDiagnosticAttempt attempt_diagnostics;
     ComputeConstantFoldAttempt fold_attempt;
-    std::vector<uint32_t> module =
-        recompile_compute_once(code, dwords, rt, config, diagnostic, entry, true, &fold_attempt);
+    std::vector<uint32_t> store_loop_data_retry;
+    std::vector<uint32_t> module = recompile_compute_once(
+        code, dwords, rt, config, diagnostic, entry, true, &fold_attempt, &store_loop_data_retry);
+    if (module.empty() && store_loop_data_retry.size() == dwords &&
+        !store_loop_data_retry.empty() &&
+        std::equal(store_loop_data_retry.begin(), store_loop_data_retry.end(), code) &&
+        !config.force_exchange_dispatcher && config.wave_size == 64 &&
+        config.native_subgroup_size == 64 && !compute_extent_is_partial(config)) {
+        // CONFIDENCE: HIGH -- eligibility was bound to the real refused header, its original
+        // closed store loop, authentic native entry and current preheader DATA. This grants only
+        // a fresh exact attempt: synchronized wave control retains scalar live-out and effects,
+        // while the existing dispatcher checks every input, backing and current generation.
+        RecompileDiagnosticAttempt exact_diagnostics;
+        ComputeShaderConfig exact = config;
+        exact.force_exchange_dispatcher = true;
+        auto retried =
+            recompile_compute_once(store_loop_data_retry.data(), store_loop_data_retry.size(), rt,
+                                   exact, diagnostic, entry, false);
+        exact_diagnostics.discard();
+        if (!retried.empty()) {
+            attempt_diagnostics.discard();
+            return retried;
+        }
+        // Failed attempts retain the original terminal refusal and all original permissions.
+    }
     // CONFIDENCE: HIGH. Optional SCC folding rewrites the decoded stream and can revoke its
     // original native mask-word proof. Preserve successful optimized modules; a failed physical
     // read may retry the original branches through a fresh builder with all existing proofs.
@@ -690,7 +714,8 @@ std::vector<uint32_t>
 recompile_compute_once(const uint32_t* code, size_t dwords, const ShaderResourceTable* rt,
                        const ComputeShaderConfig& config, RecompileDiagnosticContext diagnostic,
                        const PortableEntryExecRoot& entry, bool fold_constants,
-                       ComputeConstantFoldAttempt* fold_attempt) {
+                       ComputeConstantFoldAttempt* fold_attempt,
+                       std::vector<uint32_t>* store_loop_data_retry) {
     if (!config.float_transport.canonical()) return {};
     const bool has_null_guarded_raw_store = rt &&
         std::any_of(rt->resources.begin(), rt->resources.end(),
@@ -1036,6 +1061,8 @@ recompile_compute_once(const uint32_t* code, size_t dwords, const ShaderResource
     auto safe_branches = safe_execz_branches(ins);
     for (uint32_t wpc : waterfall_branches(ins)) safe_branches.insert(wpc);
     const auto record_mask_word_failure = [&] {
+        if (store_loop_data_retry && b.compute_store_loop_data_retry)
+            *store_loop_data_retry = b.saved_mask_original_words;
         if (fold_attempt)
             fold_attempt->missing_mask_words =
                 b.stage_reject_reason == "saved-mask-physical-word-unavailable" ||
