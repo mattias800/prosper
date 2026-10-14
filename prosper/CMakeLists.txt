@@ -2712,6 +2712,11 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_partial_vcc_word.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_wave32_exec_boundary
+    SOURCES tests/gpu/recompiler/test_wave32_exec_boundary.cpp
+            tests/gpu/recompiler/test_wave32_active_data.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_exec_spill_data
     SOURCES tests/gpu/recompiler/test_exec_spill_data.cpp
     INCLUDES tests
