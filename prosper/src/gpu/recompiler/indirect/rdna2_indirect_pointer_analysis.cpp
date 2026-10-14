@@ -347,17 +347,17 @@ bool analyze_rdna2_static_pointer_footprint(
     // packets is insufficient if an intervening same-length instruction overwrites either producer.
     if (!vgpr_unchanged(instructions, 1u, 17u, 43u) ||
         !vgpr_unchanged(instructions, kSelectorFetchPc, 40u, 2u) ||
-        !scalar_range_unchanged(instructions, 3u, 17u, 8u, 4u))
+        !scalar_range_unchanged(instructions, 3u, 17u, 8u, 4u, IndirectWave::Wave64))
         return false;
 
     // Retain each saved mask until every consumer. In particular, s[2:3] is the filtered pre-arm
     // mask used both by pc267's complement and pc351's restore; a scalar clobber in the long mode-2
     // body would otherwise let a selector-2 lane enter the 52-byte arm with only 28 bytes captured.
-    if (!scalar_range_unchanged(instructions, 38u, 374u, 0u, 2u) ||
-        !scalar_range_unchanged(instructions, 29u, 44u, 6u, 2u) ||
-        !scalar_range_unchanged(instructions, 44u, 351u, 2u, 2u) ||
-        !scalar_range_unchanged(instructions, 47u, 78u, 6u, 2u) ||
-        !scalar_range_unchanged(instructions, 271u, 298u, 6u, 2u))
+    if (!scalar_range_unchanged(instructions, 38u, 374u, 0u, 2u, IndirectWave::Wave64) ||
+        !scalar_range_unchanged(instructions, 29u, 44u, 6u, 2u, IndirectWave::Wave64) ||
+        !scalar_range_unchanged(instructions, 44u, 351u, 2u, 2u, IndirectWave::Wave64) ||
+        !scalar_range_unchanged(instructions, 47u, 78u, 6u, 2u, IndirectWave::Wave64) ||
+        !scalar_range_unchanged(instructions, 271u, 298u, 6u, 2u, IndirectWave::Wave64))
         return false;
 
     if (!pointer_pair_unchanged(instructions, kSourceFetchPc, 50u) ||
