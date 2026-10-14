@@ -1700,7 +1700,7 @@ inline uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
             // and `image_load_mip` at pc33 in the third. Neither is the defect -- the same
             // "a reject PC names where a fact was consumed, not where it was lost" as #2481/#2801.
             //
-            // Known remainder, recorded rather than fixed: `0x345`, `0x363`, `0x364`, `0x372` and
+            // Known remainder, recorded rather than fixed: `0x345`, `0x363`, `0x372` and
             // `0x178` are B32 VOP3 forms still falling to the default. No live title has been
             // observed reading a mask half through one, so they stay out of the list under the
             // add-on-evidence rule above -- but the next investigation that meets one has the set
@@ -1748,9 +1748,16 @@ inline uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
             //
             // Charged the pair, the read demanded VCC_HI too and both programs were declined with
             // `wave64-ambiguous-mask-read`. The signed sibling 0x149 stays at the default.
+            //
+            // V_BCNT_U32_B32 (0x364): `D.u32 = CountOneBits(S0.u32) + S1.u32`, two 32-bit
+            // operands (RDNA2 ISA 70648). The population-count idiom counts a B64 mask one half
+            // at a time (`v_bcnt v7, s8, 0` / `v_bcnt v7, s9, v7`); charged the pair, the high
+            // half's read reached the never-written s10 and the fresh-mask guard refused the
+            // compare over the count (`fabricated-fresh-mask-source`, fragment_partial_wave_exec,
+            // #5146). The same fixture's MBCNT reads were already one dword (0x365 / 0x366).
             if (in.opcode == 0x141 || in.opcode == 0x143 || in.opcode == 0x148 ||
                 in.opcode == 0x157 || in.opcode == kVop3OpcodeLshlAddU32 || in.opcode == 0x347 ||
-                in.opcode == 0x36f || in.opcode == kVop3OpcodeAdd3U32 ||
+                in.opcode == 0x36f || in.opcode == 0x364 || in.opcode == kVop3OpcodeAdd3U32 ||
                 in.opcode == kVop3OpcodeAndOrB32 || in.opcode == kVop3OpcodeMulLoU32 ||
                 in.opcode == kVop3OpcodeMulHiU32)
                 return 1;
