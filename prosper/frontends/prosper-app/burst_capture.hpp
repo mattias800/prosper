@@ -24,6 +24,7 @@
 #include <cstring>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace prosper::frontend {
@@ -90,7 +91,7 @@ inline std::string burst_continuity(const std::vector<uint64_t>& flips) {
 struct BurstFrame {
     std::vector<uint8_t> rgba;   // tightly packed width*height*4
     uint32_t width = 0, height = 0;
-    uint64_t source_flip = 0;    // the guest flip the presented frame came from
+    uint64_t source_flip = 0;   // the guest flip the presented frame came from
 };
 
 struct BurstResult {
@@ -155,4 +156,4 @@ private:
     uint32_t target_ = 0;
 };
 
-}  // namespace prosper::frontend
+}   // namespace prosper::frontend

@@ -29,8 +29,7 @@ LumaGrid grid_from(const std::function<double(uint32_t x, uint32_t y)>& f) {
     LumaGrid g;
     for (uint32_t y = 0; y < kFlickerGridH; ++y)
         for (uint32_t x = 0; x < kFlickerGridW; ++x)
-            g.cell[y * kFlickerGridW + x] =
-                static_cast<float>(std::clamp(f(x, y), 0.0, 255.0));
+            g.cell[y * kFlickerGridW + x] = static_cast<float>(std::clamp(f(x, y), 0.0, 255.0));
     return g;
 }
 
@@ -83,15 +82,19 @@ RunResult run(FlickerDetector& d, uint32_t frames, const std::function<LumaGrid(
     return r;
 }
 
-}  // namespace
+}   // namespace
 
 // ---- the signature ---------------------------------------------------------------------------
 
 TEST(FrameFlickerSignature, UniformImageGivesItsLumaInEveryCell) {
     const uint32_t w = 320, h = 180;
     std::vector<uint8_t> px(static_cast<size_t>(w) * h * 4);
-    for (size_t i = 0; i < px.size(); i += 4) { px[i] = 200; px[i + 1] = 100; px[i + 2] = 50; }
-    const LumaGrid g = luma_grid_from_rgba(px.data(), w, h, w * 4);
+    for (size_t i = 0; i < px.size(); i += 4) {
+        px[i] = 200;
+        px[i + 1] = 100;
+        px[i + 2] = 50;
+    }
+    const LumaGrid g = luma_grid_from_rgba(px.data(), w, h, static_cast<size_t>(w) * 4);
     const double expected = 0.2126 * 200 + 0.7152 * 100 + 0.0722 * 50;
     for (float c : g.cell) EXPECT_NEAR(c, expected, 0.01);
 }
@@ -103,7 +106,8 @@ TEST(FrameFlickerSignature, CellsFollowTheImageAndRespectRowPitch) {
     const size_t pitch = static_cast<size_t>(w) * 4 + 16;
     std::vector<uint8_t> px(pitch * h, 255);
     for (uint32_t y = 0; y < h; ++y)
-        for (uint32_t x = w / 2; x < w; ++x) std::memset(&px[y * pitch + x * 4], 0, 4);
+        for (uint32_t x = w / 2; x < w; ++x)
+            std::memset(&px[y * pitch + static_cast<size_t>(x) * 4], 0, 4);
     const LumaGrid g = luma_grid_from_rgba(px.data(), w, h, pitch);
     for (uint32_t y = 0; y < kFlickerGridH; ++y) {
         EXPECT_NEAR(g.cell[y * kFlickerGridW + 0], 255.0, 0.01);
@@ -114,7 +118,7 @@ TEST(FrameFlickerSignature, CellsFollowTheImageAndRespectRowPitch) {
 }
 
 TEST(FrameFlickerSignature, TooSmallOrNullImageIsAllZero) {
-    std::vector<uint8_t> px(16 * 16 * 4, 255);
+    std::vector<uint8_t> px(size_t{16} * 16 * 4, 255);
     const LumaGrid small = luma_grid_from_rgba(px.data(), 16, 16, 64);
     const LumaGrid null = luma_grid_from_rgba(nullptr, 256, 144, 1024);
     for (size_t i = 0; i < kFlickerCells; ++i) {
@@ -138,7 +142,8 @@ TEST(FrameFlickerDetector, StrictAlternationFiresAfterOneSecond) {
     const FlickerEpisode& e = d.episode();
     EXPECT_EQ(e.start_ns, 1'000'000'000ull + 2 * kFrame60);
     EXPECT_GE(r.first_sustained_ns, kFlickerSustainNs);
-    EXPECT_LE(r.first_sustained_ns, 2 * kFrame60 + kFlickerSustainNs + kFrame60);
+    // Onset additionally needs two fresh flicker frames, with one frame of clock quantization.
+    EXPECT_LE(r.first_sustained_ns, kFlickerSustainNs + 4 * kFrame60);
     EXPECT_GT(e.mean_d1(), 30.0);
     EXPECT_LT(e.mean_d2(), 0.01);
     EXPECT_NEAR(e.share(), 1.0, 1e-9);
@@ -154,6 +159,29 @@ TEST(FrameFlickerDetector, AlternationPresentedTwicePerFrameStillFires) {
     const RunResult r = run(d, 240, [&](uint32_t t) { return (t / 2) % 2 ? b : a; });
     EXPECT_EQ(r.onsets, 1u);
     EXPECT_GT(r.sustained, 0u);
+}
+
+TEST(FrameFlickerDetector, AlternationPresentedThreeTimesPerFrameStillFires) {
+    const LumaGrid a = picture(), b = noise(2);
+    for (const uint32_t presentations : {3u, 6u}) {
+        FlickerDetector d;
+        const RunResult r =
+            run(d, 360, [&](uint32_t t) { return (t / presentations) % 2 ? b : a; });
+        EXPECT_EQ(r.onsets, 1u) << "presentations per content frame " << presentations;
+        EXPECT_GT(r.sustained, 0u);
+    }
+}
+
+TEST(FrameFlickerDetector, SlowDistinctAlternationStillFires) {
+    // Preserve sparse alternation, including intervals up to 0.9 s between distinct frames.
+    const LumaGrid a = picture(), b = noise(2);
+    for (const uint64_t interval : {250'000'000ull, 900'000'000ull}) {
+        FlickerDetector d;
+        uint32_t onsets = 0;
+        for (uint32_t t = 0; t < 24; ++t)
+            onsets += d.push(t % 2 ? b : a, 1'000'000'000ull + t * interval).onset;
+        EXPECT_EQ(onsets, 1u) << "interval " << interval;
+    }
 }
 
 TEST(FrameFlickerDetector, RegionNamesTheAlternatingQuarter) {
@@ -201,7 +229,10 @@ TEST(FrameFlickerDetector, PansDoNotFire) {
 
 TEST(FrameFlickerDetector, PanAtThirtyShownTwiceDoesNotFire) {
     FlickerDetector d;
-    const RunResult r = run(d, 300, [&](uint32_t t) { return panned(1.5 * (t / 2)); });
+    const RunResult r = run(d, 300, [&](uint32_t t) {
+        const uint32_t content_frame = t / 2;
+        return panned(1.5 * static_cast<double>(content_frame));
+    });
     EXPECT_EQ(r.sustained, 0u);
     EXPECT_EQ(r.flicker, 0u);
 }
@@ -291,17 +322,50 @@ TEST(FrameFlickerDetector, StrobeThenPresenterStallThenCutDoesNotFire) {
     EXPECT_EQ(sustained, 0u);
 }
 
+TEST(FrameFlickerDetector, LongerStrobeThenPresenterStallCannotFinishSustain) {
+    // 0.8 s passes both the vote and the episode-comparison floor. No repeat is presented during
+    // the pause, so neither repeat ageing nor that floor prevents the first new frame firing.
+    FlickerDetector d;
+    const LumaGrid a = picture(), b = noise(9);
+    for (uint32_t t = 0; t < 48; ++t)
+        EXPECT_FALSE(d.push(t % 2 ? b : a, 1'000'000'000ull + t * kFrame60).sustained);
+    ASSERT_TRUE(d.in_episode());
+    const auto resumed = d.push(a, 4'000'000'000ull);
+    EXPECT_FALSE(resumed.onset);
+    EXPECT_FALSE(resumed.sustained);
+    EXPECT_FALSE(d.in_episode());
+}
+
+TEST(FrameFlickerDetector, ShortPresenterPauseThenSingleChangeDoesNotFire) {
+    // A pause can be shorter than the allowed sparse-presentation interval. Resuming on one
+    // old parity still cannot turn the preceding 0.8 s flash into a sustained defect.
+    const LumaGrid a = picture(), b = noise(9);
+    for (const uint64_t pause : {400'000'000ull, 900'000'000ull}) {
+        FlickerDetector d;
+        uint64_t now = 1'000'000'000ull;
+        for (uint32_t t = 0; t < 48; ++t, now += kFrame60)
+            EXPECT_FALSE(d.push(t % 2 ? b : a, now).onset);
+        now += pause;
+        for (uint32_t t = 0; t < 60; ++t, now += kFrame60)
+            EXPECT_FALSE(d.push(a, now).onset) << "pause " << pause << " resumed frame " << t;
+    }
+}
+
 TEST(FrameFlickerDetector, SlowHardBlinkDoesNotFire) {
     // A tenth of the screen blinks at 1 Hz (+60 luma, half a second on, half off). Every distinct
     // frame is a perfect d2 = 0 vote, but the repeats between them are a still picture, not an
     // alternation at the presented cadence.
-    FlickerDetector d;
     const LumaGrid a = picture();
     LumaGrid lit = a;
-    for (size_t i = 0; i < kFlickerCells / 10; ++i) lit.cell[i] = std::min(255.0f, lit.cell[i] + 60.0f);
-    const RunResult r = run(d, 600, [&](uint32_t t) { return (t / 30) % 2 ? lit : a; });
-    EXPECT_EQ(r.onsets, 0u);
-    EXPECT_EQ(r.sustained, 0u);
+    for (size_t i = 0; i < kFlickerCells / 10; ++i)
+        lit.cell[i] = std::min(255.0f, lit.cell[i] + 60.0f);
+    for (const uint32_t half_period : {30u, 15u}) {
+        FlickerDetector d;
+        const RunResult r =
+            run(d, 600, [&](uint32_t t) { return (t / half_period) % 2 ? lit : a; });
+        EXPECT_EQ(r.onsets, 0u) << "blink half-period in presented frames " << half_period;
+        EXPECT_EQ(r.sustained, 0u);
+    }
 }
 
 TEST(FrameFlickerDetector, ShakeOfAFewFramesDoesNotFire) {
@@ -340,14 +404,15 @@ TEST(FrameFlickerProcess, ChangingSignatureSourceRestartsTheDetector) {
     const uint64_t compared0 = count(Counter::FlickerComparedFrames);
     const uint64_t flicker0 = count(Counter::FlickerFrames);
     for (int i = 0; i < 12; ++i)
-        observe_presented_frame(i % 2 ? bright.data() : dark.data(), w, h, w * 4, 100 + i,
-                                FlickerSource::CpuFrame);
+        observe_presented_frame(i % 2 ? bright.data() : dark.data(), w, h,
+                                static_cast<size_t>(w) * 4, 100 + i, FlickerSource::CpuFrame);
     EXPECT_EQ(count(Counter::FlickerComparedFrames) - compared0, 10u);
     EXPECT_EQ(count(Counter::FlickerFrames) - flicker0, 10u);
     // The same alternation, but each frame through the other source: never compared at all.
     const uint64_t compared1 = count(Counter::FlickerComparedFrames);
     for (int i = 0; i < 12; ++i)
-        observe_presented_frame(i % 2 ? bright.data() : dark.data(), w, h, w * 4, 200 + i,
+        observe_presented_frame(i % 2 ? bright.data() : dark.data(), w, h,
+                                static_cast<size_t>(w) * 4, 200 + i,
                                 i % 2 ? FlickerSource::CpuFrame : FlickerSource::GpuSample);
     EXPECT_EQ(count(Counter::FlickerComparedFrames) - compared1, 0u);
 }
@@ -371,12 +436,15 @@ bool fired(const std::vector<AlarmFiring>& v, const char* rule) {
         if (std::strcmp(a.rule, rule) == 0) return true;
     return false;
 }
-}  // namespace
+}   // namespace
 
 TEST(FrameFlickerRule, FiresOnSustainedFramesAndNamesTheEpisode) {
     FlickerEpisode e;
     e.region_cells = 144;
-    e.x0 = 0; e.x1 = 15; e.y0 = 0; e.y1 = 8;
+    e.x0 = 0;
+    e.x1 = 15;
+    e.y0 = 0;
+    e.y1 = 8;
     WindowSample w = flicker_window(298, 290, 230);
     w.gauges[static_cast<size_t>(Gauge::FlickerEpisodeD1Milli)] = 42500;
     w.gauges[static_cast<size_t>(Gauge::FlickerEpisodeD2Milli)] = 300;
@@ -402,8 +470,8 @@ TEST(FrameFlickerRule, FiresOnSustainedFramesAndNamesTheEpisode) {
 
 TEST(FrameFlickerRule, QuietWithoutASustainedFrameAndNoDataWithoutAFullVote) {
     // Flicker frames that never formed a sustained episode (a strobe) are not an alarm.
-    EXPECT_FALSE(fired(evaluate_rules(flicker_window(298, 120, 0), RuleThresholds{}),
-                       "frame-flicker"));
+    EXPECT_FALSE(
+        fired(evaluate_rules(flicker_window(298, 120, 0), RuleThresholds{}), "frame-flicker"));
     // A frontend that compared fewer frames than one vote window has no data, not a quiet answer.
     EXPECT_FALSE(rule_has_data("frame-flicker", flicker_window(kFlickerWindowFrames - 1, 0, 0)));
     EXPECT_TRUE(rule_has_data("frame-flicker", flicker_window(kFlickerWindowFrames, 0, 0)));

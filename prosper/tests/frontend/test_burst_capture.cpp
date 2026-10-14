@@ -8,9 +8,9 @@
 #include <string>
 #include <vector>
 
-using prosper::frontend::BurstCapture;
 using prosper::frontend::burst_continuity;
 using prosper::frontend::burst_file_name;
+using prosper::frontend::BurstCapture;
 using prosper::frontend::kBurstFramesDefault;
 using prosper::frontend::kBurstFramesMax;
 using prosper::frontend::kSnapFlipListMaxEntries;

@@ -100,13 +100,27 @@ RuleThresholds RuleThresholds::scaled(double percent) {
 
 const std::vector<const char*>& rule_names() {
     static const std::vector<const char*> names = {
-        "texture-cache-thrash", "surface-readback", "texture-reference-cost",
-        "hle-blocking-wait",    "present-cpu-overhead", "dropped-draws",
-        "skipped-dispatches",   "host-copy-pressure",   "shader-compile",
-        "gpu-memory-off-device", "unaccounted-draws",   "unimplemented-hle-calls",
-        "diagnostic-path-active", "present-path-fallback", "pipeline-cache-thrash",
-        "texture-validation-churn", "host-copy-per-flip", "present-slot-trouble",
-        "rtt-destination-refused", "color-target-count-ceiling", "gpu-sync-wait",
+        "texture-cache-thrash",
+        "surface-readback",
+        "texture-reference-cost",
+        "hle-blocking-wait",
+        "present-cpu-overhead",
+        "dropped-draws",
+        "skipped-dispatches",
+        "host-copy-pressure",
+        "shader-compile",
+        "gpu-memory-off-device",
+        "unaccounted-draws",
+        "unimplemented-hle-calls",
+        "diagnostic-path-active",
+        "present-path-fallback",
+        "pipeline-cache-thrash",
+        "texture-validation-churn",
+        "host-copy-per-flip",
+        "present-slot-trouble",
+        "rtt-destination-refused",
+        "color-target-count-ceiling",
+        "gpu-sync-wait",
         "gpu-present-stalled",
         "gpu-device-time-coverage",
         "rtt-colorless-publication",
@@ -131,7 +145,8 @@ bool rule_has_data(const char* rule, const WindowSample& w) {
     }
     // Only a frontend that presents (and signs what it presents) can see a flicker, and the vote
     // needs a full window of compared frames before it can say anything.
-    if (r == "frame-flicker") return w.count(Counter::FlickerComparedFrames) >= kFlickerWindowFrames;
+    if (r == "frame-flicker")
+        return w.count(Counter::FlickerComparedFrames) >= kFlickerWindowFrames;
     if (r == "present-cpu-overhead") return w.events(Cost::PresentCpu) != 0;
     if (r == "texture-reference-cost") return w.events(Cost::TextureRefSample) != 0;
     // Presents of either kind: a frontend without GPU present has no data for this rule.
@@ -968,7 +983,8 @@ std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresho
             (unsigned long long)w.count(Counter::FlickerPresentedFrames),
             w.gauge(Gauge::FlickerEpisodeShareMilli) / 10.0,
             w.gauge(Gauge::FlickerEpisodeD1Milli) / 1000.0,
-            w.gauge(Gauge::FlickerEpisodeD2Milli) / 1000.0, w.gauge(Gauge::FlickerEpisodeMs) / 1000.0,
+            w.gauge(Gauge::FlickerEpisodeD2Milli) / 1000.0,
+            w.gauge(Gauge::FlickerEpisodeMs) / 1000.0,
             (unsigned long long)w.gauge(Gauge::FlickerOnsetSourceFlip),
             format_flicker_region_packed(w.gauge(Gauge::FlickerEpisodeRegion)).c_str());
         a.hint = "the presented picture alternates frame to frame (each frame matches the one two "

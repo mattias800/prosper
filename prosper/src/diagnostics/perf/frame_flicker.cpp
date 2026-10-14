@@ -15,8 +15,8 @@ double luma_grid_distance(const LumaGrid& a, const LumaGrid& b) {
     return sum / static_cast<double>(kFlickerCells);
 }
 
-LumaGrid luma_grid_from_rgba(const uint8_t* rgba, uint32_t width, uint32_t height,
-                             size_t row_bytes, uint32_t points_per_axis) {
+LumaGrid luma_grid_from_rgba(const uint8_t* rgba, uint32_t width, uint32_t height, size_t row_bytes,
+                             uint32_t points_per_axis) {
     LumaGrid g;
     if (!rgba || width < kFlickerGridW || height < kFlickerGridH || points_per_axis == 0 ||
         row_bytes < static_cast<size_t>(width) * 4)
@@ -26,9 +26,9 @@ LumaGrid luma_grid_from_rgba(const uint8_t* rgba, uint32_t width, uint32_t heigh
     // multiply-adds (this runs on the present thread for every presented frame).
     constexpr uint32_t kMaxPoints = 16;
     const uint32_t points = std::min(points_per_axis, kMaxPoints);
-    std::array<uint32_t, kFlickerGridW * kMaxPoints> xs{};
+    std::array<uint32_t, static_cast<size_t>(kFlickerGridW) * kMaxPoints> xs{};
     std::array<uint32_t, kFlickerGridW> nxs{};
-    std::array<uint32_t, kFlickerGridH * kMaxPoints> ys{};
+    std::array<uint32_t, static_cast<size_t>(kFlickerGridH) * kMaxPoints> ys{};
     std::array<uint32_t, kFlickerGridH> nys{};
     auto lay_out = [points](uint32_t cells, uint32_t extent, uint32_t* out, uint32_t* counts) {
         for (uint32_t c = 0; c < cells; ++c) {
@@ -37,7 +37,8 @@ LumaGrid luma_grid_from_rgba(const uint8_t* rgba, uint32_t width, uint32_t heigh
             const uint32_t n = static_cast<uint32_t>(std::min<uint64_t>(points, b - a));
             counts[c] = n;
             for (uint32_t i = 0; i < n; ++i)
-                out[c * kMaxPoints + i] = static_cast<uint32_t>(a + (2ull * i + 1) * (b - a) / (2ull * n));
+                out[c * kMaxPoints + i] =
+                    static_cast<uint32_t>(a + (2ull * i + 1) * (b - a) / (2ull * n));
         }
     };
     lay_out(kFlickerGridW, width, xs.data(), nxs.data());
@@ -47,7 +48,8 @@ LumaGrid luma_grid_from_rgba(const uint8_t* rgba, uint32_t width, uint32_t heigh
             // Integer luma x 10000 per point (Rec.709 weights), summed exactly.
             uint64_t sum = 0;
             for (uint32_t j = 0; j < nys[cy]; ++j) {
-                const uint8_t* row = rgba + static_cast<size_t>(ys[cy * kMaxPoints + j]) * row_bytes;
+                const uint8_t* row =
+                    rgba + static_cast<size_t>(ys[cy * kMaxPoints + j]) * row_bytes;
                 uint32_t row_sum = 0;   // <= 16 points x 2,550,000: fits
                 for (uint32_t i = 0; i < nxs[cx]; ++i) {
                     const uint8_t* p = row + static_cast<size_t>(xs[cx * kMaxPoints + i]) * 4;
@@ -75,27 +77,28 @@ std::string format_region_fields(uint32_t cells, uint32_t x0, uint32_t x1, uint3
                                  uint32_t y1) {
     if (cells == 0) return "diffuse(no-single-cell)";
     char buf[96];
-    std::snprintf(buf, sizeof buf, "x%u-%u%%,y%u-%u%%(%u/%zu-cells)",
-                  x0 * 100 / kFlickerGridW, (x1 + 1) * 100 / kFlickerGridW,
-                  y0 * 100 / kFlickerGridH, (y1 + 1) * 100 / kFlickerGridH, cells, kFlickerCells);
+    std::snprintf(buf, sizeof buf, "x%u-%u%%,y%u-%u%%(%u/%zu-cells)", x0 * 100 / kFlickerGridW,
+                  (x1 + 1) * 100 / kFlickerGridW, y0 * 100 / kFlickerGridH,
+                  (y1 + 1) * 100 / kFlickerGridH, cells, kFlickerCells);
     return buf;
 }
 
-}  // namespace
+}   // namespace
 
 std::string format_flicker_region(const FlickerEpisode& e) {
     return format_region_fields(e.region_cells, e.x0, e.x1, e.y0, e.y1);
 }
 
 std::string format_flicker_region_packed(uint64_t packed) {
-    return format_region_fields(static_cast<uint32_t>(packed >> 32),
-                                static_cast<uint32_t>(packed & 0xff),
-                                static_cast<uint32_t>((packed >> 8) & 0xff),
-                                static_cast<uint32_t>((packed >> 16) & 0xff),
-                                static_cast<uint32_t>((packed >> 24) & 0xff));
+    return format_region_fields(
+        static_cast<uint32_t>(packed >> 32), static_cast<uint32_t>(packed & 0xff),
+        static_cast<uint32_t>((packed >> 8) & 0xff), static_cast<uint32_t>((packed >> 16) & 0xff),
+        static_cast<uint32_t>((packed >> 24) & 0xff));
 }
 
-uint64_t pack_flicker_region(const FlickerEpisode& e) { return pack_region(e); }
+uint64_t pack_flicker_region(const FlickerEpisode& e) {
+    return pack_region(e);
+}
 
 void FlickerDetector::refresh_region() {
     const uint64_t frames = episode_.flicker_frames;
@@ -105,12 +108,17 @@ void FlickerDetector::refresh_region() {
             const uint32_t hits = cell_hits_[static_cast<size_t>(cy) * kFlickerGridW + cx];
             if (!frames || 2ull * hits < frames || hits == 0) continue;
             ++cells;
-            x0 = std::min(x0, cx); x1 = std::max(x1, cx);
-            y0 = std::min(y0, cy); y1 = std::max(y1, cy);
+            x0 = std::min(x0, cx);
+            x1 = std::max(x1, cx);
+            y0 = std::min(y0, cy);
+            y1 = std::max(y1, cy);
         }
     episode_.region_cells = cells;
     if (cells) {
-        episode_.x0 = x0; episode_.x1 = x1; episode_.y0 = y0; episode_.y1 = y1;
+        episode_.x0 = x0;
+        episode_.x1 = x1;
+        episode_.y0 = y0;
+        episode_.y1 = y1;
     } else {
         episode_.x0 = episode_.x1 = episode_.y0 = episode_.y1 = 0;
     }
@@ -122,10 +130,20 @@ void FlickerDetector::clear_votes() {
     recent_head_ = 0;
     in_episode_ = false;
     sustained_ = false;
+    onset_confirmations_ = 0;
 }
 
 FlickerFrameVerdict FlickerDetector::push(const LumaGrid& s, uint64_t now_ns) {
     FlickerFrameVerdict v;
+    if (history_ &&
+        (now_ns < last_present_ns_ || now_ns - last_present_ns_ > t_.max_present_gap_ns)) {
+        // No repeat need arrive during a stalled presenter. Old votes and history must not pay
+        // for sustain when it resumes, even if a longer strobe already passed the comparison floor.
+        clear_votes();
+        history_ = 0;
+        repeat_run_ = 0;
+    }
+    last_present_ns_ = now_ns;
     if (history_ >= 1) {
         v.d1 = luma_grid_distance(s, prev1_);
         if (v.d1 < t_.duplicate_d1) {
@@ -133,12 +151,15 @@ FlickerFrameVerdict FlickerDetector::push(const LumaGrid& s, uint64_t now_ns) {
             // presenting each frame more than once; a long one is a still picture, and the votes
             // before it must not be carried across it to whatever comes next.
             v.duplicate = true;
-            if (now_ns - last_distinct_ns_ > t_.max_still_ns) clear_votes();
+            if (repeat_run_ <= t_.max_repeat_frames) ++repeat_run_;
+            if (repeat_run_ > t_.max_repeat_frames || now_ns - last_distinct_ns_ > t_.max_still_ns)
+                clear_votes();
             v.episode = in_episode_;
             v.sustained = in_episode_ && sustained_;
             return v;
         }
     }
+    repeat_run_ = 0;
     last_distinct_ns_ = now_ns;
     if (history_ >= 2) {
         v.compared = true;
@@ -152,12 +173,13 @@ FlickerFrameVerdict FlickerDetector::push(const LumaGrid& s, uint64_t now_ns) {
         recent_head_ = (recent_head_ + 1) % window;
         recent_count_ = std::min(recent_count_ + 1, window);
         const bool holds = recent_count_ >= window &&
-            static_cast<uint32_t>(std::popcount(recent_bits_)) >= t_.min_in_window;
+                           static_cast<uint32_t>(std::popcount(recent_bits_)) >= t_.min_in_window;
 
         if (holds) {
             if (!in_episode_) {
                 in_episode_ = true;
                 sustained_ = false;
+                onset_confirmations_ = 0;
                 episode_ = FlickerEpisode{};
                 cell_hits_.fill(0);
                 // The oldest frame of the window that formed the vote: the slot about to be
@@ -176,10 +198,16 @@ FlickerFrameVerdict FlickerDetector::push(const LumaGrid& s, uint64_t now_ns) {
                     if (c1 >= t_.cell_min_d1 && c2 <= t_.max_d2_ratio * c1) ++cell_hits_[i];
                 }
             }
-            if (!sustained_ && now_ns - episode_.start_ns >= t_.sustain_ns &&
-                episode_.compared_frames >= t_.min_episode_compared) {
-                sustained_ = true;
-                v.onset = true;
+            if (!sustained_) {
+                if (v.flicker && now_ns - episode_.start_ns >= t_.sustain_ns &&
+                    episode_.compared_frames >= t_.min_episode_compared) {
+                    if (++onset_confirmations_ >= kFlickerOnsetConfirmFrames) {
+                        sustained_ = true;
+                        v.onset = true;
+                    }
+                } else {
+                    onset_confirmations_ = 0;
+                }
             }
             if (sustained_) refresh_region();
             v.episode = true;
@@ -187,6 +215,7 @@ FlickerFrameVerdict FlickerDetector::push(const LumaGrid& s, uint64_t now_ns) {
         } else {
             in_episode_ = false;
             sustained_ = false;
+            onset_confirmations_ = 0;
         }
     }
     prev2_ = prev1_;
@@ -215,7 +244,7 @@ ProcessFlicker& process_flicker() {
     return *instance;
 }
 
-}  // namespace
+}   // namespace
 
 void set_flicker_trace_path(const char* path) {
     if (!path || !*path) return;
@@ -231,8 +260,8 @@ void set_flicker_trace_path(const char* path) {
     std::fputs("t_ms,source_flip,src,dup,d1,d2,flicker,episode,sustained\n", p.trace);
 }
 
-void observe_presented_frame(const uint8_t* rgba, uint32_t width, uint32_t height,
-                             size_t row_bytes, uint64_t source_flip, FlickerSource source) {
+void observe_presented_frame(const uint8_t* rgba, uint32_t width, uint32_t height, size_t row_bytes,
+                             uint64_t source_flip, FlickerSource source) {
     if (!enabled() || !rgba) return;
     // Built outside the lock: it depends only on the caller's pixels.
     const LumaGrid grid = luma_grid_from_rgba(rgba, width, height, row_bytes);
@@ -253,10 +282,13 @@ void observe_presented_frame(const uint8_t* rgba, uint32_t width, uint32_t heigh
     if (v.sustained && !v.duplicate) {
         add(Counter::FlickerSustainedFrames);
         const FlickerEpisode& e = p.detector.episode();
-        set(Gauge::FlickerEpisodeD1Milli, static_cast<uint64_t>(e.mean_d1() * 1000.0 + 0.5));
-        set(Gauge::FlickerEpisodeD2Milli, static_cast<uint64_t>(e.mean_d2() * 1000.0 + 0.5));
-        set(Gauge::FlickerEpisodeShareMilli, static_cast<uint64_t>(e.share() * 1000.0 + 0.5));
-        set(Gauge::FlickerEpisodeMs, static_cast<uint64_t>(e.seconds() * 1000.0 + 0.5));
+        set(Gauge::FlickerEpisodeD1Milli,
+            static_cast<uint64_t>(std::llround(e.mean_d1() * 1000.0)));
+        set(Gauge::FlickerEpisodeD2Milli,
+            static_cast<uint64_t>(std::llround(e.mean_d2() * 1000.0)));
+        set(Gauge::FlickerEpisodeShareMilli,
+            static_cast<uint64_t>(std::llround(e.share() * 1000.0)));
+        set(Gauge::FlickerEpisodeMs, static_cast<uint64_t>(std::llround(e.seconds() * 1000.0)));
         set(Gauge::FlickerEpisodeRegion, pack_flicker_region(e));
     }
     if (v.onset) {
@@ -280,4 +312,4 @@ bool take_flicker_capture_request() {
     return pending;
 }
 
-}  // namespace prosper::diagnostics::perf
+}   // namespace prosper::diagnostics::perf

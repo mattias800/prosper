@@ -23,8 +23,9 @@
 // t is a FLICKER FRAME when d1 >= min_d1 and d2 <= max_d2_ratio * d1: it looks like the frame two
 // back, not the one just before. An EPISODE is >= min_flicker_in_window of the last window_frames
 // compared frames being flicker frames; it is SUSTAINED once it has lasted sustain_ns AND holds at
-// least min_episode_compared compared frames of its own. A still picture -- repeats for longer than
-// max_still_ns -- clears the vote and ends the episode: an alternation has to keep alternating at
+// least min_episode_compared compared frames of its own, with two fresh flicker frames confirming
+// onset after those floors. Repeats beyond max_repeat_frames or max_still_ns clear the vote and
+// end the episode: an alternation has to keep alternating at
 // the presented cadence, so a strobe, a pause and a cut are not one long flicker. This rejects by
 // construction:
 //   * a camera cut -- one spike, and d2 is as large as d1 on the cut frame;
@@ -84,6 +85,16 @@ constexpr uint32_t kFlickerMinEpisodeCompared = 8;
 // It applies to REPEATS only: a slow title that simply presents rarely (Kena's flickering title ran
 // at ~4 distinct frames/s, up to 0.9 s apart, with no repeats inside the episode) is not still.
 constexpr uint64_t kFlickerMaxStillNs = 250'000'000ull;
+// At 60 Hz, 10 fps content has five repeats per distinct frame. Longer repeated runs clear the
+// vote even before max_still_ns: a 2 Hz UI blink holds each parity for fourteen repeats (~233 ms).
+constexpr uint32_t kFlickerMaxRepeatFrames = 5;
+// Two fresh flicker frames must confirm onset after the time and comparison floors. One new
+// frame after a short presenter pause cannot turn a transient flash into a sustained alarm.
+constexpr uint32_t kFlickerOnsetConfirmFrames = 2;
+// A presentation gap longer than the entire sustain period starts fresh. Unlike repeat ageing,
+// this also observes pauses with no frames at all; the sparse alternating-sequence control
+// (up to 0.9 s between presentations) remains admissible. No continuity is claimed across longer gaps.
+constexpr uint64_t kFlickerMaxPresentGapNs = kFlickerSustainNs;
 // A CELL flickers in a flicker frame when its own c1/c2 pass the same test with this floor; the
 // region a report names is the cells that flickered in at least half of the episode's flicker
 // frames. 8 levels on one cell is a visible change of that 1/576 of the screen.
@@ -98,6 +109,8 @@ struct FlickerThresholds {
     uint64_t sustain_ns = kFlickerSustainNs;
     uint32_t min_episode_compared = kFlickerMinEpisodeCompared;
     uint64_t max_still_ns = kFlickerMaxStillNs;
+    uint32_t max_repeat_frames = kFlickerMaxRepeatFrames;
+    uint64_t max_present_gap_ns = kFlickerMaxPresentGapNs;
     double cell_min_d1 = kFlickerCellMinD1;
 };
 
@@ -114,17 +127,17 @@ double luma_grid_distance(const LumaGrid& a, const LumaGrid& b);
 // them when the cell is smaller), so a 4K frame costs the same as the 256x144 GPU sample. Luma is
 // Rec.709 (0.2126 R + 0.7152 G + 0.0722 B); BGRA input only swaps R/B weights, which a change
 // detector does not care about. An image smaller than the grid in either axis yields all-zero.
-LumaGrid luma_grid_from_rgba(const uint8_t* rgba, uint32_t width, uint32_t height,
-                             size_t row_bytes, uint32_t points_per_axis = 4);
+LumaGrid luma_grid_from_rgba(const uint8_t* rgba, uint32_t width, uint32_t height, size_t row_bytes,
+                             uint32_t points_per_axis = 4);
 
 struct FlickerFrameVerdict {
     bool duplicate = false;   // a repeat of its predecessor: not entered into the history
-    bool compared = false;    // had both t-1 and t-2 to compare against
+    bool compared = false;   // had both t-1 and t-2 to compare against
     double d1 = 0, d2 = 0;
-    bool flicker = false;     // this frame passed the d1/d2 test
-    bool episode = false;     // >= min_in_window of the last window_frames compared frames flicker
+    bool flicker = false;   // this frame passed the d1/d2 test
+    bool episode = false;   // >= min_in_window of the last window_frames compared frames flicker
     bool sustained = false;   // ...and the episode has lasted sustain_ns
-    bool onset = false;       // the first sustained frame of this episode
+    bool onset = false;   // the first sustained frame of this episode
 };
 
 // The current (or, once it ended, the last) sustained episode.
@@ -133,7 +146,7 @@ struct FlickerEpisode {
     uint64_t last_ns = 0;
     uint64_t compared_frames = 0;   // compared frames since the episode started
     uint64_t flicker_frames = 0;
-    double d1_sum = 0, d2_sum = 0;  // over flicker frames
+    double d1_sum = 0, d2_sum = 0;   // over flicker frames
     // Region: cells that flickered in at least half of the flicker frames. Bounding box in cells,
     // inclusive; region_cells == 0 means no single cell passed (a diffuse change).
     uint32_t region_cells = 0;
@@ -170,8 +183,11 @@ private:
 
     FlickerThresholds t_;
     LumaGrid prev1_{}, prev2_{};
-    uint32_t history_ = 0;          // 0, 1 or 2 frames held
-    uint64_t last_distinct_ns_ = 0; // when the newest non-repeat frame arrived
+    uint32_t history_ = 0;   // 0, 1 or 2 frames held
+    uint64_t last_distinct_ns_ = 0;   // when the newest non-repeat frame arrived
+    uint64_t last_present_ns_ =
+        0;   // includes repeats, so absent presentations are distinguishable
+    uint64_t repeat_run_ = 0;   // saturates one past the configured repeat bound
     // The last window_frames compared frames, newest in bit 0, and their timestamps.
     uint32_t recent_bits_ = 0;
     uint32_t recent_count_ = 0;
@@ -179,6 +195,7 @@ private:
     uint32_t recent_head_ = 0;
     bool in_episode_ = false;
     bool sustained_ = false;
+    uint32_t onset_confirmations_ = 0;
     FlickerEpisode episode_{};
     std::array<uint32_t, kFlickerCells> cell_hits_{};
 };
@@ -191,14 +208,14 @@ private:
 // changes (an episode that straddles a change is lost; a false one is never made).
 enum class FlickerSource : uint8_t {
     GpuSample,   // prosper-app's GPU present: the NEAREST 256x144 --fps sample grid
-    CpuFrame,    // a CPU-published frame at its own resolution
+    CpuFrame,   // a CPU-published frame at its own resolution
 };
 
 // One presented frame's pixels: builds the signature and feeds the process detector, which counts
 // into the [perf-alarm] ledger (Counter::Flicker*, Gauge::Flicker*). `source_flip` is the guest flip
 // the frame came from, recorded at onset. A no-op under PROSPER_NO_PERF_ALARMS=1.
-void observe_presented_frame(const uint8_t* rgba, uint32_t width, uint32_t height,
-                             size_t row_bytes, uint64_t source_flip, FlickerSource source);
+void observe_presented_frame(const uint8_t* rgba, uint32_t width, uint32_t height, size_t row_bytes,
+                             uint64_t source_flip, FlickerSource source);
 
 // True exactly once per run: the first time a sustained episode began. The frontend's
 // PROSPER_FLICKER_CAPTURE_DIR burst consumes it.
@@ -209,4 +226,4 @@ bool take_flicker_capture_request();
 // calibrating the thresholds on a real run; off unless the frontend sets it.
 void set_flicker_trace_path(const char* path);
 
-}  // namespace prosper::diagnostics::perf
+}   // namespace prosper::diagnostics::perf

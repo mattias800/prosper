@@ -196,12 +196,10 @@ inline bool parse_snap_flip_number(const std::string& digits, int64_t& out) {
         if (d < '0' || d > '9') return false;
     try {
         out = std::stoll(digits);
-    } catch (...) {
-        return false;
-    }
+    } catch (...) { return false; }
     return true;
 }
-}  // namespace detail
+}   // namespace detail
 
 inline std::vector<int64_t> parse_snap_flip_list(const char* value) {
     std::vector<int64_t> out;
@@ -241,7 +239,8 @@ inline std::vector<int64_t> parse_snap_flip_list(const char* value) {
                 // second bound keeps a list of many overlapping ranges from growing without limit
                 // before the duplicates collapse.
                 if (static_cast<uint64_t>(last - first) >= kSnapFlipRangeMaxFrames ||
-                    out.size() + static_cast<size_t>(last - first) + 1 > 16 * kSnapFlipListMaxEntries)
+                    out.size() + static_cast<size_t>(last - first) + 1 >
+                        16 * kSnapFlipListMaxEntries)
                     return {};
                 // Counted, not `f <= last`: a range ending at INT64_MAX must not wrap.
                 for (int64_t k = 0; k <= last - first; ++k) out.push_back(first + k);

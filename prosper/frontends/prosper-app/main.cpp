@@ -22,7 +22,7 @@
 #include "gpu/capture/gpu_capture.hpp"         // request_interactive_gpu_capture (F9 frame grab)
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
 #include "diagnostics/perf/perf_alarms.hpp"  // #3891: --fps alarm marker
-#include "diagnostics/perf/frame_flicker.hpp"  // #5152: frame-flicker signature + auto burst
+#include "diagnostics/perf/frame_flicker.hpp"   // #5152: frame-flicker signature + auto burst
 #include "diagnostics/perf/perf_ledger.hpp"  // #3891: present-cpu-overhead alarm
 #include "gpu/timeline/gpu_timeline.hpp"        // request_interactive_capture_bundle (F9 whole-frame grab)
 #include "snapshot_capture.hpp"
@@ -48,7 +48,7 @@
 #include "game_path.hpp"                 // dropped/picked path -> app0 root + open action, pure seam
 #include "game_library.hpp"              // scan a games dir -> titles + metadata, pure seam
 #include "frame_grab_naming.hpp"         // one stamp + exclusively claimed F9 artifact names
-#include "burst_capture.hpp"             // #5152: Shift+F9 / flicker-triggered consecutive frames
+#include "burst_capture.hpp"   // #5152: Shift+F9 / flicker-triggered consecutive frames
 #include "frame_grab_match.hpp"          // completed producer and frame-boundary join for F9
 #include "shared/perf/performance_capture.hpp"        // bounded F8 pre/post performance artifact
 #include "shared/present/present_handoff_trace.hpp"
@@ -253,10 +253,10 @@ struct Vk {
     // (write-combined is ideal), the readback is READ by the CPU, and reading a 4K frame out of
     // write-combined memory took ~80 ms -- long enough that a burst of "consecutive" frames on a
     // 60 fps title skipped five flips between captures (#5152). Host-cached where available.
-    VkBuffer        readBuf    = VK_NULL_HANDLE;
-    VkDeviceMemory  readMem    = VK_NULL_HANDLE;
-    void*           readMapped = nullptr;
-    VkDeviceSize    readCap    = 0;
+    VkBuffer readBuf = VK_NULL_HANDLE;
+    VkDeviceMemory readMem = VK_NULL_HANDLE;
+    void* readMapped = nullptr;
+    VkDeviceSize readCap = 0;
     uint32_t        stageW = 0, stageH = 0;
 
     // --fps content sampling on the GPU present path (#3010). The swapchain blit reads the
@@ -278,10 +278,9 @@ struct Vk {
     // A sample recorded last present and not yet signed. The fence that guards it is inFlight,
     // which present_frame_gpu already waits on at entry, so the read is free.
     bool            samplePending = false;
-    bool            samplePendingFps = false;       // ...for the --fps distinct-frame counter
-    bool            samplePendingFlicker = false;   // ...for the frame-flicker detector
-    uint64_t        sampleSourceFlip = 0;           // the guest flip the pending sample came from
-
+    bool samplePendingFps = false;   // ...for the --fps distinct-frame counter
+    bool samplePendingFlicker = false;   // ...for the frame-flicker detector
+    uint64_t sampleSourceFlip = 0;   // the guest flip the pending sample came from
 
     VkCommandPool   cmdPool = VK_NULL_HANDLE;
     VkCommandBuffer cmd     = VK_NULL_HANDLE;
@@ -526,9 +525,18 @@ bool ensure_stage(Vk& vk, uint32_t w, uint32_t h) {
 bool ensure_readback(Vk& vk, uint32_t w, uint32_t h) {
     const VkDeviceSize need = (VkDeviceSize)w * h * 4;
     if (vk.readBuf && vk.readCap >= need) return true;
-    if (vk.readMapped) { vkUnmapMemory(vk.device, vk.readMem); vk.readMapped = nullptr; }
-    if (vk.readBuf) { vkDestroyBuffer(vk.device, vk.readBuf, nullptr); vk.readBuf = VK_NULL_HANDLE; }
-    if (vk.readMem) { prosper::gpu::free_device_memory(vk.device, vk.readMem); vk.readMem = VK_NULL_HANDLE; }
+    if (vk.readMapped) {
+        vkUnmapMemory(vk.device, vk.readMem);
+        vk.readMapped = nullptr;
+    }
+    if (vk.readBuf) {
+        vkDestroyBuffer(vk.device, vk.readBuf, nullptr);
+        vk.readBuf = VK_NULL_HANDLE;
+    }
+    if (vk.readMem) {
+        prosper::gpu::free_device_memory(vk.device, vk.readMem);
+        vk.readMem = VK_NULL_HANDLE;
+    }
     vk.readCap = 0;
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = need;
@@ -538,21 +546,26 @@ bool ensure_readback(Vk& vk, uint32_t w, uint32_t h) {
         vk.readBuf = VK_NULL_HANDLE;
         return false;
     }
-    VkMemoryRequirements mr; vkGetBufferMemoryRequirements(vk.device, vk.readBuf, &mr);
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(vk.device, vk.readBuf, &mr);
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     ai.allocationSize = mr.size;
-    ai.memoryTypeIndex = find_mem(vk.phys, mr.memoryTypeBits,
-                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-                                  VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    ai.memoryTypeIndex =
+        find_mem(vk.phys, mr.memoryTypeBits,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                     VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
     if (ai.memoryTypeIndex == UINT32_MAX)
-        ai.memoryTypeIndex = find_mem(vk.phys, mr.memoryTypeBits,
-                                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        ai.memoryTypeIndex =
+            find_mem(vk.phys, mr.memoryTypeBits,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     if (prosper::gpu::allocate_device_memory(vk.device, &ai, &vk.readMem) != VK_SUCCESS ||
         vkBindBufferMemory(vk.device, vk.readBuf, vk.readMem, 0) != VK_SUCCESS ||
         vkMapMemory(vk.device, vk.readMem, 0, need, 0, &vk.readMapped) != VK_SUCCESS) {
         if (vk.readMem) prosper::gpu::free_device_memory(vk.device, vk.readMem);
         vkDestroyBuffer(vk.device, vk.readBuf, nullptr);
-        vk.readBuf = VK_NULL_HANDLE; vk.readMem = VK_NULL_HANDLE; vk.readMapped = nullptr;
+        vk.readBuf = VK_NULL_HANDLE;
+        vk.readMem = VK_NULL_HANDLE;
+        vk.readMapped = nullptr;
         return false;
     }
     vk.readCap = need;
@@ -861,11 +874,10 @@ bool try_adopt_shared_present(Vk& vk, SDL_Window* win) {
 // blitting it straight to the swapchain -- no CPU pixels. `prevSlot` is the slot presented last frame; its
 // GPU read is complete once inFlight signals below, so it is released then. Updates prevSlot to the slot
 // now in flight and returns the acquire/present outcome.
-prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::frontend::GpuScanoutFrame& gf,
-                                                    int& prevSlot, bool requestReadback,
-                                                    bool& readbackReady, bool sampleContent,
-                                                    bool sampleFlicker,
-                                                    const std::vector<std::string>* overlayLines = nullptr) {
+prosper::frontend::PresentAttempt
+present_frame_gpu(Vk& vk, const prosper::frontend::GpuScanoutFrame& gf, int& prevSlot,
+                  bool requestReadback, bool& readbackReady, bool sampleContent, bool sampleFlicker,
+                  const std::vector<std::string>* overlayLines = nullptr) {
     readbackReady = false;
     prosper::frontend::PresentHandoffTrace trace(gf.frame_seq, gf.publication_id, gf.slot);
     const auto previous_begin = trace.now();
@@ -894,14 +906,13 @@ prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::front
     if (vk.samplePending) {
         vk.samplePending = false;
         if (vk.samplePendingFps)
-            gpu::note_present_publication_signature(
-                gpu::dense_content_signature(static_cast<const uint8_t*>(vk.sampleMapped),
-                                             (size_t)kFpsSampleBytes));
+            gpu::note_present_publication_signature(gpu::dense_content_signature(
+                static_cast<const uint8_t*>(vk.sampleMapped), (size_t)kFpsSampleBytes));
         // #5152 frame-flicker: the same grid, signed as mean luma per cell.
         if (vk.samplePendingFlicker)
-            perf::observe_presented_frame(static_cast<const uint8_t*>(vk.sampleMapped),
-                                          kFpsSampleW, kFpsSampleH, (size_t)kFpsSampleW * 4,
-                                          vk.sampleSourceFlip, perf::FlickerSource::GpuSample);
+            perf::observe_presented_frame(static_cast<const uint8_t*>(vk.sampleMapped), kFpsSampleW,
+                                          kFpsSampleH, (size_t)kFpsSampleW * 4, vk.sampleSourceFlip,
+                                          perf::FlickerSource::GpuSample);
     }
     if (prevSlot >= 0) { prosper::frontend::present_blit_release(prevSlot); prevSlot = -1; }
     if (requestReadback && !ensure_readback(vk, gf.width, gf.height)) {
@@ -985,8 +996,8 @@ prosper::frontend::PresentAttempt present_frame_gpu(Vk& vk, const prosper::front
         VkBufferImageCopy copy{};
         copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         copy.imageExtent = {gf.width, gf.height, 1};
-        vkCmdCopyImageToBuffer(vk.cmd, gf.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                               vk.readBuf, 1, &copy);
+        vkCmdCopyImageToBuffer(vk.cmd, gf.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vk.readBuf,
+                               1, &copy);
         VkBufferMemoryBarrier hostBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
         hostBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         hostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
@@ -2333,6 +2344,7 @@ int main(int argc, char** argv) {
     // Check side: capture the presented frame as each authored anchor arrives. Sorted ascending by
     // the parser, so one forward-only cursor covers the run -- and a target already passed when the
     // list is loaded is simply never armed, rather than firing late against the wrong scene.
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): startup read before guest environment writes.
     const char* snapFlipsEnv = getenv("PROSPER_SNAP_AT_FLIPS");
     const std::vector<int64_t> snapFlipTargets =
         prosper::frontend::parse_snap_flip_list(snapFlipsEnv);
@@ -2342,9 +2354,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[snap] replay capture armed for %zu anchor(s), first at pad flip %lld\n",
                      snapFlipTargets.size(), static_cast<long long>(snapFlipTargets.front()));
     else if (snapFlipsEnv && *snapFlipsEnv)
-        std::fprintf(stderr, "[snap] ignoring malformed PROSPER_SNAP_AT_FLIPS=\"%s\" (expected "
-                             "flips, ranges a-b or a+n of at most %zu frames, comma-separated, at "
-                             "most %zu distinct in total); no replay capture is armed\n",
+        std::fprintf(stderr,
+                     "[snap] ignoring malformed PROSPER_SNAP_AT_FLIPS=\"%s\" (expected "
+                     "flips, ranges a-b or a+n of at most %zu frames, comma-separated, at "
+                     "most %zu distinct in total); no replay capture is armed\n",
                      snapFlipsEnv, prosper::frontend::kSnapFlipRangeMaxFrames,
                      prosper::frontend::kSnapFlipListMaxEntries);
 
@@ -2352,23 +2365,29 @@ int main(int argc, char** argv) {
     // is set, captures N CONSECUTIVE presented frames -- one frame of an alternating picture lands
     // on one parity and calls the build good or broken by chance. Held in memory, written once the
     // burst is complete, so writing does not make the presenter skip the flips it is recording.
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): startup read before guest environment writes.
     const char* burstFramesEnv = getenv("PROSPER_BURST_FRAMES");
     const std::optional<uint32_t> burstFrames =
         prosper::frontend::parse_burst_frames(burstFramesEnv);
     if (!burstFrames)
-        std::fprintf(stderr, "[burst] ignoring malformed PROSPER_BURST_FRAMES=\"%s\" (expected 2-%u); "
-                             "burst capture is disabled\n",
+        std::fprintf(stderr,
+                     "[burst] ignoring malformed PROSPER_BURST_FRAMES=\"%s\" (expected 2-%u); "
+                     "burst capture is disabled\n",
                      burstFramesEnv, prosper::frontend::kBurstFramesMax);
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): startup read before guest environment writes.
     const char* flickerCaptureEnv = getenv("PROSPER_FLICKER_CAPTURE_DIR");
     const std::string flickerCaptureDir = flickerCaptureEnv ? flickerCaptureEnv : "";
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): startup read before guest environment writes.
     prosper::diagnostics::perf::set_flicker_trace_path(getenv("PROSPER_FLICKER_TRACE"));
     prosper::frontend::BurstCapture burst;
     const bool flickerSampling = prosper::diagnostics::perf::enabled();
     bool flickerSampleTried = false;
     auto armBurst = [&](const std::string& dir, const char* reason) {
         if (!burstFrames) {
-            std::fprintf(stderr, "[burst] %s ignored: burst capture is disabled by the malformed "
-                                 "PROSPER_BURST_FRAMES=\"%s\"\n", reason, burstFramesEnv);
+            std::fprintf(stderr,
+                         "[burst] %s ignored: burst capture is disabled by the malformed "
+                         "PROSPER_BURST_FRAMES=\"%s\"\n",
+                         reason, burstFramesEnv);
             return;
         }
         if (burst.active()) {
@@ -2376,13 +2395,15 @@ int main(int argc, char** argv) {
                          burst.held(), burst.target(), reason);
             return;
         }
-        const std::string stem = "burst_" +
+        const std::string stem =
+            "burst_" +
             prosper::frontend::sanitize_capture_component(
                 grabNamer.title_id().empty() ? std::string("untitled") : grabNamer.title_id()) +
             "_" + prosper::frontend::format_frame_grab_stamp(std::chrono::system_clock::now());
         const std::string where = dir.empty() ? std::string(".") : dir;
         if (burst.arm(where, stem, *burstFrames, reason))
-            std::fprintf(stderr, "[burst] %s: capturing the next %u presented frames -> %s/%s_*.bmp\n",
+            std::fprintf(stderr,
+                         "[burst] %s: capturing the next %u presented frames -> %s/%s_*.bmp\n",
                          reason, *burstFrames, where.c_str(), stem.c_str());
     };
     auto feedBurst = [&](const uint8_t* rgba, uint32_t w, uint32_t h, uint64_t sourceFlip) {
@@ -2395,10 +2416,14 @@ int main(int argc, char** argv) {
         for (uint32_t i = 0; i < done.frames.size(); ++i) {
             const prosper::frontend::BurstFrame& f = done.frames[i];
             flips.push_back(f.source_flip);
-            const std::string path = (std::filesystem::path(done.dir) /
-                prosper::frontend::burst_file_name(done.stem, i, f.source_flip)).string();
-            if (write_frame_bmp(path, f.rgba.data(), f.width, f.height)) ++written;
-            else std::fprintf(stderr, "[burst] FAILED to write %s\n", path.c_str());
+            const std::string path =
+                (std::filesystem::path(done.dir) /
+                 prosper::frontend::burst_file_name(done.stem, i, f.source_flip))
+                    .string();
+            if (write_frame_bmp(path, f.rgba.data(), f.width, f.height))
+                ++written;
+            else
+                std::fprintf(stderr, "[burst] FAILED to write %s\n", path.c_str());
         }
         std::fprintf(stderr, "[burst] %s: wrote %u of %zu frames to %s/%s_*.bmp (%s)\n",
                      done.reason.c_str(), written, done.frames.size(), done.dir.c_str(),
@@ -2855,15 +2880,18 @@ int main(int argc, char** argv) {
         const std::string manifest =
             (std::filesystem::path(snapDir) / "actuals.jsonl").string();
         for (const HeldActual& held : heldActuals) {
-            const std::string name = prosper::frontend::snap_actual_file_name(held.target, held.actual);
+            const std::string name =
+                prosper::frontend::snap_actual_file_name(held.target, held.actual);
             const std::string path = (std::filesystem::path(snapDir) / name).string();
             if (!write_frame_bmp(path, held.rgba.data(), held.w, held.h)) {
                 std::fprintf(stderr, "[snap] FAILED to write %s\n", path.c_str());
                 continue;
             }
             if (FILE* f = fopen(manifest.c_str(), "a")) {
-                std::fprintf(f, "%s\n", prosper::frontend::snap_actual_record_line(
-                    held.target, held.actual, held.w, held.h, name, held.identity).c_str());
+                std::fprintf(f, "%s\n",
+                             prosper::frontend::snap_actual_record_line(
+                                 held.target, held.actual, held.w, held.h, name, held.identity)
+                                 .c_str());
                 fclose(f);
             }
             std::fprintf(stderr, "[snap] captured anchor %lld at pad flip %lld -> %s\n",
@@ -2886,8 +2914,8 @@ int main(int argc, char** argv) {
         held.rgba.assign(rgba, rgba + static_cast<size_t>(w) * h * 4);
         heldActuals.push_back(std::move(held));
         const bool rangeContinues = nextSnapTarget < snapFlipTargets.size() &&
-            snapFlipTargets[nextSnapTarget] == target + 1 &&
-            heldActuals.size() < prosper::frontend::kBurstFramesMax;
+                                    snapFlipTargets[nextSnapTarget] == target + 1 &&
+                                    heldActuals.size() < prosper::frontend::kBurstFramesMax;
         if (!rangeContinues) writeHeldActuals();
     };
 
@@ -4166,7 +4194,8 @@ int main(int argc, char** argv) {
             ensure_fps_sample(vk);
         }
         // The first sustained flicker episode of the run, once, when an output dir was given.
-        if (!flickerCaptureDir.empty() && prosper::diagnostics::perf::take_flicker_capture_request())
+        if (!flickerCaptureDir.empty() &&
+            prosper::diagnostics::perf::take_flicker_capture_request())
             armBurst(flickerCaptureDir, "frame-flicker alarm");
 
         // Only a HUD that has something to say is passed down; an empty list leaves both present
@@ -4202,11 +4231,11 @@ int main(int argc, char** argv) {
                 // A pending snap needs the presented pixels just as a grab screenshot does, so it
                 // must also request the readback -- without this the GPU path never stages them and
                 // F6/F7 would silently do nothing on the fast path.
-                PresentAttempt attempt = present_frame_gpu(
-                    vk, gf, gpuPrevSlot,
-                    grabReadback || pendingSnapVerdict.has_value() ||
-                        pendingActualTarget.has_value() || burst.active(), grabReady,
-                    showFps, flickerSampling, fpsForPresent);
+                PresentAttempt attempt =
+                    present_frame_gpu(vk, gf, gpuPrevSlot,
+                                      grabReadback || pendingSnapVerdict.has_value() ||
+                                          pendingActualTarget.has_value() || burst.active(),
+                                      grabReady, showFps, flickerSampling, fpsForPresent);
                 prosper::frontend::producer_lineage_counters().presentation(
                     attempt == PresentAttempt::presented, gf.producer);
                 trace.emit(prosper::perf::PresentHandoffEvent::GpuAttemptResult, static_cast<int>(attempt));
@@ -4514,7 +4543,8 @@ int main(int argc, char** argv) {
     writeHeldActuals();
     if (burst.active()) {
         const uint32_t target = burst.target();
-        std::fprintf(stderr, "[burst] run ended with %zu of %u burst frames captured; none written\n",
+        std::fprintf(stderr,
+                     "[burst] run ended with %zu of %u burst frames captured; none written\n",
                      burst.cancel(), target);
     }
     if (!pendingGrabScreenshot.empty() && pendingGrabReserved && !pendingGrabBundlePath.empty()) {
@@ -4677,9 +4707,9 @@ int main(int argc, char** argv) {
     if (vk.sampleImgMem) prosper::gpu::free_device_memory(vk.device, vk.sampleImgMem);
     if (vk.sampleBuf)    vkDestroyBuffer(vk.device, vk.sampleBuf, nullptr);
     if (vk.sampleMem)    prosper::gpu::free_device_memory(vk.device, vk.sampleMem);
-    if (vk.readMapped)   vkUnmapMemory(vk.device, vk.readMem);
-    if (vk.readBuf)      vkDestroyBuffer(vk.device, vk.readBuf, nullptr);
-    if (vk.readMem)      prosper::gpu::free_device_memory(vk.device, vk.readMem);
+    if (vk.readMapped) vkUnmapMemory(vk.device, vk.readMem);
+    if (vk.readBuf) vkDestroyBuffer(vk.device, vk.readBuf, nullptr);
+    if (vk.readMem) prosper::gpu::free_device_memory(vk.device, vk.readMem);
 
 #ifdef PROSPER_AUDIO_SDL3
     shutdown_sdl3_audio_sink(); // join diagnostics and destroy streams while SDL is alive

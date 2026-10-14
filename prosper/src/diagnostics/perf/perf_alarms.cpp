@@ -525,8 +525,9 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
         std::fprintf(jsonl_, ",\"cpu_rtt_publication_checks\":%llu,\"cpu_rtt_colorless_publications\":%llu",
                      n(Counter::CpuRttPublicationChecks), n(Counter::CpuRttColorlessPublications));
         // frame-flicker (#5152): presented frames signed, compared, voting flicker, sustained.
-        std::fprintf(jsonl_, ",\"flicker_presented\":%llu,\"flicker_compared\":%llu,"
-                             "\"flicker_frames\":%llu,\"flicker_sustained\":%llu",
+        std::fprintf(jsonl_,
+                     ",\"flicker_presented\":%llu,\"flicker_compared\":%llu,"
+                     "\"flicker_frames\":%llu,\"flicker_sustained\":%llu",
                      n(Counter::FlickerPresentedFrames), n(Counter::FlickerComparedFrames),
                      n(Counter::FlickerFrames), n(Counter::FlickerSustainedFrames));
         {
