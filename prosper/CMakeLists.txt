@@ -3315,6 +3315,7 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_workgroup_uniformity
     SOURCES tests/gpu/test_workgroup_uniformity.cpp src/gpu/recompiler/rdna2_decode.cpp
             src/gpu/recompiler/rdna2_instruction_effects.cpp
+            src/gpu/recompiler/rdna2_scalar_source_words.cpp
     INCLUDES src)
 
   # ADR 0028: compute cross-lane operation inventory and Wave64 route selection (CPU only).
@@ -3873,18 +3874,21 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_raw_wide_flat_read_effects.cpp
             src/gpu/recompiler/rdna2_decode.cpp
             src/gpu/recompiler/rdna2_instruction_effects.cpp
+            src/gpu/recompiler/rdna2_scalar_source_words.cpp
             src/gpu/recompiler/rdna2_raw_wide_data.cpp
     INCLUDES src)
   prosper_add_gtest(test_raw_wide_vop3_source_width
     SOURCES tests/gpu/recompiler/test_raw_wide_vop3_source_width.cpp
             src/gpu/recompiler/rdna2_decode.cpp
             src/gpu/recompiler/rdna2_instruction_effects.cpp
+            src/gpu/recompiler/rdna2_scalar_source_words.cpp
             src/gpu/recompiler/rdna2_raw_wide_data.cpp
     INCLUDES src)
   prosper_add_gtest(test_raw_wide_replayed_load
     SOURCES tests/gpu/recompiler/test_raw_wide_replayed_load.cpp
             src/gpu/recompiler/rdna2_decode.cpp
             src/gpu/recompiler/rdna2_instruction_effects.cpp
+            src/gpu/recompiler/rdna2_scalar_source_words.cpp
             src/gpu/recompiler/rdna2_raw_wide_data.cpp
     INCLUDES src)
   prosper_add_gtest(test_raw_wide_disjoint_paths
@@ -3894,6 +3898,7 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_raw_wide_loop_after_load.cpp
             src/gpu/recompiler/rdna2_decode.cpp
             src/gpu/recompiler/rdna2_instruction_effects.cpp
+            src/gpu/recompiler/rdna2_scalar_source_words.cpp
             src/gpu/recompiler/rdna2_raw_wide_data.cpp
     INCLUDES src)
   prosper_add_gtest(test_graphics_raw_register_wide_data

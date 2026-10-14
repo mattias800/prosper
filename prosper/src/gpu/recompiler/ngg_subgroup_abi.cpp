@@ -254,7 +254,7 @@ bool vop_rmw_destination(const Rdna2Inst& in) {
     // half (OPSEL[3]). The opcode facts are the effects table's; VOP3P is not tabulated yet.
     if (in.has_dpp) return true;
     if (in.has_sdwa && (in.sdwa_dst_sel != 6 || in.sdwa_dst_unused == 2)) return true;
-    if (in.fmt == Rdna2Format::VOP3P) return false;
+    if (in.fmt == Rdna2Format::VOP3P) return in.opcode == 0x21 || in.opcode == 0x22;
     if (in.fmt == Rdna2Format::VOP3 && (in.vop3p_opsel & 0x8u)) return true;
     const Rdna2InstructionEffects& effects = rdna2_instruction_effects(in);
     if (!effects.describes_vector_result()) return true;   // fail closed: charge the read
