@@ -22,15 +22,20 @@
 //   d1 = dist(s_t, s_t-1), d2 = dist(s_t, s_t-2)
 // t is a FLICKER FRAME when d1 >= min_d1 and d2 <= max_d2_ratio * d1: it looks like the frame two
 // back, not the one just before. An EPISODE is >= min_flicker_in_window of the last window_frames
-// compared frames being flicker frames; it is SUSTAINED once it has lasted sustain_ns. This rejects
-// by construction:
+// compared frames being flicker frames; it is SUSTAINED once it has lasted sustain_ns AND holds at
+// least min_episode_compared compared frames of its own. A still picture -- repeats for longer than
+// max_still_ns -- clears the vote and ends the episode: an alternation has to keep alternating at
+// the presented cadence, so a strobe, a pause and a cut are not one long flicker. This rejects by
+// construction:
 //   * a camera cut -- one spike, and d2 is as large as d1 on the cut frame;
 //   * a pan or any motion -- the frame two back is further away than the one just before (d2 >= d1);
 //   * fades and slow changes -- d1 below min_d1 (and d2 ~ 2*d1 anyway);
 //   * 30 fps content presented twice at 60 -- a frame whose d1 is below duplicate_d1 is a REPEAT
 //     and is not entered into the history at all, so the distinct frames are compared with each
 //     other and an ordinary pan stays a pan;
-//   * grain / dither noise -- per-cell means of independent noise are as far from t-2 as from t-1.
+//   * grain / dither noise -- per-cell means of independent noise are as far from t-2 as from t-1;
+//   * a strobe or hit flash followed by a still screen and then any change, and a slow blink -- the
+//     still stretch clears the old votes before the 1 s could be counted across it.
 // Thresholds are named constants below with the measurement that set them.
 //
 // The pure half (LumaGrid, FlickerDetector) has no clock, I/O or globals and is unit-tested over
@@ -70,6 +75,15 @@ constexpr double kFlickerDuplicateD1 = 0.25;
 constexpr uint32_t kFlickerWindowFrames = 8;
 constexpr uint32_t kFlickerMinInWindow = 6;
 constexpr uint64_t kFlickerSustainNs = 1'000'000'000ull;
+// ...and the sustain must be made of alternation, not of wall-clock time: at least this many compared
+// frames inside the episode itself (on top of the 8 that formed the vote).
+constexpr uint32_t kFlickerMinEpisodeCompared = 8;
+// max_still_ns: a run of repeats lasting longer than this since the last distinct frame clears the
+// vote window and ends any episode. 250 ms still admits a 10 fps title flipped at 60 (5 repeats,
+// ~83 ms); a still screen between a strobe and a cut, or the off half of a 1 Hz blink, exceeds it.
+// It applies to REPEATS only: a slow title that simply presents rarely (Kena's flickering title ran
+// at ~4 distinct frames/s, up to 0.9 s apart, with no repeats inside the episode) is not still.
+constexpr uint64_t kFlickerMaxStillNs = 250'000'000ull;
 // A CELL flickers in a flicker frame when its own c1/c2 pass the same test with this floor; the
 // region a report names is the cells that flickered in at least half of the episode's flicker
 // frames. 8 levels on one cell is a visible change of that 1/576 of the screen.
@@ -82,6 +96,8 @@ struct FlickerThresholds {
     uint32_t window_frames = kFlickerWindowFrames;
     uint32_t min_in_window = kFlickerMinInWindow;
     uint64_t sustain_ns = kFlickerSustainNs;
+    uint32_t min_episode_compared = kFlickerMinEpisodeCompared;
+    uint64_t max_still_ns = kFlickerMaxStillNs;
     double cell_min_d1 = kFlickerCellMinD1;
 };
 
@@ -150,10 +166,12 @@ public:
 
 private:
     void refresh_region();
+    void clear_votes();   // forget the vote window and end any episode (a still picture)
 
     FlickerThresholds t_;
     LumaGrid prev1_{}, prev2_{};
     uint32_t history_ = 0;          // 0, 1 or 2 frames held
+    uint64_t last_distinct_ns_ = 0; // when the newest non-repeat frame arrived
     // The last window_frames compared frames, newest in bit 0, and their timestamps.
     uint32_t recent_bits_ = 0;
     uint32_t recent_count_ = 0;

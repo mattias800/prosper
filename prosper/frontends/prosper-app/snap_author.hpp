@@ -180,10 +180,13 @@ inline std::string snap_author_line(uint32_t index,
 //   `1200-1207`   flips 1200 through 1207 inclusive (a reversed range is malformed);
 //   `1200+8`      eight flips starting at 1200 (`+0` is malformed);
 //   `400-407,1000,2000+4`.
-// The expansion is capped at kSnapFlipListMaxEntries anchors in total -- every anchor is a
-// full-resolution BMP, ~24 MiB at 4K -- and a list that would exceed it is void like any other
-// malformed list, rather than truncated.
-inline constexpr size_t kSnapFlipListMaxEntries = 256;
+// A range is capped at kSnapFlipRangeMaxFrames frames -- every anchor is a full-resolution BMP,
+// ~24 MiB at 4K -- and the whole list at kSnapFlipListMaxEntries DISTINCT anchors, counted after
+// duplicates collapse, so overlapping ranges and the generated lists of tools/snapshot/snaps.py
+// (7 to 33 anchors per authored snap) are not refused for size they do not have. A list over either
+// cap is void like any other malformed list, rather than truncated.
+inline constexpr size_t kSnapFlipRangeMaxFrames = 256;
+inline constexpr size_t kSnapFlipListMaxEntries = 4096;
 
 namespace detail {
 // A non-empty run of decimal digits that fits int64_t, or nullopt-like false.
@@ -224,7 +227,7 @@ inline std::vector<int64_t> parse_snap_flip_list(const char* value) {
                     int64_t count = 0;
                     if (!detail::parse_snap_flip_number(token.substr(0, plus), first) ||
                         !detail::parse_snap_flip_number(token.substr(plus + 1), count) ||
-                        count < 1 || count > static_cast<int64_t>(kSnapFlipListMaxEntries) ||
+                        count < 1 || count > static_cast<int64_t>(kSnapFlipRangeMaxFrames) ||
                         first > INT64_MAX - (count - 1))
                         return {};
                     last = first + (count - 1);
@@ -234,9 +237,11 @@ inline std::vector<int64_t> parse_snap_flip_list(const char* value) {
                 } else {
                     return {};
                 }
-                // Checked BEFORE expanding, so `0-99999999999` costs a comparison, not memory.
-                if (static_cast<uint64_t>(last - first) >= kSnapFlipListMaxEntries ||
-                    out.size() + static_cast<size_t>(last - first) + 1 > kSnapFlipListMaxEntries)
+                // Checked BEFORE expanding, so `0-99999999999` costs a comparison, not memory; the
+                // second bound keeps a list of many overlapping ranges from growing without limit
+                // before the duplicates collapse.
+                if (static_cast<uint64_t>(last - first) >= kSnapFlipRangeMaxFrames ||
+                    out.size() + static_cast<size_t>(last - first) + 1 > 16 * kSnapFlipListMaxEntries)
                     return {};
                 // Counted, not `f <= last`: a range ending at INT64_MAX must not wrap.
                 for (int64_t k = 0; k <= last - first; ++k) out.push_back(first + k);
@@ -248,6 +253,7 @@ inline std::vector<int64_t> parse_snap_flip_list(const char* value) {
     }
     std::sort(out.begin(), out.end());
     out.erase(std::unique(out.begin(), out.end()), out.end());
+    if (out.size() > kSnapFlipListMaxEntries) return {};
     return out;
 }
 

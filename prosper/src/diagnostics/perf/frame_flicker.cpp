@@ -116,18 +116,30 @@ void FlickerDetector::refresh_region() {
     }
 }
 
+void FlickerDetector::clear_votes() {
+    recent_bits_ = 0;
+    recent_count_ = 0;
+    recent_head_ = 0;
+    in_episode_ = false;
+    sustained_ = false;
+}
+
 FlickerFrameVerdict FlickerDetector::push(const LumaGrid& s, uint64_t now_ns) {
     FlickerFrameVerdict v;
     if (history_ >= 1) {
         v.d1 = luma_grid_distance(s, prev1_);
         if (v.d1 < t_.duplicate_d1) {
-            // A repeat: neither a vote nor a history entry. The episode state stands as it was.
+            // A repeat: neither a vote nor a history entry. A short run of them is a title
+            // presenting each frame more than once; a long one is a still picture, and the votes
+            // before it must not be carried across it to whatever comes next.
             v.duplicate = true;
+            if (now_ns - last_distinct_ns_ > t_.max_still_ns) clear_votes();
             v.episode = in_episode_;
             v.sustained = in_episode_ && sustained_;
             return v;
         }
     }
+    last_distinct_ns_ = now_ns;
     if (history_ >= 2) {
         v.compared = true;
         v.d2 = luma_grid_distance(s, prev2_);
@@ -164,7 +176,8 @@ FlickerFrameVerdict FlickerDetector::push(const LumaGrid& s, uint64_t now_ns) {
                     if (c1 >= t_.cell_min_d1 && c2 <= t_.max_d2_ratio * c1) ++cell_hits_[i];
                 }
             }
-            if (!sustained_ && now_ns - episode_.start_ns >= t_.sustain_ns) {
+            if (!sustained_ && now_ns - episode_.start_ns >= t_.sustain_ns &&
+                episode_.compared_frames >= t_.min_episode_compared) {
                 sustained_ = true;
                 v.onset = true;
             }

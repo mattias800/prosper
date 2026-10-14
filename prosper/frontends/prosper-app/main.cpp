@@ -728,7 +728,6 @@ using prosper::frontend::PresentAttempt;
 prosper::frontend::PresentAttempt present_frame(Vk& vk, const uint8_t* rgba, uint32_t w, uint32_t h,
                                                 const std::vector<std::string>* overlayLines = nullptr) {
     if (!ensure_stage(vk, w, h)) return PresentAttempt::out_of_date;
-    memcpy(vk.stageMapped, rgba, (size_t)w * h * 4);
 
     const VkResult waitResult = vkWaitForFences(
         vk.device, 1, &vk.inFlight, VK_TRUE, UINT64_MAX);
@@ -737,6 +736,9 @@ prosper::frontend::PresentAttempt present_frame(Vk& vk, const uint8_t* rgba, uin
                 static_cast<int>(waitResult));
         return PresentAttempt::failed;
     }
+    // After the wait, not before it: the previous present's buffer->image copy reads this buffer,
+    // and ensure_stage only waits when it resizes (#5169 review).
+    memcpy(vk.stageMapped, rgba, (size_t)w * h * 4);
     uint32_t imgIndex = 0;
     // Bound the acquire (#1182): an occluded/minimized window releases no swapchain image, and an
     // infinite wait here would block the app main thread — freezing visible output, stalling SDL
@@ -2341,9 +2343,10 @@ int main(int argc, char** argv) {
                      snapFlipTargets.size(), static_cast<long long>(snapFlipTargets.front()));
     else if (snapFlipsEnv && *snapFlipsEnv)
         std::fprintf(stderr, "[snap] ignoring malformed PROSPER_SNAP_AT_FLIPS=\"%s\" (expected "
-                             "flips, ranges a-b or a+n, comma-separated, at most %zu in total); "
-                             "no replay capture is armed\n",
-                     snapFlipsEnv, prosper::frontend::kSnapFlipListMaxEntries);
+                             "flips, ranges a-b or a+n of at most %zu frames, comma-separated, at "
+                             "most %zu distinct in total); no replay capture is armed\n",
+                     snapFlipsEnv, prosper::frontend::kSnapFlipRangeMaxFrames,
+                     prosper::frontend::kSnapFlipListMaxEntries);
 
     // Burst capture (#5152): Shift+F9, or the frame-flicker alarm when PROSPER_FLICKER_CAPTURE_DIR
     // is set, captures N CONSECUTIVE presented frames -- one frame of an alternating picture lands
@@ -2363,7 +2366,11 @@ int main(int argc, char** argv) {
     const bool flickerSampling = prosper::diagnostics::perf::enabled();
     bool flickerSampleTried = false;
     auto armBurst = [&](const std::string& dir, const char* reason) {
-        if (!burstFrames) return;
+        if (!burstFrames) {
+            std::fprintf(stderr, "[burst] %s ignored: burst capture is disabled by the malformed "
+                                 "PROSPER_BURST_FRAMES=\"%s\"\n", reason, burstFramesEnv);
+            return;
+        }
         if (burst.active()) {
             std::fprintf(stderr, "[burst] a burst is already capturing (%zu of %u); %s ignored\n",
                          burst.held(), burst.target(), reason);
@@ -2832,6 +2839,8 @@ int main(int argc, char** argv) {
     // written together when the range ends (or after kBurstFramesMax frames). Writing each 4K BMP
     // between two presents is what made a range sparse: on this project's dev disk one write
     // stalled the presenter for seconds, and `2000+4` on Dead Cells landed at flips 2000 and 2219.
+    // KNOWN LIMIT (as for F9, #3324): a guest that leaves through _Exit mid-range never reaches the
+    // flush at the end of main, so the held frames of that range (at most kBurstFramesMax) are lost.
     struct HeldActual {
         int64_t target = 0, actual = 0;
         uint32_t w = 0, h = 0;
@@ -4503,9 +4512,11 @@ int main(int argc, char** argv) {
     // #5152: a range that was still running keeps what it captured; a burst that was not complete
     // says what it is dropping rather than leaving its reader to wonder.
     writeHeldActuals();
-    if (burst.active())
+    if (burst.active()) {
+        const uint32_t target = burst.target();
         std::fprintf(stderr, "[burst] run ended with %zu of %u burst frames captured; none written\n",
-                     burst.held(), burst.target());
+                     burst.cancel(), target);
+    }
     if (!pendingGrabScreenshot.empty() && pendingGrabReserved && !pendingGrabBundlePath.empty()) {
         // No verified closing-frame candidate supplied this press with pixels. Other GPU frames
         // may have been presented and staged. Keep the reserved BMP untouched and state the exact

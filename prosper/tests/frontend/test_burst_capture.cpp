@@ -14,6 +14,7 @@ using prosper::frontend::burst_file_name;
 using prosper::frontend::kBurstFramesDefault;
 using prosper::frontend::kBurstFramesMax;
 using prosper::frontend::kSnapFlipListMaxEntries;
+using prosper::frontend::kSnapFlipRangeMaxFrames;
 using prosper::frontend::parse_burst_frames;
 using prosper::frontend::parse_snap_flip_list;
 
@@ -67,15 +68,31 @@ TEST(SnapFlipRanges, OverflowVoidsInsteadOfWrapping) {
 }
 
 TEST(SnapFlipRanges, ExpansionIsCapped) {
-    const std::string at_cap = "0-" + std::to_string(kSnapFlipListMaxEntries - 1);
-    EXPECT_EQ(parse_snap_flip_list(at_cap.c_str()).size(), kSnapFlipListMaxEntries);
-    const std::string over = "0-" + std::to_string(kSnapFlipListMaxEntries);
+    // Per range.
+    const std::string at_cap = "0-" + std::to_string(kSnapFlipRangeMaxFrames - 1);
+    EXPECT_EQ(parse_snap_flip_list(at_cap.c_str()).size(), kSnapFlipRangeMaxFrames);
+    const std::string over = "0-" + std::to_string(kSnapFlipRangeMaxFrames);
     EXPECT_TRUE(parse_snap_flip_list(over.c_str()).empty());
+    const std::string plus_over = "0+" + std::to_string(kSnapFlipRangeMaxFrames + 1);
+    EXPECT_TRUE(parse_snap_flip_list(plus_over.c_str()).empty());
     // A huge range is refused before it is expanded (it would otherwise allocate gigabytes).
     EXPECT_TRUE(parse_snap_flip_list("0-4000000000").empty());
-    // The cap is on the TOTAL, across entries.
-    const std::string total = "0+" + std::to_string(kSnapFlipListMaxEntries) + ",100000";
-    EXPECT_TRUE(parse_snap_flip_list(total.c_str()).empty());
+}
+
+TEST(SnapFlipRanges, TotalCapCountsDistinctAnchors) {
+    // Overlapping ranges collapse first: 0-200 twice is 201 anchors, not 402.
+    EXPECT_EQ(parse_snap_flip_list("0-200,0-200").size(), 201u);
+    // A generated list of many plain anchors (snaps.py emits 7-33 per snap) is not a range and is
+    // well inside the total.
+    std::string many;
+    for (int i = 0; i < 300; ++i) many += std::to_string(1000 + 10 * i) + ",";
+    EXPECT_EQ(parse_snap_flip_list(many.c_str()).size(), 300u);
+    // Exactly at the distinct total, and one over.
+    std::string total;
+    for (size_t r = 0; r < kSnapFlipListMaxEntries / kSnapFlipRangeMaxFrames; ++r)
+        total += std::to_string(r * 1000) + "+" + std::to_string(kSnapFlipRangeMaxFrames) + ",";
+    EXPECT_EQ(parse_snap_flip_list(total.c_str()).size(), kSnapFlipListMaxEntries);
+    EXPECT_TRUE(parse_snap_flip_list((total + "999999").c_str()).empty());
 }
 
 // ---- burst capture ----------------------------------------------------------------------------

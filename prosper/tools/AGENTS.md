@@ -1000,8 +1000,9 @@ burst completes, so writing does not make the presenter skip the flips it is rec
 that skipped every other flip cannot show a period-2 flicker. Plain F9 is unchanged. Two headless ways
 to the same evidence:
 - `PROSPER_SNAP_AT_FLIPS` accepts ranges: `1200-1207` (inclusive) or `1200+8`, mixed freely with single
-  pad-flip anchors (`400-407,1000`). At most 256 anchors in total; a reversed range, `+0`, an overflow or
-  a list over the cap voids the WHOLE list (logged), like any malformed entry. A range's frames are held
+  pad-flip anchors (`400-407,1000`). At most 256 frames per range and 4096 distinct anchors in total; a
+  reversed range, `+0`, an overflow or a list over a cap voids the WHOLE list (logged), like any
+  malformed entry. A range's frames are held
   in memory (up to 32 at a time) and written when it ends -- written one by one, a 4K BMP stalled the
   presenter for seconds and `2000+4` landed at flips 2000 and 2219. Each `actual_f<anchor>_at<flip>.bmp`
   still names where it really landed, so check that before reading a burst as consecutive.
@@ -1009,6 +1010,7 @@ to the same evidence:
   detects a sustained alternation, a burst is saved there automatically (once per run).
   `PROSPER_FLICKER_TRACE=<path.csv>` writes the detector's per-presented-frame `d1`/`d2` for calibration.
   The rule itself is described in `src/diagnostics/AGENTS.md`.
+
 For a scripted route with a stable guest phase line, set
 `PROSPER_CAPTURE_BUNDLE_AFTER_GUEST_LOG='exact complete line'` together with the existing
 `PROSPER_CAPTURE_BUNDLE=/path/frame.prgbundle` and optional `PROSPER_CAPTURE_BUNDLE_MAX_MB=N` settings.

@@ -429,8 +429,10 @@ and why) plus the process-wide feed; prosper-app signs every presented frame -- 
 path from the `--fps` NEAREST sample grid it already copied to host memory under the fence the next
 present waits on anyway (so no new wait, PERF-P1), on the CPU paths from the published pixels.
 Repeats (`d1 < 0.25`) are not votes, so 30 fps content shown twice is compared frame to distinct frame.
-A pan (`d2 >= d1`), a fade, a cut (one spike) and a sub-second strobe stay quiet; each is a test arm in
-`tests/diagnostics/test_frame_flicker.cpp`. The line names `period=2`, the window's and the episode's
+The sustain must be made of alternation: the episode needs 8 compared frames of its own, and a still
+picture (repeats for more than 250 ms) clears the vote, so a strobe, a pause and then a cut or a fade,
+or a slow blink, is not one long flicker. A pan (`d2 >= d1`), a fade, a cut (one spike) and a
+sub-second strobe stay quiet too; each is a test arm in `tests/diagnostics/test_frame_flicker.cpp`. The line names `period=2`, the window's and the episode's
 flicker share, the episode's mean `d1`/`d2`, the guest flip it became sustained at, and `region=` --
 the grid cells that flickered in at least half the episode, as a screen box, which separates a broken
 3D layer from a broken UI. It is a CORRECTNESS-class rule (sustain is the detector's 1 s; the threshold

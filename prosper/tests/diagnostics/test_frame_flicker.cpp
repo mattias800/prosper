@@ -7,6 +7,7 @@
 // detector that cannot see the defect at all.
 #include "diagnostics/perf/frame_flicker.hpp"
 #include "diagnostics/perf/perf_alarm_rules.hpp"
+#include "diagnostics/perf/perf_ledger.hpp"
 
 #include <gtest/gtest.h>
 
@@ -131,11 +132,13 @@ TEST(FrameFlickerDetector, StrictAlternationFiresAfterOneSecond) {
     const RunResult r = run(d, 180, [&](uint32_t t) { return t % 2 ? b : a; });
     EXPECT_EQ(r.onsets, 1u);
     EXPECT_GT(r.sustained, 100u);
-    // Sustained no earlier than one second after the alternation began, and not much later: the
-    // vote needs the 8-frame window, the sustain 1 s on top of the window's first frame.
-    EXPECT_GE(r.first_sustained_ns, kFlickerSustainNs);
-    EXPECT_LE(r.first_sustained_ns, kFlickerSustainNs + 12 * kFrame60);
+    // The episode is dated from the OLDEST frame of the window that formed the vote -- frame 2, the
+    // first one with two predecessors -- so it becomes sustained one second after that frame, not
+    // one second after the vote passed (which would be 7 frames later).
     const FlickerEpisode& e = d.episode();
+    EXPECT_EQ(e.start_ns, 1'000'000'000ull + 2 * kFrame60);
+    EXPECT_GE(r.first_sustained_ns, kFlickerSustainNs);
+    EXPECT_LE(r.first_sustained_ns, 2 * kFrame60 + kFlickerSustainNs + kFrame60);
     EXPECT_GT(e.mean_d1(), 30.0);
     EXPECT_LT(e.mean_d2(), 0.01);
     EXPECT_NEAR(e.share(), 1.0, 1e-9);
@@ -244,6 +247,63 @@ TEST(FrameFlickerDetector, AlternationShorterThanASecondDoesNotFire) {
     EXPECT_EQ(sustained, 0u);
 }
 
+TEST(FrameFlickerDetector, StrobeThenStillThenChangeDoesNotFire) {
+    // A confirm flash (10 frames of alternation), a still load screen, then a cut -- or a slow
+    // fade. The votes from the flash must not survive the still stretch: the second of stillness
+    // would otherwise pay for the 1 s sustain, and the first new frame would fire.
+    const LumaGrid a = picture(), b = noise(7), c = noise(8);
+    for (const bool fade : {false, true}) {
+        FlickerDetector d;
+        const RunResult r = run(d, 300, [&](uint32_t t) {
+            if (t < 10) return t % 2 ? b : a;
+            if (t < 108) return a;
+            if (!fade) return c;
+            LumaGrid g = a;
+            const double k = std::max(0.0, 1.0 - (t - 108) / 120.0);
+            for (float& v : g.cell) v = static_cast<float>(v * k);
+            return g;
+        });
+        EXPECT_EQ(r.onsets, 0u) << (fade ? "then a fade" : "then a cut");
+        EXPECT_EQ(r.sustained, 0u) << (fade ? "then a fade" : "then a cut");
+    }
+}
+
+TEST(FrameFlickerDetector, StrobeThenPresenterStallThenCutDoesNotFire) {
+    // As above, but the pause presents NOTHING (a load that stops flipping), so no repeat ever
+    // arrives to clear the votes. The 2 s gap must still not pay for the sustain: the episode has
+    // to contain alternation of its own.
+    FlickerDetector d;
+    const LumaGrid a = picture(), b = noise(9);
+    uint32_t onsets = 0, sustained = 0;
+    uint64_t now = 1'000'000'000ull;
+    for (uint32_t t = 0; t < 10; ++t, now += kFrame60) {
+        const FlickerFrameVerdict v = d.push(t % 2 ? b : a, now);
+        onsets += v.onset;
+        sustained += v.sustained;
+    }
+    now += 2'000'000'000ull;
+    for (uint32_t t = 0; t < 120; ++t, now += kFrame60) {
+        const FlickerFrameVerdict v = d.push(panned(0.5 * t), now);
+        onsets += v.onset;
+        sustained += v.sustained;
+    }
+    EXPECT_EQ(onsets, 0u);
+    EXPECT_EQ(sustained, 0u);
+}
+
+TEST(FrameFlickerDetector, SlowHardBlinkDoesNotFire) {
+    // A tenth of the screen blinks at 1 Hz (+60 luma, half a second on, half off). Every distinct
+    // frame is a perfect d2 = 0 vote, but the repeats between them are a still picture, not an
+    // alternation at the presented cadence.
+    FlickerDetector d;
+    const LumaGrid a = picture();
+    LumaGrid lit = a;
+    for (size_t i = 0; i < kFlickerCells / 10; ++i) lit.cell[i] = std::min(255.0f, lit.cell[i] + 60.0f);
+    const RunResult r = run(d, 600, [&](uint32_t t) { return (t / 30) % 2 ? lit : a; });
+    EXPECT_EQ(r.onsets, 0u);
+    EXPECT_EQ(r.sustained, 0u);
+}
+
 TEST(FrameFlickerDetector, ShakeOfAFewFramesDoesNotFire) {
     // A camera shake: the picture jumps back and forth for 5 frames inside an ongoing pan.
     FlickerDetector d;
@@ -263,6 +323,33 @@ TEST(FrameFlickerDetector, OneGlitchFrameInEightDoesNotFire) {
     const RunResult r = run(d, 300, [&](uint32_t t) { return t % 8 == 7 ? n : panned(0.25 * t); });
     EXPECT_GT(r.flicker, 20u) << "the glitches should produce single flicker frames";
     EXPECT_EQ(r.sustained, 0u);
+}
+
+// ---- the process feed -------------------------------------------------------------------------
+
+TEST(FrameFlickerProcess, ChangingSignatureSourceRestartsTheDetector) {
+    // The GPU-present sample grid and a CPU frame sample different points of the same picture, so a
+    // run whose presents alternate between the two paths must not read as an alternating picture.
+    // Positive half first: the same two images through ONE source are compared and vote.
+    const uint32_t w = 64, h = 36;
+    std::vector<uint8_t> dark(static_cast<size_t>(w) * h * 4, 20), bright(dark.size(), 220);
+    auto count = [](Counter c) {
+        return ledger().counters[static_cast<size_t>(c)].load(std::memory_order_relaxed);
+    };
+    ASSERT_TRUE(enabled()) << "PROSPER_NO_PERF_ALARMS must be unset for this test";
+    const uint64_t compared0 = count(Counter::FlickerComparedFrames);
+    const uint64_t flicker0 = count(Counter::FlickerFrames);
+    for (int i = 0; i < 12; ++i)
+        observe_presented_frame(i % 2 ? bright.data() : dark.data(), w, h, w * 4, 100 + i,
+                                FlickerSource::CpuFrame);
+    EXPECT_EQ(count(Counter::FlickerComparedFrames) - compared0, 10u);
+    EXPECT_EQ(count(Counter::FlickerFrames) - flicker0, 10u);
+    // The same alternation, but each frame through the other source: never compared at all.
+    const uint64_t compared1 = count(Counter::FlickerComparedFrames);
+    for (int i = 0; i < 12; ++i)
+        observe_presented_frame(i % 2 ? bright.data() : dark.data(), w, h, w * 4, 200 + i,
+                                i % 2 ? FlickerSource::CpuFrame : FlickerSource::GpuSample);
+    EXPECT_EQ(count(Counter::FlickerComparedFrames) - compared1, 0u);
 }
 
 // ---- the rule ---------------------------------------------------------------------------------
