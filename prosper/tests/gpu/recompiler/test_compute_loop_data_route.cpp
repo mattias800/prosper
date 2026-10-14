@@ -12,7 +12,9 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <ios>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
