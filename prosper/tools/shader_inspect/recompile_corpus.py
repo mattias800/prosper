@@ -13,6 +13,22 @@ shader_inspect reports a verdict but writes no SPIR-V; that half compares verdic
   recompile_corpus.py check  <corpus-dir> --inspect <shader_inspect> --baseline BASELINE.json
   recompile_corpus.py dumps  <before-dir> <after-dir>
 
+The all-stage corpus gate runs the same comparison over every refused program live runs dumped,
+on their recorded live inputs where the build can read them (shader_corpus.py has the details):
+
+  recompile_corpus.py harvest  <corpus> --root DIR [--root DIR ...] [--exclude DIR ...]
+  recompile_corpus.py survey   <corpus> --inspect <shader_inspect> --out RESULTS.json
+  recompile_corpus.py flips    <corpus> BASE.json CANDIDATE.json [--out REPORT.json]
+  recompile_corpus.py compare  <corpus> --base <shader_inspect> --candidate <shader_inspect>
+                               [--out-dir DIR]
+
+`harvest` copies every `refused_shaders_*` program and sidecar under the roots into
+`<corpus>/<stage>/<prefix>_<key>.bin` (deduplicated by content) and records its sources, dates and
+title in `<corpus>/manifest.json`; it never moves or deletes a source. `survey` answers every
+program with one build. `flips` lists the programs whose verdict (accepted/refused) or SPIR-V
+changed, grouped by refusal reason and opcode and ranked by the number of titles each group
+touches. `compare` is survey + survey + flips in one command; it exits 1 when any program changed.
+
 `dumps` compares two PROSPER_SHADER_DUMP_SUCCESS directories from live runs. Each `.spv` file name is
 `success_<stage>_at_<addr>_<spirv-hash>_<raw-hash>` (only the raw `.bin` of a chained vertex program
 also carries a `_main_...` continuation, so the `.spv` names do not), so the SPIR-V hash is in the
@@ -32,7 +48,11 @@ import sys
 import tempfile
 from pathlib import Path
 
-STAGES = {"cs": "compute", "ps": "fragment", "vs": "vertex"}
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import shader_corpus  # noqa: E402
+
+STAGES = {"cs": "compute", "ps": "fragment", "vs": "vertex", "vsmain": "vertex"}
 VERDICT_PREFIXES = ("stage-recompile stage=", "[recompile-reject]")
 
 
@@ -201,15 +221,105 @@ def run_check(args, results: dict) -> int:
     return 1 if problems else 0
 
 
+def read_results(path: Path) -> dict:
+    data = json.loads(path.read_text())
+    if data.get("format") != shader_corpus.RESULTS_FORMAT or not isinstance(
+        data.get("programs"), dict
+    ):
+        raise ValueError(f"{path} is not a {shader_corpus.RESULTS_FORMAT} file")
+    return data
+
+
+def write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=1, sort_keys=True) + "\n")
+
+
+def report_flips(corpus: Path, base: dict, cand: dict, names, out: Path | None) -> int:
+    manifest = shader_corpus.load_manifest(corpus)
+    report = shader_corpus.flips(manifest, base, cand)
+    for line in shader_corpus.summarize_corpus(manifest):
+        print(line)
+    for line in shader_corpus.format_flips(report, *names):
+        print(line)
+    if out is not None:
+        write_json(out, report)
+        print(f"report -> {out}")
+    if report["compared"] == 0:
+        print("no program in common: nothing was compared", file=sys.stderr)
+        return 2
+    return 1 if report["changes"] else 0
+
+
+def run_corpus(args) -> int:
+    corpus = args.corpus.resolve()
+    try:
+        if args.mode == "harvest":
+            if not args.root:
+                print("harvest needs at least one --root", file=sys.stderr)
+                return 2
+            manifest = shader_corpus.harvest(corpus, args.root, args.exclude)
+            for line in shader_corpus.summarize_corpus(manifest):
+                print(line)
+            return 0
+        if args.mode == "survey":
+            if not args.inspect or not args.out:
+                print("survey needs --inspect and --out", file=sys.stderr)
+                return 2
+            write_json(args.out, shader_corpus.survey(corpus, args.inspect, args.jobs))
+            print(f"surveyed -> {args.out}")
+            return 0
+        if args.mode == "flips":
+            if not args.after or not args.third:
+                print("flips needs BASE.json and CANDIDATE.json", file=sys.stderr)
+                return 2
+            base, cand = read_results(args.after), read_results(args.third)
+            names = (args.after.stem, args.third.stem)
+            return report_flips(corpus, base, cand, names, args.out)
+        # compare
+        if not args.base or not args.candidate:
+            print("compare needs --base and --candidate", file=sys.stderr)
+            return 2
+        out_dir = args.out_dir or corpus.parent / "shader-corpus-results"
+        arms = {}
+        for name, inspect in (("base", args.base), ("candidate", args.candidate)):
+            print(f"surveying {name}: {inspect}")
+            arms[name] = shader_corpus.survey(corpus, inspect, args.jobs)
+            write_json(out_dir / f"{name}.json", arms[name])
+        return report_flips(
+            corpus, arms["base"], arms["candidate"], ("base", "candidate"), out_dir / "flips.json"
+        )
+    except (shader_corpus.InspectorError, OSError, ValueError) as err:
+        print(err, file=sys.stderr)
+        return 2
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("mode", choices=("record", "check", "dumps"))
+    ap.add_argument(
+        "mode", choices=("record", "check", "dumps", "harvest", "survey", "flips", "compare")
+    )
     ap.add_argument("corpus", type=Path)
-    ap.add_argument("after", nargs="?", type=Path, help="dumps: the second directory")
-    ap.add_argument("--inspect", help="path to the shader_inspect binary (record/check)")
-    ap.add_argument("--out", type=Path, help="record: baseline file to write")
+    ap.add_argument(
+        "after", nargs="?", type=Path, help="dumps: the second directory; flips: the base results"
+    )
+    ap.add_argument("third", nargs="?", type=Path, help="flips: the candidate results")
+    ap.add_argument("--inspect", help="path to the shader_inspect binary (record/check/survey)")
+    ap.add_argument(
+        "--out",
+        type=Path,
+        help="record: baseline file to write; survey: results file; flips: JSON report",
+    )
     ap.add_argument("--baseline", type=Path, help="check: baseline file to compare against")
+    ap.add_argument("--root", action="append", default=[], help="harvest: a directory to search")
+    ap.add_argument("--exclude", action="append", default=[], help="harvest: never descend here")
+    ap.add_argument("--base", help="compare: the shader_inspect of the build before the change")
+    ap.add_argument("--candidate", help="compare: the shader_inspect of the build under test")
+    ap.add_argument("--out-dir", type=Path, help="compare: where results and the report go")
+    ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4, help="parallel inspectors")
     args = ap.parse_args(argv)
+    if args.mode in ("harvest", "survey", "flips", "compare"):
+        return run_corpus(args)
     if args.mode == "dumps":
         return run_dumps(args)
     if not args.inspect or not args.corpus.is_dir() or not Path(args.inspect).exists():

@@ -373,6 +373,7 @@ RefusedShaderReplay replay_refused_shader_inputs(const std::vector<uint32_t>& co
         return replay;
     }
     replay.produced = !spirv.empty();
+    replay.spirv = std::move(spirv);
     const auto records = rejection.take();
     if (!replay.produced && !records.empty())
         replay.reject = records.back().first + " " + records.back().second;

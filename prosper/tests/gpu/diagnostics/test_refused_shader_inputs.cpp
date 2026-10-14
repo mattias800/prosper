@@ -526,6 +526,32 @@ TEST(RefusedShaderInputs, LegacySchemaOneCannotInventRawLaunchAuthority) {
     EXPECT_TRUE(replay.incomplete.empty()) << replay.incomplete;
     EXPECT_FALSE(replay.reject.empty());
 }
+// A corpus run compares two builds by the module each replay produced (ADR 0006), so a produced
+// replay carries its module and a refusal carries none.
+TEST(RefusedShaderInputs, ReplayCarriesTheModuleItProduced) {
+    const auto root = fresh_root("refused_inputs_replay_module");
+    namespace entry = prosper::test::portable_entry_exec;
+    const auto resources = entry::table(64);
+    const auto path = root / "entry.inputs";
+    ASSERT_TRUE(
+        write_refused_compute_inputs(path, 0x4930, &resources, entry::config(64), "refusal"));
+    auto bytes = sidecar_bytes(path);
+    const auto current = decode_refused_shader_inputs(bytes);
+    const auto produced = replay_refused_shader_inputs(entry::program(64), current);
+    ASSERT_TRUE(produced.produced);
+    ASSERT_GE(produced.spirv.size(), 5u);
+    EXPECT_EQ(produced.spirv[0], 0x07230203u);   // SPIR-V magic
+    EXPECT_EQ(replay_refused_shader_inputs(entry::program(64), current).spirv, produced.spirv);
+
+    bytes.erase(bytes.end() - 44, bytes.end() - 8);   // drop the schema-4 launch record
+    bytes[8] = 1;
+    bytes[9] = bytes[10] = bytes[11] = 0;
+    checksum_sidecar(bytes);
+    const auto refused =
+        replay_refused_shader_inputs(entry::program(64), decode_refused_shader_inputs(bytes));
+    ASSERT_FALSE(refused.produced);
+    EXPECT_TRUE(refused.spirv.empty());
+}
 TEST(RefusedShaderInputs, InputIdentityBindsEveryRawWordAndPresenceBit) {
     const auto c = prosper::test::portable_entry_exec::config();
     const auto hash = refused_compute_inputs_identity(nullptr, c);

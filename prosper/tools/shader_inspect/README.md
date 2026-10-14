@@ -412,3 +412,61 @@ prints its constant-buffer selector, adjustment/clamp, complete target list, mer
 
 The input is bounded to 16 MiB and decoding stops at the first `s_endpgm` or unknown instruction.
 Raw and SPIR-V dumps contain title-derived code, are local-only, and must not be committed.
+
+## Corpus gate: which real game shaders a recompiler change flips (#5146)
+
+Run this before merging a recompiler change. It replays every refused program that live runs on
+this machine have dumped (all titles, compute, fragment and vertex) through two `shader_inspect`
+builds and lists the programs whose verdict or SPIR-V changed. A guard that refuses genuine
+shaders shows up here as `newly-refused` or `refused-earlier` groups, before it merges.
+
+```bash
+# Once, and again whenever new runs have dumped refused shaders. It only reads the sources, and
+# skips ctest's own dumps inside CMake build trees.
+python3 recompile_corpus.py harvest ~/shader-corpus --root ~ --exclude ~/prosper-testdata
+
+# Build only the shader_inspect target for each side, then:
+python3 recompile_corpus.py compare ~/shader-corpus \
+    --base <main-build>/shader_inspect --candidate <pr-build>/shader_inspect \
+    --out-dir ~/shader-corpus-results/<pr>
+```
+
+`harvest` copies each `refused_shaders_*/<cs|ps|vs|vsmain>_*.bin` and its `.inputs` sidecar into
+`~/shader-corpus/<stage>/`, deduplicated by the content of both files. `manifest.json` beside them
+records each copy's source paths, dump dates, live reject text, sidecar schema and title id. The
+title comes from the dump's path, then from the run's own files (`<id>-app0` in `run.log`,
+frame-grab names and similar), then from the same code appearing in a titled dump. The corpus is
+game content: keep it out of the repository.
+
+`compare` exits 1 when anything changed and 2 when it could not run. It prints the corpus size,
+then each change class, then the groups ranked by how many titles they touch:
+
+- **`newly-refused` / `newly-accepted`**: the verdict flipped. A group is the refusing build's
+  reject kind plus `mode=`/`reason=`, and the ISA mnemonic of the refused instruction. Counts are
+  distinct programs, so a title that was run fifty times does not outweigh one run of another.
+- **`refused-earlier` / `refused-later`**: both builds refuse, at a different PC. On input-free
+  answers this is often the only sign of a new guard (see below).
+- **`output-changed`**: both accept, with different SPIR-V. `accepted by both, SPIR-V: N not
+  compared` counts pairs where a build wrote no module. That is not a change.
+
+How each program is answered:
+
+- **With its live inputs** (`--inputs`), when both builds can read the sidecar. This is the
+  answer that counts. A build only reads the sidecar schemas it knows: graphics schema 3 dates from
+  #4917, compute schema 4 from #4936, and builds older than those report `unreadable`.
+- **Otherwise without inputs**: `--stage compute`, or the `--synthetic-table` probe for vertex and
+  fragment. Every build can do this, but with no descriptor table both builds usually stop at the
+  first image, buffer or scalar load. A later guard is then visible only as `refused-earlier`.
+  Measured on Kena: 26 programs were refused live by `73413cb44` and not by `0a53e2a1f`. In the
+  input-free comparison, 6 flipped verdict, 10 more showed as `refused-earlier`, and 10 showed no
+  change.
+
+So a comparison between two current builds is decided almost entirely by replay. A retrospective
+against a build older than #4917/#4936 is mostly input-free. The report's first lines say which
+mode decided how many programs.
+
+SPIR-V is hashed for the vertex/fragment synthetic probe on every build, and for `--inputs` replays
+on builds whose `--inputs` accepts `--spirv-out` (this change). Each step can also run alone:
+`survey <corpus> --inspect <bin> --out X.json` answers every program with one build, and
+`flips <corpus> A.json B.json` compares two such files. Use these to add a third build without
+re-running the first two.
