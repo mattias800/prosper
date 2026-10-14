@@ -58,9 +58,11 @@ void missing(const Result& result, uint32_t pc) {
         << result.reject;
 }
 
+// Local-ID subset controls use V_CMPX_NE_U32: only v0 is a launch input. A U64
+// compare would also read the absent v1 and refuse before the saved-DATA consumer.
 std::vector<uint32_t> unchanged_mask(bool genuine = true) {
     return {
-        0x7dea0080u, // A = actual incoming EXEC & (local-ID != 0)
+        0x7daa0080u, // A = actual incoming EXEC & (local-ID != 0)
         0xbe84047eu, // s[4:5] = actual A, before the word is written
         genuine ? 0x7e040281u : 0x7e040309u,
         0x7da40080u, // another narrowing cannot remove DATA already genuine throughout A
@@ -72,7 +74,7 @@ std::vector<uint32_t> unchanged_mask(bool genuine = true) {
 
 std::vector<uint32_t> both_paths_equal(bool equal) {
     return {
-        0x7dea0080u,
+        0x7daa0080u,
         0xbe84047eu,
         0xbf068001u,
         0xbf840002u, // genuine runtime workgroup X selects the scalar predecessor
@@ -213,7 +215,7 @@ TEST(SavedExecData, SelfCopyKeepsTheSameActualPairValue) {
 namespace {
 std::vector<uint32_t> backedge(bool genuine) {
     return {
-        0x7dea0080u,
+        0x7daa0080u,
         0xbe84047eu,
         0x7e040281u,
         0xbe860380u,
@@ -256,7 +258,7 @@ ActiveVectorWords saved_mask() {
     ActiveVectorWords state;
     state.enabled = state.current_is_entry = state.current_within_entry = true;
     state.current = state.entry_words = {0};
-    step(state, {0x7dea0080u}); // actual current A; CMPX writes EXEC only, preserving VCC
+    step(state, {0x7daa0080u}); // actual current A; CMPX writes EXEC only, preserving VCC
     step(state, {0xbe84047eu}, {{4, 2}}); // unchanged s[4:5] = A before v2 is written
     return state;
 }
@@ -360,7 +362,7 @@ namespace {
 // v2 belongs to A before C is saved. ANDN1 selects nonempty A\C, whereas ORN1 may
 // enable lanes outside A. Neither instruction's old-EXEC destination is its result.
 std::vector<uint32_t> andn1_subset(bool genuine = true, bool widening = false) {
-    return {0x7dea0080u, 0xbe84047eu, genuine ? 0x7e040281u : 0x7e040309u,  0x7da40081u,
+    return {0x7daa0080u, 0xbe84047eu, genuine ? 0x7e040281u : 0x7e040309u,  0x7da40081u,
             0xbe86047eu, 0xbefe0404u, widening ? 0xbe883806u : 0xbe883706u, 0x7d280480u,
             0xbf810000u};
 }

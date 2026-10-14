@@ -19,7 +19,7 @@ std::vector<uint32_t> program() {
         0x7e02020cu, // v1 = genuine pointer low s12
         0x7e04020du, // v2 = genuine pointer high s13
         0xbe84047eu, // save the complete EXEC in s[4:5]
-        0x7dea0080u, // narrow EXEC by comparing actual local-ID v0
+        0x7daa0080u, // narrow EXEC by comparing actual local-ID v0
         0xdc308000u, 0x037d0001u, // global_load_dword v3, v[1:2]
         0x7d280680u, // compare the loaded v3
         0xbf810000u,
@@ -122,7 +122,7 @@ TEST(FlatActiveWord, MissingHighAddressCannotSupplyTheComparison) {
 TEST(FlatActiveWord, ActiveAddressWordsSurviveARealDispatcherEdge) {
     const std::vector<uint32_t> code{
         0xbe84047eu, // save full EXEC before the addresses exist
-        0x7dea0080u, // narrow using genuine v0
+        0x7daa0080u, // narrow using genuine v0
         0x7e02020cu, 0x7e04020du, // define both pointer words under the narrowed EXEC
         0xbf060000u, 0xbf850001u, 0xbf800000u, // genuine SCC and a conditional CFG edge
         0xdc308000u, 0x037d0001u, // load v3 in the same active domain
@@ -134,7 +134,7 @@ TEST(FlatActiveWord, ActiveAddressWordsSurviveARealDispatcherEdge) {
 
 TEST(FlatActiveWord, WideningAtTheDispatcherEdgeDoesNotCreateAddressWords) {
     const std::vector<uint32_t> code{
-        0xbe84047eu, 0x7dea0080u, 0x7e02020cu, 0x7e04020du, 0xbf060000u, 0xbf850001u, 0xbf800000u,
+        0xbe84047eu, 0x7daa0080u, 0x7e02020cu, 0x7e04020du, 0xbf060000u, 0xbf850001u, 0xbf800000u,
         0xbefe0404u, // restore the wider mask whose inactive pointer words never existed
         0xdc308000u, 0x037d0001u, 0x7d280680u, 0xbf810000u,
     };
@@ -144,7 +144,7 @@ TEST(FlatActiveWord, WideningAtTheDispatcherEdgeDoesNotCreateAddressWords) {
 namespace {
 std::vector<uint32_t> both_arm_addresses() {
     return {
-        0xbe84047eu, 0x7dea0080u, 0x7e02020cu, 0xbf060000u,
+        0xbe84047eu, 0x7daa0080u, 0x7e02020cu, 0xbf060000u,
         0xbf850002u, // both scalar successors reach the load
         0x7e04020du, 0xbf820001u,
         0x7e04020du, // both arms independently define the current high pointer word
@@ -155,7 +155,7 @@ std::vector<uint32_t> both_arm_addresses() {
 std::vector<uint32_t> backedge_address(bool genuine) {
     return {
         0xbe84047eu,
-        0x7dea0080u,
+        0x7daa0080u,
         0x7e02020cu,
         0x7e04020du,
         0xbe860380u, // genuine scalar loop counter s6=0
@@ -183,13 +183,13 @@ TEST(FlatActiveWord, OnePredecessorCannotSupplyTheJoinedAddress) {
 
 TEST(FlatActiveWord, ASecondNarrowingRetainsCurrentAddressWords) {
     auto code = both_arm_addresses();
-    code.insert(code.begin() + 8, 0x7dea0080u);
+    code.insert(code.begin() + 8, 0x7daa0080u);
     dispatcher_module(compile(code, true));
 }
 
 TEST(FlatActiveWord, RestoringTheSavedCurrentMaskRetainsAddressWords) {
     auto code = both_arm_addresses();
-    code.insert(code.begin() + 8, {0xbe86047eu, 0x7dea0080u, 0xbefe0406u});
+    code.insert(code.begin() + 8, {0xbe86047eu, 0x7daa0080u, 0xbefe0406u});
     dispatcher_module(compile(code, true));
 }
 
@@ -224,7 +224,7 @@ TEST(FlatActiveWord, PartialNativeLaunchCannotDefineAMissingWord) {
 namespace {
 std::vector<uint32_t> saved_backedge_address(bool genuine) {
     return {
-        0xbe84047eu, 0x7dea0080u, 0x7e02020cu, 0x7e04020du,
+        0xbe84047eu, 0x7daa0080u, 0x7e02020cu, 0x7e04020du,
         0xbe86047eu, 0xbe880380u, // save current EXEC in s[6:7], genuine s8=0
         0xdc308000u, 0x037d0001u, 0x7d280680u, genuine ? 0x7e04020du : 0x7e040309u,
         0xbefe0406u, // this identical mask value must not revive an overwritten DATA generation
@@ -243,9 +243,9 @@ TEST(FlatActiveWord, CurrentSavedMaskCannotReviveMissingBackedgeReplacement) {
 
 TEST(FlatActiveWord, LaterEntryWriteRefreshesItsPreviouslySavedMask) {
     const std::vector<uint32_t> code{
-        0xbe84047eu, 0x7dea0080u, 0xbefe0404u, // return to exactly the actual initial EXEC
+        0xbe84047eu, 0x7daa0080u, 0xbefe0404u, // return to exactly the actual initial EXEC
         0x7e02020cu, 0x7e04020du, // address words now cover that entry mask
-        0x7dea0080u, 0xbefe0404u, // save predates the address, but the mask value is unchanged
+        0x7daa0080u, 0xbefe0404u, // save predates the address, but the mask value is unchanged
         0xbf060000u, 0xbf850001u, 0xbf800000u, 0xdc308000u, 0x037d0001u, 0x7d280680u, 0xbf810000u,
     };
     dispatcher_module(compile(code, true));
@@ -255,7 +255,7 @@ namespace {
 std::vector<uint32_t> entry_both_arms() {
     return {
         0xbe84047eu, 0x7e02020cu, 0xbf060000u, 0xbf850002u, 0x7e04020du, 0xbf820001u, 0x7e04020du,
-        0x7dea0080u, 0xbefe0404u, 0xdc308000u, 0x037d0001u, 0x7d280680u, 0xbf810000u,
+        0x7daa0080u, 0xbefe0404u, 0xdc308000u, 0x037d0001u, 0x7d280680u, 0xbf810000u,
     };
 }
 } // namespace
@@ -273,7 +273,7 @@ TEST(FlatActiveWord, OneEntryArmCannotRefreshTheOldSavedMask) {
 namespace {
 std::vector<uint32_t> buffer_address() {
     return {
-        0xbe84047eu, 0x7dea0080u, 0x7e020280u, // genuine active offset v1=0
+        0xbe84047eu, 0x7daa0080u, 0x7e020280u, // genuine active offset v1=0
         0xe0301000u, 0x80030301u, // buffer_load_dword v3,v1,s[12:15],0 offen
         0xbf060000u, 0xbf850001u, 0xbf800000u, 0x7d280680u, 0xbf810000u,
     };
@@ -320,7 +320,7 @@ namespace {
 std::vector<uint32_t> saveexec_address(uint32_t opcode, bool parent_addresses) {
     std::vector<uint32_t> code{
         0xbe84047eu, // retain the actual parent EXEC
-        0x7dea0080u, // active subset A from genuine local-ID v0
+        0x7daa0080u, // active subset A from genuine local-ID v0
         0x7e02020cu,
         0x7e04020du, // pointer words exist only under A
         0xbe860004u | (opcode << 8), // s_*_saveexec_b64 s[6:7],s[4:5]
@@ -378,7 +378,7 @@ std::vector<uint32_t> whole_entry_buffer(bool typed, bool missing_address) {
         0x7e060281u, // whole-entry genuine old v3
         missing_address ? 0xbf800000u : 0x7e020280u,
         0xbe84047eu,
-        0x7dea0080u,
+        0x7daa0080u,
         typed ? 0xe8b01000u : 0xe0301000u,
         0x80030301u,
         0x7d280680u,
@@ -497,7 +497,7 @@ TEST(FlatActiveWord, BothSelectedBufferAddressWordsMustBeCurrentBeforeOverwrite)
                         missing_word == 1 ? 0xbf800000u : 0x7e020280u,
                         missing_word == 2 ? 0xbf800000u : 0x7e040280u,
                         0xbe84047eu,
-                        0x7dea0080u,
+                        0x7daa0080u,
                         typed ? 0xe8b03000u : 0xe0303000u,
                         0x80030001u | (destination << 8u),
                         0x7d280080u | (destination << 9u),
@@ -538,7 +538,7 @@ std::vector<uint32_t> scalar_offset_buffer(const ScalarOffsetCase& arm) {
         0xbe800300u | (static_cast<uint32_t>(arm.target) << 16u) |
             (arm.supplied ? 0x80u : 0x16u), // copy zero or absent s22 into the scalar offset
         0xbe84047eu,
-        0x7dea0080u,
+        0x7daa0080u,
         arm.typed ? 0xe8b01000u : 0xe0301000u,
         (static_cast<uint32_t>(arm.target) << 24u) | 0x00030301u,
         0x7d280680u,

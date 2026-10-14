@@ -18,7 +18,7 @@ using namespace prosper::gpu;
 std::vector<uint32_t> partition(bool first = true, bool second = true) {
     return {
         0xbe84047eu, // save actual parent EXEC in s[4:5]
-        0x7dea0080u, // A = parent & (genuine local-ID v0 != 0)
+        0x7daa0080u, // A = parent & (genuine local-ID v0 != 0)
         0xbf880001u, // an empty A skips its writer, without creating a missing active lane
         first ? 0x7e040281u : 0x7e040309u,
         0x8afe7e04u, // B = parent & ~A
@@ -90,7 +90,7 @@ TEST(ComplementaryExecData, MissingBothHalvesCannotDefineTheRestoredParent) {
 namespace {
 std::vector<uint32_t> scalar_first_half(bool alternate_genuine) {
     return {
-        0xbe84047eu, 0x7dea0080u, 0xbf060000u,
+        0xbe84047eu, 0x7daa0080u, 0xbf060000u,
         0xbf840002u, // independent genuine SCC, not an EXEC-empty condition
         0x7e040281u, 0xbf820001u, alternate_genuine ? 0x7e040281u : 0x7e040309u,
         0x8afe7e04u, 0xbf880001u, 0x7e040282u,
@@ -169,7 +169,7 @@ namespace {
 std::vector<uint32_t> execnz_partition(bool first, bool second) {
     return {
         0xbe84047eu,
-        0x7dea0080u,
+        0x7daa0080u,
         0xbf890001u,
         0xbf820001u,
         first ? 0x7e040281u : 0x7e040309u,
@@ -187,7 +187,7 @@ std::vector<uint32_t> accumulating_partition(bool first, bool second, bool expli
                                              bool alias = false, bool e64 = false) {
     auto code = partition(first, second);
     code.resize(8);
-    code.push_back(0x7dea0080u); // narrow again to A, with genuine DATA retained in both halves
+    code.push_back(0x7daa0080u); // narrow again to A, with genuine DATA retained in both halves
     if (e64) {
         code.push_back(0xd51f0002u); // v_mac_f32_e64 v2, v0/v2, v0/v9 (implicit old v2)
         code.push_back((alias ? 0x102u : 0x100u) | (explicit_source ? 0x20000u : 0x21200u));
@@ -251,7 +251,7 @@ namespace {
 std::vector<uint32_t> scalar_accumulator(bool genuine) {
     auto code = scalar_first_half(genuine);
     code.resize(11);
-    code.insert(code.end(), {0x7dea0080u, 0x3e040100u, 0xbefe0404u, 0x7d280480u, 0xbf810000u});
+    code.insert(code.end(), {0x7daa0080u, 0x3e040100u, 0xbefe0404u, 0x7d280480u, 0xbf810000u});
     return code;
 }
 
@@ -325,7 +325,7 @@ namespace {
 std::vector<uint32_t> peer_overwrite_arm(bool poison) {
     return {
         0xbe84047eu,
-        0x7dea0080u,
+        0x7daa0080u,
         0xbf880001u,
         0x7e040281u,
         0x8afe7e04u,
@@ -376,7 +376,7 @@ ActiveVectorWords first_half() {
     state.enabled = state.current_is_entry = state.current_within_entry = true;
     state.current = state.entry_words = {0};
     advance_active_vector_words(state, inst({0xbe84047eu}), {{4, 2}}, {}, 4, true, false);
-    advance_active_vector_words(state, inst({0x7dea0080u}), {}, {}, -1, true, false);
+    advance_active_vector_words(state, inst({0x7daa0080u}), {}, {}, -1, true, false);
     advance_active_vector_words(state, inst({0x7e040281u}), {}, {2}, -1, true, true);
     advance_active_vector_words(state, inst({0x8afe7e04u}), {{126, 2}}, {}, -1, true, false);
     return state;
