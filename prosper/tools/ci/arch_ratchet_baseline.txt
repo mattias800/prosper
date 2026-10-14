@@ -345,7 +345,7 @@ layer-include|prosper/src/host/image/runtime_module_load.cpp|hle 1
 layer-include|prosper/src/host/tls/guest_tls.cpp|hle 2
 layer-include|prosper/src/loader/linker.hpp|hle 1
 layer-include|prosper/src/loader/tls_layout.hpp|hle 1
-# recompiler-include: spec GPU-1 / ADR 0006 (proposed; pending owner acceptance) -- the recompiler is a pure function and
+# recompiler-include: spec GPU-1 / ADR 0006 (accepted 2026-10-14) -- the recompiler is a pure function and
 # reaches up into nothing. Seeded with the includes present at acceptance; each row falls as the include moves down
 # or the switch it carried becomes a request field.
 recompiler-include|prosper/src/gpu/recompiler/compute_wave_route.cpp|diagnostics 2
@@ -364,9 +364,6 @@ recompiler-include|prosper/src/gpu/recompiler/rdna2_to_spirv_internal.hpp|gpu/di
 recompiler-include|prosper/src/gpu/recompiler/spirv/declarations.cpp|diagnostics 1
 recompiler-include|prosper/src/gpu/recompiler/spirv_fragment_vote_lowering.hpp|diagnostics 1
 recompiler-include|prosper/src/gpu/recompiler/spirv_wave_width.cpp|gpu/diagnostics 1
-# recompiler-include: spec GPU-1 / ADR 0006 (proposed; pending owner acceptance) -- the recompiler is a pure function and
-# reaches up into nothing. Seeded with the includes present at acceptance; each row falls as the include moves down
-# or the switch it carried becomes a request field.
 fixture-include|prosper/frontends/prosper-app/test_frame_grab_match.cpp 1
 fixture-include|prosper/frontends/shared/live/live_renderer.cpp 3
 fixture-include|prosper/frontends/shared/live/live_renderer_internal.hpp 3
