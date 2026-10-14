@@ -10,9 +10,11 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   makes it the cheapest thing in the stack to unit-test.
 - `rdna2_instruction_effects` — the ONE per-opcode table of what an instruction reads and writes
   (SCC read/write, SGPR destination and source widths, implicit VCC/EXEC/M0, EXEC-update kind),
-  complete for SOP2/SOP1/SOPK/SOPC/SOPP with reserved encodings listed explicitly (#5146). Ask it;
-  do not add a private opcode list beside it. `test_rdna2_instruction_effects` fails when a
-  decodable opcode has no entry. Other formats are still answered by older helpers.
+  complete for SOP2/SOP1/SOPK/SOPC/SOPP with reserved encodings listed explicitly (#5146), and
+  the source widths of every VOP1/VOP2/VOPC/VOP3 opcode. PS5 code uses gfx10.1-era VALU encodings
+  gfx1030 dropped (v_madak_f32, v_mad_f32), so the VALU rows are llvm-mc gfx1030 UNION gfx1013. Ask
+  it; do not add a private opcode list beside it. `test_rdna2_instruction_effects` fails when a
+  decodable opcode has no entry. Other questions and formats are still answered by older helpers.
 - `rdna2_to_spirv` (+ `_internal`, `emit_alu`, `emit_cfg`, `alu_support`, `cfg_support`) — the
   translator: register state, control-flow structurization, and per-instruction lowering.
 - `ngg_subgroup_shell` / `ngg_subgroup_abi` / `ngg_export_record` — the merged ES+GS NGG subgroup

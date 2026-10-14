@@ -202,6 +202,10 @@ const char* fmt_name(Rdna2Format fmt) {
         case Rdna2Format::SOPK: return "SOPK";
         case Rdna2Format::SOPC: return "SOPC";
         case Rdna2Format::SOPP: return "SOPP";
+        case Rdna2Format::VOP1: return "VOP1";
+        case Rdna2Format::VOP2: return "VOP2";
+        case Rdna2Format::VOPC: return "VOPC";
+        case Rdna2Format::VOP3: return "VOP3";
         default: return "other";
     }
 }
@@ -218,13 +222,32 @@ Rdna2Inst decode(Rdna2Format fmt, uint32_t op, uint32_t ssrc0 = 2u) {
         case Rdna2Format::SOPK: code[0] = 0xB0000000u | (op << 23) | (4u << 16) | 0x10u; break;
         case Rdna2Format::SOPC: code[0] = 0xBF000000u | (op << 16) | (6u << 8) | ssrc0; break;
         case Rdna2Format::SOPP: code[0] = 0xBF800000u | (op << 16); break;
+        // VALU forms with VGPR sources (v1, v2, v3), so no SDWA/DPP/literal field is triggered.
+        case Rdna2Format::VOP1: code[0] = 0x7E000000u | (4u << 17) | (op << 9) | 257u; break;
+        case Rdna2Format::VOP2: code[0] = (op << 25) | (4u << 17) | (2u << 9) | 257u; break;
+        case Rdna2Format::VOPC: code[0] = 0x7C000000u | (op << 17) | (2u << 9) | 257u; break;
+        case Rdna2Format::VOP3:
+            code[0] = 0xD4000000u | (op << 16) | 4u;
+            code[1] = 257u | (258u << 9) | (259u << 18);
+            break;
         default: break;
     }
     return rdna2_decode_one(code, 2);
 }
 
+// A VOP3 instruction with SGPR sources s2, s6 and s10.
+Rdna2Inst decode_vop3_sgpr(uint32_t op) {
+    const uint32_t code[2] = {0xD4000000u | (op << 16) | 4u, 2u | (6u << 9) | (10u << 18)};
+    return rdna2_decode_one(code, 2);
+}
+
 const Rdna2Format kTabulated[] = {Rdna2Format::SOP2, Rdna2Format::SOP1, Rdna2Format::SOPK,
                                   Rdna2Format::SOPC, Rdna2Format::SOPP};
+const Rdna2Format kValu[] = {Rdna2Format::VOP2, Rdna2Format::VOP1, Rdna2Format::VOPC,
+                             Rdna2Format::VOP3};
+const Rdna2Format kEveryTabulated[] = {Rdna2Format::SOP2, Rdna2Format::SOP1, Rdna2Format::SOPK,
+                                       Rdna2Format::SOPC, Rdna2Format::SOPP, Rdna2Format::VOP2,
+                                       Rdna2Format::VOP1, Rdna2Format::VOPC, Rdna2Format::VOP3};
 
 std::vector<LlvmOpcode> llvm_set(Rdna2Format fmt) {
     switch (fmt) {
@@ -248,10 +271,10 @@ bool in_set(std::initializer_list<uint32_t> set, uint32_t op) {
 // ---- Coverage --------------------------------------------------------------------------------
 
 TEST(Rdna2InstructionEffects, OpcodeSpaceIsExactlyWhatTheDecoderProduces) {
-    for (Rdna2Format fmt : kTabulated) {
-        const uint32_t space = rdna2_effects_opcode_space(fmt);
-        ASSERT_GT(space, 0u) << fmt_name(fmt);
-        for (uint32_t op = 0; op < space; ++op) {
+    for (Rdna2Format fmt : kEveryTabulated) {
+        const Rdna2OpcodeRange range = rdna2_effects_opcode_range(fmt);
+        ASSERT_LT(range.first, range.end) << fmt_name(fmt);
+        for (uint32_t op = range.first; op < range.end; ++op) {
             const Rdna2Inst in = decode(fmt, op);
             EXPECT_EQ(in.fmt, fmt) << fmt_name(fmt) << " op=" << op;
             EXPECT_EQ(in.opcode, op) << fmt_name(fmt) << " op=" << op;
@@ -260,12 +283,15 @@ TEST(Rdna2InstructionEffects, OpcodeSpaceIsExactlyWhatTheDecoderProduces) {
     // The first opcode past each space belongs to another format: the space is not too small.
     EXPECT_NE(decode(Rdna2Format::SOP2, 0x60).fmt, Rdna2Format::SOP2);
     EXPECT_NE(decode(Rdna2Format::SOPK, 0x1d).fmt, Rdna2Format::SOPK);
+    EXPECT_NE(decode(Rdna2Format::VOP2, 0x3e).fmt, Rdna2Format::VOP2);
+    EXPECT_NE(decode(Rdna2Format::VOP3, 0xff).fmt, Rdna2Format::VOP3);
 }
 
 TEST(Rdna2InstructionEffects, EveryDecodableOpcodeHasAnEntry) {
-    for (Rdna2Format fmt : kTabulated) {
+    for (Rdna2Format fmt : kEveryTabulated) {
         EXPECT_TRUE(rdna2_effects_format_is_tabulated(fmt)) << fmt_name(fmt);
-        for (uint32_t op = 0; op < rdna2_effects_opcode_space(fmt); ++op)
+        const Rdna2OpcodeRange range = rdna2_effects_opcode_range(fmt);
+        for (uint32_t op = range.first; op < range.end; ++op)
             EXPECT_NE(rdna2_instruction_effects(fmt, op).status, Rdna2EffectsStatus::Unknown)
                 << fmt_name(fmt) << " op=0x" << std::hex << op
                 << " decodes but has no entry: add a named row or a reserved range";
@@ -277,7 +303,8 @@ TEST(Rdna2InstructionEffects, RowsAreUniqueAndWellFormed) {
     for (const Rdna2InstructionEffectsRow& row : rdna2_instruction_effects_rows()) {
         EXPECT_TRUE(seen.insert({static_cast<int>(row.fmt), row.opcode}).second)
             << fmt_name(row.fmt) << " op=0x" << std::hex << row.opcode << " has two rows";
-        EXPECT_LT(row.opcode, rdna2_effects_opcode_space(row.fmt))
+        const Rdna2OpcodeRange range = rdna2_effects_opcode_range(row.fmt);
+        EXPECT_TRUE(row.opcode >= range.first && row.opcode < range.end)
             << fmt_name(row.fmt) << " op=0x" << std::hex << row.opcode << " cannot be decoded";
         const Rdna2InstructionEffects& e = row.effects;
         if (e.status == Rdna2EffectsStatus::Known) {
@@ -288,6 +315,13 @@ TEST(Rdna2InstructionEffects, RowsAreUniqueAndWellFormed) {
             EXPECT_EQ(e.exec != Rdna2ExecEffect::None,
                       (e.implicit_writes & kRdna2ImplicitExec) != 0)
                 << e.name;
+        } else if (e.status == Rdna2EffectsStatus::SourcesOnly) {
+            EXPECT_NE(e.name, nullptr);
+            EXPECT_TRUE(row.fmt == Rdna2Format::VOP1 || row.fmt == Rdna2Format::VOP2 ||
+                        row.fmt == Rdna2Format::VOPC || row.fmt == Rdna2Format::VOP3);
+            // Nothing but the sources is described.
+            EXPECT_EQ(e.sdst_dwords, 0u);
+            EXPECT_EQ(e.implicit_reads | e.implicit_writes, 0u);
         } else {
             EXPECT_EQ(e.status, Rdna2EffectsStatus::Reserved);
             EXPECT_EQ(e.name, nullptr);
@@ -309,7 +343,8 @@ TEST(Rdna2InstructionEffects, NamedOpcodesAreExactlyLlvmGfx1030) {
             EXPECT_STREQ(e.name, entry.name)
                 << fmt_name(fmt) << " op=0x" << std::hex << entry.opcode;
         }
-        for (uint32_t op = 0; op < rdna2_effects_opcode_space(fmt); ++op)
+        const Rdna2OpcodeRange range = rdna2_effects_opcode_range(fmt);
+        for (uint32_t op = range.first; op < range.end; ++op)
             if (!llvm_ops.contains(op))
                 EXPECT_EQ(rdna2_instruction_effects(fmt, op).status, Rdna2EffectsStatus::Reserved)
                     << fmt_name(fmt) << " op=0x" << std::hex << op << " is invalid in llvm-mc";
@@ -317,8 +352,15 @@ TEST(Rdna2InstructionEffects, NamedOpcodesAreExactlyLlvmGfx1030) {
 }
 
 TEST(Rdna2InstructionEffects, UntabulatedLookupsAreUnknownNotNoEffect) {
-    EXPECT_EQ(rdna2_instruction_effects(Rdna2Format::VOP3, 0x16d).status,
+    EXPECT_EQ(rdna2_instruction_effects(Rdna2Format::VOP3P, 0x10).status,
               Rdna2EffectsStatus::Unknown);
+    // VOP3 0x000-0x0FF decode as VOPC, so they are not VOP3 entries.
+    EXPECT_EQ(rdna2_instruction_effects(Rdna2Format::VOP3, 0x50).status,
+              Rdna2EffectsStatus::Unknown);
+    // A VALU entry describes its sources only: it is not "known" for the other questions.
+    EXPECT_EQ(rdna2_instruction_effects(Rdna2Format::VOP3, 0x16d).status,
+              Rdna2EffectsStatus::SourcesOnly);
+    EXPECT_FALSE(rdna2_instruction_effects(Rdna2Format::VOP3, 0x16d).known());
     EXPECT_EQ(rdna2_instruction_effects(Rdna2Format::Unknown, 0).status,
               Rdna2EffectsStatus::Unknown);
     EXPECT_EQ(rdna2_instruction_effects(Rdna2Format::SOP1, 0x1000).status,
@@ -640,4 +682,93 @@ TEST(Rdna2InstructionEffectsRegression, ScalarSourceWidthsCountPairReads) {
     };
     for (const Case& c : cases)
         EXPECT_EQ(scalar_alu_source_words(decode(c.fmt, c.op), c.source), c.width) << c.name;
+}
+
+// ---- VALU source widths ------------------------------------------------------------------------
+
+// An ISA-side structural check, independent of the llvm-mc derivation the rows came from: a pair
+// source appears exactly where the mnemonic names a 64-bit operand type, apart from a short list
+// of operands the ISA types by other means (lane masks, the SAD forms' bit ranges).
+TEST(Rdna2InstructionEffectsValu, PairSourcesFollowTheMnemonic) {
+    const auto names_64bit = [](const std::string& name) {
+        for (const char* suffix : {"_f64", "_i64", "_u64", "_b64"})
+            if (name.find(suffix) != std::string::npos) return true;
+        return false;
+    };
+    // name -> source index read as a pair although the name carries no 64-bit type.
+    const std::set<std::pair<std::string, uint32_t>> untyped_pairs = {
+        {"v_cndmask_b32", 2},      {"v_add_co_ci_u32", 2},   {"v_sub_co_ci_u32", 2},
+        {"v_subrev_co_ci_u32", 2}, {"v_qsad_pk_u16_u8", 0},  {"v_qsad_pk_u16_u8", 2},
+        {"v_mqsad_pk_u16_u8", 0},  {"v_mqsad_pk_u16_u8", 2}, {"v_mqsad_u32_u8", 0},
+        {"v_mqsad_u32_u8", 2},
+    };
+    size_t rows = 0;
+    for (const Rdna2InstructionEffectsRow& row : rdna2_instruction_effects_rows()) {
+        if (row.effects.status != Rdna2EffectsStatus::SourcesOnly) continue;
+        ++rows;
+        const std::string name = row.effects.name;
+        bool any_pair = false;
+        for (uint32_t source = 0; source < 3; ++source) {
+            const uint32_t width = row.effects.ssrc_dwords[source];
+            EXPECT_LE(width, 2u) << name;
+            if (width != 2) continue;
+            any_pair = true;
+            EXPECT_TRUE(names_64bit(name) || untyped_pairs.contains({name, source}))
+                << name << " source " << source << " is a pair but its name has no 64-bit type";
+        }
+        if (names_64bit(name) && name.find("cvt_") == std::string::npos &&
+            name.find("lshl") == std::string::npos)
+            EXPECT_TRUE(any_pair) << name << " names a 64-bit type but reads no pair";
+    }
+    EXPECT_GT(rows, 500u);
+}
+
+// scalar_alu_source_words charged every VOP3 opcode missing from a hand-kept B32 allowlist TWO
+// SGPRs per source, so a B32 read of s9 also demanded s10 and a fresh-mask guard refused valid
+// shaders (#5148 added V_BCNT_U32_B32 one opcode at a time). It also charged one SGPR for the pair
+// read of F64 VOP1/VOP2/VOPC operands. Each case below was answered wrongly by that code.
+TEST(Rdna2InstructionEffectsRegression, ValuSourceWidthsComeFromTheIsaNotAnAllowlist) {
+    struct Case {
+        Rdna2Format fmt;
+        uint32_t op;
+        uint32_t source;
+        uint32_t width;
+        const char* name;
+    };
+    const Case cases[] = {
+        // The comment's "known remainder" of B32 forms left on the pair default.
+        {Rdna2Format::VOP3, 0x345, 0, 1, "v_xad_u32"},
+        {Rdna2Format::VOP3, 0x363, 0, 1, "v_bfm_b32"},
+        {Rdna2Format::VOP3, 0x372, 2, 1, "v_or3_b32"},
+        {Rdna2Format::VOP3, 0x178, 1, 1, "v_xor3_b32"},
+        {Rdna2Format::VOP3, 0x149, 0, 1, "v_bfe_i32"},
+        {Rdna2Format::VOP3, 0x158, 0, 1, "v_med3_i32"},
+        {Rdna2Format::VOP3, 0x103, 0, 1, "v_add_f32_e64"},
+        // Pair reads the old code charged one SGPR.
+        {Rdna2Format::VOP3, 0x18f, 0, 2, "v_cvt_f32_f64_e64"},
+        {Rdna2Format::VOP3, 0x164, 1, 2, "v_add_f64"},
+        // Unchanged answers the table must keep.
+        {Rdna2Format::VOP3, 0x364, 0, 1, "v_bcnt_u32_b32"},
+        {Rdna2Format::VOP3, 0x101, 2, 2, "v_cndmask_b32_e64 lane mask"},
+        {Rdna2Format::VOP3, 0x176, 2, 2, "v_mad_u64_u32 addend"},
+        {Rdna2Format::VOP3, 0x2ff, 0, 1, "v_lshlrev_b64 shift"},
+        {Rdna2Format::VOP3, 0x2ff, 1, 2, "v_lshlrev_b64 value"},
+    };
+    for (const Case& c : cases)
+        EXPECT_EQ(scalar_alu_source_words(decode_vop3_sgpr(c.op), c.source), c.width) << c.name;
+    // A source the instruction does not have: the decoder fills SRC2 of every VOP3.
+    EXPECT_EQ(scalar_alu_source_words(decode_vop3_sgpr(0x103), 2), UINT32_MAX) << "v_add_f32_e64";
+    // VOPC: an F64 compare and its e32 form read pairs; CLASS_F64's class mask is one SGPR.
+    const uint32_t cmp_lt_f64_e64[2] = {0xD4000000u | (0x21u << 16) | 106u, 2u | (6u << 9)};
+    const Rdna2Inst cmp = rdna2_decode_one(cmp_lt_f64_e64, 2);
+    ASSERT_EQ(cmp.fmt, Rdna2Format::VOPC);
+    EXPECT_EQ(scalar_alu_source_words(cmp, 0), 2u) << "v_cmp_lt_f64_e64";
+    EXPECT_EQ(scalar_alu_source_words(cmp, 1), 2u) << "v_cmp_lt_f64_e64";
+    const uint32_t class_f64_e64[2] = {0xD4000000u | (0xa8u << 16) | 106u, 2u | (6u << 9)};
+    const Rdna2Inst cls = rdna2_decode_one(class_f64_e64, 2);
+    EXPECT_EQ(scalar_alu_source_words(cls, 0), 2u) << "v_cmp_class_f64";
+    EXPECT_EQ(scalar_alu_source_words(cls, 1), 1u) << "v_cmp_class_f64 class mask";
+    // VOP1 e32 with an SGPR source: v_cvt_f32_f64 v4, s[2:3].
+    const uint32_t cvt_e32[1] = {0x7E000000u | (4u << 17) | (0x0fu << 9) | 2u};
+    EXPECT_EQ(scalar_alu_source_words(rdna2_decode_one(cvt_e32, 1), 0), 2u) << "v_cvt_f32_f64_e32";
 }
