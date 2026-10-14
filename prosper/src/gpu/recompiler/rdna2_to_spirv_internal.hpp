@@ -565,6 +565,9 @@ struct SpirvCompute {
     // one terminal line so the recorded reason names the cause rather than the effect.
     uint32_t stage_reject_pc = UINT32_MAX;
     std::string stage_reject_reason;
+    // Private attempt result, never an admission fact: the original closed store loop may retry
+    // its lost header DATA through a fresh exact dispatcher, keeping every dispatcher proof.
+    bool compute_store_loop_data_retry = false;
     // The loop-header assumptions (blanket_root keys) some lane-bit read was admitted on, through a
     // word whose only mark was a header's blanket mark (sreg_loop_blanket). Each loop checks its own
     // at its back edge (LoopBlanketCheck). Mutable: the admitting predicate takes the builder const.

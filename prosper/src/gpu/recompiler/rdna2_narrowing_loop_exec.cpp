@@ -2,9 +2,13 @@
 // Keep this code-only proof separate from the carried-value obligations checked by the emitter.
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_native_launch.hpp"
+#include "gpu/recompiler/rdna2_vector_old_word.hpp"
+#include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_scalar_condition_marks.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstddef>
 #include <vector>
@@ -240,6 +244,55 @@ bool narrowing_loop_exec_admission(const std::vector<Rdna2Inst>& ins, const DivL
                                    const RegState& entry) {
     return structured_loop_only_narrows_exec(ins, loop) &&
            new_loop_admission_is_lane_local(ins, loop, entry);
+}
+
+bool closed_compute_store_loop_data_retry(const SpirvCompute& b, const RegState& rs,
+                                          const DivLoop& loop, const Rdna2Inst& header,
+                                          uint32_t preheader_exec, const uint32_t* code,
+                                          size_t dwords) {
+    if (!native_compute_has_complete_entry(b) || !code || !dwords || !preheader_exec ||
+        !rs.exec_narrowed || b.saved_mask_original_fragment_entry ||
+        b.saved_mask_original_compute_launch != b.guest_compute_launch ||
+        dwords != b.saved_mask_original_words.size() ||
+        !std::equal(b.saved_mask_original_words.begin(), b.saved_mask_original_words.end(), code) ||
+        b.stage_reject_pc != loop.header_pc ||
+        b.stage_reject_reason != "fabricated-fresh-mask-source" || header.pc != loop.header_pc ||
+        !plain_cmpx(header))
+        return false;
+    // Authenticate the original immutable loop, not an optional fold's alias or new edge. This
+    // classifier changes no existing structured permission and publishes no EXEC subset fact.
+    std::vector<Rdna2Inst> original;
+    rdna2_walk(b.saved_mask_original_words.data(), b.saved_mask_original_words.size(), original);
+    if (original.empty() || !original.back().is_end ||
+        !structured_loop_only_narrows_exec(original, loop))
+        return false;
+    bool actual_header = false, ordinary_store = false;
+    for (const auto& in : original) {
+        if (in.pc == header.pc) actual_header = in == header;
+        if (in.pc <= loop.exit_branch_pc || in.pc >= loop.backedge_pc ||
+            in.fmt != Rdna2Format::MUBUF || in.mubuf_lds || in.mubuf_tfe)
+            continue;
+        ordinary_store |=
+            (in.opcode >= 0x04u && in.opcode <= 0x07u) ||
+            (in.opcode >= kMubufOpcodeStoreDword && in.opcode <= kMubufOpcodeStoreDwordX3);
+    }
+    if (!actual_header || !ordinary_store) return false;
+    // At least one consumed current word must carry genuine preheader ownership. A scope ID
+    // alone is insufficient: require its real value and the immutable preheader ancestry. The
+    // fresh dispatcher independently meets ALL sources and generations, including backedges.
+    for (uint32_t source = 0; source < header.n_src; ++source) {
+        if (header.src[source].kind != OperandKind::VGPR) continue;
+        for (uint32_t word = 0; word < vector_provenance_source_span(header, source); ++word) {
+            const int reg = header.src[source].value + static_cast<int>(word);
+            const auto value = rs.vreg.find(reg);
+            const auto marks = rs.vreg_source_marks.find(reg);
+            if (value != rs.vreg.end() && value->second && marks != rs.vreg_source_marks.end() &&
+                marks->second.placeholder && marks->second.hard && marks->second.outside_exec &&
+                vector_word_defined_in_exec(rs, marks->second, preheader_exec))
+                return true;
+        }
+    }
+    return false;
 }
 
 uint32_t make_narrowing_loop_exec_phi(SpirvCompute& b, RegState& rs, uint32_t preheader,

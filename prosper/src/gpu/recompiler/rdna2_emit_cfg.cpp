@@ -6860,6 +6860,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             // presence inside or after the loop cannot stand in for a scalar-lifetime MUST proof.
             rs.scalar_presence_has_no_placeholders = false;
             const bool entry_exec_narrowed = rs.exec_narrowed;
+            const uint32_t loop_entry_exec = rs.exec;
             const bool narrowing_exec = b.is_compute && narrowing_loop_exec_admission(ins, L, rs);
             std::set<int> cv, cs, condv, conds, scalar_may_writes;
             loop_written_regs(ins, L.header_pc, L.backedge_pc, cv, cs);
@@ -6924,6 +6925,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 if (!emit_structured(
                         L.header_pc, L.exit_branch_pc, L.exit_branch_pc)) return false;
             } else if (!emit_range(L.header_pc, L.exit_branch_pc)) {
+                if (idx < ins.size())
+                    b.compute_store_loop_data_retry = closed_compute_store_loop_data_retry(
+                        b, rs, L, ins[idx], loop_entry_exec, code, dwords);
                 return false;
             }
             // A canonical SCC loop must compute a fresh representable scalar predicate on every

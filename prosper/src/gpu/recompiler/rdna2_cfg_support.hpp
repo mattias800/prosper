@@ -664,6 +664,12 @@ struct DivLoop {
 bool structured_loop_only_narrows_exec(const std::vector<Rdna2Inst>& ins, const DivLoop& loop);
 bool narrowing_loop_exec_admission(const std::vector<Rdna2Inst>& ins, const DivLoop& loop,
                                    const RegState& entry);
+// A refused native store-loop header may select the existing exact dispatcher. This proves
+// only eligibility to try a fresh builder, never DATA, scalar, resource or effect admission.
+bool closed_compute_store_loop_data_retry(const SpirvCompute& b, const RegState& rs,
+                                          const DivLoop& loop, const Rdna2Inst& header,
+                                          uint32_t preheader_exec, const uint32_t* code,
+                                          size_t dwords);
 uint32_t make_narrowing_loop_exec_phi(SpirvCompute& b, RegState& rs, uint32_t preheader,
                                       std::size_t& patch, bool admitted);
 template <class PhiRecords>

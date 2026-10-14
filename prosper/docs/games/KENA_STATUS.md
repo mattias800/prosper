@@ -1139,6 +1139,16 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 
 ## Ruled out
 
+- **The shortest retained compute refusal needs a new FORMAT-store opcode route** — false for
+  the #5140 input. Its original selected route is structured, and a copied-choice diagnostic using
+  the existing exact dispatcher emits the ordinary FORMAT loads and stores. That diagnostic changes
+  the compiler choice and does not establish admission with the captured choice (2026-10-14).
+- **Adding only an EXEC ancestry link repairs that loop safely** — not established. Its loop also
+  refreshes scalar descriptors, stores through them and exposes scalar state after the exit. The
+  structured loop policy deliberately excludes those effects; an ancestry link would neither close
+  the conditional header source roots nor prove the scalar live-out generation. #5140 retries a
+  fresh exact builder under its existing input, resource, effect and launch proofs instead.
+
 - **The run-to-run refusal of `ps b8e8f38ec3a5fc7f` is a shader-cache key that ignores an input, or
   a race between draw-realization workers** — false. The graphics compile key includes the resource
   table, and the variation follows the descriptor words: stale bytes in the slots of switch arms the
