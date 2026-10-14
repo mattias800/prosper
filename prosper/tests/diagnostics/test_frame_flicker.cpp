@@ -254,6 +254,17 @@ TEST(FrameFlickerDetector, ShakeOfAFewFramesDoesNotFire) {
     EXPECT_EQ(r.sustained, 0u);
 }
 
+TEST(FrameFlickerDetector, OneGlitchFrameInEightDoesNotFire) {
+    // A garbage frame every 8th frame inside a slow pan, for 5 s: the frame AFTER each glitch looks
+    // like the one two back (the pan barely moved), so each glitch makes one flicker frame. That is
+    // a defect, but not an alternation: one vote in eight must never sustain an episode.
+    FlickerDetector d;
+    const LumaGrid n = noise(6);
+    const RunResult r = run(d, 300, [&](uint32_t t) { return t % 8 == 7 ? n : panned(0.25 * t); });
+    EXPECT_GT(r.flicker, 20u) << "the glitches should produce single flicker frames";
+    EXPECT_EQ(r.sustained, 0u);
+}
+
 // ---- the rule ---------------------------------------------------------------------------------
 
 namespace {

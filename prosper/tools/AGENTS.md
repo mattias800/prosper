@@ -1001,7 +1001,10 @@ that skipped every other flip cannot show a period-2 flicker. Plain F9 is unchan
 to the same evidence:
 - `PROSPER_SNAP_AT_FLIPS` accepts ranges: `1200-1207` (inclusive) or `1200+8`, mixed freely with single
   pad-flip anchors (`400-407,1000`). At most 256 anchors in total; a reversed range, `+0`, an overflow or
-  a list over the cap voids the WHOLE list (logged), like any malformed entry.
+  a list over the cap voids the WHOLE list (logged), like any malformed entry. A range's frames are held
+  in memory (up to 32 at a time) and written when it ends -- written one by one, a 4K BMP stalled the
+  presenter for seconds and `2000+4` landed at flips 2000 and 2219. Each `actual_f<anchor>_at<flip>.bmp`
+  still names where it really landed, so check that before reading a burst as consecutive.
 - `PROSPER_FLICKER_CAPTURE_DIR=<dir>`: the first time the always-on `frame-flicker` `[perf-alarm]`
   detects a sustained alternation, a burst is saved there automatically (once per run).
   `PROSPER_FLICKER_TRACE=<path.csv>` writes the detector's per-presented-frame `d1`/`d2` for calibration.
