@@ -1615,7 +1615,8 @@ detect_forward_ifs(const std::vector<Rdna2Inst>& ins, bool allow_vcc, const uint
 // can only turn a right result into zero, never a wrong one into a refusal. Charged the base
 // alone, a table whose first register was never written lost its result at the next join.
 // Charged the whole range s[base..105], every result did, since almost no program defines all of
-// those words. The read range below is for proofs that refuse; this is for the one that drops.
+// those words. scalar_alu_source_words describes the read range for refusing proofs; this is
+// for the one that drops.
 inline bool s_movrels_b32_result_is_scalar_data(const Rdna2Inst& in) {
     return in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovrelsB32 &&
            in.dst.kind == OperandKind::SGPR && in.dst.value >= 0 && in.dst.value <= 105 &&

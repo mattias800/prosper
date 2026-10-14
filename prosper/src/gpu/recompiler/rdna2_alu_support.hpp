@@ -484,7 +484,8 @@ inline uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in,
     }
 }
 
-uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source);   // rdna2_cfg_support.hpp
+uint32_t scalar_alu_source_words(const Rdna2Inst& in,
+                                 uint32_t source);   // rdna2_instruction_effects.cpp
 
 // May `words` consecutive scalar words starting at `reg` become per-lane mask bits? Not when any is
 // the structured emitter's fabricated zero (sreg_merge_placeholder: a one-path write, a loop phi, a
