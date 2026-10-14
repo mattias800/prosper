@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <map>
 #include <set>
 #include <utility>
@@ -30,7 +31,18 @@ bool lane_mapped_vector_write(const Rdna2Inst& in) {
                    !(in.opcode >= 0x40 && in.opcode <= 0x47);
         case Rdna2Format::VOP2: return true;
         case Rdna2Format::VOPC: return true;
-        case Rdna2Format::VOP3: return in.opcode < 0x300;
+        case Rdna2Format::VOP3:
+            // ADD3 is an independent B32 sum of all three same-lane inputs. Its RDNA2 encoding
+            // has no ABS/OPSEL/CLAMP/NEG/OMOD fields; truncated or modified forms grant no fact.
+            if (in.opcode == kVop3OpcodeAdd3U32)
+                return in.len_dwords >= 2 && in.n_src == 3 && !in.has_sdwa &&
+                       !(in.words[0] & 0x0000ff00u) && !(in.words[1] & 0xf8000000u) &&
+                       (in.has_literal || std::none_of(std::begin(in.src), std::end(in.src),
+                                                       [](const Operand& operand) {
+                                                           return operand.kind ==
+                                                                  OperandKind::Literal;
+                                                       }));
+            return in.opcode < 0x300;
         default: return false;
     }
 }

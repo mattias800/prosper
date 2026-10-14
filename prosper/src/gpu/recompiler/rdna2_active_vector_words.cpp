@@ -1,6 +1,8 @@
 #include "gpu/recompiler/rdna2_active_vector_words.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_vector_old_word.hpp"
+#include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
 #include <algorithm>
@@ -163,7 +165,8 @@ bool active_vector_sources_defined(const ActiveVectorWords& state, const Rdna2In
          (in.opcode == 0x02 || (in.opcode >= 0x40 && in.opcode <= 0x47))) ||
         (in.fmt == Rdna2Format::VOP2 &&
          ((!mac && in.opcode == 0x1f) || in.opcode == 0x2b || in.opcode == 0x3c)) ||
-        (in.fmt == Rdna2Format::VOP3 && in.opcode >= 0x300 && in.opcode != 0x346) ||
+        (in.fmt == Rdna2Format::VOP3 && in.opcode >= 0x300 && in.opcode != 0x346 &&
+         (in.opcode != kVop3OpcodeAdd3U32 || !vector_write_completes_active_word(in))) ||
         (in.fmt != Rdna2Format::VOP1 && in.fmt != Rdna2Format::VOP2 &&
          in.fmt != Rdna2Format::VOP3 && in.fmt != Rdna2Format::VOPC))
         return false;
