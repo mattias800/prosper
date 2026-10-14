@@ -4361,6 +4361,10 @@ endif()
   target_include_directories(test_gpu_capture PRIVATE tests)
   target_link_libraries(test_gpu_capture PRIVATE prosper_core)
   add_test(NAME gpu_capture_roundtrip COMMAND test_gpu_capture)
+  prosper_add_gtest(test_capture_future_version
+    SOURCES tests/gpu/capture/test_capture_future_version.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   if(Python3_Interpreter_FOUND)
     add_test(NAME gpu_capture_failed_setup
              COMMAND "${Python3_EXECUTABLE}"
