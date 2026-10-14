@@ -3834,6 +3834,9 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_bcnt_source_width
     SOURCES tests/gpu/recompiler/test_bcnt_source_width.cpp
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_scalar_source_words_link
+    SOURCES tests/gpu/recompiler/test_scalar_source_words_link.cpp
+    LIBRARIES prosper_core)
 
   # Scalar const-fold interpreter behind bindless-dynamic vertex-fetch resolution (no Vulkan needed).
   prosper_add_gtest(test_integer_format_store
