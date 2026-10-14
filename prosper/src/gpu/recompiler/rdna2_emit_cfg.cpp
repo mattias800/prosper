@@ -120,18 +120,8 @@ std::unordered_set<uint32_t> proven_smem_x2_descriptor_fragment_loads(
         return is_scalar_operand(operand) && operand.value == reg;
     };
     auto instruction_reads_scc = [](const Rdna2Inst& in) {
-        for (uint32_t source = 0; source < in.n_src; ++source)
-            if (in.src[source].kind == OperandKind::Special && in.src[source].value == 253)
-                return true;
-        if (in.fmt == Rdna2Format::SOP2)
-            return in.opcode == kSop2OpcodeAddcU32 || in.opcode == 0x05u ||
-                   in.opcode == kSop2OpcodeCselectB32 ||
-                   in.opcode == kSop2OpcodeCselectB64;
-        if (in.fmt == Rdna2Format::SOPP)
-            return in.opcode == kSoppOpcodeCbranchScc0 || in.opcode == 0x05u;
-        if (in.fmt == Rdna2Format::SOP1)
-            return in.opcode == kSop1OpcodeCmovB32 || in.opcode == kSop1OpcodeCmovB64;
-        return in.fmt == Rdna2Format::SOPK && in.opcode == kSopkOpcodeCmovkI32;
+        return rdna2_operand_reads_scc(in) ||
+               rdna2_reads_scc_implicitly(in.fmt, in.opcode) != Rdna2Answer::No;
     };
 
     std::unordered_set<uint32_t> direct_branch_targets;
@@ -1706,15 +1696,7 @@ bool emit_cfg_state_machine(
                 }
             };
             auto reads_scc = [](const Rdna2Inst& candidate) {
-                return (candidate.fmt == Rdna2Format::SOP2 &&
-                        (candidate.opcode == 0x04u || candidate.opcode == 0x05u ||
-                         candidate.opcode == kSop2OpcodeCselectB32 ||
-                         candidate.opcode == 0x0bu)) ||
-                       (candidate.fmt == Rdna2Format::SOP1 &&
-                        (candidate.opcode == kSop1OpcodeCmovB32 ||
-                         candidate.opcode == kSop1OpcodeCmovB64)) ||
-                       (candidate.fmt == Rdna2Format::SOPK &&
-                        candidate.opcode == kSopkOpcodeCmovkI32);
+                return rdna2_reads_scc_as_data(candidate.fmt, candidate.opcode) != Rdna2Answer::No;
             };
             const bool valid_scc_read = !reads_scc(in) || definite_scc;
             const bool b32_vcc_scalar_write =

@@ -5,6 +5,7 @@
 #include "gpu/diagnostics/fragment_arithmetic.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_fragment_terminal_tail.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
@@ -138,44 +139,11 @@ FragmentInterpolationLayout fragment_interpolation_layout(
 // an exact wave vote when a mask op writes SCC. Deliberately CONSERVATIVE and whole-shader: it answers
 // "could SCC ever be consumed", not "is this particular write live". A false positive costs one shader a
 // subgroup-size requirement it might not have needed; a false NEGATIVE would silently drop the vote a
-// consumer depends on, so every reader is listed even where the recompiler handles it elsewhere.
-//
-// SCC readers on RDNA2 (doc 70648): SOP2 s_cselect_b32/b64 (0x0a/0x0b) and the carry-in forms
-// s_addc_u32/s_subb_u32 (0x04/0x05); SOPP s_cbranch_scc0/scc1 (0x04/0x05); SOP1 s_cmov_b32/b64
-// (0x02/0x03); SOPK s_cmovk_i32 (0x02). SOPC and s_cmp_*/s_cmpk_* WRITE SCC and are not readers.
-//
-// SOPK was omitted in the first version of this scan and that was a genuine false negative -- the
-// direction this function's own contract calls the dangerous one, since a missed reader silently
-// drops the vote its consumer depends on. Caught in review of #2416. The file already documents the
-// hazard at the `sopk_writes_scalar_data` exclusion note: "several SOPK ops (s_addk/s_mulk/s_cmovk/
-// s_cmpk) READ or read-modify-write their dst via the implicit SIMM16".
-//
-// Only s_cmovk_i32 READS SCC in this space, verified rather than taken from a table --
-// `llvm-mc -mcpu=gfx1030 -disassemble` over the SOPK opcode range gives 0x00 s_movk_i32,
-// 0x02 s_cmovk_i32, 0x03.. s_cmpk_* (which WRITE SCC), 0x0f s_addk_i32, 0x10 s_mulk_i32,
-// 0x12/0x13 s_getreg/s_setreg. Including the whole SOPK format would be conservative in the safe
-// direction but costs every shader containing an s_movk -- which is nearly all of them -- a
-// subgroup-size requirement it does not need.
+// consumer depends on. The readers come from the instruction-effects table (rdna2_program_reads_scc):
+// its own copy here once listed SOP1 0x02/0x03 as s_cmov, which are reserved and s_mov_b32 -- so it
+// charged almost every shader and missed a shader whose only reader was s_cmov_b32/b64 (0x05/0x06).
 inline bool shader_reads_scc(const std::vector<Rdna2Inst>& ins) {
-    for (const auto& in : ins) {
-        switch (in.fmt) {
-            case Rdna2Format::SOP2:
-                if (in.opcode == 0x04 || in.opcode == 0x05 ||
-                    in.opcode == 0x0a || in.opcode == 0x0b) return true;
-                break;
-            case Rdna2Format::SOPP:
-                if (in.opcode == 0x04 || in.opcode == 0x05) return true;
-                break;
-            case Rdna2Format::SOP1:
-                if (in.opcode == 0x02 || in.opcode == 0x03) return true;
-                break;
-            case Rdna2Format::SOPK:
-                if (in.opcode == 0x02) return true;   // s_cmovk_i32: conditional move ON SCC
-                break;
-            default: break;
-        }
-    }
-    return false;
+    return rdna2_program_reads_scc(ins);
 }
 
 // FRAGMENT alpha-test / clip() discard via a SCALAR BRANCH. A per-lane condition (v_cmp -> VCC) is folded

@@ -3310,6 +3310,7 @@ if(TARGET prosper_core)
   # cases can be checked without a renderer/core build or a potentially unsafe GPU dispatch.
   prosper_add_gtest(test_workgroup_uniformity
     SOURCES tests/gpu/test_workgroup_uniformity.cpp src/gpu/recompiler/rdna2_decode.cpp
+            src/gpu/recompiler/rdna2_instruction_effects.cpp
     INCLUDES src)
 
   # ADR 0028: compute cross-lane operation inventory and Wave64 route selection (CPU only).
@@ -3532,6 +3533,12 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_rdna2_predicate_tables.cpp
     LIBRARIES prosper_core)
 
+  # The shared instruction-effects table (#5146): every decodable scalar opcode has an entry, the
+  # named ones match llvm-mc gfx1030, and the old private lists' bugs stay fixed.
+  prosper_add_gtest(test_rdna2_instruction_effects
+    SOURCES tests/gpu/recompiler/test_rdna2_instruction_effects.cpp
+    LIBRARIES prosper_core)
+
   # Exhaustive per-family opcode/length sweep of the walker (words built from the encoding layout).
   prosper_add_gtest(test_rdna2_decode_sweep
     SOURCES tests/gpu/recompiler/test_rdna2_decode_sweep.cpp
@@ -3556,6 +3563,7 @@ if(TARGET prosper_core)
   # SOP2 destination widths are decoder-only facts checked against LLVM's SOP2 classes.
   prosper_add_gtest(test_sop2_dest_width
     SOURCES tests/gpu/recompiler/test_sop2_dest_width.cpp src/gpu/recompiler/rdna2_decode.cpp
+            src/gpu/recompiler/rdna2_instruction_effects.cpp
     INCLUDES src)
 
   # Mandatory-literal capture is a decoder-only fact: K/data must be captured, not just counted.
@@ -3846,16 +3854,19 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_raw_wide_flat_read_effects
     SOURCES tests/gpu/recompiler/test_raw_wide_flat_read_effects.cpp
             src/gpu/recompiler/rdna2_decode.cpp
+            src/gpu/recompiler/rdna2_instruction_effects.cpp
             src/gpu/recompiler/rdna2_raw_wide_data.cpp
     INCLUDES src)
   prosper_add_gtest(test_raw_wide_vop3_source_width
     SOURCES tests/gpu/recompiler/test_raw_wide_vop3_source_width.cpp
             src/gpu/recompiler/rdna2_decode.cpp
+            src/gpu/recompiler/rdna2_instruction_effects.cpp
             src/gpu/recompiler/rdna2_raw_wide_data.cpp
     INCLUDES src)
   prosper_add_gtest(test_raw_wide_replayed_load
     SOURCES tests/gpu/recompiler/test_raw_wide_replayed_load.cpp
             src/gpu/recompiler/rdna2_decode.cpp
+            src/gpu/recompiler/rdna2_instruction_effects.cpp
             src/gpu/recompiler/rdna2_raw_wide_data.cpp
     INCLUDES src)
   prosper_add_gtest(test_raw_wide_disjoint_paths
@@ -3864,6 +3875,7 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_raw_wide_loop_after_load
     SOURCES tests/gpu/recompiler/test_raw_wide_loop_after_load.cpp
             src/gpu/recompiler/rdna2_decode.cpp
+            src/gpu/recompiler/rdna2_instruction_effects.cpp
             src/gpu/recompiler/rdna2_raw_wide_data.cpp
     INCLUDES src)
   prosper_add_gtest(test_graphics_raw_register_wide_data

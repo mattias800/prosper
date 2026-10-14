@@ -19,6 +19,7 @@
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
@@ -3409,14 +3410,12 @@ inline uint64_t blanket_root(uint32_t header_pc, int r) {
 }
 
 // Explicit SCC is a numeric 0/1 source in any decoded operand role; scalar condition/carry
-// instructions also consume it implicitly. Keep emission marks and CFG relay inventory aligned.
+// instructions also consume it implicitly (s_cselect, s_addc/s_subb, s_cmov, s_cmovk -- the
+// instruction-effects table owns that list). An SCC branch is not a data read and is not reported.
+// A reserved or unknown scalar opcode IS reported: callers use this to demand a defined SCC.
 inline bool scalar_reads_scc(const Rdna2Inst& in) {
-    for (uint32_t source = 0; source < in.n_src; ++source)
-        if (in.src[source].kind == OperandKind::Special && in.src[source].value == 253) return true;
-    return (in.fmt == Rdna2Format::SOP2 &&
-            (in.opcode == 0x04 || in.opcode == 0x05 || in.opcode == 0x0a || in.opcode == 0x0b)) ||
-           (in.fmt == Rdna2Format::SOP1 && (in.opcode == 0x05 || in.opcode == 0x06)) ||
-           (in.fmt == Rdna2Format::SOPK && in.opcode == 0x02);
+    return rdna2_operand_reads_scc(in) ||
+           rdna2_reads_scc_as_data(in.fmt, in.opcode) != Rdna2Answer::No;
 }
 
 // scalar_source_marks() lives in rdna2_cfg_support.hpp, beside the width inventories it reads.
@@ -3728,9 +3727,10 @@ inline void expire_saved_b64_mask(RegState& rs, const SavedB64MaskSnapshot& befo
 inline bool sopk_writes_scalar_data(uint32_t opcode) {
     // GFX10 SOPK encodes both read-only compares/waits/register-mode operations and genuine SGPR
     // destinations in the same SDST field. Keep the distinction central so CFG/provenance scans do
-    // not mistake s_cmpk's source register for a redefinition.
-    return opcode == 0x00 || opcode == 0x02 || opcode == 0x0F ||
-           opcode == 0x10 || opcode == 0x12;
+    // not mistake s_cmpk's source register for a redefinition. The instruction-effects table owns
+    // the answer; an encoding it does not know is reported as a writer.
+    const Rdna2InstructionEffects& effects = rdna2_instruction_effects(Rdna2Format::SOPK, opcode);
+    return !effects.known() || effects.sdst_dwords != 0;
 }
 uint32_t scalar_write_width(const Rdna2Inst& in);
 bool rdna2_may_write_guest_memory(const Rdna2Inst& in);
@@ -3757,26 +3757,14 @@ inline bool vop3_writes_mask_sdst(const Rdna2Inst& in) {
 inline uint32_t scalar_write_width(const Rdna2Inst& in) {
     switch (in.fmt) {
         case Rdna2Format::SOP1:
-            if (in.opcode == 0x20) return 0; // s_setpc_b64 reads its decoded "dst" field.
-            switch (in.opcode) {
-                case kSop1OpcodeCmovB64: // both words may change even though the write is conditional
-                case kSop1OpcodeMovrelsB64:   // D = SGPR[src + M0], a pair like any B64 move
-                case 0x04: case 0x08: case 0x0a: case 0x1f: case 0x2d:
-                case 0x24: case 0x25: case 0x26: case 0x27:
-                case 0x28: case 0x29: case 0x2a: case 0x2b:
-                case 0x37: case 0x38: case 0x3b:
-                    return 2; // B64 data/mask writes
-                default: return 1;
-            }
         case Rdna2Format::SOP2:
-            switch (in.opcode) {
-                case 0x0b: case 0x0f: case 0x11: case 0x13: case 0x15:
-                case 0x17: case 0x19: case 0x1b: case 0x1d:
-                case 0x1f: case 0x21: case 0x25: case 0x29:
-                    return 2; // B64 data/mask writes
-                default: return 1;
-            }
-        case Rdna2Format::SOPK: return sopk_writes_scalar_data(in.opcode) ? 1u : 0u;
+        case Rdna2Format::SOPK: {
+            // The instruction-effects table owns the scalar ALU destination widths (a conditional
+            // s_cmov_b64 still counts both words). An encoding it does not know is charged a pair,
+            // the widest scalar ALU destination.
+            const Rdna2InstructionEffects& effects = rdna2_instruction_effects(in);
+            return effects.known() ? effects.sdst_dwords : 2u;
+        }
         case Rdna2Format::SMEM:
             switch (in.opcode) {
                 case 0x0: case 0x8: return 1;
@@ -3786,8 +3774,8 @@ inline uint32_t scalar_write_width(const Rdna2Inst& in) {
                 case 0x4: case 0xc: return 16;
                 default: return 0;
             }
-        case Rdna2Format::VOP1: return in.opcode == 0x02 ? 1u : 0u; // v_readfirstlane
-        case Rdna2Format::VOP3: return in.opcode == 0x360 ? 1u : 0u; // v_readlane
+        case Rdna2Format::VOP1:
+        case Rdna2Format::VOP3: return rdna2_lane_read_writes_sgpr(in) ? 1u : 0u;
         default: return 0;
     }
 }
