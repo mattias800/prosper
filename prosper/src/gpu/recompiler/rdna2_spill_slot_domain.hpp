@@ -63,10 +63,13 @@ bool spill_source_is_scalar_data(const Rdna2Inst& in, const std::set<int>& masks
 // V_READLANE retypes its destination in `sets`: a data reload stays a scalar word, a mask reload
 // becomes a mask and no scalar word, and a reload that is a mask on some paths becomes ambiguous,
 // so its first read is refused. Adds each V_WRITELANE that stores a mask to `mask_writelane_pcs`
-// when it is given.
+// when it is given. `proven_half_reload` marks a V_READLANE the caller proved reloads one known
+// half of a saved-mask instance from a MaskLo/MaskHi slot: emit_alu publishes its exact ballot
+// word, exactly as for a `proven_half_readlane_pcs` site, so its destination is not retyped.
 void advance_spill_slot_domains(SpillSlotDomains& state, const Rdna2Inst& in,
                                 const SpillSlotMustSets& sets, const SpillSlotContext& context,
                                 const std::vector<int>& vector_writes,
-                                std::unordered_set<uint32_t>* mask_writelane_pcs);
+                                std::unordered_set<uint32_t>* mask_writelane_pcs,
+                                bool proven_half_reload = false);
 
 }   // namespace prosper::gpu

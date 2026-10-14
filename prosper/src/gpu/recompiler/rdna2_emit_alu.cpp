@@ -4279,6 +4279,22 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     }
                     mask_value = half->second;
                     mask_source = true;
+                } else if (in.src[0].kind == OperandKind::SGPR && in.src[0].value > 0 &&
+                           b.wave64_mask_high_half_writelane_pcs.contains(in.pc) &&
+                           !saved_mask_spill_uses_data(rs, in.src[0].value)) {
+                    // The HIGH dword of a MUST saved-mask pair with no retained physical word
+                    // (SpillSlotDomain::MaskHi, proven by the dispatcher). Its value is the upper
+                    // ballot word of the pair's Bool, so the slot stores that Bool; a reload the
+                    // dispatcher proves is this half (wave64_mask_readlane_half_for_pc) takes the
+                    // upper ballot word and, beside the low half, rebuilds the pair. Without the
+                    // Bool there is nothing exact to store: refuse rather than spill a placeholder.
+                    const int root = in.src[0].value - 1;
+                    const auto saved = rs.sreg_bool.find(root);
+                    if (saved == rs.sreg_bool.end() || rs.sreg_bool_b32.contains(root)) {
+                        ok = false; return true;
+                    }
+                    mask_value = saved->second;
+                    mask_source = true;
                 } else if (in.src[0].value == 126 || in.src[0].value == 127) {
                     mask_value = rs.exec; mask_source = true;
                 } else if ((in.src[0].value == 106 || in.src[0].value == 107) &&

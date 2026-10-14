@@ -202,6 +202,8 @@ bool is_native_b64_logical(const SpirvCompute& b, const Rdna2Inst& in) {
 namespace {
 struct LogicalDataDemand {
     std::set<uint32_t> logical_data, native_copies, fragment_copies, fragment_survivors;
+    // Logical results whose DATA something other than a mask-half spill reads.
+    std::set<uint32_t> logical_data_beyond_mask_spills;
     std::set<uint32_t> fragment_saved_masks, ngg_copies;
 };
 
@@ -362,6 +364,7 @@ LogicalDataDemand analyze_logical_data_demand(const SpirvCompute& b,
             }
         }
     }
+    std::vector<int> spill_read(count, -1);
     for (size_t i = 0; i < count; ++i) {
         const auto& in = original[i];
         if (rdna2_escapes_decoded_effects(in) || in.fmt == Rdna2Format::Unknown) {
@@ -423,6 +426,21 @@ LogicalDataDemand analyze_logical_data_demand(const SpirvCompute& b,
               condition.value <= 105) ||
              ((condition.kind == OperandKind::SGPR || condition.kind == OperandKind::Special) &&
               condition.value == 106));
+        // A constant-lane V_WRITELANE of either dword of a MUST saved-mask pair, in exact native
+        // Wave64 compute. When its producer cannot supply physical words, emit_alu spills the pair's
+        // Bool instead (MaskLo/MaskHi slots) and a reload proven to be that half publishes its own
+        // ballot word, so such a spill alone does not demand the producer's DATA. Recorded here and
+        // excluded only from the second liveness run below.
+        const bool mask_half_spill =
+            b.is_compute && !b.is_fragment_packet() && b.wave_size == 64 &&
+            b.native_subgroup_size == 64 && !closed_copy_domain(b) && in.fmt == Rdna2Format::VOP3 &&
+            in.opcode == 0x361 && in.src[0].kind == OperandKind::SGPR &&
+            in.src[1].kind == OperandKind::InlineInt && in.src[1].value >= 0 &&
+            in.src[1].value <= 63 &&
+            ((in.src[0].value <= 104 && masks_before[i].test(in.src[0].value)) ||
+             (in.src[0].value >= 1 && in.src[0].value <= 105 &&
+              masks_before[i].test(in.src[0].value - 1)));
+        if (mask_half_spill) spill_read[i] = in.src[0].value;
         for (uint32_t source = 0; source < in.n_src; ++source) {
             if ((source == 0 && mbcnt_mask) || (source == 2 && cndmask_mask)) continue;
             const auto& operand = in.src[source];
@@ -445,36 +463,55 @@ LogicalDataDemand analyze_logical_data_demand(const SpirvCompute& b,
         }
         mark(reads[i], in.dst.value, scalar_implicit_destination_read_width(in));
     }
-    std::deque<size_t> pending;
-    std::vector<bool> queued(count, true);
-    for (size_t i = count; i-- > 0;) pending.push_back(i);
-    while (!pending.empty()) {
-        const size_t i = pending.front();
-        pending.pop_front();
-        queued[i] = false;
-        Words out;
-        for (size_t next : successors[i]) out |= before[next];
-        after[i] = out;
-        Words value = (out & ~kills[i]) | reads[i];
-        const auto& in = original[i];
-        if (relays[i] && (out & kills[i]).any()) {
-            if (saveexec(in))
-                mark(value, 126, 2);   // saved DATA is OLD EXEC, independent of the new source
-            else
-                for (uint32_t source = 0; source < in.n_src; ++source) {
-                    const auto& operand = in.src[source];
-                    if (operand.kind == OperandKind::SGPR || operand.kind == OperandKind::Special)
-                        mark(value, operand.value, 2);
+    const auto liveness = [&](const std::vector<Words>& reads, std::vector<Words>& before,
+                              std::vector<Words>& after) {
+        std::deque<size_t> pending;
+        std::vector<bool> queued(count, true);
+        for (size_t i = count; i-- > 0;) pending.push_back(i);
+        while (!pending.empty()) {
+            const size_t i = pending.front();
+            pending.pop_front();
+            queued[i] = false;
+            Words out;
+            for (size_t next : successors[i]) out |= before[next];
+            after[i] = out;
+            Words value = (out & ~kills[i]) | reads[i];
+            const auto& in = original[i];
+            if (relays[i] && (out & kills[i]).any()) {
+                if (saveexec(in))
+                    mark(value, 126, 2);   // saved DATA is OLD EXEC, independent of the new source
+                else
+                    for (uint32_t source = 0; source < in.n_src; ++source) {
+                        const auto& operand = in.src[source];
+                        if (operand.kind == OperandKind::SGPR ||
+                            operand.kind == OperandKind::Special)
+                            mark(value, operand.value, 2);
+                    }
+            }
+            if (value == before[i]) continue;
+            before[i] = value;
+            for (size_t previous : predecessors[i])
+                if (!queued[previous]) {
+                    queued[previous] = true;
+                    pending.push_back(previous);
                 }
         }
-        if (value == before[i]) continue;
-        before[i] = value;
-        for (size_t previous : predecessors[i])
-            if (!queued[previous]) {
-                queued[previous] = true;
-                pending.push_back(previous);
-            }
-    }
+    };
+    liveness(reads, before, after);
+    // The same liveness with the mask-half spills' reads removed. A logical whose DATA is live only
+    // here is demanded by something other than such a spill; one live only in the first run is
+    // demanded solely by mask-half spills (native_logical_data_demanded).
+    std::vector<Words> spill_free_reads = reads, spill_free_before(count), spill_free_after(count);
+    bool any_mask_half_spill = false;
+    for (size_t i = 0; i < count; ++i)
+        if (spill_read[i] >= 0) {
+            spill_free_reads[i].reset(static_cast<size_t>(spill_read[i]));
+            any_mask_half_spill = true;
+        }
+    if (any_mask_half_spill)
+        liveness(spill_free_reads, spill_free_before, spill_free_after);
+    else
+        spill_free_after = after;
     for (size_t i = 0; i < count; ++i) {
         // CONFIDENCE: HIGH -- this reuses the same original CFG's backward MAY DATA liveness
         // and instruction-order MUST mask domains. It withholds representation only; it grants
@@ -493,9 +530,11 @@ LogicalDataDemand analyze_logical_data_demand(const SpirvCompute& b,
             mask_source(masks_before[i], in.src[0], in) &&
             mask_source(masks_before[i], in.src[1], in))
             result.fragment_survivors.insert(in.pc);
-        if (is_native_b64_logical(b, original[i]) && (after[i] & kills[i]).any())
+        if (is_native_b64_logical(b, original[i]) && (after[i] & kills[i]).any()) {
             result.logical_data.insert(original[i].pc);
-        else if (native_vcc_copy(b, original[i]) && relays[i] && !(after[i] & kills[i]).any())
+            if ((spill_free_after[i] & kills[i]).any())
+                result.logical_data_beyond_mask_spills.insert(original[i].pc);
+        } else if (native_vcc_copy(b, original[i]) && relays[i] && !(after[i] & kills[i]).any())
             result.native_copies.insert(original[i].pc);
         else if (fragment_vcc_copy(b, original[i]) && relays[i] && !(after[i] & kills[i]).any())
             result.fragment_copies.insert(original[i].pc);
@@ -518,6 +557,9 @@ void initialize_native_logical_data_demand(SpirvCompute& b, const std::vector<Rd
         initial ? initial->sreg_bool_b32 : std::unordered_set<int>{};
     const auto result = analyze_logical_data_demand(b, original, initial);
     b.native_logical_data_demand_pcs.insert(result.logical_data.begin(), result.logical_data.end());
+    b.native_logical_data_beyond_mask_spill_pcs.insert(
+        result.logical_data_beyond_mask_spills.begin(),
+        result.logical_data_beyond_mask_spills.end());
     b.native_bool_only_vcc_copy_pcs = result.native_copies;
     b.fragment_bool_only_vcc_copy_pcs = result.fragment_copies;
     b.fragment_bool_only_saved_mask_pcs = result.fragment_saved_masks;
@@ -616,6 +658,12 @@ bool native_logical_producer_has_full_participation(const SpirvCompute& b, const
 bool native_logical_data_demanded(const SpirvCompute& b, const Rdna2Inst& in) {
     if (!b.native_logical_data_demand_pcs.contains(in.pc) ||
         in.pc >= b.saved_mask_original_words.size())
+        return false;
+    // DATA read only by mask-half spills is not demanded from a producer that cannot ballot it:
+    // those spills then store the pair's Bool, and each proven reload publishes its own word
+    // (#5175). A participating producer keeps supplying the words it always did.
+    if (!b.native_logical_data_beyond_mask_spill_pcs.contains(in.pc) &&
+        !native_logical_producer_has_full_participation(b, in))
         return false;
     auto original = rdna2_decode_one(b.saved_mask_original_words.data() + in.pc,
                                      b.saved_mask_original_words.size() - in.pc);
