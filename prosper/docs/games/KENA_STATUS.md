@@ -1139,6 +1139,16 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
 
 ## Ruled out
 
+- **Cause 2 of the #5026 black title (`ps 0x500b3d0000` refused at
+  `structured-saved-mask-domain-missing-edge pc=1531 merge=1629 s106`) needs a liveness-aware
+  merge or a new scalar-only VCC proof** — false on `main` since #5150. The structured join
+  already lets a word dead at the merge go missing on an edge. The refusal came from
+  `v_max3_f32 v, lit, vcc_lo, v` after the merge, whose VCC_LO source was charged a VCC *pair*:
+  that failed the scalar-only proof for the arm's VCC CSELECTs and, through them, the join's
+  VCC_HI liveness. The live inputs replay rejected on #5149 `b119257a5` and `ok` on #5157
+  `1a36a45e7` (#5150 plus a pure out-of-line move) and on `bd607818e`. A local guard-off build
+  of `bd607818e` shows the world on every even present (18/18) and noise on every odd one
+  (11/11), with no `500b3d0000` refusal. Tests pin the shape (#5168, 2026-10-14).
 - **The shortest retained compute refusal needs a new FORMAT-store opcode route** — false for
   the #5140 input. Its original selected route is structured, and a copied-choice diagnostic using
   the existing exact dispatcher emits the ordinary FORMAT loads and stores. That diagnostic changes
