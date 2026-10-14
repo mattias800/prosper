@@ -3539,11 +3539,12 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_rdna2_instruction_effects.cpp
     LIBRARIES prosper_core)
 
-  # Link only the defining module: another core object must not accidentally supply a weak
-  # inline copy of the declaration-only ALU helper (#5153).
+  # Link only the helper and its table dependency: another core object must not accidentally
+  # supply a weak inline copy of the declaration-only ALU helper (#5153).
   prosper_add_gtest(test_scalar_alu_width_linkage
     SOURCES tests/gpu/recompiler/test_scalar_alu_width_linkage.cpp
             src/gpu/recompiler/rdna2_instruction_effects.cpp
+            src/gpu/recompiler/rdna2_scalar_source_words.cpp
     INCLUDES src)
 
   # Exhaustive per-family opcode/length sweep of the walker (words built from the encoding layout).

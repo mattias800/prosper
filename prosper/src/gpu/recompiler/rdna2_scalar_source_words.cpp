@@ -39,8 +39,9 @@ uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
         case Rdna2Format::VOP3: {
             // Every VALU source width comes from the instruction-effects table, derived from the
             // ISA (70648 12.7-12.12) and checked against llvm-mc: a B32 operand is one SGPR, an
-            // F64/I64/U64/B64 operand a pair, and a lane mask (SRC2 of v_cndmask_b32, the
-            // carry-in forms and v_mad_u64_u32) the Wave64 pair. It replaces an allowlist of B32
+            // F64/I64/U64/B64 operand a pair, and a lane mask (SRC2 of v_cndmask_b32 and the
+            // carry-in forms) the Wave64 pair. The MAD_U64/I64 SRC2 is a numeric addend pair.
+            // It replaces an allowlist of B32
             // VOP3 opcodes over a "two dwords" default, extended one opcode at a time as titles
             // were refused (V_LSHL_ADD_U32 #2790, V_MUL_LO/HI_U32 #2952, V_MED3_F32 #4429,
             // V_BFE_U32 #4848, V_BCNT_U32_B32 #5148): every B32 form outside that list charged a
@@ -56,4 +57,5 @@ uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
         default: return 0;
     }
 }
+
 }   // namespace prosper::gpu
