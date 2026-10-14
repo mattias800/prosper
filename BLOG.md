@@ -19,6 +19,16 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-10-15
+
+### Kena's title world no longer flickers to noise on every other frame
+
+One skipped compute dispatch caused the flicker. The world now holds on every frame, and the sun shafts and haze are back with it. These captures use a local build with the separate fresh-mask guard switched off, because the default build is still black ([#5175](https://github.com/mattias800/prosper/issues/5175)).
+
+<p align="center"><img src="assets/screenshots/issue-5175-kena-title-after.webp" alt="Kena: Bridge of Spirits title menu over the sunlit forest shrine with light shafts; Linux RADV prosper-app, local build with the fresh-mask guard off, pad flip 231"></p>
+<p align="center"><img src="assets/screenshots/issue-5175-kena-title-after-consecutive.webp" alt="Eight consecutive frames, pad flips 230 to 237, all showing the same lit world under the menu"></p>
+<p align="center"><img src="assets/screenshots/issue-5175-kena-title-before-burst.webp" alt="Before: eight consecutive presents from the same local main build, flips 177 to 184, alternating full-screen noise and the world"></p>
+
 ## 2026-10-14
 
 ### Kena's title world is back underneath its remaining black-screen cause

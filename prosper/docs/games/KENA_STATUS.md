@@ -9,6 +9,28 @@ Unreal Engine 4 (Ember Lab), one 28.5 GB `kena-ps5.pak` (no IoStore), Wwise, SDK
 [#3787](https://github.com/mattias800/prosper/issues/3787). Brought up on Windows 11 / RTX 4090;
 Linux/AMD title-menu investigations are recorded below.
 
+## The even/odd title flicker was one skipped compute dispatch (2026-10-15, #5175)
+
+The flicker underneath the black title (#5026): every even present showed the world and every odd one full-screen noise.
+
+- **Cause.** `cs 0x5008e80000` (18x10x64 groups, 8x8x1) was refused since #4890, and its dispatch was skipped every frame.
+- **Causal A/B, same binary.** The #5026 good bracket `0a53e2a1f` is stable across both parities. With `PROSPER_COMPUTE_SKIP_PROGRAM=0x5008e80000` it flickers: even 9/9 world, odd 5/5 noise.
+- **Hypothesis, not verified.** The dispatch writes one half of a per-frame ping-pong pair. The grid shape fits a froxel volume with temporal history, and the fix also brings back the sun shafts and haze.
+- **Why it was refused.** The terminal line, `unresolved-operand pc=29` (`s_cbranch_vccz`), is the straight-line fallback's. The real refusal came from the CFG dispatcher:
+  - A lane-varying compare (pc350) or B64 logical (pc300/301) writes an SGPR pair.
+  - Both halves are spilled with `v_writelane`, reloaded with `v_readlane`, and the pair is consumed as a mask (`s_and_b64 vcc, exec, s[14:15]` at pc782, `s_mov_b64 exec, s[0:1]` at pc1791).
+  - The producers have no physical-participation proof (an early scalar spill at pc14, and a VOPC-driven `vccz` at pc29), so the pair's words never exist.
+  - The high-half spill was therefore refused, and so was the logical whose words only that spill read.
+- **Fix.** A refused exact native Wave64 program is retried once. The retry spills each half as the pair's Bool (the high half as a `MaskHi` slot) and reloads it as a proven half, the same route an EXEC half takes.
+- **Kena before/after.** Linux RADV, visible `prosper-app`, 110 s, fresh saves, no input, with #4949's fresh-mask guard switched off locally:
+
+  | measure | before | after |
+  |---|---|---|
+  | `frame-flicker` alarm | fired in 12 of 23 windows | silent in 22/22 and 18/18 windows |
+  | frames flagged by the per-frame trace | 250 of 366 | 0 of 336, then 0 of 332 |
+  | snapped frames | 48 world / 48 noise, by parity | 64/64 world |
+  | refused programs | 3 | 2 (`cs 0x50071e0000`, `vs 0x5009400000`) |
+
 ## Why the same program was refused in one run and admitted in the next: two mechanisms (2026-10-09, #4796)
 
 Measured on Linux/RADV with `prosper-app` in a visible window, `PROSPER_NULL_PAGE=1`, and
@@ -1138,6 +1160,11 @@ in 5 down 5-10 s in with `0xC0000005` and nothing in stderr — item 5.
    12 with the ordering removed. Shared code: any UE4 title using this listener.
 
 ## Ruled out
+
+- **`ps 0x5009360000` (the #5026 bisect's second flicker suspect) causes the title flicker**: false. Main stopped refusing it and still flickered. Skipping `cs 0x5008e80000` alone on the stable good bracket reproduces the flicker (#5175, 2026-10-15).
+- **The flicker also needs `cs 0x50071e0000` (`loop exit cannot name VCC`)**: false. With only `cs 0x5008e80000` admitted, 64/64 snapped frames show the world while `0x50071e0000` stays refused (#5175).
+- **`cs 0x5008e80000` refuses at `s_cbranch_vccz pc=29` on an SDWA scalar compare**: wrong instruction. That is the straight-line fallback's terminal line. The dispatcher's refusal is `wave64-ambiguous-mask-read pc=782`, then `native-logical-data-words-unavailable pc=300` (`PROSPER_DBG=1`, #5175).
+- **Letting `v_writelane` keep the native participation proof would supply pc300's words**: false. A local switch skipping that `common` kill still refuses at pc300 (#5175).
 
 - **Cause 2 of the #5026 black title (`ps 0x500b3d0000` refused at
   `structured-saved-mask-domain-missing-edge pc=1531 merge=1629 s106`) needs a liveness-aware
