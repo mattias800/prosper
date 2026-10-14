@@ -1,8 +1,8 @@
 // test_launch_vgprs: the VGPRs a guest wave starts with (#5146).
 //
 // The fresh-mask guard (#4943) refuses a predicate formed from a VGPR that no instruction and no
-// launch value defined. That is right for a never-written register and wrong for one the hardware
-// loads at launch, so the recompiler must treat as defined EXACTLY the launch words it supplies:
+// launch value defined. A hardware launch value can supply DATA only where this backend actually
+// binds it; an unsupplied word stays unavailable. The inventory records that same binding contract:
 //   - compute: v0..v2 thread ids, as COMPUTE_PGM_RSRC2.TIDIG_COMP_CNT enables them;
 //   - pixel: the SPI_PS_INPUT_ENA/ADDR fields, packed in field order, ADDR reserving widths.
 // Each accepted arm below has a refused twin that differs only in the launch contract, so neither

@@ -23,7 +23,7 @@ namespace prosper::gpu {
 enum class LaunchVgprState : uint8_t {
     // ADDR reserves the slot but ENA is clear: hardware loads nothing into it.
     Reserved,
-    // Hardware loads the word, but this backend has no value for it. An ALU read is refused.
+    // Hardware loads the word, but this backend has no value for it. A fresh predicate is refused.
     Unsupplied,
     // Hardware loads the word and the stage shell binds the same value.
     Supplied,
