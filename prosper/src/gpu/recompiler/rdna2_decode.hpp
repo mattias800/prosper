@@ -411,11 +411,10 @@ bool rdna2_mimg_reads_sampler(const Rdna2Inst& in);
 // branch target outside `code[0, dwords)`, an unknown encoding, a back-edge into the body or a
 // fall-through that does not land on a decoded instruction. `code` is the live stream, not the prefix.
 bool rdna2_append_closed_tail_blocks(const uint32_t* code, size_t dwords, std::vector<Rdna2Inst>& full);
-// Number of consecutive SGPRs an SOP2 instruction writes through its SDST: 1 for the opcodes
-// positively known to produce a 32-bit result (add/sub/min/max/cselect/bit-logic/shift/bfm/mul/bfe
-// in their b32/u32/i32 forms), 2 for everything else. FAIL-CLOSED: an opcode not listed here
-// (every 64-bit form, and anything unknown) is treated as a pair write, so the result can only
-// over-approximate which registers an instruction may clobber. SCC is not an SGPR and is not counted.
+// Number of consecutive SGPRs an SOP2 instruction writes through its SDST, from the
+// instruction-effects table (defined in rdna2_instruction_effects.cpp). FAIL-CLOSED: a reserved or
+// unknown opcode is treated as a pair write, so the result can only over-approximate which
+// registers an instruction may clobber. SCC is not an SGPR and is not counted.
 uint32_t rdna2_sop2_dest_dwords(uint32_t opcode);
 // Number of consecutive data VGPRs an instruction writes from its decoded destination. This
 // inventory is shared by control-flow analyses and instruction-scoped value proofs so scalar VALU

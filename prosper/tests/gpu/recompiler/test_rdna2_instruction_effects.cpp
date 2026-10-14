@@ -19,7 +19,11 @@
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 
 #include "gpu/recompiler/indirect/rdna2_indirect_scalar_writes.hpp"
+#include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/rdna2_dead_wave_masks.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_scalar_condition_marks.hpp"
+#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
 #include <gtest/gtest.h>
 
@@ -459,4 +463,126 @@ TEST(Rdna2InstructionEffectsRegression, ConservativeWidthChargesEveryPairDestina
     carry.sdst = {OperandKind::SGPR, 4};
     EXPECT_FALSE(scalar_range_unchanged({carry}, 1u, 3u, 5u, 1u, IndirectWave::Wave64));
     EXPECT_TRUE(scalar_range_unchanged({carry}, 1u, 3u, 5u, 1u, IndirectWave::Wave32));
+}
+
+// rdna2_recompile_fragment.cpp's shader_reads_scc listed SOP1 0x02/0x03 as s_cmov. 0x03 is
+// s_mov_b32 and 0x02 is reserved; s_cmov_b32/b64 are 0x05/0x06. Nearly every shader contains an
+// s_mov_b32, so the scan said "reads SCC" for almost everything (paying a wave vote it did not need)
+// and missed a shader whose only reader was an s_cmov. It also ignored an explicit SCC operand.
+TEST(Rdna2InstructionEffectsRegression, ProgramReadsSccRecognisesCmovNotMov) {
+    EXPECT_FALSE(rdna2_program_reads_scc({decode(Rdna2Format::SOP1, kSop1OpcodeMovB32)}))
+        << "s_mov_b32 does not read SCC (the old scan said it did)";
+    EXPECT_TRUE(rdna2_program_reads_scc({decode(Rdna2Format::SOP1, kSop1OpcodeCmovB32)}))
+        << "s_cmov_b32 reads SCC (the old scan missed it)";
+    EXPECT_TRUE(rdna2_program_reads_scc({decode(Rdna2Format::SOP1, kSop1OpcodeCmovB64)}));
+    EXPECT_TRUE(rdna2_program_reads_scc({decode(Rdna2Format::SOP1, kSop1OpcodeMovB32, 253u)}))
+        << "s_mov_b32 s4, scc reads SCC through its operand";
+    EXPECT_TRUE(rdna2_program_reads_scc({decode(Rdna2Format::SOPP, kSoppOpcodeCbranchScc0)}));
+    EXPECT_FALSE(rdna2_program_reads_scc({decode(Rdna2Format::SOPP, kSoppOpcodeCbranchExecz)}));
+}
+
+// dead_wave_mask_writes elides a dead `s_and_b64 vcc, ...` only when nothing reads SCC, because the
+// elided instruction also produces SCC. Its private reader list ignored an explicit SCC operand, so
+// a program reading SCC through `s_mov_b32 sN, scc` lost the SCC its mask op computed.
+TEST(Rdna2InstructionEffectsRegression, DeadWaveMaskElisionSeesAnSccOperandReader) {
+    // s_and_b64 vcc, s[0:1], vcc ; s_mov_b32 s2, scc ; s_endpgm
+    const uint32_t code[] = {0x80000000u | (0x0fu << 23) | (106u << 16) | (106u << 8) | 0u,
+                             0xBE800000u | (2u << 16) | (kSop1OpcodeMovB32 << 8) | 253u,
+                             0xBF810000u};
+    std::vector<Rdna2Inst> ins;
+    rdna2_walk(code, std::size(code), ins);
+    ASSERT_EQ(ins.size(), 3u);
+    ASSERT_EQ(ins[0].fmt, Rdna2Format::SOP2);
+    ASSERT_EQ(ins[1].src[0].value, 253);
+    EXPECT_TRUE(dead_wave_mask_writes(ins).empty())
+        << "the mask op's SCC is read, so it must not be elided";
+    // Positive control: without the SCC read the same mask op is dead and elided.
+    std::vector<Rdna2Inst> no_reader = {ins[0], ins[2]};
+    no_reader[1].pc = ins[0].pc + ins[0].len_dwords;
+    EXPECT_EQ(dead_wave_mask_writes(no_reader).count(ins[0].pc), 1u);
+}
+
+// scalar_write_width answered one SGPR for these 64-bit destinations (and for s_rfe_b64, which
+// writes none), so liveness and provenance believed the high word survived.
+TEST(Rdna2InstructionEffectsRegression, ScalarWriteWidthCountsEveryPairDestination) {
+    struct Case {
+        Rdna2Format fmt;
+        uint32_t op;
+        uint32_t width;
+        const char* name;
+    };
+    const Case cases[] = {
+        {Rdna2Format::SOP2, 0x23, 2, "s_ashr_i64"},
+        {Rdna2Format::SOP2, 0x2a, 2, "s_bfe_i64"},
+        {Rdna2Format::SOP1, 0x0c, 2, "s_brev_b64"},
+        {Rdna2Format::SOP1, 0x1c, 2, "s_bitset0_b64"},
+        {Rdna2Format::SOP1, 0x1e, 2, "s_bitset1_b64"},
+        {Rdna2Format::SOP1, 0x21, 2, "s_swappc_b64"},
+        {Rdna2Format::SOP1, 0x31, 2, "s_movreld_b64"},
+        {Rdna2Format::SOP1, 0x39, 2, "s_andn1_wrexec_b64"},
+        {Rdna2Format::SOP1, 0x3a, 2, "s_andn2_wrexec_b64"},
+        {Rdna2Format::SOP1, 0x22, 0, "s_rfe_b64"},
+        {Rdna2Format::SOPK, 0x16, 2, "s_call_b64"},
+        {Rdna2Format::SOPK, 0x1b, 1, "s_subvector_loop_begin"},
+    };
+    for (const Case& c : cases) {
+        const Rdna2Inst in = decode(c.fmt, c.op);
+        EXPECT_EQ(scalar_write_width(in), c.width) << c.name;
+    }
+    EXPECT_TRUE(sopk_writes_scalar_data(0x16)) << "s_call_b64 writes its return address";
+}
+
+// rdna2_sop2_dest_dwords reported a pair for every B32 opcode past 0x28, so an analysis believed
+// s_lshl2_add_u32 s4 also clobbered s5. scalar_write_width said one dword for the same opcodes.
+TEST(Rdna2InstructionEffectsRegression, Sop2DestDwordsAgreesWithScalarWriteWidth) {
+    for (const LlvmOpcode& entry : kLlvmSop2)
+        EXPECT_EQ(rdna2_sop2_dest_dwords(entry.opcode),
+                  scalar_write_width(decode(Rdna2Format::SOP2, entry.opcode)))
+            << entry.name;
+    EXPECT_EQ(rdna2_sop2_dest_dwords(0x2f), 1u) << "s_lshl2_add_u32";
+    EXPECT_EQ(rdna2_sop2_dest_dwords(0x0c), 2u) << "a reserved opcode fails closed to a pair";
+}
+
+// scalar_instruction_preserves_scc answered "unknown" for SOP1 forms the ISA says leave SCC alone
+// (Table 14: "Sets SCC? n"), which cost the Wave32 SCC provenance a refresh it was entitled to.
+TEST(Rdna2InstructionEffectsRegression, SccPreservationCoversEveryNonWritingSop1) {
+    for (uint32_t op : {0x0cu, 0x11u, 0x12u, 0x17u, 0x18u, 0x19u, 0x1au, 0x1cu, 0x1eu, 0x2fu, 0x30u,
+                        0x31u, 0x49u}) {
+        const Rdna2Inst in = decode(Rdna2Format::SOP1, op);
+        EXPECT_TRUE(scalar_instruction_preserves_scc(in)) << "SOP1 op=0x" << std::hex << op;
+        EXPECT_FALSE(scalar_instruction_writes_scc(in)) << "SOP1 op=0x" << std::hex << op;
+    }
+    // A reserved encoding is neither.
+    const Rdna2Inst reserved = decode(Rdna2Format::SOPC, 0x10);
+    EXPECT_FALSE(scalar_instruction_preserves_scc(reserved));
+    EXPECT_FALSE(scalar_instruction_writes_scc(reserved));
+}
+
+// scalar_alu_source_words derived most scalar source widths from the DESTINATION width, so every
+// instruction whose source is wider than its result was charged one SGPR for a pair read: the
+// B64 bit counts and finds, the B64 bit compares, and (through the width bugs above) every B64
+// form scalar_write_width undercounted. A pair read charged one word lets a proof treat the high
+// word as unread.
+TEST(Rdna2InstructionEffectsRegression, ScalarSourceWidthsCountPairReads) {
+    struct Case {
+        Rdna2Format fmt;
+        uint32_t op;
+        uint32_t source;
+        uint32_t width;
+        const char* name;
+    };
+    const Case cases[] = {
+        {Rdna2Format::SOP1, 0x0e, 0, 2, "s_bcnt0_i32_b64"},
+        {Rdna2Format::SOP1, 0x12, 0, 2, "s_ff0_i32_b64"},
+        {Rdna2Format::SOP1, 0x0c, 0, 2, "s_brev_b64"},
+        {Rdna2Format::SOP1, 0x39, 0, 2, "s_andn1_wrexec_b64"},
+        {Rdna2Format::SOPC, 0x0f, 0, 2, "s_bitcmp1_b64"},
+        {Rdna2Format::SOPC, 0x0f, 1, 1, "s_bitcmp1_b64 bit index"},
+        {Rdna2Format::SOP2, 0x23, 0, 2, "s_ashr_i64"},
+        {Rdna2Format::SOP2, 0x23, 1, 1, "s_ashr_i64 shift count"},
+        {Rdna2Format::SOP1, 0x1c, 0, 1, "s_bitset0_b64 bit index"},
+        {Rdna2Format::SOP1, 0x10, 0, 2, "s_bcnt1_i32_b64 (was already right)"},
+    };
+    for (const Case& c : cases)
+        EXPECT_EQ(scalar_alu_source_words(decode(c.fmt, c.op), c.source), c.width) << c.name;
 }

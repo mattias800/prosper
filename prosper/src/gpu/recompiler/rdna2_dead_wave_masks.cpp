@@ -1,20 +1,16 @@
 // See rdna2_dead_wave_masks.hpp. Moved unchanged out of rdna2_emit_cfg.cpp.
 #include "gpu/recompiler/rdna2_dead_wave_masks.hpp"
 
+#include "gpu/recompiler/rdna2_instruction_effects.hpp"
+
 #include <unordered_map>
 
 namespace prosper::gpu {
 
 std::unordered_set<uint32_t> dead_wave_mask_writes(const std::vector<Rdna2Inst>& ins) {
-    for (const auto& in : ins) {
-        const bool reads_scc =
-            (in.fmt == Rdna2Format::SOPP && (in.opcode == 0x04 || in.opcode == 0x05)) ||
-            (in.fmt == Rdna2Format::SOP2 &&
-             (in.opcode == 0x04 || in.opcode == 0x05 || in.opcode == 0x0a || in.opcode == 0x0b)) ||
-            (in.fmt == Rdna2Format::SOP1 && (in.opcode == 0x05 || in.opcode == 0x06)) ||
-            (in.fmt == Rdna2Format::SOPK && in.opcode == 0x02);
-        if (reads_scc) return {};
-    }
+    // An elided mask op also stops producing SCC, so any SCC reader -- implicit or an explicit
+    // SCC operand -- forbids every claim.
+    if (rdna2_program_reads_scc(ins)) return {};
     auto is_mask = [](const Rdna2Inst& in) {
         return in.fmt == Rdna2Format::SOP2 &&
                (in.opcode == 0x0f || in.opcode == 0x11 || in.opcode == 0x13 || in.opcode == 0x15 ||

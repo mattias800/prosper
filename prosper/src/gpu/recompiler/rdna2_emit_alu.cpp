@@ -211,19 +211,7 @@ uint32_t emit_f16_unary(SpirvCompute& b, uint32_t opcode, uint32_t x) {
 // ALU format handled here; sets ok=false if it is an ALU op this stage doesn't support yet. Non-ALU
 // formats (EXP/memory/...) return false so the stage-specific caller can handle them.
 static bool instruction_reads_scc_as_scalar_data(const Rdna2Inst& in) {
-    switch (in.fmt) {
-        case Rdna2Format::SOP2:
-            return in.opcode == kSop2OpcodeAddcU32 || in.opcode == 0x05u ||
-                   in.opcode == kSop2OpcodeCselectB32 ||
-                   in.opcode == kSop2OpcodeCselectB64;
-        case Rdna2Format::SOP1:
-            return in.opcode == kSop1OpcodeCmovB32 ||
-                   in.opcode == kSop1OpcodeCmovB64;
-        case Rdna2Format::SOPK:
-            return in.opcode == kSopkOpcodeCmovkI32;
-        default:
-            return false;
-    }
+    return rdna2_reads_scc_as_data(in.fmt, in.opcode) != Rdna2Answer::No;
 }
 
 bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool allow_exec_update,

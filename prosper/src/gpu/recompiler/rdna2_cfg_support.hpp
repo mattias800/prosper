@@ -1638,20 +1638,17 @@ inline uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
                 source == 0 && in.src[0].kind == OperandKind::SGPR && in.src[0].value >= 0 &&
                 in.src[0].value <= 105)
                 return static_cast<uint32_t>(106 - in.src[0].value);
-            if (in.opcode == kSop1OpcodeBitreplicateB64B32)
-                return 1u;   // 32-bit source replicated to 64-bit dst
-            if (in.opcode == kSop1OpcodeBcnt1I32B64 || in.opcode == kSop1OpcodeFf1I32B64 ||
-                in.opcode == kSop1OpcodeFlbitI32B64 || in.opcode == 0x18 ||
-                in.opcode == kSop1OpcodeQuadmaskB64)
-                return 2;   // bcnt/ff1/flbit consume a B64 pair
-            return scalar_write_width(in) == 1 ? 1u : 2u;
+            [[fallthrough]];
         case Rdna2Format::SOP2:
-            if (in.opcode == 0x1f || in.opcode == 0x21)
-                return source == 1 ? 1u : 2u;   // B64 shifts use a B32 shift count
-            if (in.opcode == kSop2OpcodeBfmB64) return 1;   // BFM width and offset are B32
-            if (in.opcode == kSop2OpcodeBfeU64) return source == 1 ? 1u : 2u;
-            return scalar_write_width(in) == 1 ? 1u : 2u;
-        case Rdna2Format::SOPC: return in.opcode == 0x12 || in.opcode == 0x13 ? 2u : 1u;
+        case Rdna2Format::SOPC: {
+            // Every other scalar ALU source width comes from the instruction-effects table (a B64
+            // shift's count, BFM's operands and S_BITREPLICATE's source are B32; S_BCNT*/S_FF*/
+            // S_FLBIT*_B64 read a pair). A source the instruction does not have, or an opcode the
+            // table cannot classify, is charged a pair: every consumer treats wider as "prove more".
+            const Rdna2InstructionEffects& effects = rdna2_instruction_effects(in);
+            if (!effects.known() || source >= 2 || !effects.ssrc_dwords[source]) return 2u;
+            return effects.ssrc_dwords[source];
+        }
         case Rdna2Format::VOP1:
         case Rdna2Format::VOP2: return 1;
         case Rdna2Format::VOPC: {
