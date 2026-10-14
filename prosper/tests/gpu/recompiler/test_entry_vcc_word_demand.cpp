@@ -219,7 +219,9 @@ TEST(EntryVccWordDemand, CmpxAndUnmodeledSmemDoNotPublishVccWords) {
 
 TEST(EntryVccWordDemand, UnclassifiedWideReadersKeepThePairDemand) {
     auto words = code();
-    words[2] = 0xd7450000u;   // V_XAD_U32 still has the conservative pair-width inventory
+    // An unassigned VOP3 opcode (0x3ff) is the one VALU source the effects table cannot classify,
+    // so it keeps the conservative pair width. (V_XAD_U32, used here before #5146, is B32.)
+    words[2] = 0xd7ff0000u;
     ASSERT_EQ(scalar_alu_source_words(decode(words)[2], 0u), 2u);
     EXPECT_FALSE(region_defines_vcc_before_any_read(decode(words)));
     const std::vector<uint32_t> unknown{0xbeea03aau, 0xf4000504u, 0xd4000000u, 0xbf810000u};

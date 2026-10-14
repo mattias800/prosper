@@ -34,6 +34,10 @@ enum class Rdna2EffectsStatus : uint8_t {
     Unknown,   // no entry: every answer about this opcode is "unknown"; callers stay conservative
     Reserved,   // the decoder accepts the encoding but RDNA2 assigns no instruction to it
     Known,
+    // A VALU instruction whose name and source widths are described and nothing else yet: its
+    // destination and implicit-register fields are NOT facts and read as zero. Ask
+    // describes_sources(), never known(), for its source widths.
+    SourcesOnly,
 };
 
 // Architectural registers an instruction reads or writes WITHOUT naming them in an operand.
@@ -69,13 +73,19 @@ struct Rdna2InstructionEffects {
     // Consecutive SGPRs written through the decoded destination field (Rdna2Inst::dst). 0 when the
     // field is not written: it is a source (s_cmpk_*, s_setreg_b32, s_waitcnt_*) or unused.
     uint8_t sdst_dwords = 0;
-    // Consecutive SGPRs read through SSRC0 / SSRC1 when that operand names a register. SOPK and
-    // SOPP have no SSRC fields; SOPK forms that read their SDST field are not described here yet.
-    uint8_t ssrc_dwords[2] = {0, 0};
+    // Consecutive SGPRs read through source operand 0/1/2 when it names a scalar register
+    // (SSRC0/SSRC1 for SALU, SRC0-SRC2 for VALU). 0 means the instruction has no such source.
+    // SOPK and SOPP have no SSRC fields; SOPK forms that read their SDST field are not described
+    // here yet. A VALU lane-mask source (SRC2 of v_cndmask_b32 and of the carry-in forms) is
+    // charged the Wave64 pair.
+    uint8_t ssrc_dwords[3] = {0, 0, 0};
     Rdna2M0Relative m0_relative = Rdna2M0Relative::None;
     Rdna2ExecEffect exec = Rdna2ExecEffect::None;
 
     bool known() const { return status == Rdna2EffectsStatus::Known; }
+    bool describes_sources() const {
+        return status == Rdna2EffectsStatus::Known || status == Rdna2EffectsStatus::SourcesOnly;
+    }
 };
 
 // The table entry for (fmt, opcode). Returns an entry with status Unknown for a format without a
@@ -85,12 +95,18 @@ inline const Rdna2InstructionEffects& rdna2_instruction_effects(const Rdna2Inst&
     return rdna2_instruction_effects(in.fmt, in.opcode);
 }
 
-// Formats whose whole decodable opcode space has entries (SOP2, SOP1, SOPK, SOPC, SOPP).
+// Formats whose whole decodable opcode space has entries: the scalar ALU formats with full
+// effects, and VOP1, VOP2, VOPC and VOP3 with source widths only (status SourcesOnly).
 bool rdna2_effects_format_is_tabulated(Rdna2Format fmt);
-// How many opcode values the decoder can produce in a tabulated format: the opcode field width
-// minus the encodings another format claims first (SOP2 opcodes 0x60-0x7F are SOPK/SOP1/SOPC/SOPP,
-// SOPK opcodes 0x1D-0x1F are SOP1/SOPC/SOPP). 0 for a format without a table.
-uint32_t rdna2_effects_opcode_space(Rdna2Format fmt);
+// The opcodes [first, end) the decoder can produce in a tabulated format: the opcode field minus
+// the encodings another format claims first (SOP2 0x60-0x7F are SOPK/SOP1/SOPC/SOPP, SOPK
+// 0x1D-0x1F are SOP1/SOPC/SOPP, VOP2 0x3E/0x3F are VOPC/VOP1, VOP3 0x000-0x0FF decode as VOPC).
+// {0, 0} for a format without a table.
+struct Rdna2OpcodeRange {
+    uint32_t first = 0;
+    uint32_t end = 0;
+};
+Rdna2OpcodeRange rdna2_effects_opcode_range(Rdna2Format fmt);
 
 // Every row of the table: the named instructions, then one Reserved row per reserved opcode. For
 // coverage and consistency tests.

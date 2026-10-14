@@ -36,6 +36,7 @@ constexpr Rdna2InstructionEffects op(const char* name, uint8_t dst, uint8_t s0, 
     e.sdst_dwords = dst;
     e.ssrc_dwords[0] = s0;
     e.ssrc_dwords[1] = s1;
+    e.ssrc_dwords[2] = 0;
     e.m0_relative = relative;
     e.exec = exec;
     return e;
@@ -62,6 +63,16 @@ constexpr Rdna2InstructionEffects compare(const char* name, uint8_t s0, uint8_t 
 }
 constexpr Rdna2InstructionEffects plain(const char* name) {
     return op(name, 0, 0, 0);
+}
+// A VALU instruction described by its source widths only.
+constexpr Rdna2InstructionEffects valu(const char* name, uint8_t s0, uint8_t s1, uint8_t s2) {
+    Rdna2InstructionEffects e;
+    e.status = Rdna2EffectsStatus::SourcesOnly;
+    e.name = name;
+    e.ssrc_dwords[0] = s0;
+    e.ssrc_dwords[1] = s1;
+    e.ssrc_dwords[2] = s2;
+    return e;
 }
 constexpr Rdna2InstructionEffects reserved() {
     Rdna2InstructionEffects e;
@@ -321,6 +332,590 @@ constexpr Row kSopp[] = {
     {F::SOPP, 0x28, plain("s_ttracedata_imm")},
 };
 
+// ---- VALU source widths: VOP2 (ISA 12.7), VOP1 (12.8), VOPC (12.9) and VOP3 (12.12; VOP2 and
+// VOP1 promote to VOP3 at +0x100 and +0x180, VOPC keeps its number and decodes as VOPC). Only the
+// name and the width of each source are described (status SourcesOnly).
+//
+// Derived by two independent routes, which were required to agree:
+//   * llvm-mc -mcpu=gfx1030 -mattr=+wavefrontsize64 -disassemble over every encoding with SGPR
+//     sources s2/s6/s10: the register class LLVM prints for each operand (s[2:3] is a pair);
+//   * the ISA 70648 pseudo-code: a source is a pair when it is read as S<n>.u64/i64/f64/b64/d or
+//     by a bit index above 31, or when a compare's name ends in _F64/_I64/_U64 (CLASS_F64: S0).
+// They differed on 9 rows, all resolved in LLVM's favour: V_RSQ_F64 (ISA erratum, its pseudo-code
+// reads S0.f16), V_QSAD_PK_U16_U8, V_MQSAD_PK_U16_U8 and V_MQSAD_U32_U8 (S0[55:24]-style bit
+// ranges), and the lane-mask SRC2 of v_cndmask_b32 and the three carry-in forms, which the ISA
+// leaves untyped and Wave64 reads as a pair. CONFIDENCE: HIGH.
+//
+// PS5 guest code also uses gfx10.1-era encodings that gfx1030 and ISA 70648 dropped, so the rows
+// are the UNION of llvm-mc gfx1030 and gfx1013. From gfx1013: v_mac_f32 (VOP2 0x1F / VOP3 0x11F),
+// v_madmk_f32 / v_madak_f32 (VOP2 0x20 / 0x21, about 14,000 uses in the local shader corpus),
+// v_mad_f32 (VOP3 0x141, Kena's merged-GS prolog) and v_mul_lo_i32 (VOP3 0x16B). From gfx1030:
+// v_dot2c_f32_f16 and v_dot4c_i32_i8. Where both define an opcode the widths agree, and the scalar
+// formats above are identical in both.
+// A VGPR-only source (v_readlane_b32's SRC0) is listed with its width; an attribute field that is
+// not a register operand (the v_interp forms) is 0. A literal constant (v_madak's K) is not a source.
+constexpr Row kVop2[] = {
+    {F::VOP2, 0x001, valu("v_cndmask_b32", 1, 1, 0)},
+    {F::VOP2, 0x002, valu("v_dot2c_f32_f16", 1, 1, 0)},
+    {F::VOP2, 0x003, valu("v_add_f32", 1, 1, 0)},
+    {F::VOP2, 0x004, valu("v_sub_f32", 1, 1, 0)},
+    {F::VOP2, 0x005, valu("v_subrev_f32", 1, 1, 0)},
+    {F::VOP2, 0x006, valu("v_fmac_legacy_f32", 1, 1, 0)},
+    {F::VOP2, 0x007, valu("v_mul_legacy_f32", 1, 1, 0)},
+    {F::VOP2, 0x008, valu("v_mul_f32", 1, 1, 0)},
+    {F::VOP2, 0x009, valu("v_mul_i32_i24", 1, 1, 0)},
+    {F::VOP2, 0x00a, valu("v_mul_hi_i32_i24", 1, 1, 0)},
+    {F::VOP2, 0x00b, valu("v_mul_u32_u24", 1, 1, 0)},
+    {F::VOP2, 0x00c, valu("v_mul_hi_u32_u24", 1, 1, 0)},
+    {F::VOP2, 0x00d, valu("v_dot4c_i32_i8", 1, 1, 0)},
+    {F::VOP2, 0x00f, valu("v_min_f32", 1, 1, 0)},
+    {F::VOP2, 0x010, valu("v_max_f32", 1, 1, 0)},
+    {F::VOP2, 0x011, valu("v_min_i32", 1, 1, 0)},
+    {F::VOP2, 0x012, valu("v_max_i32", 1, 1, 0)},
+    {F::VOP2, 0x013, valu("v_min_u32", 1, 1, 0)},
+    {F::VOP2, 0x014, valu("v_max_u32", 1, 1, 0)},
+    {F::VOP2, 0x016, valu("v_lshrrev_b32", 1, 1, 0)},
+    {F::VOP2, 0x018, valu("v_ashrrev_i32", 1, 1, 0)},
+    {F::VOP2, 0x01a, valu("v_lshlrev_b32", 1, 1, 0)},
+    {F::VOP2, 0x01b, valu("v_and_b32", 1, 1, 0)},
+    {F::VOP2, 0x01c, valu("v_or_b32", 1, 1, 0)},
+    {F::VOP2, 0x01d, valu("v_xor_b32", 1, 1, 0)},
+    {F::VOP2, 0x01e, valu("v_xnor_b32", 1, 1, 0)},
+    {F::VOP2, 0x01f, valu("v_mac_f32", 1, 1, 0)},
+    {F::VOP2, 0x020, valu("v_madmk_f32", 1, 1, 0)},
+    {F::VOP2, 0x021, valu("v_madak_f32", 1, 1, 0)},
+    {F::VOP2, 0x025, valu("v_add_nc_u32", 1, 1, 0)},
+    {F::VOP2, 0x026, valu("v_sub_nc_u32", 1, 1, 0)},
+    {F::VOP2, 0x027, valu("v_subrev_nc_u32", 1, 1, 0)},
+    {F::VOP2, 0x028, valu("v_add_co_ci_u32", 1, 1, 0)},
+    {F::VOP2, 0x029, valu("v_sub_co_ci_u32", 1, 1, 0)},
+    {F::VOP2, 0x02a, valu("v_subrev_co_ci_u32", 1, 1, 0)},
+    {F::VOP2, 0x02b, valu("v_fmac_f32", 1, 1, 0)},
+    {F::VOP2, 0x02c, valu("v_fmamk_f32", 1, 1, 0)},
+    {F::VOP2, 0x02d, valu("v_fmaak_f32", 1, 1, 0)},
+    {F::VOP2, 0x02f, valu("v_cvt_pkrtz_f16_f32", 1, 1, 0)},
+    {F::VOP2, 0x032, valu("v_add_f16", 1, 1, 0)},
+    {F::VOP2, 0x033, valu("v_sub_f16", 1, 1, 0)},
+    {F::VOP2, 0x034, valu("v_subrev_f16", 1, 1, 0)},
+    {F::VOP2, 0x035, valu("v_mul_f16", 1, 1, 0)},
+    {F::VOP2, 0x036, valu("v_fmac_f16", 1, 1, 0)},
+    {F::VOP2, 0x037, valu("v_fmamk_f16", 1, 1, 0)},
+    {F::VOP2, 0x038, valu("v_fmaak_f16", 1, 1, 0)},
+    {F::VOP2, 0x039, valu("v_max_f16", 1, 1, 0)},
+    {F::VOP2, 0x03a, valu("v_min_f16", 1, 1, 0)},
+    {F::VOP2, 0x03b, valu("v_ldexp_f16", 1, 1, 0)},
+    {F::VOP2, 0x03c, valu("v_pk_fmac_f16", 1, 1, 0)},
+};
+constexpr Row kVop1[] = {
+    {F::VOP1, 0x001, valu("v_mov_b32", 1, 0, 0)},
+    {F::VOP1, 0x002, valu("v_readfirstlane_b32", 1, 0, 0)},
+    {F::VOP1, 0x003, valu("v_cvt_i32_f64", 2, 0, 0)},
+    {F::VOP1, 0x004, valu("v_cvt_f64_i32", 1, 0, 0)},
+    {F::VOP1, 0x005, valu("v_cvt_f32_i32", 1, 0, 0)},
+    {F::VOP1, 0x006, valu("v_cvt_f32_u32", 1, 0, 0)},
+    {F::VOP1, 0x007, valu("v_cvt_u32_f32", 1, 0, 0)},
+    {F::VOP1, 0x008, valu("v_cvt_i32_f32", 1, 0, 0)},
+    {F::VOP1, 0x00a, valu("v_cvt_f16_f32", 1, 0, 0)},
+    {F::VOP1, 0x00b, valu("v_cvt_f32_f16", 1, 0, 0)},
+    {F::VOP1, 0x00c, valu("v_cvt_rpi_i32_f32", 1, 0, 0)},
+    {F::VOP1, 0x00d, valu("v_cvt_flr_i32_f32", 1, 0, 0)},
+    {F::VOP1, 0x00e, valu("v_cvt_off_f32_i4", 1, 0, 0)},
+    {F::VOP1, 0x00f, valu("v_cvt_f32_f64", 2, 0, 0)},
+    {F::VOP1, 0x010, valu("v_cvt_f64_f32", 1, 0, 0)},
+    {F::VOP1, 0x011, valu("v_cvt_f32_ubyte0", 1, 0, 0)},
+    {F::VOP1, 0x012, valu("v_cvt_f32_ubyte1", 1, 0, 0)},
+    {F::VOP1, 0x013, valu("v_cvt_f32_ubyte2", 1, 0, 0)},
+    {F::VOP1, 0x014, valu("v_cvt_f32_ubyte3", 1, 0, 0)},
+    {F::VOP1, 0x015, valu("v_cvt_u32_f64", 2, 0, 0)},
+    {F::VOP1, 0x016, valu("v_cvt_f64_u32", 1, 0, 0)},
+    {F::VOP1, 0x017, valu("v_trunc_f64", 2, 0, 0)},
+    {F::VOP1, 0x018, valu("v_ceil_f64", 2, 0, 0)},
+    {F::VOP1, 0x019, valu("v_rndne_f64", 2, 0, 0)},
+    {F::VOP1, 0x01a, valu("v_floor_f64", 2, 0, 0)},
+    {F::VOP1, 0x020, valu("v_fract_f32", 1, 0, 0)},
+    {F::VOP1, 0x021, valu("v_trunc_f32", 1, 0, 0)},
+    {F::VOP1, 0x022, valu("v_ceil_f32", 1, 0, 0)},
+    {F::VOP1, 0x023, valu("v_rndne_f32", 1, 0, 0)},
+    {F::VOP1, 0x024, valu("v_floor_f32", 1, 0, 0)},
+    {F::VOP1, 0x025, valu("v_exp_f32", 1, 0, 0)},
+    {F::VOP1, 0x027, valu("v_log_f32", 1, 0, 0)},
+    {F::VOP1, 0x02a, valu("v_rcp_f32", 1, 0, 0)},
+    {F::VOP1, 0x02b, valu("v_rcp_iflag_f32", 1, 0, 0)},
+    {F::VOP1, 0x02e, valu("v_rsq_f32", 1, 0, 0)},
+    {F::VOP1, 0x02f, valu("v_rcp_f64", 2, 0, 0)},
+    {F::VOP1, 0x031, valu("v_rsq_f64", 2, 0, 0)},
+    {F::VOP1, 0x033, valu("v_sqrt_f32", 1, 0, 0)},
+    {F::VOP1, 0x034, valu("v_sqrt_f64", 2, 0, 0)},
+    {F::VOP1, 0x035, valu("v_sin_f32", 1, 0, 0)},
+    {F::VOP1, 0x036, valu("v_cos_f32", 1, 0, 0)},
+    {F::VOP1, 0x037, valu("v_not_b32", 1, 0, 0)},
+    {F::VOP1, 0x038, valu("v_bfrev_b32", 1, 0, 0)},
+    {F::VOP1, 0x039, valu("v_ffbh_u32", 1, 0, 0)},
+    {F::VOP1, 0x03a, valu("v_ffbl_b32", 1, 0, 0)},
+    {F::VOP1, 0x03b, valu("v_ffbh_i32", 1, 0, 0)},
+    {F::VOP1, 0x03c, valu("v_frexp_exp_i32_f64", 2, 0, 0)},
+    {F::VOP1, 0x03d, valu("v_frexp_mant_f64", 2, 0, 0)},
+    {F::VOP1, 0x03e, valu("v_fract_f64", 2, 0, 0)},
+    {F::VOP1, 0x03f, valu("v_frexp_exp_i32_f32", 1, 0, 0)},
+    {F::VOP1, 0x040, valu("v_frexp_mant_f32", 1, 0, 0)},
+    {F::VOP1, 0x042, valu("v_movreld_b32", 1, 0, 0)},
+    {F::VOP1, 0x043, valu("v_movrels_b32", 1, 0, 0)},
+    {F::VOP1, 0x044, valu("v_movrelsd_b32", 1, 0, 0)},
+    {F::VOP1, 0x048, valu("v_movrelsd_2_b32", 1, 0, 0)},
+    {F::VOP1, 0x050, valu("v_cvt_f16_u16", 1, 0, 0)},
+    {F::VOP1, 0x051, valu("v_cvt_f16_i16", 1, 0, 0)},
+    {F::VOP1, 0x052, valu("v_cvt_u16_f16", 1, 0, 0)},
+    {F::VOP1, 0x053, valu("v_cvt_i16_f16", 1, 0, 0)},
+    {F::VOP1, 0x054, valu("v_rcp_f16", 1, 0, 0)},
+    {F::VOP1, 0x055, valu("v_sqrt_f16", 1, 0, 0)},
+    {F::VOP1, 0x056, valu("v_rsq_f16", 1, 0, 0)},
+    {F::VOP1, 0x057, valu("v_log_f16", 1, 0, 0)},
+    {F::VOP1, 0x058, valu("v_exp_f16", 1, 0, 0)},
+    {F::VOP1, 0x059, valu("v_frexp_mant_f16", 1, 0, 0)},
+    {F::VOP1, 0x05a, valu("v_frexp_exp_i16_f16", 1, 0, 0)},
+    {F::VOP1, 0x05b, valu("v_floor_f16", 1, 0, 0)},
+    {F::VOP1, 0x05c, valu("v_ceil_f16", 1, 0, 0)},
+    {F::VOP1, 0x05d, valu("v_trunc_f16", 1, 0, 0)},
+    {F::VOP1, 0x05e, valu("v_rndne_f16", 1, 0, 0)},
+    {F::VOP1, 0x05f, valu("v_fract_f16", 1, 0, 0)},
+    {F::VOP1, 0x060, valu("v_sin_f16", 1, 0, 0)},
+    {F::VOP1, 0x061, valu("v_cos_f16", 1, 0, 0)},
+    {F::VOP1, 0x062, valu("v_sat_pk_u8_i16", 1, 0, 0)},
+    {F::VOP1, 0x063, valu("v_cvt_norm_i16_f16", 1, 0, 0)},
+    {F::VOP1, 0x064, valu("v_cvt_norm_u16_f16", 1, 0, 0)},
+    {F::VOP1, 0x065, valu("v_swap_b32", 1, 0, 0)},
+    {F::VOP1, 0x068, valu("v_swaprel_b32", 1, 0, 0)},
+};
+constexpr Row kVopc[] = {
+    {F::VOPC, 0x000, valu("v_cmp_f_f32", 1, 1, 0)},
+    {F::VOPC, 0x001, valu("v_cmp_lt_f32", 1, 1, 0)},
+    {F::VOPC, 0x002, valu("v_cmp_eq_f32", 1, 1, 0)},
+    {F::VOPC, 0x003, valu("v_cmp_le_f32", 1, 1, 0)},
+    {F::VOPC, 0x004, valu("v_cmp_gt_f32", 1, 1, 0)},
+    {F::VOPC, 0x005, valu("v_cmp_lg_f32", 1, 1, 0)},
+    {F::VOPC, 0x006, valu("v_cmp_ge_f32", 1, 1, 0)},
+    {F::VOPC, 0x007, valu("v_cmp_o_f32", 1, 1, 0)},
+    {F::VOPC, 0x008, valu("v_cmp_u_f32", 1, 1, 0)},
+    {F::VOPC, 0x009, valu("v_cmp_nge_f32", 1, 1, 0)},
+    {F::VOPC, 0x00a, valu("v_cmp_nlg_f32", 1, 1, 0)},
+    {F::VOPC, 0x00b, valu("v_cmp_ngt_f32", 1, 1, 0)},
+    {F::VOPC, 0x00c, valu("v_cmp_nle_f32", 1, 1, 0)},
+    {F::VOPC, 0x00d, valu("v_cmp_neq_f32", 1, 1, 0)},
+    {F::VOPC, 0x00e, valu("v_cmp_nlt_f32", 1, 1, 0)},
+    {F::VOPC, 0x00f, valu("v_cmp_tru_f32", 1, 1, 0)},
+    {F::VOPC, 0x010, valu("v_cmpx_f_f32", 1, 1, 0)},
+    {F::VOPC, 0x011, valu("v_cmpx_lt_f32", 1, 1, 0)},
+    {F::VOPC, 0x012, valu("v_cmpx_eq_f32", 1, 1, 0)},
+    {F::VOPC, 0x013, valu("v_cmpx_le_f32", 1, 1, 0)},
+    {F::VOPC, 0x014, valu("v_cmpx_gt_f32", 1, 1, 0)},
+    {F::VOPC, 0x015, valu("v_cmpx_lg_f32", 1, 1, 0)},
+    {F::VOPC, 0x016, valu("v_cmpx_ge_f32", 1, 1, 0)},
+    {F::VOPC, 0x017, valu("v_cmpx_o_f32", 1, 1, 0)},
+    {F::VOPC, 0x018, valu("v_cmpx_u_f32", 1, 1, 0)},
+    {F::VOPC, 0x019, valu("v_cmpx_nge_f32", 1, 1, 0)},
+    {F::VOPC, 0x01a, valu("v_cmpx_nlg_f32", 1, 1, 0)},
+    {F::VOPC, 0x01b, valu("v_cmpx_ngt_f32", 1, 1, 0)},
+    {F::VOPC, 0x01c, valu("v_cmpx_nle_f32", 1, 1, 0)},
+    {F::VOPC, 0x01d, valu("v_cmpx_neq_f32", 1, 1, 0)},
+    {F::VOPC, 0x01e, valu("v_cmpx_nlt_f32", 1, 1, 0)},
+    {F::VOPC, 0x01f, valu("v_cmpx_tru_f32", 1, 1, 0)},
+    {F::VOPC, 0x020, valu("v_cmp_f_f64", 2, 2, 0)},
+    {F::VOPC, 0x021, valu("v_cmp_lt_f64", 2, 2, 0)},
+    {F::VOPC, 0x022, valu("v_cmp_eq_f64", 2, 2, 0)},
+    {F::VOPC, 0x023, valu("v_cmp_le_f64", 2, 2, 0)},
+    {F::VOPC, 0x024, valu("v_cmp_gt_f64", 2, 2, 0)},
+    {F::VOPC, 0x025, valu("v_cmp_lg_f64", 2, 2, 0)},
+    {F::VOPC, 0x026, valu("v_cmp_ge_f64", 2, 2, 0)},
+    {F::VOPC, 0x027, valu("v_cmp_o_f64", 2, 2, 0)},
+    {F::VOPC, 0x028, valu("v_cmp_u_f64", 2, 2, 0)},
+    {F::VOPC, 0x029, valu("v_cmp_nge_f64", 2, 2, 0)},
+    {F::VOPC, 0x02a, valu("v_cmp_nlg_f64", 2, 2, 0)},
+    {F::VOPC, 0x02b, valu("v_cmp_ngt_f64", 2, 2, 0)},
+    {F::VOPC, 0x02c, valu("v_cmp_nle_f64", 2, 2, 0)},
+    {F::VOPC, 0x02d, valu("v_cmp_neq_f64", 2, 2, 0)},
+    {F::VOPC, 0x02e, valu("v_cmp_nlt_f64", 2, 2, 0)},
+    {F::VOPC, 0x02f, valu("v_cmp_tru_f64", 2, 2, 0)},
+    {F::VOPC, 0x030, valu("v_cmpx_f_f64", 2, 2, 0)},
+    {F::VOPC, 0x031, valu("v_cmpx_lt_f64", 2, 2, 0)},
+    {F::VOPC, 0x032, valu("v_cmpx_eq_f64", 2, 2, 0)},
+    {F::VOPC, 0x033, valu("v_cmpx_le_f64", 2, 2, 0)},
+    {F::VOPC, 0x034, valu("v_cmpx_gt_f64", 2, 2, 0)},
+    {F::VOPC, 0x035, valu("v_cmpx_lg_f64", 2, 2, 0)},
+    {F::VOPC, 0x036, valu("v_cmpx_ge_f64", 2, 2, 0)},
+    {F::VOPC, 0x037, valu("v_cmpx_o_f64", 2, 2, 0)},
+    {F::VOPC, 0x038, valu("v_cmpx_u_f64", 2, 2, 0)},
+    {F::VOPC, 0x039, valu("v_cmpx_nge_f64", 2, 2, 0)},
+    {F::VOPC, 0x03a, valu("v_cmpx_nlg_f64", 2, 2, 0)},
+    {F::VOPC, 0x03b, valu("v_cmpx_ngt_f64", 2, 2, 0)},
+    {F::VOPC, 0x03c, valu("v_cmpx_nle_f64", 2, 2, 0)},
+    {F::VOPC, 0x03d, valu("v_cmpx_neq_f64", 2, 2, 0)},
+    {F::VOPC, 0x03e, valu("v_cmpx_nlt_f64", 2, 2, 0)},
+    {F::VOPC, 0x03f, valu("v_cmpx_tru_f64", 2, 2, 0)},
+    {F::VOPC, 0x080, valu("v_cmp_f_i32", 1, 1, 0)},
+    {F::VOPC, 0x081, valu("v_cmp_lt_i32", 1, 1, 0)},
+    {F::VOPC, 0x082, valu("v_cmp_eq_i32", 1, 1, 0)},
+    {F::VOPC, 0x083, valu("v_cmp_le_i32", 1, 1, 0)},
+    {F::VOPC, 0x084, valu("v_cmp_gt_i32", 1, 1, 0)},
+    {F::VOPC, 0x085, valu("v_cmp_ne_i32", 1, 1, 0)},
+    {F::VOPC, 0x086, valu("v_cmp_ge_i32", 1, 1, 0)},
+    {F::VOPC, 0x087, valu("v_cmp_t_i32", 1, 1, 0)},
+    {F::VOPC, 0x088, valu("v_cmp_class_f32", 1, 1, 0)},
+    {F::VOPC, 0x089, valu("v_cmp_lt_i16", 1, 1, 0)},
+    {F::VOPC, 0x08a, valu("v_cmp_eq_i16", 1, 1, 0)},
+    {F::VOPC, 0x08b, valu("v_cmp_le_i16", 1, 1, 0)},
+    {F::VOPC, 0x08c, valu("v_cmp_gt_i16", 1, 1, 0)},
+    {F::VOPC, 0x08d, valu("v_cmp_ne_i16", 1, 1, 0)},
+    {F::VOPC, 0x08e, valu("v_cmp_ge_i16", 1, 1, 0)},
+    {F::VOPC, 0x08f, valu("v_cmp_class_f16", 1, 1, 0)},
+    {F::VOPC, 0x090, valu("v_cmpx_f_i32", 1, 1, 0)},
+    {F::VOPC, 0x091, valu("v_cmpx_lt_i32", 1, 1, 0)},
+    {F::VOPC, 0x092, valu("v_cmpx_eq_i32", 1, 1, 0)},
+    {F::VOPC, 0x093, valu("v_cmpx_le_i32", 1, 1, 0)},
+    {F::VOPC, 0x094, valu("v_cmpx_gt_i32", 1, 1, 0)},
+    {F::VOPC, 0x095, valu("v_cmpx_ne_i32", 1, 1, 0)},
+    {F::VOPC, 0x096, valu("v_cmpx_ge_i32", 1, 1, 0)},
+    {F::VOPC, 0x097, valu("v_cmpx_t_i32", 1, 1, 0)},
+    {F::VOPC, 0x098, valu("v_cmpx_class_f32", 1, 1, 0)},
+    {F::VOPC, 0x099, valu("v_cmpx_lt_i16", 1, 1, 0)},
+    {F::VOPC, 0x09a, valu("v_cmpx_eq_i16", 1, 1, 0)},
+    {F::VOPC, 0x09b, valu("v_cmpx_le_i16", 1, 1, 0)},
+    {F::VOPC, 0x09c, valu("v_cmpx_gt_i16", 1, 1, 0)},
+    {F::VOPC, 0x09d, valu("v_cmpx_ne_i16", 1, 1, 0)},
+    {F::VOPC, 0x09e, valu("v_cmpx_ge_i16", 1, 1, 0)},
+    {F::VOPC, 0x09f, valu("v_cmpx_class_f16", 1, 1, 0)},
+    {F::VOPC, 0x0a0, valu("v_cmp_f_i64", 2, 2, 0)},
+    {F::VOPC, 0x0a1, valu("v_cmp_lt_i64", 2, 2, 0)},
+    {F::VOPC, 0x0a2, valu("v_cmp_eq_i64", 2, 2, 0)},
+    {F::VOPC, 0x0a3, valu("v_cmp_le_i64", 2, 2, 0)},
+    {F::VOPC, 0x0a4, valu("v_cmp_gt_i64", 2, 2, 0)},
+    {F::VOPC, 0x0a5, valu("v_cmp_ne_i64", 2, 2, 0)},
+    {F::VOPC, 0x0a6, valu("v_cmp_ge_i64", 2, 2, 0)},
+    {F::VOPC, 0x0a7, valu("v_cmp_t_i64", 2, 2, 0)},
+    {F::VOPC, 0x0a8, valu("v_cmp_class_f64", 2, 1, 0)},
+    {F::VOPC, 0x0a9, valu("v_cmp_lt_u16", 1, 1, 0)},
+    {F::VOPC, 0x0aa, valu("v_cmp_eq_u16", 1, 1, 0)},
+    {F::VOPC, 0x0ab, valu("v_cmp_le_u16", 1, 1, 0)},
+    {F::VOPC, 0x0ac, valu("v_cmp_gt_u16", 1, 1, 0)},
+    {F::VOPC, 0x0ad, valu("v_cmp_ne_u16", 1, 1, 0)},
+    {F::VOPC, 0x0ae, valu("v_cmp_ge_u16", 1, 1, 0)},
+    {F::VOPC, 0x0b0, valu("v_cmpx_f_i64", 2, 2, 0)},
+    {F::VOPC, 0x0b1, valu("v_cmpx_lt_i64", 2, 2, 0)},
+    {F::VOPC, 0x0b2, valu("v_cmpx_eq_i64", 2, 2, 0)},
+    {F::VOPC, 0x0b3, valu("v_cmpx_le_i64", 2, 2, 0)},
+    {F::VOPC, 0x0b4, valu("v_cmpx_gt_i64", 2, 2, 0)},
+    {F::VOPC, 0x0b5, valu("v_cmpx_ne_i64", 2, 2, 0)},
+    {F::VOPC, 0x0b6, valu("v_cmpx_ge_i64", 2, 2, 0)},
+    {F::VOPC, 0x0b7, valu("v_cmpx_t_i64", 2, 2, 0)},
+    {F::VOPC, 0x0b8, valu("v_cmpx_class_f64", 2, 1, 0)},
+    {F::VOPC, 0x0b9, valu("v_cmpx_lt_u16", 1, 1, 0)},
+    {F::VOPC, 0x0ba, valu("v_cmpx_eq_u16", 1, 1, 0)},
+    {F::VOPC, 0x0bb, valu("v_cmpx_le_u16", 1, 1, 0)},
+    {F::VOPC, 0x0bc, valu("v_cmpx_gt_u16", 1, 1, 0)},
+    {F::VOPC, 0x0bd, valu("v_cmpx_ne_u16", 1, 1, 0)},
+    {F::VOPC, 0x0be, valu("v_cmpx_ge_u16", 1, 1, 0)},
+    {F::VOPC, 0x0c0, valu("v_cmp_f_u32", 1, 1, 0)},
+    {F::VOPC, 0x0c1, valu("v_cmp_lt_u32", 1, 1, 0)},
+    {F::VOPC, 0x0c2, valu("v_cmp_eq_u32", 1, 1, 0)},
+    {F::VOPC, 0x0c3, valu("v_cmp_le_u32", 1, 1, 0)},
+    {F::VOPC, 0x0c4, valu("v_cmp_gt_u32", 1, 1, 0)},
+    {F::VOPC, 0x0c5, valu("v_cmp_ne_u32", 1, 1, 0)},
+    {F::VOPC, 0x0c6, valu("v_cmp_ge_u32", 1, 1, 0)},
+    {F::VOPC, 0x0c7, valu("v_cmp_t_u32", 1, 1, 0)},
+    {F::VOPC, 0x0c8, valu("v_cmp_f_f16", 1, 1, 0)},
+    {F::VOPC, 0x0c9, valu("v_cmp_lt_f16", 1, 1, 0)},
+    {F::VOPC, 0x0ca, valu("v_cmp_eq_f16", 1, 1, 0)},
+    {F::VOPC, 0x0cb, valu("v_cmp_le_f16", 1, 1, 0)},
+    {F::VOPC, 0x0cc, valu("v_cmp_gt_f16", 1, 1, 0)},
+    {F::VOPC, 0x0cd, valu("v_cmp_lg_f16", 1, 1, 0)},
+    {F::VOPC, 0x0ce, valu("v_cmp_ge_f16", 1, 1, 0)},
+    {F::VOPC, 0x0cf, valu("v_cmp_o_f16", 1, 1, 0)},
+    {F::VOPC, 0x0d0, valu("v_cmpx_f_u32", 1, 1, 0)},
+    {F::VOPC, 0x0d1, valu("v_cmpx_lt_u32", 1, 1, 0)},
+    {F::VOPC, 0x0d2, valu("v_cmpx_eq_u32", 1, 1, 0)},
+    {F::VOPC, 0x0d3, valu("v_cmpx_le_u32", 1, 1, 0)},
+    {F::VOPC, 0x0d4, valu("v_cmpx_gt_u32", 1, 1, 0)},
+    {F::VOPC, 0x0d5, valu("v_cmpx_ne_u32", 1, 1, 0)},
+    {F::VOPC, 0x0d6, valu("v_cmpx_ge_u32", 1, 1, 0)},
+    {F::VOPC, 0x0d7, valu("v_cmpx_t_u32", 1, 1, 0)},
+    {F::VOPC, 0x0d8, valu("v_cmpx_f_f16", 1, 1, 0)},
+    {F::VOPC, 0x0d9, valu("v_cmpx_lt_f16", 1, 1, 0)},
+    {F::VOPC, 0x0da, valu("v_cmpx_eq_f16", 1, 1, 0)},
+    {F::VOPC, 0x0db, valu("v_cmpx_le_f16", 1, 1, 0)},
+    {F::VOPC, 0x0dc, valu("v_cmpx_gt_f16", 1, 1, 0)},
+    {F::VOPC, 0x0dd, valu("v_cmpx_lg_f16", 1, 1, 0)},
+    {F::VOPC, 0x0de, valu("v_cmpx_ge_f16", 1, 1, 0)},
+    {F::VOPC, 0x0df, valu("v_cmpx_o_f16", 1, 1, 0)},
+    {F::VOPC, 0x0e0, valu("v_cmp_f_u64", 2, 2, 0)},
+    {F::VOPC, 0x0e1, valu("v_cmp_lt_u64", 2, 2, 0)},
+    {F::VOPC, 0x0e2, valu("v_cmp_eq_u64", 2, 2, 0)},
+    {F::VOPC, 0x0e3, valu("v_cmp_le_u64", 2, 2, 0)},
+    {F::VOPC, 0x0e4, valu("v_cmp_gt_u64", 2, 2, 0)},
+    {F::VOPC, 0x0e5, valu("v_cmp_ne_u64", 2, 2, 0)},
+    {F::VOPC, 0x0e6, valu("v_cmp_ge_u64", 2, 2, 0)},
+    {F::VOPC, 0x0e7, valu("v_cmp_t_u64", 2, 2, 0)},
+    {F::VOPC, 0x0e8, valu("v_cmp_u_f16", 1, 1, 0)},
+    {F::VOPC, 0x0e9, valu("v_cmp_nge_f16", 1, 1, 0)},
+    {F::VOPC, 0x0ea, valu("v_cmp_nlg_f16", 1, 1, 0)},
+    {F::VOPC, 0x0eb, valu("v_cmp_ngt_f16", 1, 1, 0)},
+    {F::VOPC, 0x0ec, valu("v_cmp_nle_f16", 1, 1, 0)},
+    {F::VOPC, 0x0ed, valu("v_cmp_neq_f16", 1, 1, 0)},
+    {F::VOPC, 0x0ee, valu("v_cmp_nlt_f16", 1, 1, 0)},
+    {F::VOPC, 0x0ef, valu("v_cmp_tru_f16", 1, 1, 0)},
+    {F::VOPC, 0x0f0, valu("v_cmpx_f_u64", 2, 2, 0)},
+    {F::VOPC, 0x0f1, valu("v_cmpx_lt_u64", 2, 2, 0)},
+    {F::VOPC, 0x0f2, valu("v_cmpx_eq_u64", 2, 2, 0)},
+    {F::VOPC, 0x0f3, valu("v_cmpx_le_u64", 2, 2, 0)},
+    {F::VOPC, 0x0f4, valu("v_cmpx_gt_u64", 2, 2, 0)},
+    {F::VOPC, 0x0f5, valu("v_cmpx_ne_u64", 2, 2, 0)},
+    {F::VOPC, 0x0f6, valu("v_cmpx_ge_u64", 2, 2, 0)},
+    {F::VOPC, 0x0f7, valu("v_cmpx_t_u64", 2, 2, 0)},
+    {F::VOPC, 0x0f8, valu("v_cmpx_u_f16", 1, 1, 0)},
+    {F::VOPC, 0x0f9, valu("v_cmpx_nge_f16", 1, 1, 0)},
+    {F::VOPC, 0x0fa, valu("v_cmpx_nlg_f16", 1, 1, 0)},
+    {F::VOPC, 0x0fb, valu("v_cmpx_ngt_f16", 1, 1, 0)},
+    {F::VOPC, 0x0fc, valu("v_cmpx_nle_f16", 1, 1, 0)},
+    {F::VOPC, 0x0fd, valu("v_cmpx_neq_f16", 1, 1, 0)},
+    {F::VOPC, 0x0fe, valu("v_cmpx_nlt_f16", 1, 1, 0)},
+    {F::VOPC, 0x0ff, valu("v_cmpx_tru_f16", 1, 1, 0)},
+};
+constexpr Row kVop3[] = {
+    {F::VOP3, 0x101, valu("v_cndmask_b32", 1, 1, 2)},
+    {F::VOP3, 0x103, valu("v_add_f32", 1, 1, 0)},
+    {F::VOP3, 0x104, valu("v_sub_f32", 1, 1, 0)},
+    {F::VOP3, 0x105, valu("v_subrev_f32", 1, 1, 0)},
+    {F::VOP3, 0x106, valu("v_fmac_legacy_f32", 1, 1, 0)},
+    {F::VOP3, 0x107, valu("v_mul_legacy_f32", 1, 1, 0)},
+    {F::VOP3, 0x108, valu("v_mul_f32", 1, 1, 0)},
+    {F::VOP3, 0x109, valu("v_mul_i32_i24", 1, 1, 0)},
+    {F::VOP3, 0x10a, valu("v_mul_hi_i32_i24", 1, 1, 0)},
+    {F::VOP3, 0x10b, valu("v_mul_u32_u24", 1, 1, 0)},
+    {F::VOP3, 0x10c, valu("v_mul_hi_u32_u24", 1, 1, 0)},
+    {F::VOP3, 0x10f, valu("v_min_f32", 1, 1, 0)},
+    {F::VOP3, 0x110, valu("v_max_f32", 1, 1, 0)},
+    {F::VOP3, 0x111, valu("v_min_i32", 1, 1, 0)},
+    {F::VOP3, 0x112, valu("v_max_i32", 1, 1, 0)},
+    {F::VOP3, 0x113, valu("v_min_u32", 1, 1, 0)},
+    {F::VOP3, 0x114, valu("v_max_u32", 1, 1, 0)},
+    {F::VOP3, 0x116, valu("v_lshrrev_b32", 1, 1, 0)},
+    {F::VOP3, 0x118, valu("v_ashrrev_i32", 1, 1, 0)},
+    {F::VOP3, 0x11a, valu("v_lshlrev_b32", 1, 1, 0)},
+    {F::VOP3, 0x11b, valu("v_and_b32", 1, 1, 0)},
+    {F::VOP3, 0x11c, valu("v_or_b32", 1, 1, 0)},
+    {F::VOP3, 0x11d, valu("v_xor_b32", 1, 1, 0)},
+    {F::VOP3, 0x11e, valu("v_xnor_b32", 1, 1, 0)},
+    {F::VOP3, 0x11f, valu("v_mac_f32", 1, 1, 0)},
+    {F::VOP3, 0x125, valu("v_add_nc_u32", 1, 1, 0)},
+    {F::VOP3, 0x126, valu("v_sub_nc_u32", 1, 1, 0)},
+    {F::VOP3, 0x127, valu("v_subrev_nc_u32", 1, 1, 0)},
+    {F::VOP3, 0x128, valu("v_add_co_ci_u32", 1, 1, 2)},
+    {F::VOP3, 0x129, valu("v_sub_co_ci_u32", 1, 1, 2)},
+    {F::VOP3, 0x12a, valu("v_subrev_co_ci_u32", 1, 1, 2)},
+    {F::VOP3, 0x12b, valu("v_fmac_f32", 1, 1, 0)},
+    {F::VOP3, 0x12f, valu("v_cvt_pkrtz_f16_f32", 1, 1, 0)},
+    {F::VOP3, 0x132, valu("v_add_f16", 1, 1, 0)},
+    {F::VOP3, 0x133, valu("v_sub_f16", 1, 1, 0)},
+    {F::VOP3, 0x134, valu("v_subrev_f16", 1, 1, 0)},
+    {F::VOP3, 0x135, valu("v_mul_f16", 1, 1, 0)},
+    {F::VOP3, 0x136, valu("v_fmac_f16", 1, 1, 0)},
+    {F::VOP3, 0x139, valu("v_max_f16", 1, 1, 0)},
+    {F::VOP3, 0x13a, valu("v_min_f16", 1, 1, 0)},
+    {F::VOP3, 0x13b, valu("v_ldexp_f16", 1, 1, 0)},
+    {F::VOP3, 0x140, valu("v_fma_legacy_f32", 1, 1, 1)},
+    {F::VOP3, 0x141, valu("v_mad_f32", 1, 1, 1)},
+    {F::VOP3, 0x142, valu("v_mad_i32_i24", 1, 1, 1)},
+    {F::VOP3, 0x143, valu("v_mad_u32_u24", 1, 1, 1)},
+    {F::VOP3, 0x144, valu("v_cubeid_f32", 1, 1, 1)},
+    {F::VOP3, 0x145, valu("v_cubesc_f32", 1, 1, 1)},
+    {F::VOP3, 0x146, valu("v_cubetc_f32", 1, 1, 1)},
+    {F::VOP3, 0x147, valu("v_cubema_f32", 1, 1, 1)},
+    {F::VOP3, 0x148, valu("v_bfe_u32", 1, 1, 1)},
+    {F::VOP3, 0x149, valu("v_bfe_i32", 1, 1, 1)},
+    {F::VOP3, 0x14a, valu("v_bfi_b32", 1, 1, 1)},
+    {F::VOP3, 0x14b, valu("v_fma_f32", 1, 1, 1)},
+    {F::VOP3, 0x14c, valu("v_fma_f64", 2, 2, 2)},
+    {F::VOP3, 0x14d, valu("v_lerp_u8", 1, 1, 1)},
+    {F::VOP3, 0x14e, valu("v_alignbit_b32", 1, 1, 1)},
+    {F::VOP3, 0x14f, valu("v_alignbyte_b32", 1, 1, 1)},
+    {F::VOP3, 0x150, valu("v_mullit_f32", 1, 1, 1)},
+    {F::VOP3, 0x151, valu("v_min3_f32", 1, 1, 1)},
+    {F::VOP3, 0x152, valu("v_min3_i32", 1, 1, 1)},
+    {F::VOP3, 0x153, valu("v_min3_u32", 1, 1, 1)},
+    {F::VOP3, 0x154, valu("v_max3_f32", 1, 1, 1)},
+    {F::VOP3, 0x155, valu("v_max3_i32", 1, 1, 1)},
+    {F::VOP3, 0x156, valu("v_max3_u32", 1, 1, 1)},
+    {F::VOP3, 0x157, valu("v_med3_f32", 1, 1, 1)},
+    {F::VOP3, 0x158, valu("v_med3_i32", 1, 1, 1)},
+    {F::VOP3, 0x159, valu("v_med3_u32", 1, 1, 1)},
+    {F::VOP3, 0x15a, valu("v_sad_u8", 1, 1, 1)},
+    {F::VOP3, 0x15b, valu("v_sad_hi_u8", 1, 1, 1)},
+    {F::VOP3, 0x15c, valu("v_sad_u16", 1, 1, 1)},
+    {F::VOP3, 0x15d, valu("v_sad_u32", 1, 1, 1)},
+    {F::VOP3, 0x15e, valu("v_cvt_pk_u8_f32", 1, 1, 1)},
+    {F::VOP3, 0x15f, valu("v_div_fixup_f32", 1, 1, 1)},
+    {F::VOP3, 0x160, valu("v_div_fixup_f64", 2, 2, 2)},
+    {F::VOP3, 0x164, valu("v_add_f64", 2, 2, 0)},
+    {F::VOP3, 0x165, valu("v_mul_f64", 2, 2, 0)},
+    {F::VOP3, 0x166, valu("v_min_f64", 2, 2, 0)},
+    {F::VOP3, 0x167, valu("v_max_f64", 2, 2, 0)},
+    {F::VOP3, 0x168, valu("v_ldexp_f64", 2, 1, 0)},
+    {F::VOP3, 0x169, valu("v_mul_lo_u32", 1, 1, 0)},
+    {F::VOP3, 0x16a, valu("v_mul_hi_u32", 1, 1, 0)},
+    {F::VOP3, 0x16b, valu("v_mul_lo_i32", 1, 1, 0)},
+    {F::VOP3, 0x16c, valu("v_mul_hi_i32", 1, 1, 0)},
+    {F::VOP3, 0x16d, valu("v_div_scale_f32", 1, 1, 1)},
+    {F::VOP3, 0x16e, valu("v_div_scale_f64", 2, 2, 2)},
+    {F::VOP3, 0x16f, valu("v_div_fmas_f32", 1, 1, 1)},
+    {F::VOP3, 0x170, valu("v_div_fmas_f64", 2, 2, 2)},
+    {F::VOP3, 0x171, valu("v_msad_u8", 1, 1, 1)},
+    {F::VOP3, 0x172, valu("v_qsad_pk_u16_u8", 2, 1, 2)},
+    {F::VOP3, 0x173, valu("v_mqsad_pk_u16_u8", 2, 1, 2)},
+    {F::VOP3, 0x174, valu("v_trig_preop_f64", 2, 1, 0)},
+    {F::VOP3, 0x175, valu("v_mqsad_u32_u8", 2, 1, 0)},
+    {F::VOP3, 0x176, valu("v_mad_u64_u32", 1, 1, 2)},
+    {F::VOP3, 0x177, valu("v_mad_i64_i32", 1, 1, 2)},
+    {F::VOP3, 0x178, valu("v_xor3_b32", 1, 1, 1)},
+    {F::VOP3, 0x181, valu("v_mov_b32", 1, 0, 0)},
+    {F::VOP3, 0x183, valu("v_cvt_i32_f64", 2, 0, 0)},
+    {F::VOP3, 0x184, valu("v_cvt_f64_i32", 1, 0, 0)},
+    {F::VOP3, 0x185, valu("v_cvt_f32_i32", 1, 0, 0)},
+    {F::VOP3, 0x186, valu("v_cvt_f32_u32", 1, 0, 0)},
+    {F::VOP3, 0x187, valu("v_cvt_u32_f32", 1, 0, 0)},
+    {F::VOP3, 0x188, valu("v_cvt_i32_f32", 1, 0, 0)},
+    {F::VOP3, 0x18a, valu("v_cvt_f16_f32", 1, 0, 0)},
+    {F::VOP3, 0x18b, valu("v_cvt_f32_f16", 1, 0, 0)},
+    {F::VOP3, 0x18c, valu("v_cvt_rpi_i32_f32", 1, 0, 0)},
+    {F::VOP3, 0x18d, valu("v_cvt_flr_i32_f32", 1, 0, 0)},
+    {F::VOP3, 0x18e, valu("v_cvt_off_f32_i4", 1, 0, 0)},
+    {F::VOP3, 0x18f, valu("v_cvt_f32_f64", 2, 0, 0)},
+    {F::VOP3, 0x190, valu("v_cvt_f64_f32", 1, 0, 0)},
+    {F::VOP3, 0x191, valu("v_cvt_f32_ubyte0", 1, 0, 0)},
+    {F::VOP3, 0x192, valu("v_cvt_f32_ubyte1", 1, 0, 0)},
+    {F::VOP3, 0x193, valu("v_cvt_f32_ubyte2", 1, 0, 0)},
+    {F::VOP3, 0x194, valu("v_cvt_f32_ubyte3", 1, 0, 0)},
+    {F::VOP3, 0x195, valu("v_cvt_u32_f64", 2, 0, 0)},
+    {F::VOP3, 0x196, valu("v_cvt_f64_u32", 1, 0, 0)},
+    {F::VOP3, 0x197, valu("v_trunc_f64", 2, 0, 0)},
+    {F::VOP3, 0x198, valu("v_ceil_f64", 2, 0, 0)},
+    {F::VOP3, 0x199, valu("v_rndne_f64", 2, 0, 0)},
+    {F::VOP3, 0x19a, valu("v_floor_f64", 2, 0, 0)},
+    {F::VOP3, 0x1a0, valu("v_fract_f32", 1, 0, 0)},
+    {F::VOP3, 0x1a1, valu("v_trunc_f32", 1, 0, 0)},
+    {F::VOP3, 0x1a2, valu("v_ceil_f32", 1, 0, 0)},
+    {F::VOP3, 0x1a3, valu("v_rndne_f32", 1, 0, 0)},
+    {F::VOP3, 0x1a4, valu("v_floor_f32", 1, 0, 0)},
+    {F::VOP3, 0x1a5, valu("v_exp_f32", 1, 0, 0)},
+    {F::VOP3, 0x1a7, valu("v_log_f32", 1, 0, 0)},
+    {F::VOP3, 0x1aa, valu("v_rcp_f32", 1, 0, 0)},
+    {F::VOP3, 0x1ab, valu("v_rcp_iflag_f32", 1, 0, 0)},
+    {F::VOP3, 0x1ae, valu("v_rsq_f32", 1, 0, 0)},
+    {F::VOP3, 0x1af, valu("v_rcp_f64", 2, 0, 0)},
+    {F::VOP3, 0x1b1, valu("v_rsq_f64", 2, 0, 0)},
+    {F::VOP3, 0x1b3, valu("v_sqrt_f32", 1, 0, 0)},
+    {F::VOP3, 0x1b4, valu("v_sqrt_f64", 2, 0, 0)},
+    {F::VOP3, 0x1b5, valu("v_sin_f32", 1, 0, 0)},
+    {F::VOP3, 0x1b6, valu("v_cos_f32", 1, 0, 0)},
+    {F::VOP3, 0x1b7, valu("v_not_b32", 1, 0, 0)},
+    {F::VOP3, 0x1b8, valu("v_bfrev_b32", 1, 0, 0)},
+    {F::VOP3, 0x1b9, valu("v_ffbh_u32", 1, 0, 0)},
+    {F::VOP3, 0x1ba, valu("v_ffbl_b32", 1, 0, 0)},
+    {F::VOP3, 0x1bb, valu("v_ffbh_i32", 1, 0, 0)},
+    {F::VOP3, 0x1bc, valu("v_frexp_exp_i32_f64", 2, 0, 0)},
+    {F::VOP3, 0x1bd, valu("v_frexp_mant_f64", 2, 0, 0)},
+    {F::VOP3, 0x1be, valu("v_fract_f64", 2, 0, 0)},
+    {F::VOP3, 0x1bf, valu("v_frexp_exp_i32_f32", 1, 0, 0)},
+    {F::VOP3, 0x1c0, valu("v_frexp_mant_f32", 1, 0, 0)},
+    {F::VOP3, 0x1c2, valu("v_movreld_b32", 1, 0, 0)},
+    {F::VOP3, 0x1c3, valu("v_movrels_b32", 1, 0, 0)},
+    {F::VOP3, 0x1c4, valu("v_movrelsd_b32", 1, 0, 0)},
+    {F::VOP3, 0x1c8, valu("v_movrelsd_2_b32", 1, 0, 0)},
+    {F::VOP3, 0x1d0, valu("v_cvt_f16_u16", 1, 0, 0)},
+    {F::VOP3, 0x1d1, valu("v_cvt_f16_i16", 1, 0, 0)},
+    {F::VOP3, 0x1d2, valu("v_cvt_u16_f16", 1, 0, 0)},
+    {F::VOP3, 0x1d3, valu("v_cvt_i16_f16", 1, 0, 0)},
+    {F::VOP3, 0x1d4, valu("v_rcp_f16", 1, 0, 0)},
+    {F::VOP3, 0x1d5, valu("v_sqrt_f16", 1, 0, 0)},
+    {F::VOP3, 0x1d6, valu("v_rsq_f16", 1, 0, 0)},
+    {F::VOP3, 0x1d7, valu("v_log_f16", 1, 0, 0)},
+    {F::VOP3, 0x1d8, valu("v_exp_f16", 1, 0, 0)},
+    {F::VOP3, 0x1d9, valu("v_frexp_mant_f16", 1, 0, 0)},
+    {F::VOP3, 0x1da, valu("v_frexp_exp_i16_f16", 1, 0, 0)},
+    {F::VOP3, 0x1db, valu("v_floor_f16", 1, 0, 0)},
+    {F::VOP3, 0x1dc, valu("v_ceil_f16", 1, 0, 0)},
+    {F::VOP3, 0x1dd, valu("v_trunc_f16", 1, 0, 0)},
+    {F::VOP3, 0x1de, valu("v_rndne_f16", 1, 0, 0)},
+    {F::VOP3, 0x1df, valu("v_fract_f16", 1, 0, 0)},
+    {F::VOP3, 0x1e0, valu("v_sin_f16", 1, 0, 0)},
+    {F::VOP3, 0x1e1, valu("v_cos_f16", 1, 0, 0)},
+    {F::VOP3, 0x1e2, valu("v_sat_pk_u8_i16", 1, 0, 0)},
+    {F::VOP3, 0x1e3, valu("v_cvt_norm_i16_f16", 1, 0, 0)},
+    {F::VOP3, 0x1e4, valu("v_cvt_norm_u16_f16", 1, 0, 0)},
+    {F::VOP3, 0x200, valu("v_interp_p1_f32", 0, 1, 0)},
+    {F::VOP3, 0x201, valu("v_interp_p2_f32", 0, 1, 0)},
+    {F::VOP3, 0x202, valu("v_interp_mov_f32", 0, 0, 0)},
+    {F::VOP3, 0x2ff, valu("v_lshlrev_b64", 1, 2, 0)},
+    {F::VOP3, 0x300, valu("v_lshrrev_b64", 1, 2, 0)},
+    {F::VOP3, 0x301, valu("v_ashrrev_i64", 1, 2, 0)},
+    {F::VOP3, 0x303, valu("v_add_nc_u16", 1, 1, 0)},
+    {F::VOP3, 0x304, valu("v_sub_nc_u16", 1, 1, 0)},
+    {F::VOP3, 0x305, valu("v_mul_lo_u16", 1, 1, 0)},
+    {F::VOP3, 0x307, valu("v_lshrrev_b16", 1, 1, 0)},
+    {F::VOP3, 0x308, valu("v_ashrrev_i16", 1, 1, 0)},
+    {F::VOP3, 0x309, valu("v_max_u16", 1, 1, 0)},
+    {F::VOP3, 0x30a, valu("v_max_i16", 1, 1, 0)},
+    {F::VOP3, 0x30b, valu("v_min_u16", 1, 1, 0)},
+    {F::VOP3, 0x30c, valu("v_min_i16", 1, 1, 0)},
+    {F::VOP3, 0x30d, valu("v_add_nc_i16", 1, 1, 0)},
+    {F::VOP3, 0x30e, valu("v_sub_nc_i16", 1, 1, 0)},
+    {F::VOP3, 0x30f, valu("v_add_co_u32", 1, 1, 0)},
+    {F::VOP3, 0x310, valu("v_sub_co_u32", 1, 1, 0)},
+    {F::VOP3, 0x311, valu("v_pack_b32_f16", 1, 1, 0)},
+    {F::VOP3, 0x312, valu("v_cvt_pknorm_i16_f16", 1, 1, 0)},
+    {F::VOP3, 0x313, valu("v_cvt_pknorm_u16_f16", 1, 1, 0)},
+    {F::VOP3, 0x314, valu("v_lshlrev_b16", 1, 1, 0)},
+    {F::VOP3, 0x319, valu("v_subrev_co_u32", 1, 1, 0)},
+    {F::VOP3, 0x340, valu("v_mad_u16", 1, 1, 1)},
+    {F::VOP3, 0x342, valu("v_interp_p1ll_f16", 0, 1, 0)},
+    {F::VOP3, 0x343, valu("v_interp_p1lv_f16", 0, 1, 1)},
+    {F::VOP3, 0x344, valu("v_perm_b32", 1, 1, 1)},
+    {F::VOP3, 0x345, valu("v_xad_u32", 1, 1, 1)},
+    {F::VOP3, 0x346, valu("v_lshl_add_u32", 1, 1, 1)},
+    {F::VOP3, 0x347, valu("v_add_lshl_u32", 1, 1, 1)},
+    {F::VOP3, 0x34b, valu("v_fma_f16", 1, 1, 1)},
+    {F::VOP3, 0x351, valu("v_min3_f16", 1, 1, 1)},
+    {F::VOP3, 0x352, valu("v_min3_i16", 1, 1, 1)},
+    {F::VOP3, 0x353, valu("v_min3_u16", 1, 1, 1)},
+    {F::VOP3, 0x354, valu("v_max3_f16", 1, 1, 1)},
+    {F::VOP3, 0x355, valu("v_max3_i16", 1, 1, 1)},
+    {F::VOP3, 0x356, valu("v_max3_u16", 1, 1, 1)},
+    {F::VOP3, 0x357, valu("v_med3_f16", 1, 1, 1)},
+    {F::VOP3, 0x358, valu("v_med3_i16", 1, 1, 1)},
+    {F::VOP3, 0x359, valu("v_med3_u16", 1, 1, 1)},
+    {F::VOP3, 0x35a, valu("v_interp_p2_f16", 0, 1, 1)},
+    {F::VOP3, 0x35e, valu("v_mad_i16", 1, 1, 1)},
+    {F::VOP3, 0x35f, valu("v_div_fixup_f16", 1, 1, 1)},
+    {F::VOP3, 0x360, valu("v_readlane_b32", 1, 1, 0)},
+    {F::VOP3, 0x361, valu("v_writelane_b32", 1, 1, 0)},
+    {F::VOP3, 0x362, valu("v_ldexp_f32", 1, 1, 0)},
+    {F::VOP3, 0x363, valu("v_bfm_b32", 1, 1, 0)},
+    {F::VOP3, 0x364, valu("v_bcnt_u32_b32", 1, 1, 0)},
+    {F::VOP3, 0x365, valu("v_mbcnt_lo_u32_b32", 1, 1, 0)},
+    {F::VOP3, 0x366, valu("v_mbcnt_hi_u32_b32", 1, 1, 0)},
+    {F::VOP3, 0x368, valu("v_cvt_pknorm_i16_f32", 1, 1, 0)},
+    {F::VOP3, 0x369, valu("v_cvt_pknorm_u16_f32", 1, 1, 0)},
+    {F::VOP3, 0x36a, valu("v_cvt_pk_u16_u32", 1, 1, 0)},
+    {F::VOP3, 0x36b, valu("v_cvt_pk_i16_i32", 1, 1, 0)},
+    {F::VOP3, 0x36d, valu("v_add3_u32", 1, 1, 1)},
+    {F::VOP3, 0x36f, valu("v_lshl_or_b32", 1, 1, 1)},
+    {F::VOP3, 0x371, valu("v_and_or_b32", 1, 1, 1)},
+    {F::VOP3, 0x372, valu("v_or3_b32", 1, 1, 1)},
+    {F::VOP3, 0x373, valu("v_mad_u32_u16", 1, 1, 1)},
+    {F::VOP3, 0x375, valu("v_mad_i32_i16", 1, 1, 1)},
+    {F::VOP3, 0x376, valu("v_sub_nc_i32", 1, 1, 0)},
+    {F::VOP3, 0x377, valu("v_permlane16_b32", 1, 1, 1)},
+    {F::VOP3, 0x378, valu("v_permlanex16_b32", 1, 1, 1)},
+    {F::VOP3, 0x37f, valu("v_add_nc_i32", 1, 1, 0)},
+};
+
 // Encodings the decoder accepts but RDNA2 does not assign, listed EXPLICITLY rather than inferred
 // from the gaps between named rows: deleting a named row must leave its slot Unknown, so the
 // coverage test notices, instead of quietly turning it into a reserved encoding. Each range is
@@ -348,31 +943,102 @@ constexpr ReservedRange kReserved[] = {
     {F::SOPP, 0x1c, 0x1d},
     {F::SOPP, 0x26, 0x27},
     {F::SOPP, 0x29, 0x7f},
+    {F::VOP2, 0x000, 0x000},
+    {F::VOP2, 0x00e, 0x00e},
+    {F::VOP2, 0x015, 0x015},
+    {F::VOP2, 0x017, 0x017},
+    {F::VOP2, 0x019, 0x019},
+    {F::VOP2, 0x022, 0x024},
+    {F::VOP2, 0x02e, 0x02e},
+    {F::VOP2, 0x030, 0x031},
+    {F::VOP2, 0x03d, 0x03d},
+    {F::VOP1, 0x000, 0x000},
+    {F::VOP1, 0x009, 0x009},
+    {F::VOP1, 0x01b, 0x01f},
+    {F::VOP1, 0x026, 0x026},
+    {F::VOP1, 0x028, 0x029},
+    {F::VOP1, 0x02c, 0x02d},
+    {F::VOP1, 0x030, 0x030},
+    {F::VOP1, 0x032, 0x032},
+    {F::VOP1, 0x041, 0x041},
+    {F::VOP1, 0x045, 0x047},
+    {F::VOP1, 0x049, 0x04f},
+    {F::VOP1, 0x066, 0x067},
+    {F::VOP1, 0x069, 0x0ff},
+    {F::VOPC, 0x040, 0x07f},
+    {F::VOPC, 0x0af, 0x0af},
+    {F::VOPC, 0x0bf, 0x0bf},
+    {F::VOP3, 0x100, 0x100},
+    {F::VOP3, 0x102, 0x102},
+    {F::VOP3, 0x10d, 0x10e},
+    {F::VOP3, 0x115, 0x115},
+    {F::VOP3, 0x117, 0x117},
+    {F::VOP3, 0x119, 0x119},
+    {F::VOP3, 0x120, 0x124},
+    {F::VOP3, 0x12c, 0x12e},
+    {F::VOP3, 0x130, 0x131},
+    {F::VOP3, 0x137, 0x138},
+    {F::VOP3, 0x13c, 0x13f},
+    {F::VOP3, 0x161, 0x163},
+    {F::VOP3, 0x179, 0x180},
+    {F::VOP3, 0x182, 0x182},
+    {F::VOP3, 0x189, 0x189},
+    {F::VOP3, 0x19b, 0x19f},
+    {F::VOP3, 0x1a6, 0x1a6},
+    {F::VOP3, 0x1a8, 0x1a9},
+    {F::VOP3, 0x1ac, 0x1ad},
+    {F::VOP3, 0x1b0, 0x1b0},
+    {F::VOP3, 0x1b2, 0x1b2},
+    {F::VOP3, 0x1c1, 0x1c1},
+    {F::VOP3, 0x1c5, 0x1c7},
+    {F::VOP3, 0x1c9, 0x1cf},
+    {F::VOP3, 0x1e5, 0x1ff},
+    {F::VOP3, 0x203, 0x2fe},
+    {F::VOP3, 0x302, 0x302},
+    {F::VOP3, 0x306, 0x306},
+    {F::VOP3, 0x315, 0x318},
+    {F::VOP3, 0x31a, 0x33f},
+    {F::VOP3, 0x341, 0x341},
+    {F::VOP3, 0x348, 0x34a},
+    {F::VOP3, 0x34c, 0x350},
+    {F::VOP3, 0x35b, 0x35d},
+    {F::VOP3, 0x367, 0x367},
+    {F::VOP3, 0x36c, 0x36c},
+    {F::VOP3, 0x36e, 0x36e},
+    {F::VOP3, 0x370, 0x370},
+    {F::VOP3, 0x374, 0x374},
+    {F::VOP3, 0x379, 0x37e},
+    {F::VOP3, 0x380, 0x3ff},
 };
 
-// The decoder's opcode field widths, minus encodings another format claims first
-// (rdna2_decode_one: SOPP, SOPC, SOP1 and SOPK are carved out of the SOP2 prefix).
+// The decoder's opcode spaces, minus encodings another format claims first (rdna2_decode_one).
 // SOP2: bits[29:23]; 0x60-0x7F are the SOPK/SOP1/SOPC/SOPP prefixes.
-constexpr uint32_t kSop2Space = 0x60;
+constexpr Rdna2OpcodeRange kSop2Range{0, 0x60};
 // SOP1: bits[15:8].
-constexpr uint32_t kSop1Space = 0x100;
+constexpr Rdna2OpcodeRange kSop1Range{0, 0x100};
 // SOPK: bits[27:23]; 0x1D/0x1E/0x1F are the SOP1/SOPC/SOPP prefixes.
-constexpr uint32_t kSopkSpace = 0x1d;
+constexpr Rdna2OpcodeRange kSopkRange{0, 0x1d};
 // SOPC and SOPP: bits[22:16].
-constexpr uint32_t kSopcSpace = 0x80;
-constexpr uint32_t kSoppSpace = 0x80;
+constexpr Rdna2OpcodeRange kSopcRange{0, 0x80};
+constexpr Rdna2OpcodeRange kSoppRange{0, 0x80};
+// VOP2: bits[30:25]; 0x3E/0x3F are the VOPC/VOP1 prefixes.
+constexpr Rdna2OpcodeRange kVop2Range{0, 0x3e};
+// VOP1 and VOPC: 8-bit opcode fields (a VOPC e64 compare keeps its e32 number).
+constexpr Rdna2OpcodeRange kVop1Range{0, 0x100};
+constexpr Rdna2OpcodeRange kVopcRange{0, 0x100};
+// VOP3: bits[25:16]; 0x000-0x0FF are VOPC e64 and decode as VOPC.
+constexpr Rdna2OpcodeRange kVop3Range{0x100, 0x400};
 
-constexpr size_t kMaxSpace = 0x100;
-
+template <size_t N>
 struct FormatTable {
-    std::array<Rdna2InstructionEffects, kMaxSpace> by_opcode{};
+    std::array<Rdna2InstructionEffects, N> by_opcode{};
 };
 
 // Dense lookup for one format: its named rows plus its explicit reserved ranges. Every other slot
 // stays Unknown.
-template <size_t N>
-constexpr FormatTable dense(Rdna2Format fmt, const Row (&rows)[N]) {
-    FormatTable table;
+template <size_t N, size_t R>
+constexpr FormatTable<N> dense(Rdna2Format fmt, const Row (&rows)[R]) {
+    FormatTable<N> table;
     for (const ReservedRange& range : kReserved)
         if (range.fmt == fmt)
             for (uint32_t opcode = range.first; opcode <= range.last; ++opcode)
@@ -381,19 +1047,49 @@ constexpr FormatTable dense(Rdna2Format fmt, const Row (&rows)[N]) {
     return table;
 }
 
-constexpr FormatTable kSop2Table = dense(F::SOP2, kSop2);
-constexpr FormatTable kSop1Table = dense(F::SOP1, kSop1);
-constexpr FormatTable kSopkTable = dense(F::SOPK, kSopk);
-constexpr FormatTable kSopcTable = dense(F::SOPC, kSopc);
-constexpr FormatTable kSoppTable = dense(F::SOPP, kSopp);
+constexpr auto kSop2Table = dense<0x100>(F::SOP2, kSop2);
+constexpr auto kSop1Table = dense<0x100>(F::SOP1, kSop1);
+constexpr auto kSopkTable = dense<0x100>(F::SOPK, kSopk);
+constexpr auto kSopcTable = dense<0x100>(F::SOPC, kSopc);
+constexpr auto kSoppTable = dense<0x100>(F::SOPP, kSopp);
+constexpr auto kVop2Table = dense<0x100>(F::VOP2, kVop2);
+constexpr auto kVop1Table = dense<0x100>(F::VOP1, kVop1);
+constexpr auto kVopcTable = dense<0x100>(F::VOPC, kVopc);
+constexpr auto kVop3Table = dense<0x400>(F::VOP3, kVop3);
 
-const FormatTable* table_for(Rdna2Format fmt) {
+Rdna2OpcodeRange range_for(Rdna2Format fmt) {
     switch (fmt) {
-        case F::SOP2: return &kSop2Table;
-        case F::SOP1: return &kSop1Table;
-        case F::SOPK: return &kSopkTable;
-        case F::SOPC: return &kSopcTable;
-        case F::SOPP: return &kSoppTable;
+        case F::SOP2: return kSop2Range;
+        case F::SOP1: return kSop1Range;
+        case F::SOPK: return kSopkRange;
+        case F::SOPC: return kSopcRange;
+        case F::SOPP: return kSoppRange;
+        case F::VOP2: return kVop2Range;
+        case F::VOP1: return kVop1Range;
+        case F::VOPC: return kVopcRange;
+        case F::VOP3: return kVop3Range;
+        default: return {};
+    }
+}
+
+template <size_t N>
+const Rdna2InstructionEffects* lookup(const FormatTable<N>& table, uint32_t opcode) {
+    return opcode < N ? &table.by_opcode[opcode] : nullptr;
+}
+
+const Rdna2InstructionEffects* entry_for(Rdna2Format fmt, uint32_t opcode) {
+    const Rdna2OpcodeRange range = range_for(fmt);
+    if (opcode < range.first || opcode >= range.end) return nullptr;
+    switch (fmt) {
+        case F::SOP2: return lookup(kSop2Table, opcode);
+        case F::SOP1: return lookup(kSop1Table, opcode);
+        case F::SOPK: return lookup(kSopkTable, opcode);
+        case F::SOPC: return lookup(kSopcTable, opcode);
+        case F::SOPP: return lookup(kSoppTable, opcode);
+        case F::VOP2: return lookup(kVop2Table, opcode);
+        case F::VOP1: return lookup(kVop1Table, opcode);
+        case F::VOPC: return lookup(kVopcTable, opcode);
+        case F::VOP3: return lookup(kVop3Table, opcode);
         default: return nullptr;
     }
 }
@@ -408,6 +1104,10 @@ std::vector<Row> all_rows() {
     append(kSopk);
     append(kSopc);
     append(kSopp);
+    append(kVop2);
+    append(kVop1);
+    append(kVopc);
+    append(kVop3);
     for (const ReservedRange& range : kReserved)
         for (uint32_t opcode = range.first; opcode <= range.last; ++opcode)
             rows.push_back({range.fmt, opcode, reserved()});
@@ -441,24 +1141,16 @@ bool never_touches_scc(Rdna2Format fmt) {
 }   // namespace
 
 const Rdna2InstructionEffects& rdna2_instruction_effects(Rdna2Format fmt, uint32_t opcode) {
-    const FormatTable* table = table_for(fmt);
-    if (!table || opcode >= kMaxSpace) return kUnknown;
-    return table->by_opcode[opcode];
+    const Rdna2InstructionEffects* entry = entry_for(fmt, opcode);
+    return entry ? *entry : kUnknown;
 }
 
 bool rdna2_effects_format_is_tabulated(Rdna2Format fmt) {
-    return table_for(fmt) != nullptr;
+    return range_for(fmt).end != 0;
 }
 
-uint32_t rdna2_effects_opcode_space(Rdna2Format fmt) {
-    switch (fmt) {
-        case F::SOP2: return kSop2Space;
-        case F::SOP1: return kSop1Space;
-        case F::SOPK: return kSopkSpace;
-        case F::SOPC: return kSopcSpace;
-        case F::SOPP: return kSoppSpace;
-        default: return 0;
-    }
+Rdna2OpcodeRange rdna2_effects_opcode_range(Rdna2Format fmt) {
+    return range_for(fmt);
 }
 
 std::span<const Rdna2InstructionEffectsRow> rdna2_instruction_effects_rows() {

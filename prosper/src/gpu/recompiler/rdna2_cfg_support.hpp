@@ -1650,115 +1650,25 @@ inline uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
             return effects.ssrc_dwords[source];
         }
         case Rdna2Format::VOP1:
-        case Rdna2Format::VOP2: return 1;
-        case Rdna2Format::VOPC: {
-            const uint32_t effective = vopc_is_cmpx(in.opcode) ? in.opcode - 0x10u : in.opcode;
-            const bool integer64 = (effective >= 0xa1u && effective <= 0xa6u) ||
-                                   (effective >= 0xe1u && effective <= 0xe6u);
-            return integer64 ? 2u : 1u;
+        case Rdna2Format::VOP2:
+        case Rdna2Format::VOPC:
+        case Rdna2Format::VOP3: {
+            // Every VALU source width comes from the instruction-effects table, derived from the
+            // ISA (70648 12.7-12.12) and checked against llvm-mc: a B32 operand is one SGPR, an
+            // F64/I64/U64/B64 operand a pair, and a lane mask (SRC2 of v_cndmask_b32, the
+            // carry-in forms and v_mad_u64_u32) the Wave64 pair. It replaces an allowlist of B32
+            // VOP3 opcodes over a "two dwords" default, extended one opcode at a time as titles
+            // were refused (V_LSHL_ADD_U32 #2790, V_MUL_LO/HI_U32 #2952, V_MED3_F32 #4429,
+            // V_BFE_U32 #4848, V_BCNT_U32_B32 #5148): every B32 form outside that list charged a
+            // never-read sibling SGPR and could refuse a valid shader (#5146).
+            // A source the instruction does not have (the decoder fills SRC2 of every VOP3) is
+            // UINT32_MAX, as v_readlane_b32's and v_mbcnt's always were. An encoding the table
+            // cannot classify is charged a pair.
+            const Rdna2InstructionEffects& effects = rdna2_instruction_effects(in);
+            if (!effects.describes_sources()) return 2u;
+            if (source >= 3 || !effects.ssrc_dwords[source]) return UINT32_MAX;
+            return effects.ssrc_dwords[source];
         }
-        case Rdna2Format::VOP3:
-            if (in.opcode == 0x176 || in.opcode == 0x177)
-                return source < 2 ? 1u : (source == 2 ? 2u : UINT32_MAX);
-            // These add/subtract forms read two B32 operands; the fresh SDST carry is an output,
-            // not a paired source. MAD_U64/I64 remain separate paired-source consumers.
-            if (vop3b_fresh_carry_output(in)) return source < 2 ? 1u : UINT32_MAX;
-            if (in.opcode == 0x360 || in.opcode == 0x361 || in.opcode == 0x365 ||
-                in.opcode == 0x366 || in.opcode == 0x11f)
-                return source < 2 ? 1u : UINT32_MAX;
-            if (in.opcode == kVop3OpcodeLshlrevB64 || in.opcode == kVop3OpcodeLshrrevB64)
-                return source == 0 ? 1u : (source == 1 ? 2u : UINT32_MAX);
-            // CONFIDENCE: HIGH -- carry-in ADD/SUB/SUBREV lower SRC0/SRC1 as B32;
-            // only SRC2 names the actual SGPR-pair predicate (RDNA2 70648, section 12.7).
-            if (in.opcode == 0x128 || in.opcode == 0x129 || in.opcode == 0x12a)
-                return source < 2 ? 1u : (source == 2 ? 2u : UINT32_MAX);
-            if (in.opcode == 0x101)
-                return source < 2 ? 1u : 2u;   // cndmask data is B32; condition is a pair
-            // B32 VOP3 forms, each of whose sources is ONE dword. The list is an allowlist over a
-            // deliberately fail-closed `return 2` default: every consumer of this width treats a
-            // wider answer as "prove more" (a pair read blocks `sgpr_dead_at_merge`'s
-            // MaskDomainOnly relaxation, and demands both physical words be MUST scalar data in the
-            // Wave64 transfer), so over-reporting only costs acceptances while under-reporting
-            // would be unsound. Entries are therefore added on evidence, one op at a time.
-            //
-            // V_LSHL_ADD_U32 is the direct sibling of V_ADD_LSHL_U32 below it and was the one
-            // missing: `D.u32 = (S0.u32 << S1.u32[4:0]) + S2.u32`, three 32-bit operands (RDNA2 ISA
-            // 70648). Sonic Frontiers' Cyber Space stage runs the byte-identical idiom in all three
-            // of its scene-target-width kernels (#2790) --
-            //
-            //     s_mul_i32      vcc_lo, s16, 12          VCC_LO as ordinary scalar scratch
-            //     s_mov_b64      s[6:7], exec
-            //     v_lshl_add_u32 v7, v6, 2, vcc_lo        a 32-BIT read of that scratch dword
-            //
-            // -- and charging that read the pair made the CFG dispatcher demand VCC_HI, which is a
-            // live mask half at that join and can never be a scalar word. All three declined with
-            // `wave64-ambiguous-mask-read`, then fell to the straight-line emitter, where the
-            // reported reject is whatever it reaches first: `s_cbranch_execz` at pc28 in two of them
-            // and `image_load_mip` at pc33 in the third. Neither is the defect -- the same
-            // "a reject PC names where a fact was consumed, not where it was lost" as #2481/#2801.
-            //
-            // Known remainder, recorded rather than fixed: `0x345`, `0x363`, `0x372` and
-            // `0x178` are B32 VOP3 forms still falling to the default. No live title has been
-            // observed reading a mask half through one, so they stay out of the list under the
-            // add-on-evidence rule above -- but the next investigation that meets one has the set
-            // rather than re-deriving it (review of #2820).
-            //
-            // V_MUL_LO_U32 / V_MUL_HI_U32 (0x169 / 0x16a): `D.u32 = S0.u32 * S1.u32`, low or high 32
-            // bits of the product -- two 32-bit operands (RDNA2 ISA 70648). Metaphor: ReFantazio's
-            // UI-composite kernel 0x2281c74100 (#2952) runs the compiler's unsigned-division idiom
-            // with VCC_LO as scalar scratch:
-            //
-            //     s_sub_i32          vcc_lo, 0, s26
-            //     v_readfirstlane_b32 vcc_hi, v5
-            //     s_mul_i32 / s_mul_hi_u32 / s_add_i32 over vcc_lo, vcc_hi
-            //     v_mul_hi_u32       v5, vcc_lo, v23       a 32-BIT read of that scratch dword
-            //     v_mul_lo_u32       v6, s26, v5
-            //
-            // and the pair charge rejected its second barrier phase with
-            // `wave64-ambiguous-mask-read` at pc184.
-            //
-            // V_MED3_F32 (0x157): `D.f32 = median(S0.f32, S1.f32, S2.f32)`, three 32-bit operands
-            // (RDNA2 ISA 70648; the emitter already lowers it that way). One Unity vertex program,
-            // byte-identical in Alex Kidd in Miracle World DX, Greak and Summer Sports Games
-            // (#4429), clamps with a constant held in the SGPR just below a vertex-buffer
-            // descriptor it selected from a table by a runtime index:
-            //
-            //     s_load_dwordx4 s[8:11], s[24:25], vcc_lo   the V# for this attribute
-            //     v_med3_f32     v16, 0x509502f9, s7, v0     a 32-BIT read of s7, not of s7:s8
-            //     buffer_load_format_xyzw v[0:3], v1, s[8:11], s12 idxen
-            //
-            // Charging that read the pair made s8 -- the descriptor's first word -- look like
-            // numeric data, so the load "needed backing" it could never be given
-            // (`raw-wide-data-requires-backing` at pc62) and every draw using the program was
-            // dropped: 20,998 in 120 s of Alex Kidd, 85,840 in 140 s of Summer Sports.
-            // Its integer siblings 0x158 / 0x159 and the min3/max3 forms 0x151-0x156 are B32 too
-            // and still fall to the default, under the add-on-evidence rule above.
-            //
-            // V_BFE_U32 (0x148): `D.u32 = (S0.u32 >> S1.u32[4:0]) & ((1 << S2.u32[4:0]) - 1)`,
-            // three 32-bit operands (RDNA2 ISA 70648; emit_alu lowers S0 with a one-dword read).
-            // House of the Dead 2's fragment programs 0x41c7dfd500 / 0x41d05bd900 (#4848) recycle
-            // VCC as scalar scratch in a table-search loop that one path skips, then reload VCC_LO:
-            //
-            //     s_buffer_load_dword vcc_lo, s[0:3], 0xae4   VCC_LO scalar; VCC_HI still ambiguous
-            //     v_bfe_u32           v0, vcc_lo, s4, 1       a 32-BIT read of that dword
-            //     v_cmp_ne_u32        vcc, 0, v0              complete VCC replacement
-            //
-            // Charged the pair, the read demanded VCC_HI too and both programs were declined with
-            // `wave64-ambiguous-mask-read`. The signed sibling 0x149 stays at the default.
-            //
-            // V_BCNT_U32_B32 (0x364): `D.u32 = CountOneBits(S0.u32) + S1.u32`, two 32-bit
-            // operands (RDNA2 ISA 70648). The population-count idiom counts a B64 mask one half
-            // at a time (`v_bcnt v7, s8, 0` / `v_bcnt v7, s9, v7`); charged the pair, the high
-            // half's read reached the never-written s10 and the fresh-mask guard refused the
-            // compare over the count (`fabricated-fresh-mask-source`, fragment_partial_wave_exec,
-            // #5146). The same fixture's MBCNT reads were already one dword (0x365 / 0x366).
-            if (in.opcode == 0x141 || in.opcode == 0x143 || in.opcode == 0x148 ||
-                in.opcode == 0x157 || in.opcode == kVop3OpcodeLshlAddU32 || in.opcode == 0x347 ||
-                in.opcode == 0x36f || in.opcode == 0x364 || in.opcode == kVop3OpcodeAdd3U32 ||
-                in.opcode == kVop3OpcodeAndOrB32 || in.opcode == kVop3OpcodeMulLoU32 ||
-                in.opcode == kVop3OpcodeMulHiU32)
-                return 1;
-            return 2;
         default: return 0;
     }
 }
