@@ -3,6 +3,7 @@
 // data-driven coverage report over the real game shaders (shader_histo).
 #include "../fixtures/checked_compute_launch.hpp"
 #include "../fixtures/compute_coverage_inputs.hpp"
+#include "../fixtures/legacy_coverage_fixtures.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -23,6 +24,7 @@
 
 using namespace prosper::gpu;
 namespace coverage_inputs = prosper::test::coverage_inputs;
+namespace coverage_fixtures = prosper::test::coverage_fixtures;
 
 static int fails = 0;
 #define CHECK(c, m) do { if (!(c)) { printf("  [FAIL] %s\n", m); fails++; } \
@@ -1846,13 +1848,7 @@ int main() {
     CHECK(!recompile_compute(compute_cfg_dispatch, std::size(compute_cfg_dispatch),
                              &dispatch_rt, wave32_dispatch_config).empty(),
           "the complex compute CFG dispatcher supports Wave32 without B32 mask aliases");
-    std::vector<uint32_t> compute_cfg_dispatch_created_b32 = {
-        0x7D8802F9u, 0x06068000u, // v_cmp_lt_f32_sdwa s[0:1], v0, v0
-        0xBE820300u,              // s_mov_b32 s2, s0 (new one-word mask alias)
-    };
-    compute_cfg_dispatch_created_b32.insert(
-        compute_cfg_dispatch_created_b32.end(), compute_cfg_dispatch,
-        compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    std::vector<uint32_t> compute_cfg_dispatch_created_b32 = coverage_fixtures::b32_alias();
     // The generic dispatcher now carries an unambiguous one-word mask domain at every basic-block
     // boundary. This formerly-negative fixture is the smallest compute regression for the same
     // dataflow used by Astro's complex Wave32 fragment shader.
@@ -2209,77 +2205,44 @@ int main() {
     // mask/scalar join leaves s18 ambiguous, so widening the one-dword s17 operand to a pair
     // incorrectly rejects this packet. Keep the production words intact and mutate SRC1 at that
     // same site to s18 so the negative arm still observes the genuinely ambiguous dword.
-    std::vector<uint32_t> compute_cfg_dispatch_exact_vop3_cndmask_b32_source = {
-        0xBF068008u,                         // pc0: scalar branch condition
-        0xBF840003u,                         // pc1: branch to mask-producing arm
-        0xBE920381u,                         // pc2: scalar arm s18 = 1
-        0xBE930380u,                         // pc3: scalar arm s19 = 0
-        0xBF820001u,                         // pc4: merge
-        0xBE920A7Eu,                         // pc5: mask-only WQM s[18:19] = exec
-        0xBE910381u,                         // pc6: definite scalar s17 = 1
-        0x7E300280u,                         // pc7: v24 = 0
-        0x7E2A0280u,                         // pc8: v21 = 0
-        0x7D8414F9u, 0x06868E82u,            // pc9: exact live compare writes mask s[14:15]
-        0xD5010015u, 0x00382318u,            // pc11: exact live cndmask v21,v24,s17,s[14:15]
-    };
-    compute_cfg_dispatch_exact_vop3_cndmask_b32_source.insert(
-        compute_cfg_dispatch_exact_vop3_cndmask_b32_source.end(), compute_cfg_dispatch,
-        compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    std::vector<uint32_t> compute_cfg_dispatch_exact_vop3_cndmask_b32_source =
+        coverage_fixtures::cndmask_scalar();
     CHECK(!recompile_compute(compute_cfg_dispatch_exact_vop3_cndmask_b32_source.data(),
                              compute_cfg_dispatch_exact_vop3_cndmask_b32_source.size(),
-                             &dispatch_rt, wave64_dispatch_config).empty(),
+                             &dispatch_rt, coverage_fixtures::branch_wave64())
+               .empty(),
           "GTA's exact VOP3 cndmask consumes only its scalar source dword");
 
     std::vector<uint32_t> compute_cfg_dispatch_vop3_cndmask_ambiguous_source =
         compute_cfg_dispatch_exact_vop3_cndmask_b32_source;
-    compute_cfg_dispatch_vop3_cndmask_ambiguous_source[12] =
-        0x00382518u;                         // same pc11 packet with SRC1=s18
+    compute_cfg_dispatch_vop3_cndmask_ambiguous_source[coverage_fixtures::cndmask_source_word] =
+        0x00382518u;   // same consumer packet with SRC1=s18
     CHECK(recompile_compute(compute_cfg_dispatch_vop3_cndmask_ambiguous_source.data(),
-                            compute_cfg_dispatch_vop3_cndmask_ambiguous_source.size(),
-                            &dispatch_rt, wave64_dispatch_config).empty(),
+                            compute_cfg_dispatch_vop3_cndmask_ambiguous_source.size(), &dispatch_rt,
+                            coverage_fixtures::branch_wave64())
+              .empty(),
           "VOP3 cndmask rejects an unresolved scalar dword at its exact source field");
 
     // exec_cs_205b654a00 pc2232 is V_LSHL_OR_B32 with scalar SRC0=s8. The preceding
     // V_READFIRSTLANE definitely replaces s8, while the adjacent s9 remains ambiguous after a
     // mask/scalar join. Every source of this integer VOP3A operation is one dword; mutating only
     // SRC0 at the production packet to s9 must still observe and reject the unresolved value.
-    std::vector<uint32_t> compute_cfg_dispatch_exact_lshl_or_b32_source = {
-        0xBF068008u,                         // pc0: scalar branch condition
-        0xBF840003u,                         // pc1: branch to mask-producing arm
-        0xBE880381u,                         // pc2: scalar arm s8 = 1
-        0xBE890380u,                         // pc3: scalar arm s9 = 0
-        0xBF820001u,                         // pc4: merge
-        0xBE880A7Eu,                         // pc5: mask-only WQM s[8:9] = exec
-        0x7E000280u,                         // pc6: v0 = 0
-        0x7E100500u,                         // pc7: exact upstream readfirstlane s8,v0
-        0xBE920384u, 0xBE930382u,            // pc8: scalar s[18:19] = {4,2}
-        0xBE940384u, 0xBE950382u,            // pc10: scalar s[20:21] = {4,2}
-        0xBF068008u,                         // pc12: define SCC for the pair selection
-        0x85EA1412u,                         // pc13: materialize scalar pair in VCC
-        0xD76F0002u, 0x01A92008u,            // pc14: exact lshl_or v2,s8,16,vcc_lo
-        0xBE880480u,                         // pc16: clear the unrelated pair for the tail
-    };
-    const size_t lshl_or_dispatch_base =
-        compute_cfg_dispatch_exact_lshl_or_b32_source.size();
-    compute_cfg_dispatch_exact_lshl_or_b32_source.insert(
-        compute_cfg_dispatch_exact_lshl_or_b32_source.end(), compute_cfg_dispatch,
-        compute_cfg_dispatch + std::size(compute_cfg_dispatch));
-    // This fixture deliberately overwrites s8, which is also the synthetic tail's direct V#.
-    // Preserve the tail's instruction count and CFG while removing that unrelated descriptor read.
-    compute_cfg_dispatch_exact_lshl_or_b32_source[lshl_or_dispatch_base + 12] = 0xBF800000u;
-    compute_cfg_dispatch_exact_lshl_or_b32_source[lshl_or_dispatch_base + 13] = 0xBF800000u;
+    std::vector<uint32_t> compute_cfg_dispatch_exact_lshl_or_b32_source =
+        coverage_fixtures::lshl_or_scalar();
     CHECK(!recompile_compute(compute_cfg_dispatch_exact_lshl_or_b32_source.data(),
                              compute_cfg_dispatch_exact_lshl_or_b32_source.size(), &dispatch_rt,
-                             wave64_dispatch_config).empty(),
+                             coverage_fixtures::branch_wave64())
+               .empty(),
           "GTA's exact VOP3 lshl_or consumes only its definitely replaced scalar dword");
 
     std::vector<uint32_t> compute_cfg_dispatch_lshl_or_ambiguous_source =
         compute_cfg_dispatch_exact_lshl_or_b32_source;
-    compute_cfg_dispatch_lshl_or_ambiguous_source[15] =
-        0x01A92009u;                         // same pc14 packet with SRC0=s9
+    compute_cfg_dispatch_lshl_or_ambiguous_source[coverage_fixtures::lshl_or_source_word] =
+        0x01A92009u;   // same consumer packet with SRC0=s9
     CHECK(recompile_compute(compute_cfg_dispatch_lshl_or_ambiguous_source.data(),
                             compute_cfg_dispatch_lshl_or_ambiguous_source.size(), &dispatch_rt,
-                            wave64_dispatch_config).empty(),
+                            coverage_fixtures::branch_wave64())
+              .empty(),
           "VOP3 lshl_or rejects an unresolved scalar dword at its exact source field");
 
     // exec_cs_205b658800 pc2546 is two-source V_MAC_F32 with real SRC0=s31. A scalar load
@@ -2910,14 +2873,7 @@ int main() {
                              compute_cfg_dispatch_recycled_vcc_hi.size(), &dispatch_rt,
                              wave32_dispatch_config).empty(),
           "the dispatcher keeps recycled VCC scalar and mask lifetimes distinct");
-    std::vector<uint32_t> compute_cfg_dispatch_trap = {
-        0xBF070000u, // s_cmp_lg_u32 s0, s0 (false)
-        0xBF840001u, // s_cbranch_scc0 +1 (valid data skips the assertion trap)
-        0xBF920001u, // s_trap 1
-    };
-    compute_cfg_dispatch_trap.insert(
-        compute_cfg_dispatch_trap.end(), compute_cfg_dispatch,
-        compute_cfg_dispatch + std::size(compute_cfg_dispatch));
+    std::vector<uint32_t> compute_cfg_dispatch_trap = coverage_fixtures::trap_bypass();
     CHECK(!recompile_compute(compute_cfg_dispatch_trap.data(),
                              compute_cfg_dispatch_trap.size(), &dispatch_rt,
                              wave32_dispatch_config).empty(),
@@ -3117,7 +3073,8 @@ int main() {
     CHECK(!recompile_valu(scc_data_source, sizeof(scc_data_source)/sizeof(scc_data_source[0]), 0, 0).empty(),
           "SCC is accepted as its architectural scalar 0/1 ALU source");
     const auto& mask_nor = coverage_inputs::mask_nor;
-    CHECK(!recompile_valu(mask_nor.data(), mask_nor.size(), 0, 0).empty(),
+    CHECK(!recompile_valu(mask_nor.data(), mask_nor.size(), coverage_fixtures::nor_input_words, 0)
+               .empty(),
           "s_nor_b64 combines a saved comparison mask with VCC in the bool domain");
     // An s_barrier INSIDE the loop body also rejects: the uniformity proof is per-WAVE, and a
     // barrier inside a loop whose trip count could differ across the workgroup's waves would be

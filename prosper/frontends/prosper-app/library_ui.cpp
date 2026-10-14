@@ -1136,7 +1136,7 @@ LibraryAction LibraryUi::render_frame(const std::string& status) {
 
         // Keyboard. Controller navigation is NOT implemented: ImGui's gamepad nav is off, and
         // nothing initialises SDL's gamepad subsystem while the library is alive — the pad backend
-        // does that inside start_guest, by which point the library is gone. Tracked separately
+        // does that inside start_guest, by which point the game runs in its own process. Tracked separately
         // rather than shipped as code that cannot fire.
         // Gated on text input: with the search box focused every key belongs to it — typing a
         // space once booted the wrong game (list_nav.hpp pins the gate).

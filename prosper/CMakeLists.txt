@@ -2250,9 +2250,16 @@ if(TARGET prosper_core)
 
   # The Game Log capture's teardown (#4671 review): every byte still in the pipe is forwarded, the
   # teardown stays bounded while a child process holds an inherited write end (a hang there blocks
-  # a game boot), and a failed install leaves the captured descriptors untouched.
+  # a game boot), and a failed install leaves the captured descriptors untouched. Spawned games
+  # keep console streams past the capture's readers (a readerless pipe kills the writer with
+  # SIGPIPE — pinned with a positive control), while ordinary pipe children still land in the ring.
   prosper_add_gtest(test_frontend_log_capture
     SOURCES frontends/prosper-app/test_log_capture.cpp
+    INCLUDES frontends/prosper-app)
+
+  # Library launches update persisted history and the live Recent menu without requiring SDL.
+  prosper_add_gtest(test_frontend_recent_games
+    SOURCES tests/frontend/test_recent_games.cpp
     INCLUDES frontends/prosper-app)
 
   # The optional retained-target selector bounds readback without changing the legacy broad
@@ -2666,8 +2673,16 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_fresh_mask_exec_confinement.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_confined_source_union
+    SOURCES tests/gpu/recompiler/test_confined_source_union.cpp
+    INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_vintrp_scalar_liveness
     SOURCES tests/gpu/recompiler/test_vintrp_scalar_liveness.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_native_interpolation_word
+    SOURCES tests/gpu/recompiler/test_native_interpolation_word.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
   prosper_add_gtest(test_wave32_mask_scc
@@ -2679,8 +2694,34 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_current_carry_inputs.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_legacy_coverage_fixtures
+    SOURCES tests/gpu/recompiler/test_legacy_coverage_fixtures.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_saved_exec_data
     SOURCES tests/gpu/recompiler/test_saved_exec_data.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_compute_loop_data_route
+    SOURCES tests/gpu/recompiler/test_compute_loop_data_route.cpp
+    INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
+
+  prosper_add_gtest(test_narrowing_loop_exec
+    SOURCES tests/gpu/recompiler/test_narrowing_loop_exec.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_partial_vcc_word
+    SOURCES tests/gpu/recompiler/test_partial_vcc_word.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_wave32_exec_boundary
+    SOURCES tests/gpu/recompiler/test_wave32_exec_boundary.cpp
+            tests/gpu/recompiler/test_wave32_active_data.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_exec_spill_data
+    SOURCES tests/gpu/recompiler/test_exec_spill_data.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
   prosper_add_gtest(test_flat_active_word
@@ -3664,6 +3705,14 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_counted_copy_continuation.cpp
     INCLUDES src tests tests/gpu/recompiler
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_fragment_dispatch_bool_copy
+    SOURCES tests/gpu/recompiler/test_fragment_dispatch_bool_copy.cpp
+    INCLUDES src tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_fragment_dispatch_loop
+    SOURCES tests/gpu/recompiler/test_fragment_dispatch_loop.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_fragment_logical_bool_copy
     SOURCES tests/gpu/recompiler/test_fragment_logical_bool_copy.cpp
     INCLUDES src tests tests/gpu/recompiler
@@ -3674,6 +3723,10 @@ if(TARGET prosper_core)
     LIBRARIES prosper_core)
   prosper_add_gtest(test_native_compute_launch
     SOURCES tests/gpu/recompiler/test_native_compute_launch.cpp
+    INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_native_indirect_entry
+    SOURCES tests/gpu/recompiler/test_native_indirect_entry.cpp
     INCLUDES tests tests/gpu/recompiler
     LIBRARIES prosper_core)
   prosper_add_gtest(test_native_structural_launch
@@ -4321,6 +4374,10 @@ endif()
   target_include_directories(test_gpu_capture PRIVATE tests)
   target_link_libraries(test_gpu_capture PRIVATE prosper_core)
   add_test(NAME gpu_capture_roundtrip COMMAND test_gpu_capture)
+  prosper_add_gtest(test_capture_future_version
+    SOURCES tests/gpu/capture/test_capture_future_version.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   if(Python3_Interpreter_FOUND)
     add_test(NAME gpu_capture_failed_setup
              COMMAND "${Python3_EXECUTABLE}"

@@ -2,9 +2,10 @@
 // library_ui.hpp — the game library screen: a game list (cover, name, serial, region, version,
 // path) the user picks a title from, plus a read-only controls view.
 //
-// This is the app's idle state. Once a guest boots, the library is torn down and the window goes back
-// to presenting game frames; prosper runs one game per launch (#352), so the library never draws over a
-// running title and never competes with the present path for the swapchain.
+// This is the app's idle state. A Play/Open spawns the guest in its own process (its own
+// window) and the library stays up, so closing the game window ends only the game and another
+// title can be opened. prosper still runs one game per process (#352): the library never draws
+// over a running title and never competes with the present path for the swapchain.
 //
 // It renders with Dear ImGui through the app's EXISTING Vulkan device and swapchain (third_party/imgui),
 // adding only a render pass and per-image framebuffers — no second device, no second window. Cover art
@@ -78,8 +79,8 @@ public:
     // the UI costs the user a library, not the app.
     //
     // The library owns its own command buffer, semaphores and fence and does its own acquire/present.
-    // That is deliberate rather than sharing the app's: the two never run at the same time (the library
-    // is the idle state and disappears the moment a guest boots), so separate sync objects keep the
+    // That is deliberate rather than sharing the app's: the two never run in the same process (the
+    // library is the idle state, and Play/Open starts a separate game process), so separate sync objects keep the
     // game present path exactly as it was instead of threading a second mode through it.
     bool init(SDL_Window* window, VkInstance instance, VkPhysicalDevice phys, VkDevice device,
               uint32_t queue_family, VkQueue queue, VkSwapchainKHR swapchain,

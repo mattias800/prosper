@@ -2,6 +2,7 @@
 
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_fragment_dispatch_loop.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
 #include "gpu/recompiler/rdna2_saved_mask_words.hpp"
@@ -28,10 +29,108 @@ public:
     ScopedCleanup(const ScopedCleanup&) = delete;
     ScopedCleanup& operator=(const ScopedCleanup&) = delete;
 };
+// A dropped wave-empty branch is harmless only if the same saved survivor generation
+// kills every failed invocation before the sole observable export. This private recipe is
+// deliberately narrower than the established fragment branch classifier.
+bool fragment_dispatch_early_outs_are_closed(const SpirvCompute& b, const RegState& entry,
+                                             const std::vector<Rdna2Inst>& selected,
+                                             const uint32_t* code, size_t dwords,
+                                             const std::unordered_set<uint32_t>& classified) {
+    if (classified.empty()) return true;
+    if (selected.size() < 3 || !selected.back().is_end) return false;
+    const size_t gate = selected.size() - 3;
+    const auto& restore = selected[gate];
+    if (restore.fmt != Rdna2Format::SOP1 || restore.opcode != kSop1OpcodeMovB64 ||
+        restore.dst.value != 126 || restore.src[0].kind != OperandKind::SGPR ||
+        restore.src[0].value < 0 || restore.src[0].value > 104 ||
+        selected[gate + 1].fmt != Rdna2Format::EXP || !selected[gate + 1].exp_en)
+        return false;
+    auto with_tails = selected;
+    if (!rdna2_append_closed_tail_blocks(code, dwords, with_tails)) return false;
+    for (size_t i = 0; i < gate; ++i) {
+        const auto& in = selected[i];
+        if (in.fmt == Rdna2Format::EXP || in.fmt == Rdna2Format::DS ||
+            rdna2_instruction_may_write_memory(in))
+            return false;
+        if (in.fmt == Rdna2Format::SOPP && sopp_opcode_is_direct_branch(in.opcode) &&
+            !classified.contains(in.pc)) {
+            const int64_t target = int64_t(in.pc) + in.len_dwords + in.simm16;
+            if (target > restore.pc) return false;   // no path may bypass the sole final EXEC gate
+        }
+    }
+    const auto producers = fragment_survivor_mask_producers(b, selected, &entry);
+    const int root = restore.src[0].value;
+    const auto writes_root = [root](const Rdna2Inst& in) {
+        bool overlaps = false;
+        for_each_scalar_write(in, [&](int base, uint32_t width) {
+            overlaps |= base <= root + 1 && base + static_cast<int>(width) > root;
+        });
+        return overlaps;
+    };
+    for (size_t at = 0; at < selected.size(); ++at) {
+        const auto& branch = selected[at];
+        if (!classified.contains(branch.pc)) continue;
+        // SCC1 has the opposite meaning. Only a fresh whole-mask compare followed by
+        // self ANDN2 and SCC0 can skip when no survivor exists.
+        if (at < 2 || at >= gate || branch.opcode != kSoppOpcodeCbranchScc0) return false;
+        if (!fragment_dispatch_interior_loops_are_finite(selected, branch.pc, restore.pc))
+            return false;
+        const auto& producer = selected[at - 1];
+        const auto& compare = selected[at - 2];
+        if (!producers.contains(producer.pc) || producer.dst.value != root ||
+            compare.fmt != Rdna2Format::VOPC || vopc_is_cmpx(compare.opcode) ||
+            compare.dst.value != 106)
+            return false;
+        // Exactly one unconditional entry-EXEC snapshot reaches this producer. No
+        // numeric, one-arm or overlapping replacement can manufacture its generation.
+        bool saved = false;
+        for (size_t i = 0; i + 1 < at; ++i) {
+            const auto& in = selected[i];
+            if (!saved && in.fmt == Rdna2Format::SOPP && sopp_opcode_is_direct_branch(in.opcode) &&
+                in.simm16 != 0)
+                return false;
+            if (!writes_root(in)) continue;
+            if (saved || in.fmt != Rdna2Format::SOP1 || in.opcode != kSop1OpcodeMovB64 ||
+                in.dst.value != root || in.src[0].value != 126)
+                return false;
+            saved = true;
+        }
+        if (!saved) return false;
+        const int64_t target = int64_t(branch.pc) + branch.len_dwords + branch.simm16;
+        const auto tail = std::find_if(with_tails.begin() + selected.size(), with_tails.end(),
+                                       [target](const auto& in) { return target == in.pc; });
+        // A raw terminal kill, rather than a hidden DATA consumer or a re-entry route.
+        if (tail == with_tails.end() || with_tails.end() - tail != 3 ||
+            tail->fmt != Rdna2Format::SOP1 || tail->opcode != kSop1OpcodeMovB64 ||
+            tail->dst.value != 126 || tail->src[0].kind != OperandKind::InlineInt ||
+            tail->src[0].value != 0 || (tail + 1)->fmt != Rdna2Format::EXP || (tail + 1)->exp_en ||
+            !(tail + 2)->is_end)
+            return false;
+        for (size_t i = at + 1; i < gate; ++i) {
+            const auto& in = selected[i];
+            if (writes_root(in)) return false;
+            if (in.fmt == Rdna2Format::SOPP) {
+                if (!sopp_opcode_is_direct_branch(in.opcode)) {
+                    if (in.opcode != 0 && in.opcode != 0x0c) return false;
+                    continue;
+                }
+                const int64_t next = int64_t(in.pc) + in.len_dwords + in.simm16;
+                // Interior loops have the independent finite-trip proof above. Control must never re-enter
+                // the survivor producer, escape, or bypass the final EXEC gate.
+                if (next <= branch.pc || next > restore.pc ||
+                    std::none_of(selected.begin() + at + 1, selected.begin() + gate + 1,
+                                 [next](const auto& item) { return next == item.pc; }))
+                    return false;
+            }
+        }
+    }
+    return true;
+}
 } // namespace
 
 class SavedMaskCopyFrame {
     friend class SavedMaskCopyBodyScope;
+    friend class SavedMaskCopyFragmentDispatchScope;
     friend bool consume_saved_mask_copy_continuation(SpirvCompute&, const std::vector<Rdna2Inst>&,
                                                      const uint32_t*, size_t, uint32_t,
                                                      const RegState*);
@@ -44,6 +143,7 @@ class SavedMaskCopyFrame {
         std::unordered_set<int> entry_b32_masks;
         std::set<uint32_t> native_copies, fragment_copies, ngg_copies;
         BarrierPhasedCompute barrier_phases;
+        std::unordered_set<uint32_t> fragment_mask_test_branches;
     };
     std::shared_ptr<const Origin> origin;
     SpirvCompute* builder = nullptr;
@@ -56,6 +156,7 @@ class SavedMaskCopyFrame {
     bool barrier_region = false;
     const std::vector<Rdna2Inst>* pending = nullptr;
     size_t pending_begin = 0;
+    bool pending_fragment_root = false;
 
     bool binding(const SpirvCompute& b, const std::vector<Rdna2Inst>& ins, const uint32_t* raw,
                  size_t width, const RegState* rs) const {
@@ -137,6 +238,11 @@ class SavedMaskCopyFrame {
                 rdna2_escapes_decoded_effects(in))
                 return false;
             if (in.fmt == Rdna2Format::SOPP && sopp_opcode_is_direct_branch(in.opcode)) {
+                // Only the actual private fragment selector supplies this set, computed from
+                // the authenticated selected stream by its existing kill-mask linearizer, then
+                // narrowed by a same-generation EXEC/export and closed raw-kill-tail proof.
+                // Dual demand analysis includes the authenticated raw tail instructions.
+                if (first == 0 && origin->fragment_mask_test_branches.contains(in.pc)) continue;
                 const int64_t target = int64_t(in.pc) + in.len_dwords + in.simm16;
                 if (target < start->pc ||
                     std::none_of(
@@ -148,6 +254,79 @@ class SavedMaskCopyFrame {
         return true;
     }
 };
+
+SavedMaskCopyFragmentDispatchScope::SavedMaskCopyFragmentDispatchScope(
+    SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& selected, const uint32_t* code,
+    size_t dwords, uint32_t target)
+    : builder_(b), previous_(b.saved_mask_copy_frame) {
+    if (target == UINT32_MAX || !b.is_fragment || b.is_compute || b.is_vertex ||
+        b.ngg_workgroup_shell || b.guest_stage != GuestShaderStage::Fragment ||
+        b.physical_domain != PhysicalExecutionDomain::Invocation || b.wave_size != 64 ||
+        b.allow_b32_masks || b.saved_mask_word_analysis_done || previous_ || !code || !dwords)
+        return;
+    std::vector<Rdna2Inst> original;
+    rdna2_walk(code, dwords, original);
+    auto reproduced = original;
+    const auto recipe = rdna2_pcrel_dispatch_info(code, dwords);
+    if (!rdna2_specialize_pcrel_dispatch(reproduced, recipe, target) || reproduced != selected)
+        return;
+    // Establish this proof from the genuine ORIGINAL entry and original bytes, never
+    // from the selected region's later state. Only Bool-copy generation PCs transfer.
+    const auto mask_branches = fragment_mask_test_branches(selected, b.allow_b32_masks);
+    if (!fragment_dispatch_early_outs_are_closed(b, rs, selected, code, dwords, mask_branches))
+        return;
+    auto original_with_tails = original;
+    auto selected_with_tails = selected;
+    if (!rdna2_append_closed_tail_blocks(code, dwords, original_with_tails) ||
+        !rdna2_append_closed_tail_blocks(code, dwords, selected_with_tails))
+        return;
+    initialize_saved_mask_word_proof(b, original, code, dwords, 0, &rs);
+    retain_fragment_copy_demand_intersection(b, original_with_tails, &rs);
+    retain_fragment_copy_demand_intersection(b, selected_with_tails, &rs);
+    if (!native_vcc_copy_execution_domain_matches(b) ||
+        !native_vcc_copy_entry_masks_match(b, &rs) || b.fragment_bool_only_vcc_copy_pcs.empty() ||
+        b.saved_mask_copy_revocation_epoch == UINT64_MAX)
+        return;
+    ScopedCleanup rollback(
+        [this]() noexcept {
+            if (frame_) frame_->open = false;
+            builder_.saved_mask_copy_frame = previous_;
+            revoke_saved_mask_copy_proof(builder_);
+        },
+        true);
+    auto origin = std::make_shared<SavedMaskCopyFrame::Origin>();
+    origin->words = b.saved_mask_original_words;
+    origin->instructions = selected;
+    origin->domain = b.native_vcc_copy_entry_domain;
+    origin->entry_masks = b.native_vcc_copy_entry_masks;
+    origin->entry_b32_masks = b.native_vcc_copy_entry_b32_masks;
+    origin->native_copies = b.native_bool_only_vcc_copy_pcs;
+    origin->fragment_copies = b.fragment_bool_only_vcc_copy_pcs;
+    origin->ngg_copies = b.ngg_bool_only_vcc_copy_pcs;
+    origin->fragment_mask_test_branches = mask_branches;
+    frame_ = std::shared_ptr<SavedMaskCopyFrame>(new SavedMaskCopyFrame);
+    frame_->origin = std::move(origin);
+    frame_->end = frame_->origin->instructions.size();
+    frame_->epoch = b.saved_mask_copy_revocation_epoch;
+    frame_->builder = &b;
+    frame_->state = &rs;
+    frame_->instructions = &selected;
+    frame_->code = code;
+    frame_->dwords = dwords;
+    frame_->authorized = true;
+    if (!frame_->binding(b, selected, code, dwords, &rs) || !frame_->closed_suffix(0)) {
+        frame_->open = false;
+        return;
+    }
+    frame_->pending = &selected;
+    frame_->pending_fragment_root = true;
+    b.saved_mask_copy_frame = frame_;
+}
+
+SavedMaskCopyFragmentDispatchScope::~SavedMaskCopyFragmentDispatchScope() {
+    if (frame_) frame_->open = false;
+    builder_.saved_mask_copy_frame = previous_;
+}
 
 void revoke_saved_mask_copy_proof(SpirvCompute& b) {
     b.native_bool_only_vcc_copy_pcs.clear();
@@ -185,8 +364,10 @@ SavedMaskCopyBodyScope::SavedMaskCopyBodyScope(SpirvCompute& b, RegState& rs,
     // vector lives in the private emitter method through this entire child call.
     if (previous_ && previous_->builder == &b && previous_->state == &rs) {
         const auto* pending = std::exchange(previous_->pending, nullptr);
+        const bool fragment_root = std::exchange(previous_->pending_fragment_root, false);
         if (pending == &ins && previous_->binding(b, *previous_->instructions, code, dwords, &rs) &&
-            previous_->pending_begin > previous_->begin &&
+            ((fragment_root && previous_->pending_begin == 0 && previous_->begin == 0) ||
+             previous_->pending_begin > previous_->begin) &&
             previous_->closed_suffix(previous_->pending_begin)) {
             frame_ = std::shared_ptr<SavedMaskCopyFrame>(new SavedMaskCopyFrame);
             frame_->origin = previous_->origin;

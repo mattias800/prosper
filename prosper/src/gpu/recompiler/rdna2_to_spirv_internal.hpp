@@ -565,6 +565,9 @@ struct SpirvCompute {
     // one terminal line so the recorded reason names the cause rather than the effect.
     uint32_t stage_reject_pc = UINT32_MAX;
     std::string stage_reject_reason;
+    // Private attempt result, never an admission fact: the original closed store loop may retry
+    // its lost header DATA through a fresh exact dispatcher, keeping every dispatcher proof.
+    bool compute_store_loop_data_retry = false;
     // The loop-header assumptions (blanket_root keys) some lane-bit read was admitted on, through a
     // word whose only mark was a header's blanket mark (sreg_loop_blanket). Each loop checks its own
     // at its back edge (LoopBlanketCheck). Mutable: the admitting predicate takes the builder const.
@@ -666,6 +669,11 @@ struct SpirvCompute {
     // SOP2 writes into VCC whose scalar sources are all written earlier in the same basic block
     // (rdna2_local_vcc_data.hpp). Recomputed per emit_body; no record pass erases it.
     std::unordered_set<uint32_t> vcc_local_scalar_write_pcs;
+    // Predicate-only partial VCC replacements: actual complete compare and constant-word MUST
+    // producers, bound to the exact original consumer. No initial placeholder or ballot authority.
+    bool partial_vcc_word_analysis_done = false;
+    std::vector<uint32_t> partial_vcc_original_words;
+    std::map<uint32_t, Rdna2Inst> partial_vcc_word_pcs;
     // S_BFE_U64 may write VCC as both a scalar pair and a per-lane predicate. In a CFG
     // dispatcher, the sreg variables can contain fabricated zero placeholders, so only the
     // MUST-scalar source proof permits retaining its complete scalar result.
@@ -2994,6 +3002,7 @@ struct RegState {
     std::unordered_map<int, uint32_t> vreg, sreg;
     VectorWordMarks vreg_source_marks;
     MimgSourceProof mimg_sources;
+    NativeInterpolationPublication native_interpolation_publication;
     bool vector_full_exec =
         false;   // provenance fact; dispatcher runtime predication stays enabled
     bool vector_native_interpolation = false;
@@ -3575,12 +3584,7 @@ struct LoopBlanketCheck {
         };
         const auto sanitize = [&](auto& scalar, auto& vectors) {
             std::erase_if(scalar, [&](const auto& word) { return invalid(word.second); });
-            for (auto& [reg, source] : vectors)
-                if (invalid(source.blanket_roots)) {
-                    source.blanket_roots.clear();
-                    source.hard = true;
-                    source.outside_exec = 0;
-                }
+            for (auto& [reg, source] : vectors) retire_vector_word_roots(source, violated);
         };
         sanitize(exits.blanket, exits.vectors);
         sanitize(rs.sreg_loop_blanket, rs.vreg_source_marks);

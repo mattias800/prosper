@@ -21,10 +21,16 @@ struct ScalarSourceMarks {
     // Loop-header assumptions, including the per-iteration validity of an EXEC-confined word.
     // A hard word remains unavailable outside its owner even when these assumptions hold.
     std::set<uint64_t> blanket_roots;
-    // Nonzero only for a hard placeholder whose lanes are provably confined to the lanes OUTSIDE
-    // this SPIR-V EXEC value: a partial VALU write under that EXEC replaced every other lane with
-    // clean data. A later reader under the very same EXEC value never touches those lanes.
+    // A complete writer proved its active lanes under this immutable EXEC value. Hard marks have
+    // missing lanes only outside it; soft marks also retain their global conditional proof above.
     uint32_t outside_exec = 0;
+    // Only an audited complete VALU writer publishes the independent soft-mark domain. An old
+    // outside_exec value on a memory result is not that arithmetic publication.
+    bool scoped_complete_word = false;
+    // For a soft mark, the owner's active domain depends only on these source roots, while its
+    // global blanket_roots may additionally depend on the inactive old generation. Hard marks
+    // continue to carry their active-domain obligations in blanket_roots.
+    std::set<uint64_t> scoped_blanket_roots;
 };
 using VectorWordMarks = std::map<int, ScalarSourceMarks>;
 
@@ -36,6 +42,15 @@ struct MimgSourceProof {
     bool defined = false;
     std::set<int> words;
     std::set<uint64_t> roots;
+};
+
+// One successful native Input publication, consumed by its own instruction's mark transfer.
+// This is not an architectural P2 accumulator or owned-packet interpolation validity fact.
+struct NativeInterpolationPublication {
+    uint32_t pc = UINT32_MAX;
+    int destination = -1;
+    uint32_t exec = 0;
+    uint32_t value = 0;
 };
 
 // Pure write effect, shared by structured provenance and current-EXEC CFG DATA facts.
@@ -54,8 +69,11 @@ ScalarSourceMarks vector_lane_read_marks(const RegState& rs, const Rdna2Inst& in
 // A fresh comparison/carry predicate cannot authenticate fabricated input storage. Genuine memory
 // data and checked loop-header assumptions remain separate from unavailable-source placeholders.
 bool fresh_mask_sources_defined(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in);
+void record_native_interpolation_publication(const SpirvCompute& b, RegState& rs,
+                                             const Rdna2Inst& in);
 void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSourceMarks& source);
 void join_vector_word_marks(VectorWordMarks& into, const VectorWordMarks& other);
+void retire_vector_word_roots(ScalarSourceMarks& marks, const std::set<uint64_t>& violated);
 bool vector_word_defined_in_exec(const RegState& rs, const ScalarSourceMarks& marks, uint32_t exec);
 void begin_mimg_source_proof(RegState& rs, uint32_t pc);
 void record_mimg_source_word(RegState& rs, int reg);
@@ -69,4 +87,4 @@ void mark_vector_loop_carried(RegState& rs, const std::vector<Rdna2Inst>& ins, u
 inline constexpr int kVectorBlanketBase = 256;
 ScalarSourceMarks carried_word_marks(const RegState& rs, int word);
 
-} // namespace prosper::gpu
+}   // namespace prosper::gpu

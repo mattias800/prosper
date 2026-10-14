@@ -1488,7 +1488,7 @@ bool emit_cfg_state_machine(
     if (!analyze_wave32_dispatch_words(
             b, ins, initial, starts, successors, direct_descriptor_sregs, wave32_words,
             static_mask_keys, proven_saved_mask_pair_compare_pcs, saved_mask_pair_compare_sources,
-            native_b32_mask_scc_vote_pcs))
+            native_b32_mask_scc_vote_pcs, barrier_half_phase))
         return false;
 
     // Which Wave64 mask half each spill slot and reloaded SGPR holds (rdna2_mask_half_alias.hpp).
@@ -3203,6 +3203,9 @@ bool emit_cfg_state_machine(
         state.exec_narrowed = true; // state-machine joins may carry a narrowed EXEC edge
         if (track_active_vectors && dispatch != UINT32_MAX && entry_wave64_b64)
             restore_active_vector_words(halves_in.active_vectors.current, state);
+        if (wave32_words.tracks_active_data && dispatch != UINT32_MAX &&
+            entry_block < wave32_words.reachable.size() && wave32_words.reachable[entry_block])
+            restore_active_vector_words(wave32_words.active_data[entry_block].current, state);
         state.mubuf_pcrel_tables = initial.mubuf_pcrel_tables;
         state.smem_pcrel_tables = initial.smem_pcrel_tables;
         state.mtbuf_pcrel_tables = initial.mtbuf_pcrel_tables;
@@ -6860,6 +6863,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             // presence inside or after the loop cannot stand in for a scalar-lifetime MUST proof.
             rs.scalar_presence_has_no_placeholders = false;
             const bool entry_exec_narrowed = rs.exec_narrowed;
+            const uint32_t loop_entry_exec = rs.exec;
+            const bool narrowing_exec = b.is_compute && narrowing_loop_exec_admission(ins, L, rs);
             std::set<int> cv, cs, condv, conds, scalar_may_writes;
             loop_written_regs(ins, L.header_pc, L.backedge_pc, cv, cs);
             loop_written_regs(ins, L.header_pc, L.exit_branch_pc, condv, conds);
@@ -6899,11 +6904,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             for (int r : cs) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, sget(r), preheader, p); rs.sreg[r] = ph; phis.push_back({r, 1, ph, p}); }
             LaneSlotLoopCarry lane_slots(rs);   // V_WRITELANE spill slots, as in the counted loop
             mark_loop_carried(rs, cs, ins, L.header_pc, L.backedge_pc, blanket_check);
-            // A poisoned (0) SCC live-in degrades to bfalse (invalid as an SSA phi input; dead in
-            // practice — the loop shapes re-produce SCC before any read).
+            // A poisoned SCC live-in uses bfalse; loop headers reproduce SCC before any read.
             { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.scc ? rs.scc : b.bfalse(), preheader, p); rs.scc = ph; phis.push_back({0, 2, ph, p}); }
             if (rs.vcc) { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.vcc, preheader, p); rs.vcc = ph; phis.push_back({0, 3, ph, p}); }
-            { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.exec, preheader, p); rs.exec = ph; phis.push_back({0, 4, ph, p}); }
+            open_narrowing_loop_exec_phi(b, rs, preheader, phis, narrowing_exec);
             std::vector<int> mask_keys;                        // saved masks live at entry: loop-carried bools
             for (auto& kv : rs.sreg_bool) mask_keys.push_back(kv.first);
             std::sort(mask_keys.begin(), mask_keys.end());     // deterministic emission order
@@ -6924,6 +6928,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 if (!emit_structured(
                         L.header_pc, L.exit_branch_pc, L.exit_branch_pc)) return false;
             } else if (!emit_range(L.header_pc, L.exit_branch_pc)) {
+                if (idx < ins.size())
+                    b.compute_store_loop_data_retry = closed_compute_store_loop_data_retry(
+                        b, rs, L, ins[idx], loop_entry_exec, code, dwords);
                 return false;
             }
             // A canonical SCC loop must compute a fresh representable scalar predicate on every

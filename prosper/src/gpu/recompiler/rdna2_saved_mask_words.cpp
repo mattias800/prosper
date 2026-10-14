@@ -1,5 +1,6 @@
 #include "gpu/recompiler/rdna2_saved_mask_words.hpp"
 #include "gpu/recompiler/rdna2_native_launch.hpp"
+#include "gpu/recompiler/rdna2_partial_vcc_word.hpp"
 
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
@@ -241,6 +242,8 @@ void load_missing_saved_mask_words(RegState& rs, const std::set<int>& roots,
 void initialize_saved_mask_word_proof(SpirvCompute& b, const std::vector<Rdna2Inst>& ins,
                                       const uint32_t* code, size_t dwords, uint32_t initial_active,
                                       const RegState* initial) {
+    initialize_partial_vcc_word_proof(b, ins, code, dwords,
+                                      initial_active || (initial && initial->exec_narrowed));
     if (b.saved_mask_word_analysis_done) {
         // A phase refers to the original bytes. Neither a reused pointer/PC nor a changed literal,
         // truncated stream or altered source can inherit another program's participation proof.
