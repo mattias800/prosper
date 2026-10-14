@@ -83,7 +83,8 @@ struct Emitter {
     }
     // Only the mark transfer, for memory forms the compute fixture has no resource for.
     void record(const Words& code) {
-        for (const auto& in : decode(code)) record_vector_word_marks(rs, in, scalar_source_marks(rs, in));
+        for (const auto& in : decode(code))
+            record_vector_word_marks(rs, in, scalar_source_marks(rs, in));
     }
     bool defined(uint32_t comparison) {
         return fresh_mask_sources_defined(b, rs, rdna2_decode_one(&comparison, 1));
@@ -251,7 +252,7 @@ TEST(FreshMaskLaneWiseRelay, ATypedBufferLoadIsCompleteButItsTfeAndD16FormsAreNo
         e.record({0xe8b01000u | (opcode << 16u), 0x80020800u});
         EXPECT_TRUE(e.defined(compare8)) << opcode;
     }
-    for (const Words& words : {Words{0xe8b01000u, 0x80820800u},     // TFE status word
+    for (const Words& words : {Words{0xe8b01000u, 0x80820800u},   // TFE status word
                                Words{0xe8b01000u, 0x80220800u}}) {   // tbuffer_load_format_d16_x
         Emitter e;
         ASSERT_TRUE(e.emit({cmpx_a}));
@@ -268,7 +269,10 @@ TEST(FreshMaskLaneWiseRelay, PublicCompilerAdmitsAnLdsReadRelayAndRefusesItsWide
 // ---- 3. The second arm of an if/else completes the saved mask ----------------------------------
 
 Words if_else(const Words& then_arm, const Words& else_arm) {
-    return cat({{cmpx_a, cmp_vcc_47, and_saveexec_vcc}, then_arm, {andn2_exec_saved}, else_arm,
+    return cat({{cmpx_a, cmp_vcc_47, and_saveexec_vcc},
+                then_arm,
+                {andn2_exec_saved},
+                else_arm,
                 {restore_exec}});
 }
 
@@ -313,7 +317,7 @@ TEST(FreshMaskLaneWiseRelay, AMergeOfNestedOwnersKeepsTheNarrowerOne) {
     ASSERT_TRUE(e.emit({cmpx_a, mov6, cmpx_b, mov7}));
     const uint32_t b = e.rs.exec;
     VectorWordMarks skipped{{6, e.rs.vreg_source_marks.at(6)}};   // owner A
-    ASSERT_TRUE(e.emit({fmac6}));                                    // owner B on the taken arm
+    ASSERT_TRUE(e.emit({fmac6}));   // owner B on the taken arm
     ASSERT_EQ(e.rs.vreg_source_marks.at(6).outside_exec, b);
     VectorWordMarks merged = e.rs.vreg_source_marks;
     join_vector_word_marks(merged, skipped, &e.rs);
