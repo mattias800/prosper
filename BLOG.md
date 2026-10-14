@@ -21,6 +21,13 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-10-14
 
+### Kena's title world is back underneath its remaining black-screen cause
+
+With #4949's fresh-mask guard switched off in a local build, current `main` draws *Kena*'s title-menu world again, on every even frame, with noise on every odd frame. The default build is still black, so this shows what the remaining fix (#5026) should uncover; it is not a default-route result ([#5168](https://github.com/mattias800/prosper/issues/5168)).
+
+<p align="center"><img src="assets/screenshots/issue-5168-kena-title-guard-off-world.webp" alt="Kena: Bridge of Spirits title menu over the forest shrine world; Linux RADV prosper-app, main bd607818e with a local switch disabling the fresh-mask guard, pad flip 298 (even present)"></p>
+<p align="center"><img src="assets/screenshots/issue-5168-kena-title-guard-off-flicker.webp" alt="Contact sheet of 29 frames from flips 220 to 420 of the same run: 18 even presents show the world, 11 odd presents show full-screen block noise under the menu"></p>
+
 ### A new alarm catches a picture that flickers
 
 prosper now raises a `frame-flicker` alarm when the presented picture alternates from frame to frame, and saves a burst of consecutive frames as evidence. Here it caught *Kena*'s title screen at commit `e0b0e24c`: the world on even guest flips and noise on odd ones, so any single screenshot of that build was good or broken by chance ([#5152](https://github.com/mattias800/prosper/issues/5152)).

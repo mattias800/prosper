@@ -275,3 +275,92 @@ TEST(FragmentScalarVccPair, DivergentLoopCheckSccCannotBorrowTheBodyDefinition) 
     const auto carried = compile(code, 0x27610019u);
     rejected_at(carried, 9);
 }
+
+// #5168: VCC as plain scalar scratch around a uniform branch (Kena ps 0x500b3d0000, pc1531..1629).
+// The taken edge skips the arm that rewrites both VCC words with scalar CSELECTs; after the merge
+// VCC_LO is rewritten and read only as one scalar dword by a VOP3 float op. Every select is then
+// scalar-only, so no Bool mask exists on either edge and the merge has nothing to reconcile. Until
+// V_MAX3_F32's sources were charged one dword each (#5150), that read was counted as a VCC pair:
+// the scalar-only proof failed, the select took the live-mask path, and the merge refused for a
+// mask that is dead there.
+namespace {
+std::vector<uint32_t> uniform_branch_vcc_scratch() {
+    return {
+        0xbe840382u,   // s_mov_b32 s4, 2
+        0xbeea03f2u,   // s_mov_b32 vcc_lo, 1.0     (scalar data on both edges)
+        0xbeeb03f0u,   // s_mov_b32 vcc_hi, 0.5
+        0xbf068004u,   // s_cmp_eq_u32 s4, 0
+        0xbf840009u,   // pc4: s_cbranch_scc0 pc14   (uniform skip of the arm)
+        0xbf068304u,   // s_cmp_eq_u32 s4, 3
+        0xbeea03ffu, 0x3f83e577u,   // s_mov_b32 vcc_lo, lit
+        0x856b8081u,   // s_cselect_b32 vcc_hi, 1, 0
+        0xbf068204u,   // s_cmp_eq_u32 s4, 2
+        0x856aff6au, 0x3f80312du,   // s_cselect_b32 vcc_lo, vcc_lo, lit
+        0xbf07806bu,   // s_cmp_lg_u32 vcc_hi, 0
+        0x8508f26au,   // s_cselect_b32 s8, vcc_lo, 1.0
+        0xbeea03ffu, 0x38800006u,   // pc14 (merge): s_mov_b32 vcc_lo, lit
+        0xd5540001u, 0x0400d4ffu, 0x3c9374bcu,   // v_max3_f32 v1, lit, vcc_lo, v0 (one dword)
+        0x7e040208u,   // v_mov_b32 v2, s8
+        0x7e0602f2u,   // v_mov_b32 v3, 1.0
+        0xf800180fu, 0x03020100u,   // exp mrt0 v0, v1, v2, v3 done vm
+        0xbf810000u,   // s_endpgm
+    };
+}
+
+// A live (lane-mask) select inside the arm, followed by an implicit VCC reader at the merge.
+// `redefine_at_merge` puts a VOPC that replaces the whole pair first, which makes the arm's mask
+// dead at the merge; without it the merge reader observes the arm's mask on one edge and only
+// scalar data on the other, which the structured join must still refuse.
+std::vector<uint32_t> live_select_then_merge(bool redefine_at_merge) {
+    std::vector<uint32_t> code{
+        0x7e0202f0u,   // v_mov_b32 v1, 0.5
+        0x7e0002f2u,   // v_mov_b32 v0, 1.0
+        0xbe840382u,   // s_mov_b32 s4, 2
+        0xbeea03f2u,   // s_mov_b32 vcc_lo, 1.0     (scalar data, no Bool mask)
+        0xbeeb03f0u,   // s_mov_b32 vcc_hi, 0.5
+        0xbf068004u,   // s_cmp_eq_u32 s4, 0
+        0xbf840006u,   // pc6: s_cbranch_scc0 pc13
+        0xbf068304u,   // s_cmp_eq_u32 s4, 3
+        0x856b8081u,   // s_cselect_b32 vcc_hi, 1, 0
+        0xbf068204u,   // s_cmp_eq_u32 s4, 2
+        0x856a80ffu, 0x00000080u,   // s_cselect_b32 vcc_lo, 0x80, 0
+        0x02020300u,   // v_cndmask_b32 v1, v0, v1, vcc   (the arm's lane-mask read)
+        0x7c080300u,   // pc13 (merge): v_cmp_gt_f32 vcc, v0, v1  (whole pair)
+        0x7e0602f2u,   // v_mov_b32 v3, 1.0
+        0x02040680u,   // v_cndmask_b32 v2, 0, v3, vcc
+        0xf800180fu, 0x03020100u,   // exp mrt0 v0, v1, v2, v3 done vm
+        0xbf810000u,   // s_endpgm
+    };
+    // The VOPC is the merge instruction the pc6 branch targets; without it the target is the
+    // following move and the merge block's first VCC reader is the implicit v_cndmask.
+    constexpr std::size_t kMergeRedefinition = 13;
+    if (!redefine_at_merge) code.erase(code.begin() + kMergeRedefinition);
+    return code;
+}
+}   // namespace
+
+TEST(FragmentScalarVccPair, UniformBranchScalarScratchNeedsNoMaskAtTheMerge) {
+    const auto result = compile(uniform_branch_vcc_scratch(), 0x51680001u);
+    ASSERT_FALSE(result.module.empty()) << result.reason;
+    // Scalar-only: the selects keep generic lowering and need no guest lane identity.
+    EXPECT_EQ(fragment_spirv_required_subgroup_size(result.module), 0u);
+}
+
+TEST(FragmentScalarVccPair, ALiveArmMaskDeadAtTheMergeNeedsNoSkipEdgeMask) {
+    const auto result = compile(live_select_then_merge(true), 0x51680002u);
+    ASSERT_FALSE(result.module.empty()) << result.reason;
+    // The in-arm read makes the select a live mask (lane identity) rather than scalar-only data.
+    // That the join then admits it through dead-at-merge liveness is pinned by the refused twin
+    // below, which reaches the same join and differs only in reading VCC after the merge.
+    EXPECT_EQ(fragment_spirv_required_subgroup_size(result.module), 64u);
+    EXPECT_TRUE(fragment_spirv_required_subgroup_reasons(result.module) &
+                kFragmentWaveReasonLaneId);
+}
+
+TEST(FragmentScalarVccPair, AnArmMaskLiveAfterTheMergeStillRequiresEveryEdge) {
+    const auto result = compile(live_select_then_merge(false), 0x51680003u);
+    EXPECT_TRUE(result.module.empty());
+    EXPECT_NE(result.reason.find("structured-saved-mask-domain-missing-edge"), std::string::npos)
+        << result.reason;
+    EXPECT_NE(result.reason.find("pc=6 "), std::string::npos) << result.reason;
+}
