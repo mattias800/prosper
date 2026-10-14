@@ -8,8 +8,8 @@
 // the single answer. Analyses ask it; they do not keep their own lists.
 //
 // Scope today: every opcode the decoder can produce in the scalar ALU formats SOP2, SOP1, SOPK,
-// SOPC and SOPP, and in the VALU formats VOP1, VOP2, VOPC and VOP3. Each slot of those opcode
-// spaces is either a named instruction or an explicit RESERVED encoding (one RDNA2 does not define,
+// SOPC and SOPP, in SMEM, and in the VALU formats VOP1, VOP2, VOPC, VOP3 and VOP3P. Each slot of
+// those opcode spaces is either a named instruction or an explicit RESERVED encoding (one RDNA2 does not define,
 // which the decoder still accepts because it only splits fields). `test_rdna2_instruction_effects`
 // fails if a decodable opcode has neither. A VALU row describes its sources, its vector result
 // (which lanes and VGPRs it writes, from what) and its implicit reads; see Rdna2EffectsStatus::Valu.
@@ -36,7 +36,7 @@ enum class Rdna2EffectsStatus : uint8_t {
     Unknown,   // no entry: every answer about this opcode is "unknown"; callers stay conservative
     Reserved,   // the decoder accepts the encoding but RDNA2 assigns no instruction to it
     Known,
-    // A VALU instruction (VOP1, VOP2, VOPC, VOP3). Its name, source widths, vector-result fields
+    // A VALU instruction (VOP1, VOP2, VOPC, VOP3, VOP3P). Its name, source widths, vector-result fields
     // (lane_flow, vdst_dwords, vdst_half, accumulates, m0_relative) and implicit VCC/EXEC/M0 READS
     // are facts. Its scalar destination and implicit writes are NOT described and read as zero, so
     // known() stays false: ask describes_sources() / describes_vector_result() instead.
@@ -65,6 +65,18 @@ enum class Rdna2LaneFlow : uint8_t {
     Relative,   // a source and/or destination VGPR is indexed by M0 (v_movrel*, v_swaprel)
     Swap,   // VDST and SRC0 exchange values in each lane (v_swap_b32)
     Interpolate,   // reads LDS attribute data addressed through M0 (the VOP3 v_interp_* forms)
+};
+
+// What an SMEM instruction does (ISA 70648 12.6, plus the gfx10.1 scalar stores and atomics).
+enum class Rdna2ScalarMemory : uint8_t {
+    None,   // not an SMEM row
+    Load,   // s_load*, s_buffer_load*: SDATA receives the loaded dwords
+    ScratchLoad,   // s_scratch_load*: SDATA receives dwords of the wave's private scratch
+    Store,   // s_store*, s_buffer_store*, s_scratch_store*: SDATA is read, nothing written
+    Atomic,   // s_[buffer_]atomic_*: SDATA is the data; with GLC it receives the old value
+    CacheControl,   // s_gl1_inv, s_dcache_inv/wb/discard: no register result
+    Probe,   // s_atc_probe[_buffer]: the SDATA field is a probe mode, not a register
+    HardwareRead,   // s_memtime, s_memrealtime, s_get_waveid_in_workgroup: no memory address
 };
 
 // How an instruction consumes SCC implicitly. Data: SCC is an operand of the result (s_cselect,
@@ -111,6 +123,10 @@ struct Rdna2InstructionEffects {
     bool accumulates = false;
     // SRC0's VGPR is written too, with the old VDST (v_swap_b32, v_swaprel_b32).
     bool writes_src0 = false;
+    // ---- Scalar memory (SMEM rows; status Known). sdst_dwords is what SDATA receives -- for an
+    // atomic, the returned old value, written only when GLC is set; ssrc_dwords[0] is SBASE (a
+    // pair, or a V# quad for the buffer forms) and ssrc_dwords[1] the SOFFSET register.
+    Rdna2ScalarMemory smem = Rdna2ScalarMemory::None;
 
     bool known() const { return status == Rdna2EffectsStatus::Known; }
     bool describes_sources() const {
@@ -127,7 +143,8 @@ inline const Rdna2InstructionEffects& rdna2_instruction_effects(const Rdna2Inst&
 }
 
 // Formats whose whole decodable opcode space has entries: the scalar ALU formats with full
-// effects, and VOP1, VOP2, VOPC and VOP3 with the VALU facts (status Valu).
+// effects and SMEM (status Known), and VOP1, VOP2, VOPC, VOP3 and VOP3P with the VALU facts
+// (status Valu).
 bool rdna2_effects_format_is_tabulated(Rdna2Format fmt);
 // The opcodes [first, end) the decoder can produce in a tabulated format: the opcode field minus
 // the encodings another format claims first (SOP2 0x60-0x7F are SOPK/SOP1/SOPC/SOPP, SOPK
@@ -172,6 +189,19 @@ bool rdna2_operand_reads_scc(const Rdna2Inst& in);
 // question a caller asks before deciding it may skip computing SCC, so the safe answer is yes.
 bool rdna2_program_reads_scc(const std::vector<Rdna2Inst>& ins);
 
+// ---- SMEM questions -----------------------------------------------------------------------
+// SGPRs an SMEM load writes: its width for a load row (s_load*, s_buffer_load*), 0 for every other
+// SMEM row and for a reserved encoding. s_scratch_load* is not counted: it reads the wave's
+// private scratch, which a scalar store may have written, not constant memory at SBASE.
+uint32_t rdna2_smem_load_dwords(uint32_t opcode);
+// SGPRs one decoded SMEM instruction's SDATA receives: a load's dwords, the s_memtime /
+// s_memrealtime pair, a gfx10.1 atomic's returned value when GLC is set; 0 for a store, a probe,
+// cache control and a reserved encoding.
+uint32_t rdna2_smem_destination_dwords(const Rdna2Inst& in);
+// SGPRs SBASE names: 2, or 4 for the buffer forms (a V#), 0 for an instruction with no address
+// (s_memtime, s_gl1_inv, ...). A reserved encoding is charged the quad.
+uint32_t rdna2_smem_address_dwords(uint32_t opcode);
+
 // ---- VALU result questions ------------------------------------------------------------------
 // Opcode-level answers; Unknown for a reserved or untabulated encoding and for a non-VALU format.
 // The Rdna2Inst forms below add the encoding's own modifiers (DPP, SDWA destination select).
@@ -194,6 +224,15 @@ uint32_t rdna2_valu_complete_result_dwords(Rdna2Format fmt, uint32_t opcode);
 // for an SDWA destination that is not a padded whole dword; a 16-bit result counts as complete
 // only through the SDWA DWORD + UNUSED_PAD form, which zero-fills the other half.
 uint32_t rdna2_valu_complete_result_dwords(const Rdna2Inst& in);
+// How many of a VALU encoding's three source fields the instruction reads: the highest source
+// with a register width, so a VOP3 encoding's unused SRC1/SRC2 fields (which decode as s0) are not
+// reads. 3 for an encoding the table does not describe, an accumulator (VOP3 MAC/FMAC encode the
+// old VDST in SRC2) and the v_interp_* forms.
+uint32_t rdna2_valu_source_count(Rdna2Format fmt, uint32_t opcode);
+// Consecutive registers VALU source `source` names (a pair for an F64/B64 operand, a quad for
+// v_mqsad_u32_u8's SRC2), whichever register file the operand is in; 0 when the instruction has no
+// such source or the table cannot say.
+uint32_t rdna2_valu_vgpr_source_span(const Rdna2Inst& in, uint32_t source);
 // Does a VALU instruction write a VGPR chosen at run time by M0 rather than its encoded VDST
 // (v_movreld, v_movrelsd, v_movrelsd_2, v_swaprel in every encoding)? Storage inventories treat
 // such a write as reaching every VGPR from the encoded register up.

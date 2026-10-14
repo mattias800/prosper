@@ -31,25 +31,10 @@ bool scalar_destination_dead(const std::vector<Rdna2Inst>& ins, uint32_t target_
 // 0x182, which no gfx10 target assigns to v_readfirstlane_b32_e64) fails closed.
 bool is_cross_lane_valu(const Rdna2Inst& in) {
     const bool valu = in.fmt == Rdna2Format::VOP1 || in.fmt == Rdna2Format::VOP2 ||
-                      in.fmt == Rdna2Format::VOP3 || in.fmt == Rdna2Format::VOPC;
+                      in.fmt == Rdna2Format::VOP3 || in.fmt == Rdna2Format::VOP3P ||
+                      in.fmt == Rdna2Format::VOPC;
     const Rdna2Answer answer = rdna2_valu_lane_dependent(in.fmt, in.opcode);
     return answer == Rdna2Answer::Yes || (valu && answer == Rdna2Answer::Unknown);
-}
-
-int smem_load_dwords(uint32_t opcode) {
-    switch (opcode) {
-        case 0x0:
-        case 0x8: return 1;
-        case 0x1:
-        case 0x9: return 2;
-        case 0x2:
-        case 0xA: return 4;
-        case 0x3:
-        case 0xB: return 8;
-        case 0x4:
-        case 0xC: return 16;
-        default: return 0;
-    }
 }
 
 }   // namespace
@@ -126,10 +111,10 @@ ExecSkipRegionEffects classify_exec_skip_region(const std::vector<Rdna2Inst>& in
                 fx.scalar_live_out = true;
                 break;
             case Rdna2Format::SMEM: {
-                // gfx10.3 has no scalar stores or atomics; every non-load opcode (cache control,
-                // s_memtime, s_atc_probe, and any encoding left over from older ISAs) has width 0
-                // and is refused here, which is also what keeps this fail-closed for new opcodes.
-                const int n = smem_load_dwords(in.opcode);
+                // Only a load is admitted: every other SMEM row (cache control, s_memtime,
+                // s_atc_probe, the gfx10.1 stores and atomics) and every reserved encoding has load
+                // width 0 in the effects table and is refused here.
+                const int n = static_cast<int>(rdna2_smem_load_dwords(in.opcode));
                 if (n == 0 || !dead(in.dst, n)) fx.scalar_memory_effect = true;
                 break;
             }

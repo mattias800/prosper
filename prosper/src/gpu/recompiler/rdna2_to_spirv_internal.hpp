@@ -3765,15 +3765,12 @@ inline uint32_t scalar_write_width(const Rdna2Inst& in) {
             const Rdna2InstructionEffects& effects = rdna2_instruction_effects(in);
             return effects.known() ? effects.sdst_dwords : 2u;
         }
-        case Rdna2Format::SMEM:
-            switch (in.opcode) {
-                case 0x0: case 0x8: return 1;
-                case 0x1: case 0x9: return 2;
-                case 0x2: case 0xa: return 4;
-                case 0x3: case 0xb: return 8;
-                case 0x4: case 0xc: return 16;
-                default: return 0;
-            }
+        case Rdna2Format::SMEM: {
+            // What SDATA receives (the effects table): a load's dwords, the s_memtime /
+            // s_memrealtime pair, a gfx10.1 atomic's returned value when GLC asks for it. Nothing
+            // for a store, a probe, cache control or a reserved encoding.
+            return rdna2_smem_destination_dwords(in);
+        }
         case Rdna2Format::VOP1:
         case Rdna2Format::VOP3: return rdna2_lane_read_writes_sgpr(in) ? 1u : 0u;
         default: return 0;

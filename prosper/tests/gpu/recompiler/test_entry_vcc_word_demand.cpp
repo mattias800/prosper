@@ -206,11 +206,13 @@ TEST(EntryVccWordDemand, CmpxAndUnmodeledSmemDoNotPublishVccWords) {
     const auto cmpx = decode(words);
     ASSERT_TRUE(vopc_is_cmpx(cmpx.front().opcode));
     EXPECT_FALSE(region_defines_vcc_before_any_read(cmpx));
-    const std::vector<uint32_t> unknown{0xf4141a84u, 0xfa000000u, 0xd7460000u, 0x0215066au,
+    // SMEM opcode 0x0d is unassigned in gfx1030 and gfx1013. (This fixture used 0x05, which is
+    // gfx10.1's s_scratch_load_dword and does write its SDATA.)
+    const std::vector<uint32_t> unknown{0xf4341a84u, 0xfa000000u, 0xd7460000u, 0x0215066au,
                                         0xbf810000u};
     const auto ins = decode(unknown);
     ASSERT_EQ(ins.front().fmt, Rdna2Format::SMEM);
-    ASSERT_EQ(ins.front().opcode, 5u);
+    ASSERT_EQ(ins.front().opcode, 0x0du);
     EXPECT_FALSE(region_defines_vcc_before_any_read(ins));
     auto control = unknown;
     control[0] = 0xf4201a84u;   // a supported buffer-load dword really writes VCC_LO

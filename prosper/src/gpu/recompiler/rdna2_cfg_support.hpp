@@ -191,23 +191,14 @@ sgpr_dead_at_merge(const std::vector<Rdna2Inst>& ins, uint32_t target, int R,
                 }
                 return block(in, "unmodelled-sopp");
             case Rdna2Format::SMEM: {
-                // s_load/s_buffer_load: reads the SBASE pair (src[0], 2 regs) + SOFFSET (src[1]);
-                // redefines N consecutive dst SGPRs. Anything not a plain load -> bail.
-                uint32_t n = 0;
-                switch (in.opcode) {
-                    case 0x0:
-                    case 0x8: n = 1; break;
-                    case 0x1:
-                    case 0x9: n = 2; break;
-                    case 0x2:
-                    case 0xA: n = 4; break;
-                    case 0x3:
-                    case 0xB: n = 8; break;
-                    case 0x4:
-                    case 0xC: n = 16; break;
-                    default: return block(in, "unmodelled-smem");
-                }
-                if (in.src[0].value == R || in.src[0].value + 1 == R)
+                // A load reads SBASE (src[0]: a pair, or the buffer forms' V# quad) and SOFFSET
+                // (src[1]) and redefines N consecutive SDATA SGPRs; the effects table gives both
+                // widths. Anything not a load -> bail. (This read only SBASE's first two words, so
+                // the last two words of a buffer load's V# were not seen as reads.)
+                const uint32_t n = rdna2_smem_load_dwords(in.opcode);
+                if (!n) return block(in, "unmodelled-smem");
+                if (R >= in.src[0].value &&
+                    R < in.src[0].value + static_cast<int>(rdna2_smem_address_dwords(in.opcode)))
                     return block(in, "smem-sbase");   // SBASE read
                 // SOFFSET is one dword and is consumed as an address, never as a lane mask.
                 if ((in.src[1].kind == OperandKind::SGPR ||
@@ -736,16 +727,11 @@ inline bool cannot_write_vcc(const Rdna2Inst& in) {
         case Rdna2Format::SOP2:
         case Rdna2Format::SOPK: return sgpr_dst_misses_vcc(2);   // conservative 64-bit pair
         case Rdna2Format::SMEM: {
-            uint32_t n = 0;
-            switch (in.opcode & 7) {
-                case 0: n = 1; break;
-                case 1: n = 2; break;
-                case 2: n = 4; break;
-                case 3: n = 8; break;
-                case 4: n = 16; break;
-                default: return false;
-            }
-            return sgpr_dst_misses_vcc(n);
+            // What SDATA receives, from the effects table (this used to read the width from
+            // opcode & 7, which charged s_memtime sixteen SGPRs and every opcode 5-7 mod 8 none).
+            if (!rdna2_instruction_effects(in).known()) return false;
+            const uint32_t n = rdna2_smem_destination_dwords(in);
+            return !n || sgpr_dst_misses_vcc(n);
         }
         default: return false;   // VOPC / unknown: stops the walk
     }
@@ -2013,8 +1999,9 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
         const Rdna2Inst& in = ins[w];
         switch (in.fmt) {
             case Rdna2Format::SMEM: {
-                if (!scalar_write_width(in) || in.n_src < 1) return false;
-                const uint32_t base_words = in.opcode >= 0x8 ? 4u : 2u;
+                // Only a load's result is a function of its address operands.
+                if (!rdna2_smem_load_dwords(in.opcode) || in.n_src < 1) return false;
+                const uint32_t base_words = rdna2_smem_address_dwords(in.opcode);
                 auto op_uniform = [&](const Operand& op, uint32_t words) {
                     if (op.kind == OperandKind::Special && op.value == 125)
                         return true;   // SGPR_NULL
@@ -2150,8 +2137,9 @@ inline bool branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint3
             }
             case Rdna2Format::SMEM: {
                 // Scalar-buffer loads use a four-dword descriptor; scalar-memory loads a base pair.
-                if (!scalar_write_width(in) || in.n_src < 1) return false;
-                const uint32_t base_words = in.opcode >= 0x8 ? 4u : 2u;
+                // Only a load's result is a function of its address operands.
+                if (!rdna2_smem_load_dwords(in.opcode) || in.n_src < 1) return false;
+                const uint32_t base_words = rdna2_smem_address_dwords(in.opcode);
                 if (!uniform_operand(in.src[0], base_words, w, depth)) return false;
                 return in.n_src < 2 || uniform_operand(in.src[1], 1, w, depth);
             }
@@ -2432,23 +2420,15 @@ inline PcrelTables detect_pcrel_tables(const std::vector<Rdna2Inst>& ins, const 
                 }
                 break;
             case Rdna2Format::SMEM: {
-                uint32_t n = 1;
-                switch (in.opcode) {
-                    case 0x1:
-                    case 0x9: n = 2; break;
-                    case 0x2:
-                    case 0xA: n = 4; break;
-                    case 0x3:
-                    case 0xB: n = 8; break;
-                    case 0x4:
-                    case 0xC: n = 16; break;
-                    default: break;
-                }
+                // The SGPRs SDATA may receive (the effects table); a reserved encoding keeps the
+                // old one-register kill.
+                const uint32_t n =
+                    rdna2_instruction_effects(in).known() ? rdna2_smem_destination_dwords(in) : 1u;
                 // Scalar-buffer form of the same compiler idiom: SBASE is the getpc-built V#, while
                 // SOFFSET selects a row from the embedded table. Inspect it before killing SDATA facts.
                 const int sb = in.src[0].value;
-                if (in.opcode >= 0x8 && in.opcode <= 0xC && pcoff.count(sb) && pchi.count(sb + 1) &&
-                    kconst.count(sb + 2) && kconst.count(sb + 3)) {
+                if (smem_opcode_is_buffer_load(in.opcode) && pcoff.count(sb) &&
+                    pchi.count(sb + 1) && kconst.count(sb + 2) && kconst.count(sb + 3)) {
                     const uint32_t nrec = kconst[sb + 2];
                     const uint64_t off = pcoff[sb];
                     uint32_t newest = 0;
@@ -2840,9 +2820,10 @@ inline bool terminal_guard_scc_is_workgroup_uniform(const std::vector<Rdna2Inst>
                 }
                 case Rdna2Format::SMEM: {
                     // Scalar-buffer loads use a four-dword descriptor; scalar-memory loads use a
-                    // base pair. The scalar offset is one dword in both forms.
-                    if (!scalar_write_width(writer) || writer.n_src < 1) return false;
-                    const uint32_t base_words = writer.opcode >= 0x8 ? 4u : 2u;
+                    // base pair. The scalar offset is one dword in both forms. Only a load's
+                    // result is a function of its address operands.
+                    if (!rdna2_smem_load_dwords(writer.opcode) || writer.n_src < 1) return false;
+                    const uint32_t base_words = rdna2_smem_address_dwords(writer.opcode);
                     if (!uniform_operand(writer.src[0], base_words)) return false;
                     return writer.n_src < 2 || uniform_operand(writer.src[1], 1);
                 }

@@ -148,7 +148,7 @@ inline FragmentMaskObservability prove_fragment_mask_observability(
                 continue;
             }
             if (in.fmt == Rdna2Format::SMEM &&
-                overlap(in.src[0].value, in.opcode >= 0x08 ? 4u : 2u, base))
+                overlap(in.src[0].value, rdna2_smem_address_dwords(in.opcode), base))
                 return reject("derived-mask-data-or-reduction", in.pc);
             for (int word = 0; word < 2; ++word)
                 if (!sgpr_dead_at_merge(std::vector<Rdna2Inst>{read_check}, in.pc, base + word))

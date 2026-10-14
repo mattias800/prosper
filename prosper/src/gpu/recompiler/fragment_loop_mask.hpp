@@ -156,7 +156,7 @@ inline FragmentLoopMaskProof prove_fragment_loop_mask(
         // raw-SMEM SBASE check covers two words; buffered loads consume four, so check that span
         // here too. Replace only admitted exact mask operands; all remaining touches must be dead.
         if (in.fmt == Rdna2Format::SMEM &&
-            overlaps(in.src[0].value, in.opcode >= 0x08 ? 4u : 2u))
+            overlaps(in.src[0].value, rdna2_smem_address_dwords(in.opcode)))
             return decline("scalar-memory-address-read", in.pc);
         for (uint32_t source = 0; source < in.n_src; ++source) {
             if (in.src[source].kind == OperandKind::SGPR &&

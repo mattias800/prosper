@@ -89,19 +89,13 @@ inline uint32_t ordinary_vgpr_complete_results(const Rdna2Inst& in) {
         case Rdna2Format::VOP1:
         case Rdna2Format::VOP2:
         case Rdna2Format::VOP3:
+        case Rdna2Format::VOP3P:
             // The effects table: a lane-wise result of the explicit operands alone, in every
             // VGPR VDST receives. Accumulators (MAC/FMAC/DOT*C read the old VDST), 16-bit results
             // outside the zero-filling SDWA PAD form, and cross-lane, selected-lane, relative and
             // interpolation results supply no such effect. A valid opcode with no emitter is
             // refused at emission, so naming it here grants nothing.
             return rdna2_valu_complete_result_dwords(in);
-        case Rdna2Format::VOP3P:
-            // Packed arithmetic/dot results write both halves or a full F32 word; MIXLO/MIXHI
-            // preserve the opposite half and are deliberately absent.
-            return in.opcode <= 0x12u || (in.opcode >= 0x14u && in.opcode <= 0x19u) ||
-                           in.opcode == 0x20u
-                       ? 1u
-                       : 0u;
         case Rdna2Format::DS:
             // Full-word reads/returning atomics and swizzles. D16 preserving reads are absent.
             switch (in.opcode) {

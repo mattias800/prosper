@@ -98,7 +98,8 @@ bool vector_write_depends_on_old_word(const Rdna2Inst& in, bool full_exec) {
     switch (in.fmt) {
         case Rdna2Format::VOP1:
         case Rdna2Format::VOP2:
-        case Rdna2Format::VOP3: {
+        case Rdna2Format::VOP3:
+        case Rdna2Format::VOP3P: {
             // The opcode's own answer is the effects table's: an accumulator, a selected-lane or
             // M0-relative destination, or a 16-bit result (which leaves the other half). An
             // encoding the table does not describe -- 0x13c, which prosper lowers through its
@@ -122,7 +123,6 @@ bool vector_write_depends_on_old_word(const Rdna2Inst& in, bool full_exec) {
                            : in.fmt == Rdna2Format::VOP2 && in.opcode == 1;
             return false;
         }
-        case Rdna2Format::VOP3P: return in.opcode == 0x21 || in.opcode == 0x22;
         case Rdna2Format::MIMG:
             // The compute image-atomic service preserves VDST for out-of-bounds coordinates.
             // Keeping its old-word dependency is conservative for the native fragment service.

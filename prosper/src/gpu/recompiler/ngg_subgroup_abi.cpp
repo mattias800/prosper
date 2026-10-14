@@ -251,10 +251,10 @@ bool vop_rmw_destination(const Rdna2Inst& in) {
     // Operations that read their own destination: MAC/FMAC/DOT accumulators, lane writes, permlane
     // (preserves out-of-row lanes), swaps, 16-bit results (the other half), DPP (masked rows/banks
     // keep the old value), SDWA with a partial destination and VOP3 results selecting the high
-    // half (OPSEL[3]). The opcode facts are the effects table's; VOP3P is not tabulated yet.
+    // half (OPSEL[3]). The opcode facts are the effects table's (v_fma_mixlo/mixhi_f16 keep the
+    // other half).
     if (in.has_dpp) return true;
     if (in.has_sdwa && (in.sdwa_dst_sel != 6 || in.sdwa_dst_unused == 2)) return true;
-    if (in.fmt == Rdna2Format::VOP3P) return in.opcode == 0x21 || in.opcode == 0x22;
     if (in.fmt == Rdna2Format::VOP3 && (in.vop3p_opsel & 0x8u)) return true;
     const Rdna2InstructionEffects& effects = rdna2_instruction_effects(in);
     if (!effects.describes_vector_result()) return true;   // fail closed: charge the read
@@ -266,80 +266,16 @@ bool vop_rmw_destination(const Rdna2Inst& in) {
     return rdna2_valu_result_keeps_old_vdst(in.fmt, in.opcode) == Rdna2Answer::Yes;
 }
 
-// Number of VGPRs a vector source names, classified per form; 0 means "not classified", and the
-// caller refuses the program. Every 64-bit-operand form of the gfx10.3 VALU is listed (RDNA2 ISA,
-// VOPC/VOP1/VOP3 opcode tables); VOP2 and VOP3P have none. CONFIDENCE: MED on the completeness of
-// those lists, which is why the VOP3-only opcode space outside them is refused rather than charged.
+// Number of VGPRs a vector source names; 0 means "not classified", and the caller refuses the
+// program. DS DATA fields are counted by opcode; every VALU width is the effects table's (ISA 70648
+// 12.7-12.12, every F64/B64 operand a pair). An encoding the table does not describe stays
+// unclassified. This used to be a hand list that missed v_ashrrev_i64's pair and classified the
+// VOP3-only space by opcode band.
 uint32_t vgpr_source_span(const Rdna2Inst& in, uint32_t index) {
     if (in.fmt == Rdna2Format::DS) return index == 0 ? 1u : ds_data_dwords(in.opcode);
-    const bool vop3 = in.fmt == Rdna2Format::VOP3;
-    // VOPC, natively or VOP3-encoded (opcode < 0x100): f64 compares and classes 0x20-0x3f, i64
-    // 0xa0-0xbf (class_f64 0xa8/0xb8 takes a 32-bit mask in src1), u64 0xe0-0xf7.
-    if (in.fmt == Rdna2Format::VOPC || (vop3 && in.opcode < 0x100)) {
-        const uint32_t op = in.opcode;
-        if ((op == 0xa8 || op == 0xb8) && index == 1) return 1;
-        if ((op >= 0x20 && op <= 0x3f) || (op >= 0xa0 && op <= 0xbf) || (op >= 0xe0 && op <= 0xf7))
-            return 2;
-        return 1;
-    }
-    // VOP1, natively or VOP3-encoded (0x180 + op): the f64 sources.
-    if (in.fmt == Rdna2Format::VOP1 || (vop3 && in.opcode >= 0x180 && in.opcode < 0x200)) {
-        const uint32_t op = in.fmt == Rdna2Format::VOP1 ? in.opcode : in.opcode - 0x180;
-        switch (op) {
-            case 0x03:
-            case 0x0f:
-            case 0x15:   // cvt_i32/f32/u32 from f64
-            case 0x17:
-            case 0x18:
-            case 0x19:
-            case 0x1a:   // trunc/ceil/rndne/floor_f64
-            case 0x2f:
-            case 0x31:
-            case 0x34:   // rcp/rsq/sqrt_f64
-            case 0x3c:
-            case 0x3d:
-            case 0x3e:   // frexp_exp/frexp_mant/fract_f64
-                return 2;
-            default: return 1;
-        }
-    }
-    if (in.fmt == Rdna2Format::VOP2 || in.fmt == Rdna2Format::VOP3P) return 1;
-    if (!vop3) return 1;
-    if (in.opcode >= 0x100 && in.opcode < 0x140) return 1;   // VOP3-encoded VOP2
-    if (in.opcode >= 0x140 && in.opcode < 0x180) {
-        switch (in.opcode) {
-            case 0x14c:
-            case 0x160:
-            case 0x16e:
-            case 0x170:   // fma/div_fixup/div_scale/div_fmas f64
-                return 2;
-            case 0x164:
-            case 0x165:
-            case 0x166:
-            case 0x167:   // add/mul/min/max_f64
-                return index < 2 ? 2u : 1u;
-            case 0x168:
-            case 0x174:   // ldexp_f64 / trig_preop_f64: src0 is f64
-                return index == 0 ? 2u : 1u;
-            case 0x172:
-            case 0x173:   // qsad_pk_u16_u8 / mqsad_pk_u16_u8: src0, src2 are b64
-                return index == 1 ? 1u : 2u;
-            case 0x175:   // mqsad_u32_u8: src0 b64, src2 b128
-                return index == 0 ? 2u : index == 2 ? 4u : 1u;
-            case 0x176:
-            case 0x177:   // mad_u64_u32 / mad_i64_i32: src2 is 64-bit
-                return index == 2 ? 2u : 1u;
-            case 0x161:
-            case 0x162:
-            case 0x163: return 0;   // not in the gfx10.3 table
-            // 0x178 v_xor3_b32 (three 32-bit sources); 0x179-0x17f are not classified.
-            default: return in.opcode <= 0x178 ? 1u : 0u;
-        }
-    }
-    if (in.opcode == 0x2ff || in.opcode == 0x300 || in.opcode == 0x301)   // b64 shifts: src1
-        return index == 1 ? 2u : 1u;
-    if (in.opcode >= 0x300) return 1;   // the 32-bit VOP3-only tail (add3, lshl_add, permlane...)
-    return 0;   // 0x200-0x2fe: VOP3 interpolation and unassigned space
+    if (!rdna2_instruction_effects(in).describes_sources()) return 0;
+    const uint32_t span = rdna2_valu_vgpr_source_span(in, index);
+    return span ? span : 1u;
 }
 
 // Definite full-dword VGPR results for the lanes in EXEC (under-reporting is the safe direction).
@@ -358,7 +294,6 @@ uint32_t definite_vgpr_results(const Rdna2Inst& in) {
             if (in.has_dpp || (in.has_sdwa && (in.sdwa_dst_sel != 6 || in.sdwa_dst_unused == 2)) ||
                 (in.fmt == Rdna2Format::VOP3 && (in.vop3p_opsel & 0x8u)))
                 return 0;
-            if (in.fmt == Rdna2Format::VOP3P) return rdna2_vgpr_write_count(in);
             {
                 const Rdna2InstructionEffects& effects = rdna2_instruction_effects(in);
                 if (!effects.describes_vector_result()) return 0;
@@ -510,8 +445,8 @@ Reads instruction_reads(const Rdna2Inst& in, bool wave32) {
             // A VOP3 encoding always carries three source fields; the ones its opcode does not
             // read decode as s0 and must not count as reads (a phantom s0 refuses the program).
             const uint32_t sources =
-                in.fmt == Rdna2Format::VOP3
-                    ? std::min<uint32_t>(in.n_src, vop3_architectural_source_count(in.opcode))
+                in.fmt == Rdna2Format::VOP3 || in.fmt == Rdna2Format::VOP3P
+                    ? std::min<uint32_t>(in.n_src, rdna2_valu_source_count(in.fmt, in.opcode))
                     : in.n_src;
             for (uint32_t k = 0; k < sources; ++k) {
                 const uint32_t words = scalar_alu_source_words(in, k);

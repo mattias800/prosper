@@ -45,45 +45,21 @@ inline constexpr uint32_t kSop1OpcodeBitset1B32 = 0x1d;
 inline constexpr uint32_t kSop1OpcodeGetpcB64 = 0x1f;
 inline constexpr uint32_t kSop1OpcodeBitreplicateB64B32 = 0x3b;
 
-// SOP1 opcodes that leave SCC **UNMODIFIED**.
+// SOP1 opcodes that leave SCC **UNMODIFIED** / that DEFINITELY write it.
 //
-// This is NOT the list in `rdna2_emit_cfg.cpp`'s SCC-liveness walks, and the difference is the whole
-// reason this one exists separately. That list answers *"is SCC still SCALAR-VALUED after this?"* --
-// it may be written, as long as what lands in it is still a modellable scalar. This one answers
-// *"is the SCC a later branch reads still the one an EARLIER compare produced?"*, which an
-// instruction that writes SCC breaks even when the value it writes is perfectly scalar.
+// These answer "is the SCC a later branch reads still the one an EARLIER compare produced?", which
+// an instruction that writes SCC breaks even when the value it writes is perfectly scalar. That is
+// NOT the question `rdna2_emit_cfg.cpp`'s SCC-liveness walks ask ("is SCC still SCALAR-VALUED?").
+// Borrowing that list for this question once shipped a real defect: it includes s_bcnt1_i32_b64,
+// whose ISA definition is `D.i = CountOneBits(S0.u64); SCC = (D.i != 0)` (RDNA2 70648).
 //
-// Borrowing that list for this question shipped a real defect and it is worth naming: it includes
-// `s_bcnt1_i32_b64`, whose ISA definition is `D.i = CountOneBits(S0.u64); SCC = (D.i != 0)`
-// (RDNA2 70648). Under the wrong reading, `v_cmp_* -> s_cmp_eq_u32 -> s_bcnt1_i32_b64 s5,s[20:21]
-// -> s_cbranch_scc0` would step over the popcount and prove the branch uniform from the *earlier*
-// compare, when the branch really reads a ballot popcount of a lane mask. Silent wrong pixels.
-//
-// So: derived for this question, against the ISA, and deliberately NOT shared. A verdict does not
-// transfer across a change of question just because the two lists look alike.
-inline constexpr bool sop1_opcode_leaves_scc_unmodified(uint32_t opcode) {
-    return opcode == kSop1OpcodeMovB32 || opcode == kSop1OpcodeMovB64 ||
-           opcode == kSop1OpcodeCmovB32 || opcode == kSop1OpcodeCmovB64 ||
-           opcode == kSop1OpcodeBrevB32 ||
-           opcode == kSop1OpcodeFf1I32B64 || opcode == kSop1OpcodeFlbitI32B32 ||
-           opcode == kSop1OpcodeFlbitI32B64 || opcode == kSop1OpcodeBitset0B32 ||
-           opcode == kSop1OpcodeBitset1B32 || opcode == kSop1OpcodeGetpcB64 ||
-           opcode == kSop1OpcodeBitreplicateB64B32;
-}
-// SOP1 opcodes that DEFINITELY write SCC: the gfx10 pseudos that carry `Defs = [SCC]`, directly or
-// through the SAVEEXEC/WREXEC `Defs = [EXEC, SCC]` group. This is not the complement of the list
-// above. An opcode on neither list is one nothing may assume either way, and which way is safe
-// depends on the question: a proof that SCC is unmodified must treat it as written, and a taint
-// that a write clears must treat it as not written. The raw-wide walk asked the first question's
-// list the second question, so s_ff1_i32_b32 and the relative moves ended a compare's lifetime.
-inline constexpr bool sop1_opcode_writes_scc(uint32_t opcode) {
-    return (opcode >= 0x07u && opcode <= 0x0au) ||   // S_NOT_B32/B64, S_WQM_B32/B64
-           (opcode >= 0x0du && opcode <= 0x10u) ||   // S_BCNT0/BCNT1_I32_B32/B64
-           (opcode >= 0x24u && opcode <= 0x2du) ||   // SAVEEXEC_B64 x8, S_QUADMASK_B32/B64
-           opcode == 0x34u ||   // S_ABS_I32
-           (opcode >= 0x37u && opcode <= 0x3au) ||   // ANDN1/ORN1_SAVEEXEC, ANDN1/ANDN2_WREXEC B64
-           (opcode >= 0x3cu && opcode <= 0x47u);   // SAVEEXEC_B32 x10, ANDN1/ANDN2_WREXEC_B32
-}
+// Both come from the instruction-effects table's per-opcode "Sets SCC?" fact (ISA 70648 5.3-5.8),
+// and they are not complements: a RESERVED encoding is on neither list. Which way is safe for it
+// depends on the question -- a proof that SCC is unmodified must treat it as written, and a taint
+// that a write clears must treat it as not written. These used to be two hand lists; the "leaves
+// SCC unmodified" one named 12 of the 27 SOP1 instructions that do not write SCC (#5146 step 4).
+bool sop1_opcode_leaves_scc_unmodified(uint32_t opcode);
+bool sop1_opcode_writes_scc(uint32_t opcode);
 inline constexpr uint32_t kSop1OpcodeSetpcB64 = 0x20;
 inline constexpr uint32_t kSop1OpcodeSwappcB64 = 0x21;
 inline constexpr uint32_t kSop1OpcodeRfeB64 = 0x22;
@@ -160,37 +136,20 @@ inline constexpr bool sopp_opcode_is_direct_branch(uint32_t opcode) {
            (opcode >= kSoppOpcodeCbranchScc0 && opcode <= kSoppOpcodeCbranchExecnz);
 }
 
-inline constexpr bool sop1_opcode_is_saveexec_b32(uint32_t opcode) {
-    return opcode >= kSop1OpcodeAndSaveexecB32 &&
-           opcode <= kSop1OpcodeOrn1SaveexecB32;
-}
+// The SAVEEXEC / WREXEC families, B32 and B64, from the instruction-effects table (its EXEC-update
+// kind and destination width, ISA 70648 12.3). The B64 family is three non-contiguous groups
+// (0x24-0x2B, 0x37-0x38, 0x39-0x3A), which is how the 0x39/0x3A WREXEC pair was once missed by an
+// inline range (#2120 class).
+bool sop1_opcode_is_saveexec_b32(uint32_t opcode);
+bool sop1_opcode_is_wrexec_b32(uint32_t opcode);
+bool sop1_opcode_is_saveexec_b64(uint32_t opcode);
+bool sop1_opcode_is_wrexec_b64(uint32_t opcode);
 
-inline constexpr bool sop1_opcode_is_wrexec_b32(uint32_t opcode) {
-    return opcode >= kSop1OpcodeAndn1WrexecB32 &&
-           opcode <= kSop1OpcodeAndn2WrexecB32;
-}
-
-inline constexpr bool sop1_opcode_writes_exec_b32(uint32_t opcode) {
+inline bool sop1_opcode_writes_exec_b32(uint32_t opcode) {
     return sop1_opcode_is_saveexec_b32(opcode) || sop1_opcode_is_wrexec_b32(opcode);
 }
 
-// The B64 EXEC-writing family, derived from the same LLVM TableGen source as the opcode numbers
-// above (`SOPInstructions.td`: `SOP1_Real_gfx6_gfx7_gfx10_gfx13<0x024..0x02B>` for the eight
-// AND/OR/XOR/ANDN2/ORN2/NAND/NOR/XNOR SAVEEXEC ops, plus the gfx9+ `Defs = [EXEC, SCC]` ops
-// `S_ANDN1/ORN1_SAVEEXEC_B64` at 0x37/0x38 and `S_ANDN1/ANDN2_WREXEC_B64` at 0x39/0x3A). Split by
-// operation rather than one range because 0x24-0x2B, 0x37-0x38 and 0x39-0x3A are three
-// non-contiguous groups (QUADMASK/MOVRELS/MOVRELD/ABS sit between them and do not write EXEC),
-// which is exactly how the 0x39/0x3A WREXEC pair was missed by the old inline range (#2120 class).
-inline constexpr bool sop1_opcode_is_saveexec_b64(uint32_t opcode) {
-    return (opcode >= kSop1OpcodeAndSaveexecB64 && opcode <= kSop1OpcodeXnorSaveexecB64) ||
-           opcode == kSop1OpcodeAndn1SaveexecB64 || opcode == kSop1OpcodeOrn1SaveexecB64;
-}
-
-inline constexpr bool sop1_opcode_is_wrexec_b64(uint32_t opcode) {
-    return opcode == kSop1OpcodeAndn1WrexecB64 || opcode == kSop1OpcodeAndn2WrexecB64;
-}
-
-inline constexpr bool sop1_opcode_writes_exec_b64(uint32_t opcode) {
+inline bool sop1_opcode_writes_exec_b64(uint32_t opcode) {
     return sop1_opcode_is_saveexec_b64(opcode) || sop1_opcode_is_wrexec_b64(opcode);
 }
 
@@ -277,44 +236,6 @@ inline constexpr bool emitted_vop3_opcode_has_two_data_sources(uint32_t opcode) 
            opcode == kVop3OpcodeLdexpF32 || opcode == kVop3OpcodeBfmB32 ||
            opcode == 0x364u || opcode == 0x365u || opcode == 0x366u ||
            opcode == 0x368u || opcode == 0x369u || opcode == 0x36au;
-}
-
-// How many of a VOP3 encoding's three source fields its opcode architecturally reads, where the
-// opcode's FORM settles it; 3 otherwise. The decoder exposes all three fields for most VOP3 opcodes
-// (emitted_vop3_opcode_has_two_data_sources above is its narrower, emitter-driven list), and an
-// unused field decodes as s0. Analyses that must not see that phantom read (the merged-NGG launch
-// ABI admission, where s0 is a launch register) cap their source loop with this.
-//   * 0x180..0x1ff, VOP3-encoded VOP1: SRC0 only.
-//   * 0x101..0x13f, VOP3-encoded VOP2: SRC0 and SRC1, except the forms whose SRC2 is an operand --
-//     v_cndmask_b32 (lane mask), v_add/sub/subrev_co_ci_u32 (carry-in) -- and the accumulating
-//     MAC/FMAC/DOT and literal FMAMK/FMAAK forms, which are left at three (fail-closed).
-//   * the two-source list the decoder already applies.
-// Everything else (VOP3-only operations, interpolation, unassigned space) stays at three.
-// CONFIDENCE: HIGH on the VOP1/VOP2 forms (RDNA2 ISA, VOP1/VOP2 have one/two source fields).
-inline constexpr uint32_t vop3_architectural_source_count(uint32_t opcode) {
-    if (opcode >= 0x180u && opcode < 0x200u) return 1;
-    if (opcode > 0x100u && opcode < 0x140u) {
-        switch (opcode - 0x100u) {
-            case 0x01u:   // v_cndmask_b32
-            case 0x02u:   // v_dot2c_f32_f16
-            case 0x06u:   // v_fmac_legacy_f32
-            case 0x0du:   // v_dot4c_i32_i8
-            case 0x1fu:   // v_mac_f32
-            case 0x28u:
-            case 0x29u:
-            case 0x2au:   // v_add/sub/subrev_co_ci_u32
-            case 0x2bu:   // v_fmac_f32
-            case 0x2cu:
-            case 0x2du:   // v_fmamk/fmaak_f32
-            case 0x36u:   // v_fmac_f16
-            case 0x37u:
-            case 0x38u:   // v_fmamk/fmaak_f16
-            case 0x3cu:   // v_pk_fmac_f16
-                return 3;
-            default: return 2;
-        }
-    }
-    return emitted_vop3_opcode_has_two_data_sources(opcode) ? 2u : 3u;
 }
 
 // GFX10.3 DS cross-lane/float-atomic opcodes shared by decode-side write accounting, control-flow
@@ -529,6 +450,9 @@ struct Rdna2Inst {
     // in dword1 bit 23 and appends a status VGPR after the data result, like MTBUF TFE below.
     bool     mubuf_glc = false;
     bool     mubuf_dlc = false;
+    // SMEM GLC (dword0 bit 16): a gfx10.1 scalar atomic returns the pre-op value to SDATA only
+    // when it is set.
+    bool smem_glc = false;
     bool     mubuf_lds = false;
     bool     mubuf_tfe = false;
     // MTBUF carries the GFX10 combined 7-bit BUF_FMT at dword0[25:19], just like a Gen5 V#.

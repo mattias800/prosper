@@ -620,13 +620,14 @@ TEST(RawWideReplayedLoad, SaveexecFromAnIndependentMaskDoesNotStopTheWalk) {
 }
 
 TEST(RawWideReplayedLoad, AnSmemThatIsNotAPlainLoadKeepsReplayUncertain) {
-    // SMEM opcode 0x05 is not one of the ten loads, so the writer inventory says nothing about
-    // it. Placed past the loop with operands clear of the loaded words, neither walk objects to
-    // it; only the whole-program condition can.
-    const auto instructions = program({.after_exit = {0xf414000eu, 0xfa000000u}});
+    // SMEM opcode 0x0d is unassigned (gfx1030 and gfx1013), so the writer inventory says nothing
+    // about it. Placed past the loop with operands clear of the loaded words, neither walk objects
+    // to it; only the whole-program condition can. (This used 0x05, gfx10.1's
+    // s_scratch_load_dword, whose SDATA write the inventory now sees.)
+    const auto instructions = program({.after_exit = {0xf434000eu, 0xfa000000u}});
     const Rdna2Inst& odd = at(instructions, 10);
     ASSERT_EQ(odd.fmt, Rdna2Format::SMEM);
-    ASSERT_EQ(odd.opcode, 0x5u);
+    ASSERT_EQ(odd.opcode, 0xdu);
     ASSERT_FALSE(rdna2_may_write_guest_memory(odd)) << "else the guest-write arm covers it";
     EXPECT_TRUE(flagged(instructions));
     EXPECT_EQ(numeric_blocker(instructions), "load-re-executed");

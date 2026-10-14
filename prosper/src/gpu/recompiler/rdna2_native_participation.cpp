@@ -165,7 +165,7 @@ uint64_t vector_sources(const Facts& f, const Rdna2Inst& in) {
     uint64_t result = full;
     const uint32_t n =
         in.fmt == Rdna2Format::VOP3
-            ? std::min<uint32_t>(in.n_src, vop3_architectural_source_count(in.opcode))
+            ? std::min<uint32_t>(in.n_src, rdna2_valu_source_count(in.fmt, in.opcode))
             : in.n_src;
     for (uint32_t k = 0; k < n; ++k) {
         const uint32_t span = in.src[k].kind == OperandKind::VGPR ? rdna2_vgpr_source_span(in, k)
