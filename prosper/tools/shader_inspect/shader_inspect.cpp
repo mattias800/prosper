@@ -1,6 +1,7 @@
 // shader_inspect - print the decoded RDNA2 stream and resolved control-flow targets from a raw dump.
 #include "gpu/diagnostics/refused_shader_inputs.hpp"
 #include "gpu/diagnostics/refused_graphics_inputs.hpp"
+#include "gpu/recompiler/rdna2_launch_vgprs.hpp"
 #include "gpu/execute/skippable_instruction.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
@@ -275,6 +276,42 @@ int replay_recorded_inputs(const std::string& code_path, const std::string& inpu
             inputs.compute.local_y, inputs.compute.local_z, inputs.resources.resources.size(),
             inputs.payload_omitted ? "omitted" : "kept", sets.c_str(),
             inputs.incomplete.empty() ? "" : " incomplete=", inputs.incomplete.c_str());
+    // The recorded wave-launch contract (#5146): every VGPR the hardware loads before the first
+    // instruction, and whether this build supplies it. A refusal that reads an `unsupplied` or
+    // `reserved` VGPR has no supplied launch value. `partial` exposes the existing incomplete
+    // ANCILLARY binding rather than claiming that its other hardware fields are supplied.
+    const auto launch_vgprs = [](const std::vector<LaunchVgpr>& launch, bool pixel) {
+        std::string out;
+        for (const auto& word : launch) {
+            char item[96];
+            if (pixel)
+                std::snprintf(item, sizeof item, "%sv%u:%s.%u/%s", out.empty() ? "" : ",",
+                              word.vgpr, pixel_launch_field_name(word.field), word.component,
+                              launch_vgpr_state_name(word.state));
+            else
+                std::snprintf(item, sizeof item, "%sv%u:thread_id.%c/%s", out.empty() ? "" : ",",
+                              word.vgpr, "xyz"[word.field], launch_vgpr_state_name(word.state));
+            out += item;
+        }
+        return out.empty() ? std::string("none") : out;
+    };
+    if (inputs.graphics && inputs.graphics->invocation.has_system_inputs) {
+        const auto& invocation = inputs.graphics->invocation;
+        const auto& system = invocation.system_inputs;
+        const bool geometry = invocation.interpolation.requires_geometry;
+        std::printf(
+            "inputs-launch stage=%s ps_input_ena=0x%x ps_input_addr=0x%x "
+            "interpolation_geometry=%d front_face=%s vgprs=%s\n",
+            inputs.stage.c_str(), system.ena, system.addr, geometry ? 1 : 0,
+            system.front_face_encoding == FragmentFrontFaceEncoding::SignedFloat ? "signed-float"
+            : system.front_face_encoding == FragmentFrontFaceEncoding::AllBits   ? "all-bits"
+                                                                                 : "unavailable",
+            launch_vgprs(pixel_launch_vgprs(system, geometry), true).c_str());
+    } else if (!inputs.graphics && inputs.stage == "cs") {
+        std::printf(
+            "inputs-launch stage=cs tidig_comp_cnt=%u vgprs=%s\n", inputs.compute.tidig_comp_cnt,
+            launch_vgprs(compute_launch_vgprs(inputs.compute.tidig_comp_cnt), false).c_str());
+    }
     const auto line = [](const char* label, const RefusedShaderReplay& r) {
         const char* status = !r.incomplete.empty() ? "incomplete" : r.produced ? "ok" : "rejected";
         std::printf("%s status=%s reject=\"%s\"%s%s spirv_dwords=%zu\n", label, status,
