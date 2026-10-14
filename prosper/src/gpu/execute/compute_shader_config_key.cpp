@@ -29,5 +29,6 @@ void populate_compute_shader_key(ShaderCompileKey& key, const ComputeShaderConfi
     key.compute_native_storage_format_support = config.native_storage_format_support;
     key.compute_storage_buffer_int64_atomics = config.storage_buffer_int64_atomics;
     key.compute_packed_r11_storage = config.packed_r11_storage;
+    key.compute_choices = config.choices;
 }
 } // namespace prosper::gpu

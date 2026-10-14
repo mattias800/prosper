@@ -149,6 +149,30 @@ TEST(ComputeDispatchLaunch, Wave32HasCompleteGroupsButCannotGrantWave64Words) {
     c.wave_size = 64;
     EXPECT_FALSE(compute_dispatch_has_complete_groups(c));
 }
+// ADR 0006: the request's switch-type choices change the emitted module, so they are part of the key;
+// otherwise a module compiled under one request would be served for another.
+TEST(ComputeDispatchLaunch, CacheSeparatesRequestChoices) {
+    auto config = fixture::config();
+    ShaderCompileKey unset;
+    unset.has_compute_config = true;
+    populate_compute_shader_key(unset, config);
+    config.choices.set(CompilerChoice::MimgSoft, 1);
+    ShaderCompileKey soft;
+    soft.has_compute_config = true;
+    populate_compute_shader_key(soft, config);
+    config.choices.set(CompilerChoice::MimgSoft, 0);
+    ShaderCompileKey hard;
+    hard.has_compute_config = true;
+    populate_compute_shader_key(hard, config);
+    EXPECT_FALSE(unset == soft);
+    EXPECT_FALSE(soft == hard) << "set to 1 and set to 0 are different requests";
+    EXPECT_FALSE(unset == hard) << "an unset entry (live read) is not the same request as 0";
+    EXPECT_NE(ShaderCompileKeyHash::compute(soft), ShaderCompileKeyHash::compute(hard));
+    EXPECT_NE(ShaderCompileKeyHash::compute(unset), ShaderCompileKeyHash::compute(soft));
+    auto same = soft;
+    EXPECT_TRUE(same == soft);
+    EXPECT_EQ(ShaderCompileKeyHash::compute(same), ShaderCompileKeyHash::compute(soft));
+}
 TEST(ComputeDispatchLaunch, CacheSeparatesAllRawWordsAndPresenceBits) {
     ShaderCompileKey a;
     a.has_compute_config = true;

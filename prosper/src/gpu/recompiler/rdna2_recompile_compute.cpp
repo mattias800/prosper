@@ -3,6 +3,7 @@
 #include <cstdint>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
+#include "gpu/recompiler/compiler_choices.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/compute_dispatch_launch.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -646,6 +647,9 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                                         const ShaderResourceTable* rt,
                                         const ComputeShaderConfig& config,
                                         RecompileDiagnosticContext diagnostic) {
+    // ADR 0006: the switch-type choices come from the request, not from the environment. Entries the
+    // caller left unset still fall through to their live read until the other stages migrate too.
+    CompilerChoiceScope request_choices(config.choices);
     const PortableEntryExecRoot entry(code, dwords, config);
     RecompileDiagnosticAttempt attempt_diagnostics;
     ComputeConstantFoldAttempt fold_attempt;

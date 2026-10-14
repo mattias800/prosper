@@ -7,19 +7,39 @@ CompilerChoiceScope::CompilerChoiceScope(CompilerChoiceTrace& recording)
     : previous_(active), recording_(&recording) { active = this; }
 CompilerChoiceScope::CompilerChoiceScope(const CompilerChoiceTrace& replay)
     : previous_(active), replay_(&replay) { active = this; }
+CompilerChoiceScope::CompilerChoiceScope(const CompilerChoiceSet& supplied)
+    : previous_(active), supplied_(&supplied) {
+    active = this;
+}
 CompilerChoiceScope::~CompilerChoiceScope() { active = previous_; }
 void CompilerChoiceScope::finish_replay() const {
     if (!replay_ || !replay_->error.empty() || position_ != replay_->reads.size())
         throw std::runtime_error("compiler choice trace not completely consumed");
 }
 bool replay_compiler_choice(CompilerChoice choice, int64_t& value) {
-    if (!active || !active->replay_) return false;
-    const auto& trace = *active->replay_;
-    if (!trace.error.empty() || active->position_ >= trace.reads.size() ||
-        trace.reads[active->position_].choice != choice)
+    // Request and observation scopes may sit inside a replay. Its recorded sequence still owns
+    // every semantic read; neither a supplied request nor an environment fallback may bypass it.
+    auto* scope = active;
+    while (scope && !scope->replay_) scope = scope->previous_;
+    if (!scope) return false;
+    const auto& trace = *scope->replay_;
+    if (!trace.error.empty() || scope->position_ >= trace.reads.size() ||
+        trace.reads[scope->position_].choice != choice)
         throw std::runtime_error("compiler choice trace diverged: unknown or missing semantic read");
-    value = trace.reads[active->position_++].value;
+    value = trace.reads[scope->position_++].value;
     return true;
+}
+bool supplied_compiler_choice(CompilerChoice choice, int64_t& value) {
+    // The innermost scope that answers wins; a recording-only scope does not answer.
+    for (auto* scope = active; scope; scope = scope->previous_) {
+        if (scope->replay_) return false;   // replay owns the sequence; it is asked first
+        if (!scope->supplied_) continue;
+        if (const auto v = scope->supplied_->get(choice)) {
+            value = *v;
+            return true;
+        }
+    }
+    return false;
 }
 void record_compiler_choice(CompilerChoice choice, int64_t value) {
     // A nested producing observer must not hide semantic reads from its outer observer. Stop at

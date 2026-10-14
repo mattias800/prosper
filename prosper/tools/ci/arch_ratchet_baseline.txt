@@ -120,15 +120,16 @@ getenv|prosper/src/gpu/pm4/command_processor.cpp 59
 getenv|prosper/src/gpu/present/videoout_present.cpp 1
 getenv|prosper/src/gpu/recompiler/gta5/rdna2_gta5_compute_contracts.cpp 6
 getenv|prosper/src/gpu/recompiler/rdna2_alu_support.hpp 1
-getenv|prosper/src/gpu/recompiler/rdna2_cfg_support.hpp 8
-getenv|prosper/src/gpu/recompiler/rdna2_emit_alu.cpp 20
+getenv|prosper/src/gpu/recompiler/rdna2_cfg_support.hpp 7
+getenv|prosper/src/gpu/recompiler/rdna2_emit_alu.cpp 18
 getenv|prosper/src/gpu/recompiler/rdna2_emit_cfg.cpp 17
 getenv|prosper/src/gpu/recompiler/rdna2_recompile_compute.cpp 1
 getenv|prosper/src/gpu/recompiler/rdna2_recompile_fragment.cpp 2
 getenv|prosper/src/gpu/recompiler/rdna2_recompile_vertex.cpp 7
 getenv|prosper/src/gpu/recompiler/rdna2_to_spirv.cpp 1
-getenv|prosper/src/gpu/recompiler/rdna2_to_spirv_internal.hpp 3
+getenv|prosper/src/gpu/recompiler/rdna2_to_spirv_internal.hpp 2
 getenv|prosper/src/gpu/recompiler/spirv/shader_io.cpp 1
+getenv|prosper/src/gpu/recompiler/compiler_choice_environment.cpp 4  # ADR 0006: the four switch-type choices (PROSPER_FORCE_LAYER, _VCC_SCALAR_DATA_MERGE, _MIMG_SOFT, _NO_UNNORMALIZED_COORD_NORMALIZE) moved here from rdna2_cfg_support, rdna2_emit_alu (2) and rdna2_to_spirv_internal; net zero. The adapter leaves the recompiler when the last stage supplies its own choices.
 getenv|prosper/src/gpu/state/render_state.cpp 4
 getenv|prosper/src/gpu/texture/tile.cpp 13
 getenv|prosper/src/gpu/timeline/gpu_timeline.cpp 56
@@ -311,9 +312,9 @@ platform-stub|prosper/src/hle/memory/hle_kernel_mem.cpp 2  # Windows APR constru
 host-throw|prosper/src/gpu/capture/fold_capture.cpp 4
 host-throw|prosper/src/gpu/capture/fragment_compile_case.cpp 2
 host-throw|prosper/src/gpu/capture/serialize/fold_capture_codec.cpp 2
+host-throw|prosper/src/gpu/capture/serialize/fragment_compile_case_codec.cpp 2
 host-throw|prosper/src/gpu/diagnostics/refused_graphics_inputs.cpp 1 # bounded parser; writer/replay catch all validation throws, offline decoding errors stay in shader_inspect (#4877)
 host-throw|prosper/src/gpu/diagnostics/refused_shader_inputs.cpp 1  # one require() helper; the live writer catches every throw inside write_refused_compute_inputs, and offline decode/replay errors are caught by shader_inspect (#4808)
-host-throw|prosper/src/gpu/capture/serialize/fragment_compile_case_codec.cpp 2
 host-throw|prosper/src/gpu/execute/gpu_executor.cpp 1
 # #4877: the existing caught fragment capture throw moved with the compile boundary.
 host-throw|prosper/src/gpu/execute/graphics_shader_compile.cpp 1
