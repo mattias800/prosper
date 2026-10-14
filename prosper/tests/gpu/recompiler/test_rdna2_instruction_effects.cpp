@@ -433,6 +433,51 @@ TEST(Rdna2InstructionEffects, ExecAndM0Effects) {
 
 // ---- Regressions: each of these was answered wrongly by a private list -------------------------
 
+// The decoder retains a VGPR-shaped destination for these vector encodings, while emission
+// writes the encoded scalar register. The indirect proofs must see that one-word clobber.
+TEST(Rdna2InstructionEffectsRegression, ReadfirstlaneClobbersItsEncodedScalarDestination) {
+    const uint32_t code[] = {0x7e000000u | (9u << 17) | (0x02u << 9) | 256u};
+    Rdna2Inst in = rdna2_decode_one(code, std::size(code));
+    ASSERT_EQ(in.fmt, Rdna2Format::VOP1);
+    ASSERT_EQ(in.opcode, 0x02u);
+    ASSERT_EQ(in.dst.value, 9);
+    in.pc = 2;
+    for (IndirectWave wave : {IndirectWave::Wave32, IndirectWave::Wave64}) {
+        EXPECT_EQ(conservative_scalar_write_width(in, wave), 1u);
+        EXPECT_FALSE(scalar_range_unchanged({in}, 1u, 3u, 9u, 1u, wave));
+        EXPECT_TRUE(scalar_range_unchanged({in}, 1u, 3u, 8u, 1u, wave));
+        EXPECT_TRUE(scalar_range_unchanged({in}, 1u, 3u, 10u, 1u, wave));
+        EXPECT_TRUE(scalar_range_unchanged({in}, 2u, 3u, 9u, 1u, wave));
+        EXPECT_TRUE(scalar_range_unchanged({in}, 1u, 2u, 9u, 1u, wave));
+    }
+    // Matched ordinary vector move writes v9, leaving s9 intact.
+    const uint32_t mov_code[] = {0x7e000000u | (9u << 17) | (0x01u << 9) | 256u};
+    Rdna2Inst mov = rdna2_decode_one(mov_code, std::size(mov_code));
+    mov.pc = 2;
+    EXPECT_TRUE(scalar_range_unchanged({mov}, 1u, 3u, 9u, 1u, IndirectWave::Wave64));
+}
+
+TEST(Rdna2InstructionEffectsRegression, ReadlaneClobbersItsEncodedScalarDestination) {
+    // v_readlane_b32 s9, v0, 0: the selected lane comes from inline integer zero.
+    const uint32_t code[] = {0xd7600009u, 256u | (128u << 9)};
+    Rdna2Inst in = rdna2_decode_one(code, std::size(code));
+    ASSERT_EQ(in.fmt, Rdna2Format::VOP3);
+    ASSERT_EQ(in.opcode, 0x360u);
+    ASSERT_EQ(in.dst.value, 9);
+    in.pc = 2;
+    for (IndirectWave wave : {IndirectWave::Wave32, IndirectWave::Wave64}) {
+        EXPECT_EQ(conservative_scalar_write_width(in, wave), 1u);
+        EXPECT_FALSE(scalar_range_unchanged({in}, 1u, 4u, 9u, 1u, wave));
+        EXPECT_TRUE(scalar_range_unchanged({in}, 1u, 4u, 8u, 1u, wave));
+        EXPECT_TRUE(scalar_range_unchanged({in}, 1u, 4u, 10u, 1u, wave));
+    }
+    // The adjacent WRITELANE encoding writes v9 and must not claim an s9 clobber.
+    const uint32_t write_code[] = {0xd7610009u, 0u | (128u << 9)};
+    Rdna2Inst write = rdna2_decode_one(write_code, std::size(write_code));
+    write.pc = 2;
+    EXPECT_TRUE(scalar_range_unchanged({write}, 1u, 4u, 9u, 1u, IndirectWave::Wave64));
+}
+
 // The two copies of conservative_scalar_write_width "disagreed" about a VOPC destination (1 SGPR
 // in the descriptor-range proof, 2 in the pointer analysis). Both were right for the one wave size
 // their own proof requires, so the shared copy takes the wave size; charging a Wave32 proof a pair
