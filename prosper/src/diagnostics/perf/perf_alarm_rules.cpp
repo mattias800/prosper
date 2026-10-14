@@ -143,10 +143,11 @@ bool rule_has_data(const char* rule, const WindowSample& w) {
             if (w.count(counter)) return true;
         return false;
     }
-    // Only a frontend that presents (and signs what it presents) can see a flicker, and the vote
-    // needs a full window of compared frames before it can say anything.
+    // A sustained frame already carries the detector's full vote, possibly formed in an earlier
+    // window. Sparse presentations must not fire an alarm while being reported as NO DATA.
     if (r == "frame-flicker")
-        return w.count(Counter::FlickerComparedFrames) >= kFlickerWindowFrames;
+        return w.count(Counter::FlickerSustainedFrames) != 0 ||
+               w.count(Counter::FlickerComparedFrames) >= kFlickerWindowFrames;
     if (r == "present-cpu-overhead") return w.events(Cost::PresentCpu) != 0;
     if (r == "texture-reference-cost") return w.events(Cost::TextureRefSample) != 0;
     // Presents of either kind: a frontend without GPU present has no data for this rule.

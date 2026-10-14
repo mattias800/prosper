@@ -475,6 +475,9 @@ TEST(FrameFlickerRule, QuietWithoutASustainedFrameAndNoDataWithoutAFullVote) {
     // A frontend that compared fewer frames than one vote window has no data, not a quiet answer.
     EXPECT_FALSE(rule_has_data("frame-flicker", flicker_window(kFlickerWindowFrames - 1, 0, 0)));
     EXPECT_TRUE(rule_has_data("frame-flicker", flicker_window(kFlickerWindowFrames, 0, 0)));
+    // A sustained episode formed its full vote before this window. Sparse presentations can
+    // produce fewer than eight new comparisons here, but a measured sustained frame is data.
+    EXPECT_TRUE(rule_has_data("frame-flicker", flicker_window(1, 1, 1)));
     // The threshold-scale knob does not make it more sensitive: it has none.
     EXPECT_FALSE(fired(evaluate_rules(flicker_window(298, 290, 0), RuleThresholds::scaled(1)),
                        "frame-flicker"));
