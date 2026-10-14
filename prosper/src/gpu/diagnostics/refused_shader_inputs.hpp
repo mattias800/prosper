@@ -82,6 +82,7 @@ struct RefusedShaderReplay {
     bool produced = false;             // the recompile returned a module
     std::string reject;                // the terminal reject this replay recorded
     std::string incomplete;            // set when the replay could not run on recorded inputs
+    std::vector<uint32_t> spirv;       // the module when produced, so two builds compare bytes
 };
 
 // Recompiles the recompile span of `code` (rdna2_recompile_code_span, as the live compile key

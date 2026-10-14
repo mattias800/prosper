@@ -212,6 +212,17 @@ ShaderResourceTable synthetic_resource_table(const std::vector<Rdna2Inst>& instr
     return table;
 }
 
+// Writes a module for spirv-val or a byte-for-byte comparison. False when the file could not be
+// written, including an error that only surfaces when buffered data is flushed at close.
+bool write_spirv(const std::string& path, const std::vector<uint32_t>& spirv) {
+    std::ofstream out(path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(spirv.data()),
+              static_cast<std::streamsize>(spirv.size() * sizeof(uint32_t)));
+    out.close();
+    if (!out) std::fprintf(stderr, "cannot write %s\n", path.c_str());
+    return static_cast<bool>(out);
+}
+
 // Strips the characters the dump's index line strips, so the two answers compare as text.
 std::string printable(std::string text) {
     for (char& c : text)
@@ -224,7 +235,7 @@ std::string printable(std::string text) {
 // historical table-less recompile says -- so a disagreement between the last two is visible as the
 // thing the sidecar fixed, and one between the first two as a replay gap to investigate.
 int replay_recorded_inputs(const std::string& code_path, const std::string& inputs_path,
-                           const std::vector<uint32_t>& words) {
+                           const std::vector<uint32_t>& words, const std::string& spirv_out) {
     RefusedShaderInputs inputs;
     try {
         inputs = read_refused_shader_inputs(inputs_path);
@@ -266,8 +277,9 @@ int replay_recorded_inputs(const std::string& code_path, const std::string& inpu
             inputs.incomplete.empty() ? "" : " incomplete=", inputs.incomplete.c_str());
     const auto line = [](const char* label, const RefusedShaderReplay& r) {
         const char* status = !r.incomplete.empty() ? "incomplete" : r.produced ? "ok" : "rejected";
-        std::printf("%s status=%s reject=\"%s\"%s%s\n", label, status, printable(r.reject).c_str(),
-                    r.incomplete.empty() ? "" : " why=", printable(r.incomplete).c_str());
+        std::printf("%s status=%s reject=\"%s\"%s%s spirv_dwords=%zu\n", label, status,
+                    printable(r.reject).c_str(), r.incomplete.empty() ? "" : " why=",
+                    printable(r.incomplete).c_str(), r.spirv.size());
     };
     std::printf("inputs-live status=%s reject=\"%s\"\n",
                 inputs.live_reject.empty() ? "unrecorded" : "rejected",
@@ -276,6 +288,10 @@ int replay_recorded_inputs(const std::string& code_path, const std::string& inpu
     const RefusedShaderReplay fallback = replay_refused_shader_inputs(words, inputs, false);
     line("inputs-replay", replay);
     line("inputs-tableless", fallback);
+    // The replayed module, so a corpus run compares two builds byte for byte (ADR 0006). Like the
+    // synthetic probe, a refusal leaves the output file untouched.
+    if (!spirv_out.empty() && !replay.spirv.empty() && !write_spirv(spirv_out, replay.spirv))
+        return 2;
     const bool incomplete = !replay.incomplete.empty();
     const bool match = !incomplete && !replay.produced && replay.reject == inputs.live_reject;
     std::printf("inputs-verdict %s tableless=%s\n",
@@ -346,7 +362,7 @@ int main(int argc, char** argv) {
         (raw_wide_proof && (!stage.empty() || mimg_sites || wave_reasons)) ||
         (wave64 && !raw_wide_proof) ||
         (synthetic_table && stage != "vertex" && stage != "fragment") ||
-        (!spirv_out.empty() && !synthetic_table) ||
+        (!spirv_out.empty() && !synthetic_table && inputs_path.empty()) ||
         (skippable_mimg && (!stage.empty() || mimg_sites || wave_reasons || raw_wide_proof)) ||
         (!inputs_path.empty() &&
          ((!stage.empty() && stage != "compute") || mimg_sites || skippable_mimg || wave_reasons ||
@@ -357,7 +373,8 @@ int main(int argc, char** argv) {
                      "       %s <raw-rdna2.bin> --stage vertex|fragment --synthetic-table "
                      "[--spirv-out FILE]\n",
                      argv[0]);
-        std::fprintf(stderr, "       %s <stage_*.bin> --inputs <stage_*.inputs>\n", argv[0]);
+        std::fprintf(stderr, "       %s <stage_*.bin> --inputs <stage_*.inputs> [--spirv-out FILE]\n",
+                     argv[0]);
         std::fprintf(stderr, "       %s <raw-rdna2.bin> --mimg-sites\n", argv[0]);
         std::fprintf(stderr, "       %s <raw-rdna2.bin> --skippable-mimg\n", argv[0]);
         std::fprintf(stderr, "       %s <raw-rdna2.bin> --wave-reasons\n", argv[0]);
@@ -412,7 +429,8 @@ int main(int argc, char** argv) {
             "refused-shader\n"
             "dump recorded beside it (#4808): the launch config and user-data SGPRs, the resolved\n"
             "descriptor table, and the buffer bytes the compiler may read. It prints the live\n"
-            "reject, the replayed reject, and the table-less answer for comparison.\n"
+            "reject, the replayed reject, and the table-less answer for comparison. With\n"
+            "--spirv-out it also writes the module the replay produced, if it produced one.\n"
             "\n"
             "Exit: 0 ok, 1 genuine defect, 2 usage/IO error, 3 undetermined (no resource "
             "table), 4 synthetic-table compile passed, 5 synthetic-table compile refused,\n"
@@ -445,7 +463,8 @@ int main(int argc, char** argv) {
 
     std::vector<uint32_t> words(bytes.size() / sizeof(uint32_t));
     std::memcpy(words.data(), bytes.data(), bytes.size());
-    if (!inputs_path.empty()) return replay_recorded_inputs(input_path, inputs_path, words);
+    if (!inputs_path.empty())
+        return replay_recorded_inputs(input_path, inputs_path, words, spirv_out);
     std::vector<Rdna2Inst> instructions;
     const size_t consumed = rdna2_walk(words.data(), words.size(), instructions);
 
@@ -689,16 +708,7 @@ int main(int argc, char** argv) {
                         "verdict.\n");
             // The module, for spirv-val: a compile probe that emits invalid SPIR-V is a defect the
             // status line cannot show.
-            if (!spirv_out.empty() && !spirv.empty()) {
-                std::ofstream out(spirv_out, std::ios::binary);
-                out.write(reinterpret_cast<const char*>(spirv.data()),
-                          static_cast<std::streamsize>(spirv.size() * sizeof(uint32_t)));
-                out.close();   // Check errors from flushing buffered data during close.
-                if (!out) {
-                    std::fprintf(stderr, "cannot write %s\n", spirv_out.c_str());
-                    return 2;
-                }
-            }
+            if (!spirv_out.empty() && !spirv.empty() && !write_spirv(spirv_out, spirv)) return 2;
             return spirv.empty() ? 5 : 4;
         }
         if (stage == "vertex") {
