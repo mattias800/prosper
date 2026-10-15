@@ -40,6 +40,8 @@ TEST(IrLowerVop1Integer, CopyRetainsTheSourceIdWithoutInstructions) {
 TEST(IrLowerVop1Integer, ScansStillRefuseSubwordAndDppForms) {
     for (auto op : {kVop1OpcodeFfbhU32, kVop1OpcodeFfblB32})
         for (bool dpp : {false, true}) {
+            SCOPED_TRACE(::testing::Message()
+                         << "opcode " << op << " DPP " << dpp << " SDWA " << !dpp);
             LoweringFixture t;
             auto in = instruction(op);
             in.has_dpp = dpp;
@@ -47,8 +49,9 @@ TEST(IrLowerVop1Integer, ScansStillRefuseSubwordAndDppForms) {
             const auto source = t.b.uconst(5);
             auto d = t.b.uconst(7);
             const auto words = t.code_words();
-            EXPECT_TRUE(ir::lower_vop1_integer(t.b, in, source, d, t.ok));
-            EXPECT_FALSE(t.ok);
+            EXPECT_TRUE(ir::lower_vop1_integer(t.b, in, source, d, t.ok))
+                << "the integer scan route owns this form";
+            EXPECT_FALSE(t.ok) << "scan modifiers remain unsupported";
             EXPECT_EQ(t.code_words(), words);
         }
 }

@@ -93,12 +93,15 @@ TEST(IrVectorIntegerUnaryExecution, HandWorkedIsaValuesPinScanDirectionAndZeroSe
 TEST(IrVectorIntegerUnaryExecution, EffectsRequireExactlyOneWholeWordSource) {
     std::set<Opcode> seen;
     for (const auto& def : vector_integer_unary_defs()) {
+        SCOPED_TRACE(rdna2_instruction_effects(def.fmt, def.opcode).name);
         const auto& effects = rdna2_instruction_effects(def.fmt, def.opcode);
-        EXPECT_EQ(effects.lane_flow, Rdna2LaneFlow::LaneWise);
-        EXPECT_EQ(effects.vdst_dwords, 1u);
-        EXPECT_FALSE(effects.vdst_half);
-        EXPECT_FALSE(effects.accumulates);
-        EXPECT_EQ(rdna2_valu_source_count(def.fmt, def.opcode), 1u);
+        EXPECT_EQ(effects.lane_flow, Rdna2LaneFlow::LaneWise)
+            << "unary results stay in their source lane";
+        EXPECT_EQ(effects.vdst_dwords, 1u) << "one complete destination word";
+        EXPECT_FALSE(effects.vdst_half) << "integer unary results do not preserve a halfword";
+        EXPECT_FALSE(effects.accumulates) << "the old destination is not an arithmetic input";
+        EXPECT_EQ(rdna2_valu_source_count(def.fmt, def.opcode), 1u)
+            << "only source zero is consumed";
         Block block;
         Builder ir(block);
         const auto a = ir.input(Type::U32), unused = ir.input(Type::U32);
