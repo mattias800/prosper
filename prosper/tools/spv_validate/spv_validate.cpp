@@ -308,6 +308,10 @@ static const std::vector<KnownGap> kKnownGaps = {};
 // deliberate entry here can exempt one, and it has to say why.
 struct NotAnEmitter { const char* name; const char* why; };
 static const NotAnEmitter kNotEmitters[] = {
+    {"emit_spirv",
+     "the recompiler IR's emitter (gpu/recompiler/ir/emit): returns the result ids of one IR "
+     "block's instructions appended to the caller's SpirvCompute; it assembles no module, and the "
+     "modules it contributes to are validated through the recompile_* entries"},
     {"recompile_fragment_packet_impl",
      "shared body of the public integer and resource packet entries, BOTH validated here with "
      "actual original instruction inputs; it has no independent caller/configuration route"},

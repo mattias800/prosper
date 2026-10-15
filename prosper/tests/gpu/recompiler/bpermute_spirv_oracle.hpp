@@ -116,8 +116,9 @@ struct Interpreter {
       return size(t.a[0]) * constant(t.a[1]);
     if (t.op == 30 && t.a.size() == 1 && ty(t.a[0]).op != 29)
       return size(t.a[0]);
-    if (t.op == 30 && t.a.size() == 2 && uint_type(t.a[0]) && t.a[0] == t.a[1])
-        return 2; // closed scalar-u32 low/high product pair
+    if (t.op == 30 && t.a.size() == 2 && (uint_type(t.a[0]) || int_type(t.a[0])) &&
+        t.a[0] == t.a[1])
+        return 2; // closed scalar-u32/i32 low/high product pair
     return scalar(id);
   }
   uint32_t constant(uint32_t id) {
@@ -161,6 +162,67 @@ struct Interpreter {
   bool uint_type(uint32_t id) {
     const auto &t = ty(id);
     return t.op == 21 && t.a == std::vector<uint32_t>{32, 0};
+  }
+  bool int_type(uint32_t id) {
+    const auto &t = ty(id);
+    return t.op == 21 && t.a == std::vector<uint32_t>{32, 1};
+  }
+  // One 32-bit integer word of either signedness, defined; for the signed ALU ops below.
+  uint32_t int_word(Lane &l, uint32_t id) {
+    const auto v = value(l, id);
+    if ((!uint_type(v.type) && !int_type(v.type)) || v.words.size() != 1 || !v.defined)
+      fail("not a defined 32-bit integer");
+    return v.words[0];
+  }
+  // Signed compares, arithmetic shift, signed extended multiply, GLSL SMin/SMax, BitFieldUExtract
+  // and BitReverse: what the IR scalar-ALU definitions emit (test_ir_scalar_alu_execution). Each
+  // follows the SPIR-V 1.6 / GLSL.std.450 definition; an undefined shift or bitfield range fails.
+  bool scalar_alu_op(Lane &l, uint32_t op, const std::vector<uint32_t> &a) {
+    const auto i32 = [](uint32_t v) { return std::bit_cast<int32_t>(v); };
+    // OpSLessThan (177) keeps its own arm below, which propagates an undefined operand.
+    if (op == 173 || op == 175 || op == 179) {   // OpSGreaterThan[Equal], OpSLessThanEqual
+      if (a.size() != 4 || ty(a[0]).op != 20) fail("malformed signed comparison");
+      const int32_t x = i32(int_word(l, a[2])), y = i32(int_word(l, a[3]));
+      set(l, a[1], a[0], {uint32_t(op == 173 ? x > y : op == 175 ? x >= y : x <= y)});
+      return true;
+    }
+    if (op == 195) {   // OpShiftRightArithmetic
+      if (a.size() != 4 || !int_type(a[0])) fail("unsupported ShiftRightArithmetic");
+      const uint32_t shift = int_word(l, a[3]);
+      if (shift >= 32) fail("poison shift");
+      set(l, a[1], a[0], {static_cast<uint32_t>(i32(int_word(l, a[2])) >> shift)});
+      return true;
+    }
+    if (op == 152) {   // OpSMulExtended: low, then high
+      if (a.size() != 4 || size(a[0]) != 2) fail("unsupported SMulExtended");
+      const int64_t product = int64_t{i32(int_word(l, a[2]))} * i32(int_word(l, a[3]));
+      set(l, a[1], a[0], {static_cast<uint32_t>(product),
+                          static_cast<uint32_t>(static_cast<uint64_t>(product) >> 32)});
+      return true;
+    }
+    if (op == 203) {   // OpBitFieldUExtract: undefined when offset + count > 32
+      if (a.size() != 5 || !uint_type(a[0])) fail("unsupported BitFieldUExtract");
+      const uint32_t base = int_word(l, a[2]), offset = int_word(l, a[3]), count = int_word(l, a[4]);
+      if (uint64_t{offset} + count > 32) fail("BitFieldUExtract range out of bounds");
+      const uint32_t field = offset == 32 ? 0 : base >> offset;
+      set(l, a[1], a[0], {count == 32 ? field : field & ((1u << count) - 1u)});
+      return true;
+    }
+    if (op == 204) {   // OpBitReverse
+      if (a.size() != 3 || !uint_type(a[0])) fail("unsupported BitReverse");
+      const uint32_t x = int_word(l, a[2]);
+      uint32_t r = 0;
+      for (uint32_t bit = 0; bit < 32; ++bit) r |= ((x >> bit) & 1u) << (31 - bit);
+      set(l, a[1], a[0], {r});
+      return true;
+    }
+    if (op == 12 && a.size() == 6 && glsl && a[2] == glsl && (a[3] == 39 || a[3] == 42)) {
+      if (!int_type(a[0])) fail("SMin/SMax result type");   // GLSL.std.450 SMin = 39, SMax = 42
+      const int32_t x = i32(int_word(l, a[4])), y = i32(int_word(l, a[5]));
+      set(l, a[1], a[0], {static_cast<uint32_t>(a[3] == 39 ? std::min(x, y) : std::max(x, y))});
+      return true;
+    }
+    return false;
   }
   bool unsigned_type(uint32_t id) {
     const auto &t = ty(id);
@@ -367,6 +429,7 @@ struct Interpreter {
           continue;
       }
       ++l.pc;
+      if (scalar_alu_op(l, op, a)) continue;
       if (op == 248) {
         l.label = a.at(0);
         std::vector<std::pair<uint32_t, Value>> phis;
@@ -462,7 +525,8 @@ struct Interpreter {
         const auto& aggregate = ty(v.type);
         const bool vector = aggregate.op == 23 && aggregate.a[0] == a[0];
         const bool pair = aggregate.op == 30 && aggregate.a.size() == 2 &&
-                          uint_type(aggregate.a[0]) && aggregate.a[0] == aggregate.a[1] &&
+                          (uint_type(aggregate.a[0]) || int_type(aggregate.a[0])) &&
+                          aggregate.a[0] == aggregate.a[1] &&
                           aggregate.a[0] == a[0];
         if ((!vector && !pair) || a[3] >= v.words.size()) fail("extract type/index mismatch");
         set(l, a[1], a[0], {v.words[a[3]]}, v.defined);

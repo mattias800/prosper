@@ -1,0 +1,73 @@
+// spirv_emitter.cpp — the SPIR-V half of each IR opcode's definition (see ir.hpp).
+#include "gpu/recompiler/ir/emit/spirv_emitter.hpp"
+
+#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+
+#include <cstdio>
+#include <cstdlib>
+
+namespace prosper::gpu::ir {
+
+namespace {
+
+uint32_t emit_one(SpirvCompute& b, const Inst& inst, const uint32_t* x) {
+    switch (inst.op) {
+        case Opcode::Input: break;
+        case Opcode::ConstU32: return b.uconst(inst.imm);
+        case Opcode::ConstTrue: return b.btrue();
+        case Opcode::ConstFalse: return b.bfalse();
+        case Opcode::IAdd: return b.ibin(Op_IAdd, x[0], x[1]);
+        case Opcode::ISub: return b.ibin(Op_ISub, x[0], x[1]);
+        case Opcode::IMul: return b.ibin(Op_IMul, x[0], x[1]);
+        case Opcode::UMulHi: return b.umul_hi(x[0], x[1]);
+        case Opcode::SMulHi: return b.smul_hi(x[0], x[1]);
+        case Opcode::And: return b.ibin(Op_BitwiseAnd, x[0], x[1]);
+        case Opcode::Or: return b.ibin(Op_BitwiseOr, x[0], x[1]);
+        case Opcode::Xor: return b.ibin(Op_BitwiseXor, x[0], x[1]);
+        case Opcode::Not: return b.iun(Op_Not, x[0]);
+        case Opcode::BitReverse: return b.iun(Op_BitReverse, x[0]);
+        case Opcode::Shl: return b.ibin(Op_ShiftLeftLogical, x[0], x[1]);
+        case Opcode::LShr: return b.ibin(Op_ShiftRightLogical, x[0], x[1]);
+        case Opcode::AShr: return b.sbin(Op_ShiftRightArithmetic, x[0], x[1]);
+        case Opcode::SMin: return b.sext2(Glsl_SMin, x[0], x[1]);
+        case Opcode::SMax: return b.sext2(Glsl_SMax, x[0], x[1]);
+        case Opcode::UMin: return b.uext2(Glsl_UMin, x[0], x[1]);
+        case Opcode::UMax: return b.uext2(Glsl_UMax, x[0], x[1]);
+        case Opcode::BfeU: return b.bfe_u(x[0], x[1], x[2]);
+        case Opcode::Select: return b.sel(x[0], x[1], x[2]);
+        case Opcode::BoolSelect: return b.bsel(x[0], x[1], x[2]);
+        case Opcode::IEq: return b.ucmp(Op_IEqual, x[0], x[1]);
+        case Opcode::INe: return b.ucmp(Op_INotEqual, x[0], x[1]);
+        case Opcode::ULt: return b.ucmp(Op_ULessThan, x[0], x[1]);
+        case Opcode::ULe: return b.ucmp(Op_ULessThanEqual, x[0], x[1]);
+        case Opcode::UGt: return b.ucmp(Op_UGreaterThan, x[0], x[1]);
+        case Opcode::UGe: return b.ucmp(Op_UGreaterThanEqual, x[0], x[1]);
+        case Opcode::SLt: return b.scmp(Op_SLessThan, x[0], x[1]);
+        case Opcode::SLe: return b.scmp(Op_SLessThanEqual, x[0], x[1]);
+        case Opcode::SGt: return b.scmp(Op_SGreaterThan, x[0], x[1]);
+        case Opcode::SGe: return b.scmp(Op_SGreaterThanEqual, x[0], x[1]);
+    }
+    std::fprintf(stderr, "[ir] emit_one reached an input\n");   // emit_spirv binds inputs itself
+    std::abort();
+}
+
+} // namespace
+
+std::vector<uint32_t> emit_spirv(SpirvCompute& b, const Block& block,
+                                 std::span<const uint32_t> inputs) {
+    std::vector<uint32_t> ids(block.size(), 0);
+    for (size_t i = 0; i < block.size(); ++i) {
+        const Inst& inst = block.insts()[i];
+        if (inst.op == Opcode::Input) {
+            ids[i] = inst.imm < inputs.size() ? inputs[inst.imm] : 0;
+            continue;
+        }
+        uint32_t args[3] = {0, 0, 0};
+        for (uint8_t slot = 0; slot < opcode_info(inst.op).arity; ++slot)
+            args[slot] = ids[inst.args[slot].index];
+        ids[i] = emit_one(b, inst, args);
+    }
+    return ids;
+}
+
+} // namespace prosper::gpu::ir

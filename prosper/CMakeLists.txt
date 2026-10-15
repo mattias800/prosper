@@ -333,6 +333,11 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME refactor_split_file
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/refactor/split_file.py" --selftest)
+  # extract_case_routes moves a giant `case` body into member-function routes (ADR 0012's SALU
+  # relocation); its selftest makes each of its tiling/indent/balance/escape checks fail once.
+  add_test(NAME refactor_extract_case_routes
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/refactor/extract_case_routes.py" --selftest)
   add_test(NAME refactor_map_symbols_clusters
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/refactor/map_symbols.py" --selftest)
@@ -3585,6 +3590,17 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_rdna2_instruction_effects
     SOURCES tests/gpu/recompiler/test_rdna2_instruction_effects.cpp
     LIBRARIES prosper_core)
+
+  # The recompiler IR (ADR 0012): one focused test per piece under tests/gpu/recompiler/ir/.
+  # test_ir_scalar_alu_execution runs each scalar-op definition's SPIR-V in the integer interpreter
+  # against its own constant evaluation (#2514).
+  foreach(ir_test ir_core ir_scalar_alu_execution ir_scalar_fold
+                  ir_lower_sop1 ir_lower_sop2 ir_lower_sopc ir_lower_sopk)
+    prosper_add_gtest(test_${ir_test}
+      SOURCES tests/gpu/recompiler/ir/test_${ir_test}.cpp
+      INCLUDES tests
+      LIBRARIES prosper_core)
+  endforeach()
 
   # Link only the helper and its table dependency: another core object must not accidentally
   # supply a weak inline copy of the declaration-only ALU helper (#5153).

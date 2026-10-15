@@ -183,6 +183,9 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   `tools/spv_validate` exists to stop exactly that — so a change here is a change to shipped
   shader code, not to a fixture. It is not a general emitter either.
 - `gta5/`, `indirect/` — see their own AGENTS.md.
+- `ir/` — the SSA IR of ADR 0012 and the instruction families already lowered through it (the scalar
+  ALU first). New lowering work for a migrated family goes there, not into `rdna2_emit_alu.cpp`;
+  `ir/HOW_TO_ADD_A_FAMILY.md` is the migration recipe.
 
 **An unsupported op is a FATAL gap, not an acceptable skip.** Reject paths exist as a fail-visible
 backstop for genuinely unknown encodings — mark `CONFIDENCE: LOW`, log loudly, file an issue with the
