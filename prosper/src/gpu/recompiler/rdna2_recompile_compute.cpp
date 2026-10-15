@@ -29,6 +29,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
@@ -705,7 +706,22 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     }
     if (fold_retry) {
         attempt_diagnostics.discard();
+        RecompileDiagnosticAttempt original_diagnostics;
         module = recompile_compute_once(code, dwords, rt, config, diagnostic, entry, false);
+        if (module.empty() && !config.force_exchange_dispatcher) {
+            // Recovering original physical words can expose an independent word-less saved-mask
+            // spill. Compose the Bool-half retry with that original stream; folding it again would
+            // lose the physical-word proof just restored. A failed retry keeps the original cause.
+            RecompileDiagnosticAttempt bool_half_diagnostics;
+            bool_half_module = recompile_compute_once(code, dwords, rt, config, diagnostic, entry,
+                                                      false, nullptr, nullptr, true);
+            bool_half_diagnostics.discard();
+            if (!bool_half_module.empty()) {
+                original_diagnostics.discard();
+                module = std::move(bool_half_module);
+            }
+        }
+        original_diagnostics.commit();
     } else if (!bool_half_module.empty()) {
         attempt_diagnostics.discard();
         module = std::move(bool_half_module);

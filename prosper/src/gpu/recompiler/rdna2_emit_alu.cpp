@@ -4291,7 +4291,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     const int root = in.src[0].value - 1;
                     const auto saved = rs.sreg_bool.find(root);
                     if (saved == rs.sreg_bool.end() || rs.sreg_bool_b32.contains(root)) {
-                        ok = false; return true;
+                        ok = false;
+                        return true;
                     }
                     mask_value = saved->second;
                     mask_source = true;

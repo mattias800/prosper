@@ -2172,11 +2172,10 @@ bool emit_cfg_state_machine(
                 slot->second == (half ? SpillSlotDomain::MaskHi : SpillSlotDomain::MaskLo);
             if (record_compare && proven_reload) proven_instance_half_readlane_pcs[in.pc] = half;
             if (b.is_compute)
-                advance_spill_slot_domains(slot_domains, in,
-                                           {masks, ambiguous, scalar_words, readlane_words},
-                                           slot_context, vector_writes,
-                                           record_compare ? &proven_mask_writelane_pcs : nullptr,
-                                           proven_reload);
+                advance_spill_slot_domains(
+                    slot_domains, in, {masks, ambiguous, scalar_words, readlane_words},
+                    slot_context, vector_writes,
+                    record_compare ? &proven_mask_writelane_pcs : nullptr, proven_reload);
             if (half == 1 && in.opcode == 0x361 &&
                 slot_domains[{in.dst.value, in.src[1].value}] == SpillSlotDomain::Other) {
                 slot_domains[{in.dst.value, in.src[1].value}] = SpillSlotDomain::MaskHi;

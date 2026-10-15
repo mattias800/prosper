@@ -20,6 +20,7 @@
 // the CFG dispatcher. Execution needs a device that can REQUIRE a 64-lane compute subgroup (RADV
 // yes, CI's lavapipe no), so it is gated; the compile-level assertions run everywhere. Kernels were
 // assembled with llvm-mc -mcpu=gfx1030 -mattr=+wavefrontsize64.
+#include "bpermute_spirv_oracle.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include <gtest/gtest.h>
@@ -323,4 +324,56 @@ TEST(CfgSpilledMaskHalves, SwappedReloadedHalvesAreNotTheSpilledMask) {
     ASSERT_FALSE(compile(kVopcHalvesIntoLogical, 64, true, true, 0x50610017u).empty());
     const std::string reason = last_terminal_reject_reason(0x50610016u);
     EXPECT_NE(reason.find("pc=9 words=d7610012,00010e15"), std::string::npos) << reason;
+}
+
+// A folded scalar branch revokes the original physical-word proof for the first reload.
+// Restoring the original stream must still allow the later, independent Bool-half spill retry.
+TEST(CfgSpilledMaskHalves, ConstantBranchRecoveryAlsoRetriesWordlessMaskHalves) {
+    std::vector<uint32_t> code{
+        0xbe840380u,   // s4 = 0
+        0xbe9e047eu,   // s[30:31] = exec
+        0xd7610014u, 0x0001381eu,   // v20[28] = s30
+        0xbf068004u, 0xbf840001u, 0x7e040281u,   // known scalar branch
+        0xd760000eu, 0x00013914u,   // s14 = v20[28]
+        0x7e08020eu,   // numeric DATA use of s14
+    };
+    code.insert(code.end(), std::begin(kVopcHalvesIntoLogical), std::end(kVopcHalvesIntoLogical));
+    // Observe both recovered domains: add the original full-EXEC low word to the mask result.
+    code.insert(code.end() - 2, 0x4a06060eu);   // v3 = s14 + v3
+    code.push_back(0x7e020280u);
+    code.insert(code.end(), std::begin(kTail), std::end(kTail));
+    ComputeShaderConfig config;
+    config.local_x = 64;
+    config.wave_size = 64;
+    config.native_subgroup_size = 64;
+    prosper::test::complete_compute_launch(config);
+    const auto table = output_table();
+    constexpr uint64_t address = 0x50610018u;
+    TerminalRejectCapture capture;
+    const auto spv = recompile_compute(code.data(), code.size(), &table, config,
+                                       {RecompileDiagnosticStage::Compute, address});
+    ASSERT_FALSE(spv.empty()) << last_terminal_reject_reason(address);
+    EXPECT_TRUE(has_opcode(spv, kOpSwitch));
+    for (const auto& [tag, payload] : capture.take()) {
+        EXPECT_NE(tag, "cfg-recompile-reject") << payload;
+        EXPECT_NE(tag, "compute-cfg-reject") << payload;
+        EXPECT_NE(tag, "recompile-reject") << payload;
+    }
+    bpermute_oracle::Interpreter vm(spv);
+    vm.native_subgroup_width = 64;
+    const auto out = vm.run_buffers(64, {{3, std::vector<uint32_t>(64, 0xdeadbeefu)}}, 3);
+    ASSERT_TRUE(vm.error.empty()) << vm.error;
+    ASSERT_EQ(out.size(), kLanes);
+    for (uint32_t lane = 0; lane < kLanes; ++lane)
+        EXPECT_EQ(out[lane], lane < 40 ? 99u : UINT32_MAX) << "lane " << lane;
+
+    config.dispatch_launch = {};
+    EXPECT_TRUE(recompile_compute(code.data(), code.size(), &table, config,
+                                  {RecompileDiagnosticStage::Compute, address + 1})
+                    .empty());
+    prosper::test::complete_compute_launch(config);
+    config.native_subgroup_size = 0;
+    EXPECT_TRUE(recompile_compute(code.data(), code.size(), &table, config,
+                                  {RecompileDiagnosticStage::Compute, address + 2})
+                    .empty());
 }
