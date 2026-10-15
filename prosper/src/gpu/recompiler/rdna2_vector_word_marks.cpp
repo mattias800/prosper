@@ -424,9 +424,11 @@ ScalarSourceMarks vector_source_marks(const RegState& rs, const Rdna2Inst& in) {
     return marks;
 }
 
-ScalarSourceMarks addtid_spill_marks(const RegState& rs, const Rdna2Inst& write) {
+void record_addtid_spill(SpirvCompute& b, RegState& rs, const Rdna2Inst& write, uint32_t m0) {
+    const uint64_t key = (static_cast<uint64_t>(m0) << 32) | write.literal;
     auto marks = vector_word(rs, write.src[1].value);
     const auto value = rs.vreg.find(write.src[1].value);
+    rs.lds_addtid[key] = value != rs.vreg.end() ? value->second : b.uconst(0);
     if (value == rs.vreg.end() || !value->second) {
         marks.placeholder = marks.hard = true;   // the spill stores the absent word's zero
         marks.outside_exec = 0;
@@ -441,7 +443,7 @@ ScalarSourceMarks addtid_spill_marks(const RegState& rs, const Rdna2Inst& write)
         union_marks(marks, unwritten, &rs);
     }
     // A stale slot is real LDS content, not an arbitrary value: the meet above made it hard.
-    return marks;
+    rs.lds_addtid_marks[key] = std::move(marks);
 }
 
 ScalarSourceMarks vector_relative_source_marks(const SpirvCompute& b, const RegState& rs,
