@@ -61,6 +61,9 @@ struct SpilledVectorSourceMarks {
     bool scalar_relay = false;
     bool memory = false;
     bool active_defined = false;
+    // active_defined, and the write completes every EXEC lane's result words: the result is
+    // genuine in the current EXEC whatever the relay MAY facts say about its sources.
+    bool active_complete = false;
 };
 // Snapshot before ANY scalar/mask destination fact changes, including an aliasing VOP3B SDST.
 SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& state,

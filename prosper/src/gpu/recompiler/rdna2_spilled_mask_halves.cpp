@@ -2,6 +2,7 @@
 #include "gpu/recompiler/rdna2_spilled_mask_halves.hpp"
 #include "gpu/recompiler/rdna2_scalar_condition_marks.hpp"
 #include "gpu/recompiler/rdna2_vector_old_word.hpp"
+#include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -208,7 +209,9 @@ SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& st
         state.active_vectors.enabled &&
         active_vector_sources_defined(state.active_vectors, in, state.relayed_vectors, masks,
                                       scalar_words, relayed, definite_scc);
-    return {vector_relay, relays, memory, active_defined};
+    const bool active_complete = active_defined && (vector_write_completes_active_word(in) ||
+                                                    vector_read_completes_active_word(in));
+    return {vector_relay, relays, memory, active_defined, active_complete};
 }
 
 void advance_defined_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
@@ -254,7 +257,13 @@ void advance_defined_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
     }
     const bool preserve = vector_write_depends_on_old_word(in, state.exec_known_full);
     for (int vgpr : vector_writes) {
-        if (vector_relay)
+        // CONFIDENCE: HIGH -- a complete write whose every input is genuine in the current EXEC
+        // lanes (active_vectors) makes those lanes genuine; the lanes outside EXEC keep the old
+        // word, so the result may hold a relayed value only where the old word could. Without
+        // this, a relay MAY fact on a source that is genuine wherever it is read (a word last
+        // completed under a narrower EXEC) taints a destination whose old lanes are genuine, and
+        // the dispatcher reloads it as a placeholder in every lane (#5173).
+        if (vector_relay && !source.active_complete)
             state.relayed_vectors.insert(vgpr);
         else if (!preserve)
             state.relayed_vectors.erase(vgpr);
