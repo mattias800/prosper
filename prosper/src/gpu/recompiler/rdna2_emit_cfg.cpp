@@ -18,6 +18,7 @@
 #include "gpu/recompiler/rdna2_exec_skip_region.hpp"
 #include "gpu/recompiler/rdna2_lane_slot_carry.hpp"
 #include "gpu/recompiler/rdna2_loop_vcc_carry.hpp"
+#include "gpu/recompiler/rdna2_loop_exec_widening.hpp"
 #include "gpu/recompiler/rdna2_loop_wave_scalar_route.hpp"
 #include "gpu/recompiler/rdna2_mask_half_alias.hpp"
 #include "gpu/recompiler/rdna2_barrier_mask_halves.hpp"
@@ -6452,6 +6453,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             };
             for (const auto& L : Ls) {
                 if (!compute_ok) break;
+                if (phased.found && L.condition == DivLoop::Condition::Exec)
+                    compute_ok = loop_widening_exec_pc(ins, L) < 0;
+                if (!compute_ok) break;
                 const bool stable_post_barrier_reads =
                     has_stable_post_barrier_lds_reads(L);
                 for (const auto& in : ins) {
@@ -6474,12 +6478,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                         (in.fmt == Rdna2Format::VOP3 &&
                          (in.opcode == 0x365 || in.opcode == 0x366))) { compute_ok = false; break; }
                 }
-                // Fail-visible marker for the per-invocation approximation's one known divergence: a
-                // POST-loop read of an SGPR advanced inside an Exec-condition loop. With a lane-varying
-                // bound, hardware advances in-loop scalars to the wave's MAX trip count while the
-                // per-invocation lowering yields each invocation its own exit value. Uniform bounds
-                // (all observed shapes) are exact. Diagnose loudly instead of silently diverging; if a
-                // real kernel trips this AND has a varying bound, that is the evidence to revisit.
+                // Observation only: the later loop-contract check rejects unsafe scalar live-out.
+                // This optional trace inventories the scalar reads without granting any authority.
                 if (compute_ok && L.condition == DivLoop::Condition::Exec && getenv("PROSPER_DBG")) {
                     std::set<int> lv, lsr;
                     loop_written_regs(ins, L.header_pc, L.backedge_pc, lv, lsr);

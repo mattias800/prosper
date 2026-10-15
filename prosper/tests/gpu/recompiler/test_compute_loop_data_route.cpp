@@ -346,7 +346,7 @@ Program defined_data() {
             6};
 }
 // The structured route, and output2 (binding 2) for every lane.
-std::vector<uint32_t> structured(const Result& r) {
+std::vector<uint32_t> structured(const Result& r, std::vector<uint32_t>* stores = nullptr) {
     EXPECT_FALSE(r.module.empty()) << r.reason;
     if (r.module.empty()) return {};
     EXPECT_TRUE(has_op(r.module, 246u)) << "OpLoopMerge";
@@ -360,6 +360,7 @@ std::vector<uint32_t> structured(const Result& r) {
         {{2, std::vector<uint32_t>(64, 0xdeadbeefu)}, {3, std::vector<uint32_t>(64, 0xdeadbeefu)}},
         2);
     EXPECT_TRUE(vm.error.empty()) << vm.error;
+    if (stores) *stores = vm.writable_result(3);
     return values;
 }
 } // namespace
@@ -413,7 +414,7 @@ TEST(LoopWaveScalarRoute, WithoutANativeEntryALiveWaveScalarIsRefused) {
 namespace {
 Program widening(uint32_t restore) {
     auto p = defined_data();
-    p.words[8] = restore;        // in the body, after the exit test
+    p.words[8] = restore;   // in the body, after the exit test
     p.words[14] = 0x7e060280u;   // v3 = 0
     return p;
 }
@@ -435,12 +436,46 @@ void exact_stores(const Result& r, uint32_t first_lane, uint32_t last) {
     for (uint32_t lane = 0; lane < 64; ++lane)
         EXPECT_EQ(stores[lane], lane < first_lane ? 0xdeadbeefu : last) << "lane " << lane;
 }
-} // namespace
+}   // namespace
 
 TEST(LoopExecWidening, AnAllLanesWriteReEnablesLeftLanes) {
     // The #5206 reproduction: s_mov_b64 exec, -1. Every lane, lane 0 included, stores in every
     // wave iteration; the last one (iteration 63) stores 62.
     exact_stores(compile(widening(0xbefe04c1u)), 0, 62);
+}
+TEST(LoopExecWidening, AHighToLowExecCopyReEnablesDepartedLowLanes) {
+    // High lane N+32 can still be active after low lane N has left. Moving its bit into
+    // EXEC_LO re-enables N; a bound on the other physical half is not a subset proof.
+    auto p = widening(0xbe98037fu);   // s_mov_b32 s24, exec_hi
+    p.words.insert(p.words.begin() + 9, {0xbe99037fu, 0xbefe0418u});
+    p.words[7] = 0xbf880007u;
+    p.words[14] = 0xbf82fff7u;
+    const auto r = compile(p);   // s25 = exec_hi; exec = s[24:25]
+    ASSERT_FALSE(r.module.empty()) << r.reason;
+    EXPECT_TRUE(has_op(r.module, 251u)) << "cross-half restore needs the exact route";
+    bpermute_oracle::Interpreter vm(r.module);
+    vm.native_subgroup_width = 64;
+    vm.push_constants = config().user_sgprs;
+    vm.extra_writable_bindings = {3};
+    vm.run_buffers(
+        64,
+        {{2, std::vector<uint32_t>(64, 0xdeadbeefu)}, {3, std::vector<uint32_t>(64, 0xdeadbeefu)}},
+        2);
+    ASSERT_TRUE(vm.error.empty()) << vm.error;
+    const auto stores = vm.writable_result(3);
+    ASSERT_EQ(stores.size(), 64u);
+    for (uint32_t lane = 0; lane < 64; ++lane)
+        EXPECT_EQ(stores[lane], lane < 32 ? lane + 31u : lane - 1u) << lane;
+}
+TEST(LoopExecWidening, MatchingExecHalvesMayTravelThroughOppositeRegisterParities) {
+    auto p = widening(0xbe99037eu);   // s25 = exec_lo
+    p.words.insert(p.words.begin() + 9, {0xbe98037fu, 0xbe9a0319u, 0xbe9b0318u, 0xbefe041au});
+    p.words[7] = 0xbf880009u;
+    p.words[16] = 0xbf82fff5u;
+    const auto r = compile(p);   // s24 = exec_hi; s26 = s25; s27 = s24; exec = s[26:27]
+    ASSERT_FALSE(r.module.empty()) << r.reason;
+    EXPECT_TRUE(has_op(r.module, 246u)) << "matching physical halves stay structured";
+    EXPECT_FALSE(has_op(r.module, 251u)) << "SGPR parity must not select the dispatcher";
 }
 TEST(LoopExecWidening, ARestoreOfAMaskSavedBeforeTheLoopWidens) {
     exact_stores(compile(widening(0xbefe0414u)), 0, 62);   // s_mov_b64 exec, s[20:21]
@@ -448,9 +483,9 @@ TEST(LoopExecWidening, ARestoreOfAMaskSavedBeforeTheLoopWidens) {
 TEST(LoopExecWidening, ARestoreOfAMaskSavedBeforeTheExitTestWidens) {
     // s[24:25] = EXEC at the header, before the CMPX test; restored in the body. Lanes 1..63 keep
     // iterating with the wave until iteration 63; lane 0 never entered.
-    auto p = widening(0xbefe0418u);                       // s_mov_b64 exec, s[24:25]
-    p.words.insert(p.words.begin() + 6, 0xbe98047eu);     // header: s_mov_b64 s[24:25], exec
-    p.words[13] = 0xbf82fff8u;                            // back edge -> the new header pc6
+    auto p = widening(0xbefe0418u);   // s_mov_b64 exec, s[24:25]
+    p.words.insert(p.words.begin() + 6, 0xbe98047eu);   // header: s_mov_b64 s[24:25], exec
+    p.words[13] = 0xbf82fff8u;   // back edge -> the new header pc6
     exact_stores(compile(p), 1, 62);
 }
 TEST(LoopExecWidening, ANestedIfRestoreKeepsTheStructuredRoute) {
@@ -458,11 +493,16 @@ TEST(LoopExecWidening, ANestedIfRestoreKeepsTheStructuredRoute) {
     // restores only what it narrowed after the exit test.
     auto p = widening(0x7d8a0280u);
     p.words.insert(p.words.begin() + 9, {0xbe98246au, 0x7e100280u, 0x88fe187eu});
-    p.words[7] = 0xbf880008u;    // exit -> restore at pc16
+    p.words[7] = 0xbf880008u;   // exit -> restore at pc16
     p.words[15] = 0xbf82fff6u;   // back edge -> header pc6
-    const auto values = structured(compile(p));
+    std::vector<uint32_t> stores;
+    const auto values = structured(compile(p), &stores);
     ASSERT_EQ(values.size(), 64u);
     for (uint32_t lane = 0; lane < 64; ++lane) EXPECT_EQ(values[lane], 0u) << lane;
+    ASSERT_EQ(stores.size(), 64u);
+    EXPECT_EQ(stores[0], 0xdeadbeefu) << "lane 0 never enters the body";
+    for (uint32_t lane = 1; lane < 64; ++lane)
+        EXPECT_EQ(stores[lane], lane - 1u) << "last masked store for lane " << lane;
 }
 TEST(LoopExecWidening, WithoutANativeEntryAWideningLoopIsRefused) {
     auto c = config();
@@ -470,4 +510,19 @@ TEST(LoopExecWidening, WithoutANativeEntryAWideningLoopIsRefused) {
     const auto r = compile(widening(0xbefe04c1u), c);
     EXPECT_TRUE(r.module.empty());
     EXPECT_NE(r.reason.find("exec-loop-widens"), std::string::npos) << r.reason;
+}
+
+TEST(LoopExecWidening, APortableBarrierPhaseKeepsAnExactRouteForNestedExecRestores) {
+    // The outer body restores pre-loop EXEC after its inner loop exits. Its portable phase
+    // dispatcher can reproduce that widening; a late structured refusal must not hide the route.
+    const std::vector<uint32_t> words = {
+        0xbe82047eu, 0x7e040280u, 0x7e060280u, 0xbf880003u, 0x7e040281u, 0xbefe0480u,
+        0xbf82fffcu, 0xbefe0402u, 0x7e040287u, 0xbefe0480u, 0xbf89fff7u, 0xbefe0402u,
+        0xbf8a0000u, 0xbefe0402u, 0xbf880004u, 0xd8d80000u, 0x03000000u, 0xbefe0480u,
+        0xbf82fffbu, 0xbefe0402u, 0xbefe0402u, 0xbf880004u, 0xd8d80000u, 0x04000000u,
+        0xbefe0480u, 0xbf82fffbu, 0xbefe0402u, 0x7e040d02u, kEnd};
+    const auto module = recompile_valu(words.data(), words.size(), 1, 2);
+    ASSERT_FALSE(module.empty());
+    EXPECT_TRUE(has_op(module, 251u)) << "the phase uses the exact dispatcher";
+    EXPECT_TRUE(has_op(module, 224u)) << "the proved guest barrier separates phases";
 }

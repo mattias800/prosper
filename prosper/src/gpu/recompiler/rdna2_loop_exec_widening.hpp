@@ -16,7 +16,8 @@ struct DivLoop;
 
 // The pc of the first EXEC write in [header, back edge] whose result is not provably within the
 // EXEC of the most recent exit test (an execz/execnz leaving the loop), or -1 when every write is.
-// "Within" is tracked per scalar word: EXEC after a test, a compare or a save of EXEC, and AND/OR/
+// "Within" is tracked per scalar word and physical EXEC half: a copied high word cannot prove
+// a bound on low lanes. EXEC after a test, a compare or a save of EXEC, and AND/OR/
 // XOR/ANDN2/CSELECT combinations of such words stay within; anything else (a constant other than
 // 0, a loaded or computed scalar, a complement, a mask saved before the test) does not. A forward
 // dataflow meets paths by intersection; the outer back edge restarts from EXEC alone. Unmodelled
