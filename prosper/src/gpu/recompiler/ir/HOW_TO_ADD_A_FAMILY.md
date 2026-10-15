@@ -66,7 +66,8 @@ Move the case bodies out of `emit_alu` with `tools/refactor/extract_case_routes.
 5. `lower()` calls the routes in the old order (`if (auto routed = route_x()) return *routed;`), then
    `lower_data()`, which holds the tail verbatim.
 6. Build the candidate and run the corpus gate (step 6). It must report `changes: none`. Commit the
-   relocation **alone**.
+   relocation **alone**. Before you push the behaviour commit, run the FULL ctest with
+   `--no-tests=error` as well. The corpus is not every input the recompiler has.
 
 The scalar relocation took `rdna2_emit_alu.cpp` from 9,398 to 6,849 lines and reported
 `changes: none`, with 1,449 accepted modules byte-identical.
@@ -109,6 +110,8 @@ refuses the instruction.
 Delete every duplicate of the semantics you move: the old `switch`, helper lambdas that recomputed an
 op (`logical_u32` and `bitfield_mask_u32` in SOP2), and the folder's copy in
 `rdna2_recompile_shared.hpp`. The folder reaches definitions through `shader_constant_scalar_op`.
+Mark `Fold::Yes` only on the definitions the old folder already folded, so the folder's domain stays
+the same.
 
 If a family needs a new IR opcode, add it in all five places: `Opcode` in `ir.hpp`, `kInfo` in
 `ir.cpp`, `eval.cpp`, `emit/spirv_emitter.cpp` and `builder.hpp`.
@@ -198,9 +201,14 @@ are unchanged.
 "Explained" means that for each changed module you can name the instruction whose emission changed
 and why, and you have an execution test that shows the new module computes the same result as the
 old one (or the correct one, if the old one was wrong). A changed fold that specialises a new branch
-counts as a change and needs the same treatment. In the scalar migration the folder gained every
-SOP1, SOP2 and SOPK definition, not only the old eleven SOP2 opcodes, and the gate still reported no
-change. A future family may not be so lucky.
+counts as a change and needs the same treatment.
+
+The corpus is not the only witness, though. The scalar migration first let the folder evaluate every
+definition, and the gate still said `changes: none`. Two existing ctest cases went red all the same:
+`ScalarPairMask.Wave64VccLoAndReadingAOnePathWordStillRefuses` and `rdna2_spirv_struct`'s GTA FFBH
+arm. Folding `s_bitcmp1_b32` and `s_movk_i32` proved branches that those fixtures need to stay
+runtime. So each definition carries `Fold::Yes` only where the pre-IR folder already folded that
+operation, and widening that domain is a separate decision.
 
 ## When to stop and report instead of changing tests
 
@@ -213,4 +221,6 @@ Stop, leave the tests as they are, and report to whoever dispatched you when:
 - a route's old behaviour looks wrong. Moving it is in scope; fixing it is a separate,
   corpus-gated PR;
 - the interpreter would need an operation whose SPIR-V semantics you cannot cite;
-- the family touches mark, proof or relay state in a way that cannot stay a call from the lowering.
+- the family touches mark, proof or relay state in a way that cannot stay a call from the lowering;
+- you want the folder to evaluate more operations than it did before. That is a behaviour change with
+  its own tests to revisit (see "Byte-identical, or explained").

@@ -542,10 +542,10 @@ inline ShaderConstantValue shader_constant_operand(
         }
         // Every other writer folds through its one IR definition (ir/ops/scalar_alu.hpp), the same
         // function the emitter lowers it with, so the fold cannot prove a value the emitted program
-        // does not compute (#2514). An operation without a definition, or one that reads SCC, is
-        // not a shader constant.
+        // does not compute (#2514). An operation without a definition, outside the folder's domain
+        // (ScalarOpDef::fold), or reading SCC is not a shader constant.
         const ir::ScalarOpDef* def = ir::find_scalar_op(writer.fmt, writer.opcode);
-        if (!def) return {};
+        if (!def || def->fold != ir::Fold::Yes) return {};
         return shader_constant_scalar_op(ins, block_first, i, writer, *def, depth + 1, false);
     }
     // No in-block writer means an entry/user SGPR or other runtime state. Never specialize it.
@@ -557,7 +557,7 @@ inline bool shader_constant_compare(const std::vector<Rdna2Inst>& ins, size_t bl
     const Rdna2Inst& compare = ins[compare_index];
     if (compare.fmt != Rdna2Format::SOPC) return false;
     const ir::ScalarOpDef* def = ir::find_scalar_op(compare.fmt, compare.opcode);
-    if (!def) return false;
+    if (!def || def->fold != ir::Fold::Yes) return false;
     const ShaderConstantValue scc = shader_constant_scalar_op(
         ins, block_first, compare_index, compare, *def, 0, true);
     if (!scc.known) return false;

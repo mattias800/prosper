@@ -1,6 +1,7 @@
 // The constant folder (rdna2_recompile_shared.hpp) evaluates scalar ops through their IR
-// definitions (#2514). Expected values here are worked by hand from the ISA, so a definition or an
-// operand wiring that disagrees with the ISA fails here even though fold and emitter agree.
+// definitions (#2514), within its pre-IR domain. Expected values here are worked by hand from the
+// ISA, so a definition or an operand wiring that disagrees with the ISA fails here even though fold
+// and emitter agree.
 #include "gpu/recompiler/ir/scalar_encoding.hpp"
 #include "gpu/recompiler/rdna2_recompile_shared.hpp"
 
@@ -33,22 +34,23 @@ TEST(IrScalarFold, Sop2ValuesFoldThroughTheirDefinitions) {
     const auto ab = mov(20, 5) + mov(21, 7);
     EXPECT_EQ(fold(ab + std::vector{sop2(0x01, 22, 20, 21)} + is(0xfffffffeu)), true);   // 5 - 7
     EXPECT_EQ(fold(ab + std::vector{sop2(0x01, 22, 20, 21)} + is(2u)), false);
-    // Folds the old eleven-opcode switch never covered.
-    EXPECT_EQ(fold(mov(20, 0xffffffffu) + mov(21, 1) + std::vector{sop2(0x06, 22, 20, 21)} +
-                   is(0xffffffffu)),
-              true);   // s_min_i32(-1, 1)
-    EXPECT_EQ(fold(mov(20, 0xabcd1234u) + mov(21, (8u << 16) | 4u) +
-                   std::vector{sop2(0x27, 22, 20, 21)} + is(0x23u)),
-              true);   // s_bfe_u32: 8 bits from bit 4
+    EXPECT_EQ(fold(ab + std::vector{sop2(0x26, 22, 20, 21)} + is(35u)), true);   // s_mul_i32
+    EXPECT_EQ(fold(mov(20, 0x80000000u) + mov(21, 33) + std::vector{sop2(0x22, 22, 20, 21)} +
+                   is(0xc0000000u)),
+              true);   // s_ashr_i32 masks the amount to 5 bits and keeps the sign
     EXPECT_EQ(fold(mov(20, 1) + mov(21, 33) + std::vector{sop2(0x1e, 22, 20, 21)} + is(2u)),
-              true);   // s_lshl_b32 masks the amount to 5 bits
+              true);   // s_lshl_b32
 }
 
-TEST(IrScalarFold, Sop1AndSopkValuesFold) {
-    EXPECT_EQ(fold(mov(20, 5) + std::vector{sop1(0x07, 22, 20)} + is(~5u)), true);   // s_not_b32
-    EXPECT_EQ(fold(std::vector{sopk(0x00, 22, 0xffff)} + is(0xffffffffu)), true);   // s_movk_i32
-    EXPECT_EQ(fold(mov(22, 0x7fffffffu) + std::vector{sopk(0x0f, 22, 1)} + is(0x80000000u)),
-              true);   // s_addk_i32 reads its SDST
+// ADR 0012 step 1 keeps the folder's pre-IR domain (ScalarOpDef::fold): defined operations outside
+// it are emitted through the same definitions but never specialise a branch.
+TEST(IrScalarFold, DefinitionsOutsideTheFoldDomainDoNotFold) {
+    EXPECT_EQ(fold(mov(20, 0xffffffffu) + mov(21, 1) + std::vector{sop2(0x06, 22, 20, 21)} +
+                   is(0xffffffffu)),
+              std::nullopt);   // s_min_i32
+    EXPECT_EQ(fold(mov(20, 5) + std::vector{sop1(0x07, 22, 20)} + is(~5u)), std::nullopt);
+    EXPECT_EQ(fold(std::vector{sopk(0x00, 22, 0xffff)} + is(0xffffffffu)), std::nullopt);
+    EXPECT_EQ(fold(mov(20, 5) + std::vector{sopc(0x0d, 20, kInline0)}), std::nullopt);   // bitcmp1
 }
 
 TEST(IrScalarFold, SccReadersAndRuntimeInputsDoNotFold) {
@@ -61,6 +63,5 @@ TEST(IrScalarFold, SccReadersAndRuntimeInputsDoNotFold) {
 TEST(IrScalarFold, ComparesFoldThroughTheirDefinitions) {
     EXPECT_EQ(fold(mov(20, 0xffffffffu) + std::vector{sopc(0x04, 20, kInline0)}), true);   // -1 < 0
     EXPECT_EQ(fold(mov(20, 0xffffffffu) + std::vector{sopc(0x0a, 20, kInline0)}), false);  // u32
-    EXPECT_EQ(fold(mov(20, 5) + std::vector{sopc(0x0d, 20, kInline0)}), true);   // s_bitcmp1 bit 0
-    EXPECT_EQ(fold(mov(20, 5) + std::vector{sopc(0x0c, 20, kInline0 + 1)}), true);   // bit 1 clear
+    EXPECT_EQ(fold(mov(20, 7) + std::vector{sopc(0x03, 20, kInline0 + 7)}), true);   // ge_i32 tie
 }

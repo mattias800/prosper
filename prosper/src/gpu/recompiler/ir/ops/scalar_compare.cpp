@@ -28,18 +28,18 @@ Out bitcmp_b32(Builder& ir, const In& x) {
 }
 
 constexpr ScalarOpDef kDefs[] = {
-    {F::SOPC, 0x00, O::Src0Src1, compare<&Builder::ieq>},   // s_cmp_eq_i32
-    {F::SOPC, 0x01, O::Src0Src1, compare<&Builder::ine>},   // s_cmp_lg_i32
-    {F::SOPC, 0x02, O::Src0Src1, compare<&Builder::sgt>},
-    {F::SOPC, 0x03, O::Src0Src1, compare<&Builder::sge>},
-    {F::SOPC, 0x04, O::Src0Src1, compare<&Builder::slt>},
-    {F::SOPC, 0x05, O::Src0Src1, compare<&Builder::sle>},
-    {F::SOPC, 0x06, O::Src0Src1, compare<&Builder::ieq>},   // s_cmp_eq_u32
-    {F::SOPC, 0x07, O::Src0Src1, compare<&Builder::ine>},   // s_cmp_lg_u32
-    {F::SOPC, 0x08, O::Src0Src1, compare<&Builder::ugt>},
-    {F::SOPC, 0x09, O::Src0Src1, compare<&Builder::uge>},
-    {F::SOPC, 0x0a, O::Src0Src1, compare<&Builder::ult>},
-    {F::SOPC, 0x0b, O::Src0Src1, compare<&Builder::ule>},
+    {F::SOPC, 0x00, O::Src0Src1, compare<&Builder::ieq>, Fold::Yes},   // s_cmp_eq_i32
+    {F::SOPC, 0x01, O::Src0Src1, compare<&Builder::ine>, Fold::Yes},   // s_cmp_lg_i32
+    {F::SOPC, 0x02, O::Src0Src1, compare<&Builder::sgt>, Fold::Yes},
+    {F::SOPC, 0x03, O::Src0Src1, compare<&Builder::sge>, Fold::Yes},
+    {F::SOPC, 0x04, O::Src0Src1, compare<&Builder::slt>, Fold::Yes},
+    {F::SOPC, 0x05, O::Src0Src1, compare<&Builder::sle>, Fold::Yes},
+    {F::SOPC, 0x06, O::Src0Src1, compare<&Builder::ieq>, Fold::Yes},   // s_cmp_eq_u32
+    {F::SOPC, 0x07, O::Src0Src1, compare<&Builder::ine>, Fold::Yes},   // s_cmp_lg_u32
+    {F::SOPC, 0x08, O::Src0Src1, compare<&Builder::ugt>, Fold::Yes},
+    {F::SOPC, 0x09, O::Src0Src1, compare<&Builder::uge>, Fold::Yes},
+    {F::SOPC, 0x0a, O::Src0Src1, compare<&Builder::ult>, Fold::Yes},
+    {F::SOPC, 0x0b, O::Src0Src1, compare<&Builder::ule>, Fold::Yes},
     {F::SOPC, 0x0c, O::Src0Src1, bitcmp_b32<false>},
     {F::SOPC, 0x0d, O::Src0Src1, bitcmp_b32<true>},
     {F::SOPK, 0x03, O::DstSimmSext, compare<&Builder::ieq>},   // s_cmpk_eq_i32

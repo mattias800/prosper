@@ -40,11 +40,19 @@ struct ScalarOpOut {
     Value d, scc;
 };
 
+// Whether the shader-constant folder (rdna2_recompile_shared.hpp) may evaluate this definition.
+// ADR 0012 step 1 keeps the folder's pre-IR domain exactly: the eleven SOP2 writers and the twelve
+// SOPC value compares it folded before. Admitting more is a behaviour change -- folding s_movk or
+// s_bitcmp specialises branches that two existing tests rely on staying runtime -- so it is its own
+// decision, not a side effect of moving semantics.
+enum class Fold : uint8_t { No, Yes };
+
 struct ScalarOpDef {
     Rdna2Format fmt;
     uint32_t opcode;
     ScalarOperands operands;
     ScalarOpOut (*build)(Builder& ir, const ScalarOpIn& in);
+    Fold fold = Fold::No;
 };
 
 // nullptr when (fmt, opcode) is not a plain scalar data operation.

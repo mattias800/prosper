@@ -103,12 +103,12 @@ constexpr ScalarOpDef kDefs[] = {
     {F::SOP2, 0x00, O::Src0Src1, [](Builder& ir, const In& x) -> Out {   // s_add_u32
          const Value d = ir.iadd(x.s0, x.s1);
          return {d, ir.ult(d, x.s0)};
-     }},
+     }, Fold::Yes},
     {F::SOP2, 0x01, O::Src0Src1, [](Builder& ir, const In& x) -> Out {   // s_sub_u32
          return {ir.isub(x.s0, x.s1), ir.ult(x.s0, x.s1)};
-     }},
-    {F::SOP2, 0x02, O::Src0Src1, add_i32},
-    {F::SOP2, 0x03, O::Src0Src1, sub_i32},
+     }, Fold::Yes},
+    {F::SOP2, 0x02, O::Src0Src1, add_i32, Fold::Yes},
+    {F::SOP2, 0x03, O::Src0Src1, sub_i32, Fold::Yes},
     {F::SOP2, 0x04, O::Src0Src1, addc_u32},
     {F::SOP2, 0x05, O::Src0Src1, subb_u32},
     // s_min/s_max: SCC = "S0 was selected", strict in both directions, so a tie gives SCC = 0
@@ -136,13 +136,13 @@ constexpr ScalarOpDef kDefs[] = {
      }},
     {F::SOP2, kSop2OpcodeAndB32, O::Src0Src1, [](Builder& ir, const In& x) -> Out {
          return nonzero(ir, ir.and_(x.s0, x.s1));
-     }},
+     }, Fold::Yes},
     {F::SOP2, kSop2OpcodeOrB32, O::Src0Src1, [](Builder& ir, const In& x) -> Out {
          return nonzero(ir, ir.or_(x.s0, x.s1));
-     }},
+     }, Fold::Yes},
     {F::SOP2, kSop2OpcodeXorB32, O::Src0Src1, [](Builder& ir, const In& x) -> Out {
          return nonzero(ir, ir.xor_(x.s0, x.s1));
-     }},
+     }, Fold::Yes},
     {F::SOP2, kSop2OpcodeAndn2B32, O::Src0Src1, [](Builder& ir, const In& x) -> Out {
          return nonzero(ir, ir.and_(x.s0, ir.not_(x.s1)));
      }},
@@ -162,19 +162,19 @@ constexpr ScalarOpDef kDefs[] = {
     {F::SOP2, 0x1e, O::Src0Src1, [](Builder& ir, const In& x) -> Out {   // s_lshl_b32
          const Value amount = ir.and_(x.s1, ir.c32(31));
          return nonzero(ir, ir.shl(x.s0, amount));
-     }},
+     }, Fold::Yes},
     {F::SOP2, 0x20, O::Src0Src1, [](Builder& ir, const In& x) -> Out {   // s_lshr_b32
          const Value amount = ir.and_(x.s1, ir.c32(31));
          return nonzero(ir, ir.lshr(x.s0, amount));
-     }},
+     }, Fold::Yes},
     {F::SOP2, 0x22, O::Src0Src1, [](Builder& ir, const In& x) -> Out {   // s_ashr_i32
          const Value amount = ir.and_(x.s1, ir.c32(31));
          return nonzero(ir, ir.ashr(x.s0, amount));
-     }},
+     }, Fold::Yes},
     {F::SOP2, kSop2OpcodeBfmB32, O::Src0Src1, bfm_b32},
     {F::SOP2, 0x26, O::Src0Src1, [](Builder& ir, const In& x) -> Out {   // s_mul_i32, no SCC
          return {ir.imul(x.s0, x.s1), {}};
-     }},
+     }, Fold::Yes},
     {F::SOP2, 0x27, O::Src0Src1, bfe_u32},
     {F::SOP2, 0x2e, O::Src0Src1, lshl_add_u32<1>},
     {F::SOP2, 0x2f, O::Src0Src1, lshl_add_u32<2>},
