@@ -1,8 +1,8 @@
 # `gpu/recompiler/ir` — the recompiler's SSA IR (ADR 0012)
 
 RDNA2 instructions are moving, one instruction family at a time, from direct SPIR-V emission in
-`emit_alu` (`../rdna2_emit_alu.cpp`) to a lowering through this IR. The scalar ALU (SOP1, SOP2, SOPC,
-SOPK) is the first family. Everything here is private to `gpu/recompiler`.
+`emit_alu` (`../rdna2_emit_alu.cpp`) to a lowering through this IR. Done so far: the scalar ALU
+(SOP1, SOP2, SOPC, SOPK) and VOP2's integer and bitwise group. Everything here is private to `gpu/recompiler`.
 
 | path | role |
 | --- | --- |
@@ -10,8 +10,8 @@ SOPK) is the first family. Everything here is private to `gpu/recompiler`.
 | `builder.hpp` | typed helpers that append instructions to a Block |
 | `eval.hpp`, `eval.cpp` | the evaluation half of every opcode: what the constant folder computes |
 | `emit/` | the SPIR-V half of every opcode: a Block emitted through `SpirvCompute`, in Block order |
-| `ops/` | ONE definition per guest operation (`scalar_alu.cpp`, `scalar_compare.cpp`), used by both the folder and the emitter |
-| `lower/` | RDNA2 -> IR per format: `sop1.cpp`, `sop2.cpp`, `sopc.cpp`, `sopk.cpp`, and the relocated `*_routes.cpp` |
+| `ops/` | ONE definition per guest operation (`scalar_alu.cpp`, `scalar_compare.cpp`, `vector_alu.cpp`), used by both evaluation and emission |
+| `lower/` | RDNA2 -> IR per format: `sop1.cpp`, `sop2.cpp`, `sopc.cpp`, `sopk.cpp`, `vop2.cpp`, the relocated `*_routes.cpp` / `*_stages.cpp`, and `lowering_context.hpp` (emit_alu's shared locals) |
 | `HOW_TO_ADD_A_FAMILY.md` | the recipe for migrating the next family |
 
 **The boundary that matters: `ops/` holds semantics, `lower/` holds bookkeeping.** A definition in
@@ -39,5 +39,6 @@ Size rules (ADR 0012 decision 5, enforced by `dir-file-cap` in `tools/ci/check_a
 file aims at 500 lines and must not pass 1,000; a function aims at 80. Seven relocated routes are
 over 80 lines today because they were moved verbatim; splitting them is a behaviour-neutral follow-up.
 
-Tests: `tests/gpu/recompiler/ir/`, one file per piece; `test_ir_scalar_alu_execution` runs every
-definition's SPIR-V in the integer interpreter against its own evaluation.
+Tests: `tests/gpu/recompiler/ir/`, one file per piece. `test_ir_scalar_alu_execution` and
+`test_ir_vector_alu_execution` (through `vector_lane_harness.hpp`, per lane with a partial EXEC) run
+every definition's SPIR-V in the integer interpreter against its own evaluation.
