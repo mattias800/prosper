@@ -1,5 +1,6 @@
 // See rdna2_spilled_mask_halves.hpp.
 #include "gpu/recompiler/rdna2_spilled_mask_halves.hpp"
+#include "gpu/recompiler/rdna2_loaded_arbitrary.hpp"
 #include "gpu/recompiler/rdna2_scalar_condition_marks.hpp"
 #include "gpu/recompiler/rdna2_vector_old_word.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
@@ -105,7 +106,9 @@ SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& st
                                                      const Rdna2Inst& in,
                                                      const std::set<int>& masks,
                                                      const std::set<int>& scalar_words,
-                                                     bool definite_scc, uint32_t wave_size) {
+                                                     bool definite_scc, uint32_t wave_size,
+                                                     const IndirectPointerRelocationProof*
+                                                         relocation) {
     if (vector_write_leaves_old_word(in, state.native_interpolation) ||
         (state.native_interpolation && in.fmt == Rdna2Format::VINTRP))
         return {};
@@ -215,9 +218,13 @@ SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& st
                                                     vector_read_completes_active_word(in));
     // CONFIDENCE: MED -- #5185 policy, as the structured walk applies it (vector_write_source_marks
     // in rdna2_vector_word_marks.cpp): a vector result stays arbitrary only when every relayed
-    // input it reads is an arbitrary VECTOR word. A load or LDS read result is real memory; scalar,
-    // SCC and M0-relative inputs carry no arbitrary property.
-    const bool nonarbitrary = missing_scc || missing_scalar_word || load ||
+    // input it reads is an arbitrary VECTOR word. A load's result is real memory unless it is a
+    // bounded read (below); scalar, SCC and M0-relative inputs carry no arbitrary property.
+    // #5193: a bounded read through a genuine resource is arbitrary when its relayed address
+    // words are (dispatcher_arbitrary_read, rdna2_loaded_arbitrary.cpp).
+    const bool nonarbitrary = missing_scc || missing_scalar_word ||
+                              (load && !dispatcher_arbitrary_read(in, scalar_words, relayed,
+                                                                  definite_scc, relocation)) ||
                               (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x43) ||
                               reads_relayed_word(relayed, in) ||
                               vector_any(state.nonarbitrary_vectors);

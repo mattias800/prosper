@@ -143,7 +143,8 @@ bool analyze_wave32_dispatch_words(
                     }
                     definite_scc = scalar_scc && !marks.relayed_words.contains(kRelayedScc);
                     source =
-                        spilled_vector_source_marks(marks, in, {}, source_words, definite_scc, 32);
+                        spilled_vector_source_marks(marks, in, {}, source_words, definite_scc, 32,
+                                                    b.indirect_pointer_proof);
                     if (words.tracks_active_data) {
                         ActiveVectorWords view;
                         view.current = active_data.current;

@@ -11,6 +11,7 @@
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_loaded_arbitrary.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
@@ -1679,10 +1680,12 @@ inline ScalarSourceMarks scalar_source_marks(const RegState& rs, const Rdna2Inst
         const bool fabricated = sreg_word_may_be_fabricated(rs, r);
         marks.placeholder = marks.placeholder || fabricated;
         // A scalar word is unconfined: it may be absent in every lane, so no EXEC confinement survives it.
-        // Nor is it a never-loaded VGPR: scalar data stays hard under #5174 and #5185.
-        if (fabricated) marks.outside_exec = 0;
-        if (fabricated) marks.arbitrary = false;
+        // Nor is it a never-loaded VGPR: scalar data stays hard under #5174 and #5185. A loop
+        // assumption's word is not hard: like a soft vector word it adds only its roots, which an
+        // arbitrary result keeps as obligations (#5193 companion rule).
         const auto blanket = rs.sreg_loop_blanket.find(r);
+        if (fabricated) marks.outside_exec = 0;
+        if (fabricated && blanket == rs.sreg_loop_blanket.end()) marks.arbitrary = false;
         if (fabricated && blanket == rs.sreg_loop_blanket.end())
             marks.hard = true;
         else if (fabricated)
@@ -1780,6 +1783,7 @@ inline SavedB64MaskSnapshot snapshot_saved_b64_masks(const RegState& rs, const R
 inline SavedB64MaskSnapshot snapshot_saved_b64_masks(SpirvCompute& b, const RegState& rs,
                                                      const Rdna2Inst& in) {
     auto snapshot = snapshot_saved_b64_masks(rs, in);
+    note_memory_address(b, rs, in, snapshot.source_marks);   // #5193, before the roots are cleared
     if (in.fmt == Rdna2Format::FLAT || in.fmt == Rdna2Format::MUBUF ||
         in.fmt == Rdna2Format::MTBUF) {
         // Address assumptions are read by this memory instruction, before an aliasing write.

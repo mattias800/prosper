@@ -4,6 +4,7 @@
 #include "gpu/recompiler/compiler_choices.hpp"
 #include "gpu/recompiler/compiler_resource_access.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
+#include "gpu/recompiler/rdna2_loop_arbitrary_carry.hpp"
 #include "gpu/recompiler/rdna2_diagnostic_attempt.hpp"
 #include "gpu/recompiler/rdna2_portable_mask_slots.hpp"
 
@@ -573,6 +574,18 @@ struct SpirvCompute {
     // word whose only mark was a header's blanket mark (sreg_loop_blanket). Each loop checks its own
     // at its back edge (LoopBlanketCheck). Mutable: the admitting predicate takes the builder const.
     mutable std::set<uint64_t> loop_blanket_roots_read;
+    // The subset of those roots some read needed DEFINED, not merely free of hard lanes: an
+    // unbounded or writing memory address (rdna2_loaded_arbitrary.cpp). Such a root cannot be held
+    // weakly by an arbitrary back edge (rdna2_loop_arbitrary_carry.cpp, #5193).
+    mutable std::set<uint64_t> loop_blanket_roots_strong;
+    // Set per instruction by note_memory_address: this LDS read bounds its index (#5193).
+    bool lds_bound_reads = false;
+    // The exit condition [first, second) of the top-tested compute EXEC loop being emitted, when
+    // it has no narrowing certificate. A fresh predicate there may not rest on an ARBITRARY lane:
+    // its structured invocations leave one by one, so a lane outside the preheader EXEC reaching
+    // the condition means the loop is not provably the wave's, and refusing there is what routes
+    // it to the exact dispatcher (closed_compute_store_loop_data_retry, #5193).
+    std::pair<uint32_t, uint32_t> strict_loop_condition{UINT32_MAX, 0};
     // The first V_MBCNT whose src0 is a general SGPR mask, when the program ALSO builds the
     // canonical all-ones lane-index pair. That mixture disqualifies the flattened-lane vertex model
     // for the whole program, so the reject surfaces at the all-ones instruction -- which is
@@ -3552,10 +3565,18 @@ struct LoopBlanketCheck {
     // Hard vector words whose missing lanes lie outside this preheader EXEC domain. Their header
     // reads remain conditional on each back edge defining the same domain, not just the same ID.
     std::map<int, uint32_t> confined;
+    // Vector words whose header keeps the arbitrary property, and whether this loop may hold a
+    // defined-preheader word weakly (rdna2_loop_arbitrary_carry.hpp, #5193).
+    std::set<int> arbitrary;
+    bool weak_allowed = false;
+    // Vector words whose header may NOT keep the arbitrary property: those the exit condition of a
+    // compute EXEC loop without the narrowing certificate reads (retry_gate).
+    std::set<int> no_arbitrary_header;
     uint32_t header_pc = 0;
     template <class Registers>
-    LoopBlanketCheck(const RegState& rs, const Registers& registers, uint32_t header)
-        : header_pc(header) {
+    LoopBlanketCheck(const RegState& rs, const Registers& registers, uint32_t header,
+                     std::set<int> no_arbitrary = {})
+        : no_arbitrary_header(std::move(no_arbitrary)), header_pc(header) {
         for (int r : registers) {
             if (!rs.sreg.contains(r)) continue;
             if (!merge_edge_word_fabricated(rs, r))
@@ -3570,24 +3591,11 @@ struct LoopBlanketCheck {
     template <class Exits>
     bool holds(SpirvCompute& b, RegState& rs, Exits& exits) const {
         // A carried word is violated when its back-edge value is hard-marked, or blanket-marked on
-        // an assumption of this header that is itself violated (s10 = s11 carries s11's fate).
-        std::set<uint64_t> violated;
-        for (bool grew = true; grew;) {
-            grew = false;
-            for (const auto& entry : carried) {
-                const uint64_t root = blanket_root(header_pc, entry.first);
-                const auto back = carried_word_marks(rs, entry.first);
-                if (violated.contains(root) || !back.placeholder) continue;
-                const auto owner = confined.find(entry.first);
-                const bool domain_held =
-                    !back.hard || (owner != confined.end() &&
-                                   vector_word_defined_in_exec(rs, back, owner->second));
-                const bool held = domain_held &&
-                                  std::none_of(back.blanket_roots.begin(), back.blanket_roots.end(),
-                                               [&](uint64_t r) { return violated.contains(r); });
-                if (!held) grew = violated.insert(root).second || grew;
-            }
-        }
+        // an assumption of this header that is itself violated (s10 = s11 carries s11's fate). An
+        // arbitrary back edge holds a defined-preheader vector word weakly (#5193).
+        const LoopRootVerdicts verdict =
+            loop_root_verdicts(b, rs, header_pc, carried, confined, arbitrary, weak_allowed);
+        const std::set<uint64_t>& violated = verdict.violated;
         int read_word = -1;
         for (const auto& entry : carried)
             if (read_word < 0 && violated.contains(blanket_root(header_pc, entry.first)) &&
@@ -3599,21 +3607,33 @@ struct LoopBlanketCheck {
             return std::any_of(roots.begin(), roots.end(),
                                [&](uint64_t root) { return violated.contains(root); });
         };
+        // Scalar data holds no arbitrary value: a weak root is as invalid as a violated one there.
+        const auto scalar_invalid = [&](const auto& roots) {
+            return invalid(roots) || std::any_of(roots.begin(), roots.end(), [&](uint64_t root) {
+                       return verdict.weak.contains(root);
+                   });
+        };
         const auto sanitize = [&](auto& scalar, auto& vectors) {
-            std::erase_if(scalar, [&](const auto& word) { return invalid(word.second); });
-            for (auto& [reg, source] : vectors) retire_vector_word_roots(source, violated);
+            std::erase_if(scalar, [&](const auto& word) { return scalar_invalid(word.second); });
+            for (auto& [reg, source] : vectors) {
+                strip_arbitrary_outside_roots(source, violated);
+                retire_vector_word_roots(source, violated);
+                weaken_vector_word_roots(source, verdict.weak);
+            }
         };
         sanitize(exits.blanket, exits.vectors);
         sanitize(rs.sreg_loop_blanket, rs.vreg_source_marks);
-        if (invalid(exits.scc_blanket)) exits.scc_blanket.clear();
-        if (invalid(rs.scc_loop_blanket)) rs.scc_loop_blanket.clear();
+        if (scalar_invalid(exits.scc_blanket)) exits.scc_blanket.clear();
+        if (scalar_invalid(rs.scc_loop_blanket)) rs.scc_loop_blanket.clear();
         if (read_word < 0) return true;
         log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
                                  "loop-carried %c%d is fabricated on the back edge but was read as "
                                  "lane bits in the loop (header pc=%u)",
                                  read_word >= kVectorBlanketBase ? 'v' : 's',
-                                 read_word >= kVectorBlanketBase ? read_word - kVectorBlanketBase
-                                                                 : read_word,
+                                 read_word >= kVectorBlanketBase
+                                     ? (read_word - kVectorBlanketBase) %
+                                           kArbitraryOutsideRootOffset
+                                     : read_word,
                                  header_pc);
         return false;
     }
@@ -3627,7 +3647,9 @@ struct LoopBlanketCheck {
 template <class Registers>
 void mark_loop_carried(RegState& rs, const Registers& carried, const std::vector<Rdna2Inst>& ins,
                        uint32_t lo, uint32_t hi, LoopBlanketCheck& blanket) {
-    mark_vector_loop_carried(rs, ins, lo, hi, blanket.carried, blanket.confined);
+    mark_vector_loop_carried(rs, ins, lo, hi, blanket.carried, blanket.confined, &blanket.arbitrary,
+                             blanket.no_arbitrary_header);
+    blanket.weak_allowed = loop_may_hold_weakly(ins, lo, hi);
     // A full preheader does not prove a full backedge. Clear the independent proof; ordinary
     // entry-iteration full writes still follow exec_narrowed and initialize their old generation.
     for (const auto& in : ins)

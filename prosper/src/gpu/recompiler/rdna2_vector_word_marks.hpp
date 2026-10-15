@@ -52,6 +52,9 @@ struct MimgSourceProof {
     uint32_t pc = UINT32_MAX;
     bool enabled = false;
     bool defined = false;
+    // #5193: every address word is defined in EXEC or arbitrary (no hard lane). Independent of
+    // `defined`, which this address may fail while its result is still arbitrary.
+    bool no_hard = false;
     std::set<int> words;
     std::set<uint64_t> roots;
 };
@@ -117,11 +120,22 @@ void record_mimg_source_word(RegState& rs, int reg);
 void record_mimg_address_operand(RegState& rs, const Rdna2Inst& in, uint32_t index);
 uint32_t read_mimg_source_word(SpirvCompute& b, RegState& rs, int reg);
 int mimg_address_vgpr(RegState& rs, const Rdna2Inst& in, uint32_t index);
+// `arbitrary` receives the carried words whose header keeps the arbitrary property (#5193): an
+// unconfined arbitrary preheader word, whose back edge must bring in no hard lane. No word in
+// `no_arbitrary` keeps it.
 void mark_vector_loop_carried(RegState& rs, const std::vector<Rdna2Inst>& ins, uint32_t lo,
                               uint32_t hi, std::map<int, std::set<uint64_t>>& carried,
-                              std::map<int, uint32_t>& confined);
+                              std::map<int, uint32_t>& confined, std::set<int>* arbitrary = nullptr,
+                              const std::set<int>& no_arbitrary = {});
 // Loop roots use physical scalar numbers 0..253 and disjoint vector numbers 256..511.
 inline constexpr int kVectorBlanketBase = 256;
+// A confined arbitrary header word owes two things: its owner's lanes are defined (its ordinary
+// root) and every other lane is arbitrary. The second is a separate root, word + this offset, so a
+// read inside the owner, which sees none of those lanes, does not owe it (#5193).
+inline constexpr int kArbitraryOutsideRootOffset = 1024;
+inline bool arbitrary_outside_root(uint64_t root) {
+    return static_cast<int>(root & 0xffffu) >= kVectorBlanketBase + kArbitraryOutsideRootOffset;
+}
 ScalarSourceMarks carried_word_marks(const RegState& rs, int word);
 
 }   // namespace prosper::gpu

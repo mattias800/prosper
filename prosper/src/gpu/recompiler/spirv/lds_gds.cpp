@@ -1,6 +1,7 @@
 // Generated move, not new code: `SpirvCompute`'s method bodies, lifted out of
 // gpu/recompiler/rdna2_to_spirv_internal.hpp. outline_methods.py checked each body byte for byte.
 
+#include "gpu/recompiler/rdna2_loaded_arbitrary.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
 namespace prosper::gpu {
@@ -105,8 +106,13 @@ uint32_t SpirvCompute::native_gds_append(uint32_t index, uint32_t exec_bit, bool
     }
 
 uint32_t SpirvCompute::lds_load(uint32_t idx) {
+        // #5193: a read noted as bounded (rdna2_loaded_arbitrary.cpp) loads index 0 outside the
+        // allocation and returns zero there.
+        const uint32_t inside = lds_index_inside_if_noted(*this, idx);
+        if (inside) idx = sel(inside, idx, uconst(0));
         uint32_t p = id(); putv(code, Op_AccessChain, {t_ptr_lds_u32, p, lds_var, idx});
-        uint32_t r = id(); put(code, Op_Load, {t_u32, r, p}); return r;
+        uint32_t r = id(); put(code, Op_Load, {t_u32, r, p});
+        return inside ? sel(inside, r, uconst(0)) : r;
     }
 
 uint32_t SpirvCompute::lds_load(uint32_t idx, bool predicated, uint32_t pred, uint32_t fallback) {
