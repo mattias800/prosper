@@ -32,18 +32,17 @@ struct ScalarSourceMarks {
     // global blanket_roots may additionally depend on the inactive old generation. Hard marks
     // continue to carry their active-domain obligations in blanket_roots.
     std::set<uint64_t> scoped_blanket_roots;
-    // #5174: every lane of this HARD mark that is not defined holds the launch value of a VGPR
-    // the stage's explicit launch inventory (rdna2_launch_vgprs) says hardware does not load, and
-    // no instruction on any path to here has written that lane. On hardware such a lane holds
-    // whatever an earlier wave left in the register file, so no guest-visible result can depend
-    // on it and the recompiler's zero is one of the values hardware could hold: a fresh predicate
-    // may read it. Only seed_vector_word_definedness sets this, and only from the inventory; every
-    // transfer that cannot prove it clears it.
-    bool unloaded = false;
-    // ...and, stronger, every lane outside outside_exec (every lane when it is 0) is such a
-    // never-written lane on this path. A path join needs this: a lane one path wrote and the
-    // other did not is a word with a write on some path, which #5174 keeps hard.
-    bool untouched = false;
+    // #5174 / #5185: no lane of this HARD mark holds a value whose hardware counterpart is real
+    // but unknown to prosper. Every lane that is not defined holds an ARBITRARY value: the launch
+    // value of a VGPR the stage's explicit launch inventory (rdna2_launch_vgprs) says hardware does
+    // not load and nothing wrote (on hardware, an earlier wave's leftovers), or a deterministic
+    // function, computed lane-wise or across lanes, of such values and defined ones. The
+    // recompiler holds one value hardware could have held for each, used consistently, so a fresh
+    // predicate may read them (decision on #5185: taint by hardness, not by arbitrariness).
+    // seed_vector_word_definedness sets it only from the inventory; transfers keep it only when no
+    // input that can reach a result lane is hard, and every transfer that cannot prove that
+    // clears it (memory results, relative and scalar sources, loop headers, dropped obligations).
+    bool arbitrary = false;
 };
 using VectorWordMarks = std::map<int, ScalarSourceMarks>;
 
@@ -76,7 +75,7 @@ void record_exec_mask_subset(RegState& rs, uint32_t result, uint32_t left, uint3
                              uint32_t opcode, uint32_t previous_exec);
 // Call only at a producing stage entry, after its actual input VGPRs have been published.
 // `launch` is the stage's explicit launch-VGPR inventory (rdna2_launch_vgprs). Only with it is an
-// absent word one hardware does not load (ScalarSourceMarks::unloaded); without it, as for an
+// absent word one hardware does not load (ScalarSourceMarks::arbitrary); without it, as for an
 // unknown launch profile, every absent word stays a hard placeholder.
 void seed_vector_word_definedness(RegState& rs, const std::vector<Rdna2Inst>& instructions,
                                   bool native_interpolation = false, uint32_t wave_size = 64,

@@ -266,8 +266,12 @@ TEST(FreshMaskLaneWiseRelay, PublicCompilerAdmitsAnLdsReadRelayAndRefusesItsWide
     // #5174: outside A, v8 was never written and compute never loads it, so the wider read is
     // admitted as an arbitrary value (a refusal before that decision made it an over-refusal).
     accepted(compile({cmpx_a, ds_read_v8, 0x08000000u, full_exec, compare8}));
-    // A written old v8 (relayed from v19, itself never written) survives outside A: refused.
-    refused(compile({0x7e100313u, cmpx_a, ds_read_v8, 0x08000000u, full_exec, compare8}), 5);
+    // #5185: an old v8 relayed from v19, itself never written, is arbitrary outside A too.
+    accepted(compile({0x7e100313u, cmpx_a, ds_read_v8, 0x08000000u, full_exec, compare8}));
+    // A hard old v8 (LDS data read at the never-written address v19) survives outside A: refused.
+    refused(
+        compile({ds_read_v8, 0x08000013u, cmpx_a, ds_read_v8, 0x08000000u, full_exec, compare8}),
+        6);
 }
 
 // ---- 3. The second arm of an if/else completes the saved mask ----------------------------------
@@ -314,8 +318,11 @@ TEST(FreshMaskLaneWiseRelay, PublicCompilerAdmitsThePartitionAndRefusesItsOneArm
     // #5174: v6 was never written in the second arm's lanes and compute never loads it, so the
     // one-arm read is admitted as an arbitrary value (an over-refusal under that decision).
     accepted(compile(cat({if_else({mov6}, {mov7}), {compare6}})));
-    // With a written old v6 (relayed from v19) the second arm's lanes keep it: refused.
-    refused(compile(cat({{0x7e0c0313u}, if_else({mov6}, {mov7}), {compare6}})), 8);
+    // #5185: an old v6 relayed from v19, itself never written, is arbitrary there too.
+    accepted(compile(cat({{0x7e0c0313u}, if_else({mov6}, {mov7}), {compare6}})));
+    // With a hard old v6 (LDS data read at the never-written address v19) the second arm's lanes
+    // keep it: refused.
+    refused(compile(cat({{0xd8d80000u, 0x06000013u}, if_else({mov6}, {mov7}), {compare6}})), 9);
 }
 
 // ---- 4. A structured merge meets nested owners at the narrower one ------------------------------
@@ -349,5 +356,11 @@ TEST(FreshMaskLaneWiseRelay, PublicCompilerAdmitsTheNestedMergeAndRefusesItsUnre
     // s_cmp_eq_u32 s4, 0; s_cbranch_scc1 over one instruction: a structured one-arm region.
     const Words one_arm{0xbf068004u, 0xbf840001u, fmac6};
     accepted(compile(cat({{cmpx_a, mov6, cmpx_b, mov7}, one_arm, {compare6}})));
-    refused(compile(cat({{cmpx_a, mov6, full_exec, cmpx_b, mov7}, one_arm, {compare6}})), 8);
+    // v6's lanes of B outside A were never written: arbitrary, so the unrelated owners no longer
+    // refuse (#5185). With a hard old v6 (LDS data at the never-written address v19) they do.
+    accepted(compile(cat({{cmpx_a, mov6, full_exec, cmpx_b, mov7}, one_arm, {compare6}})));
+    refused(compile(cat({{0xd8d80000u, 0x06000013u, cmpx_a, mov6, full_exec, cmpx_b, mov7},
+                         one_arm,
+                         {compare6}})),
+            10);
 }

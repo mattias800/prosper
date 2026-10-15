@@ -9,7 +9,7 @@
 // VGPR -- never loaded, reserved by ADDR only, or loaded by hardware but not supplied here -- keeps
 // its placeholder mark. A predicate formed from a loaded-but-unsupplied word is refused instead of
 // reading a zero; one formed from a word hardware never loads, and nothing wrote, reads an
-// arbitrary value that a zero faithfully stands for (#5174, ScalarSourceMarks::unloaded).
+// arbitrary value that a zero faithfully stands for (#5174, ScalarSourceMarks::arbitrary).
 //
 // Pixel stage (RDNA2 ISA 70648, PS input VGPRs; SPI_PS_INPUT_ENA / SPI_PS_INPUT_ADDR): sixteen
 // fields packed in field order. ADDR reserves each field's width even when ENA is clear, so a

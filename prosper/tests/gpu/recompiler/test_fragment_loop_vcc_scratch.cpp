@@ -388,9 +388,15 @@ TEST(FragmentLoopVccScratch, WaveVotedBoundCompilesToo) {
          {static_cast<const PixelSystemInputMapping*>(nullptr), &absent, &disabled, &displaced}) {
         const Compiled rejected = compile(varying, address++, false, missing);
         EXPECT_TRUE(rejected.spirv.empty());
-        EXPECT_NE(rejected.reason.find("fabricated-fresh-mask-source pc=4 words=7d020200 "),
-                  std::string::npos)
-            << rejected.reason;
+        // Displaced puts POS_X at v0, so v2 is a word hardware never loads: v1 relays an
+        // arbitrary value and the pre-loop compare at pc4 is admitted (#5185). The header compare
+        // at pc5 still refuses: it meets v1 with the loop-carried s0, a loop assumption, and that
+        // meet stays hard (conservative; an arbitrary value with loop obligations is not modelled).
+        // The other three are unknown launch profiles, where v2 is hard.
+        const char* expected = missing == &displaced
+                                   ? "fabricated-fresh-mask-source pc=5 words=7d020200 "
+                                   : "fabricated-fresh-mask-source pc=4 words=7d020200 ";
+        EXPECT_NE(rejected.reason.find(expected), std::string::npos) << rejected.reason;
     }
 }
 
