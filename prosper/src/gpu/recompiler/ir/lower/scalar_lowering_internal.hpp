@@ -12,8 +12,9 @@
 #pragma once
 
 #include "gpu/recompiler/ir/lower/scalar_alu_lowering.hpp"
+#include "gpu/recompiler/ir/ops/scalar_alu.hpp"
+#include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
-#include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include "gpu/recompiler/rdna2_movrels.hpp"
@@ -95,8 +96,8 @@ private:
     bool wave32_live_mask_operand(const Operand& source) const;
     bool exact_wave32_scalar_dword(const Operand& source) const;
     bool scalar_data_operand(const Operand& source) const;
-    uint32_t logical_u32(uint32_t a, uint32_t c);
-    uint32_t bitfield_mask_u32(uint32_t width, uint32_t offset);
+    // The instruction's plain data operation through its IR definition (ir/ops/scalar_alu.hpp).
+    ScalarOpIds emit_data_op(uint32_t s0, uint32_t s1);
 
     std::optional<bool> route_wave64_vcc_lo_cselect();
     std::optional<bool> route_b32_mask_cselect();
@@ -121,6 +122,7 @@ public:
 
 private:
     bool lower_data();
+    bool lower_compare_u64(uint32_t a, uint32_t c);
     std::optional<bool> route_wave32_mask_compare();
     std::optional<bool> route_b64_mask_compare();
 };
@@ -129,6 +131,9 @@ class SopkLowering : ScalarLoweringContext {
 public:
     explicit SopkLowering(const ScalarLoweringContext& context) : ScalarLoweringContext(context) {}
     bool lower();
+
+private:
+    bool lower_data(const ScalarOpDef& def);
 };
 
 } // namespace prosper::gpu::ir

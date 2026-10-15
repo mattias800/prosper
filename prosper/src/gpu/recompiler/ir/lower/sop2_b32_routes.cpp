@@ -15,9 +15,10 @@ std::optional<bool> Sop2Lowering::route_exec_lo_logical_data() {
         // VCC_LO as scalar scratch, then ORs it with literal 0x100 to select lanes 7 and 8.
         // Both complete dwords are available uniformly, so compute the architectural u32,
         // publish exact SCC, and select this invocation's Wave32 bit without a subgroup op.
-        const uint32_t result = logical_u32(val(in.src[0]), val(in.src[1]));
+        const ScalarOpIds logical = emit_data_op(val(in.src[0]), val(in.src[1]));
+        const uint32_t result = logical.d;
         if (!ok) return true;
-        rs.scc = b.ucmp(Op_INotEqual, result, b.uconst(0));
+        rs.scc = logical.scc;
         const uint32_t lane = b.ibin(
             Op_BitwiseAnd, b.guest_lane_id(), b.uconst(31));
         const uint32_t bit = b.ibin(
@@ -40,8 +41,8 @@ std::optional<bool> Sop2Lowering::route_exec_lo_bfm_data() {
         // dword as the complete Wave32 mask. GTA V uses width=16, offset=16 to enable the
         // upper half of a traversal wave. Both operands are uniform scalar DATA, so select
         // the resulting architectural bit for this invocation; S_BFM_B32 leaves SCC alone.
-        const uint32_t result = bitfield_mask_u32(
-            val(in.src[0]), val(in.src[1]));
+        const uint32_t result = emit_data_op(
+            val(in.src[0]), val(in.src[1])).d;
         if (!ok) return true;
         const uint32_t lane = b.ibin(
             Op_BitwiseAnd, b.guest_lane_id(), b.uconst(31));
@@ -130,14 +131,7 @@ std::optional<bool> Sop2Lowering::route_pack_halfwords() {
         // temporarily live in VCC_LO/HI.
         const uint32_t a = val(in.src[0]), c = val(in.src[1]);
         if (!ok) return true;
-        const uint32_t lo = in.opcode == 0x34
-            ? b.ibin(Op_ShiftRightLogical, a, b.uconst(16))
-            : b.ibin(Op_BitwiseAnd, a, b.uconst(0xffff));
-        const uint32_t hi = in.opcode == 0x32
-            ? b.ibin(Op_ShiftLeftLogical,
-                     b.ibin(Op_BitwiseAnd, c, b.uconst(0xffff)), b.uconst(16))
-            : b.ibin(Op_BitwiseAnd, c, b.uconst(0xffff0000));
-        const uint32_t result = b.ibin(Op_BitwiseOr, lo, hi);
+        const uint32_t result = emit_data_op(a, c).d;   // ir/ops/scalar_alu.cpp pack_b32_b16
         rs.sreg[in.dst.value] = result;
         rs.sreg_srt.erase(in.dst.value);
         if (b.vcc_pack_scalar_pair_pcs.contains(in.pc)) {
@@ -216,11 +210,12 @@ std::optional<bool> Sop2Lowering::route_vcc_half_b32_logical() {
             // computes `s_and_b32 vcc_lo, loop_index, 3` and immediately compares VCC_LO as
             // a uint. True VOPC/mask inputs have no scalar representation and continue into
             // the wave-mask path below.
-            const uint32_t result = logical_u32(val(in.src[0]), val(in.src[1]));
+            const ScalarOpIds logical = emit_data_op(val(in.src[0]), val(in.src[1]));
+            const uint32_t result = logical.d;
             if (!ok) return true;
             rs.sreg[in.dst.value] = result;
             rs.sreg_srt.erase(in.dst.value);
-            rs.scc = b.ucmp(Op_INotEqual, result, b.uconst(0));
+            rs.scc = logical.scc;
             // Current vertex DATA need not recreate a retired wave predicate. Preserve
             // genuine scalar arithmetic; later mask consumers still need their own proof.
             if (b.is_vertex && !b.ngg_one_lane && !rs.vcc && !complete_scalar_pair &&

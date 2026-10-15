@@ -28,68 +28,8 @@ bool SopkLowering::lower() {
     // 16-bit-immediate scalar ops. The decoder sign-extends simm16 for signed operations;
     // unsigned comparisons use the original 16-bit bit pattern. SOPK comparisons name their
     // scalar source in the encoded SDST field and write only SCC.
+    if (const ScalarOpDef* def = find_scalar_op(in.fmt, in.opcode)) return lower_data(*def);
     switch (in.opcode) {
-        case 0x00:                                  // s_movk_i32
-            rs.sreg[in.dst.value] = b.uconst((uint32_t)in.simm16);
-            rs.sreg_srt.erase(in.dst.value);
-            break;
-        case 0x10: {                                // s_mulk_i32 (read-modify-write)
-            // D = low32(D * sign_extend(SIMM16)). Unlike s_addk_i32, MULK does not write
-            // SCC. Astro Bot uses the exact `s_mulk_i32 vcc_lo, 276` word to turn a
-            // scalar table index into a byte offset before s_buffer_load_dwordx4.
-            const uint32_t a = val(in.dst);
-            rs.sreg[in.dst.value] = b.ibin(
-                Op_IMul, a, b.uconst(static_cast<uint32_t>(in.simm16)));
-            rs.sreg_srt.erase(in.dst.value);
-            break;
-        }
-        case 0x0F: {                                // s_addk_i32 (read-modify-write)
-            // SIMM16 is sign-extended, the destination receives the low 32 bits, and SCC
-            // reports signed overflow. This is the immediate form of SOP2 s_add_i32, so use
-            // the same two's-complement overflow identity: (~(a^c)) & (a^d), bit 31.
-            const uint32_t a = val(in.dst);
-            const uint32_t c = b.uconst(static_cast<uint32_t>(in.simm16));
-            const uint32_t d = b.ibin(Op_IAdd, a, c);
-            const uint32_t overflow = b.ibin(
-                Op_BitwiseAnd,
-                b.iun(Op_Not, b.ibin(Op_BitwiseXor, a, c)),
-                b.ibin(Op_BitwiseXor, a, d));
-            rs.sreg[in.dst.value] = d;
-            rs.sreg_srt.erase(in.dst.value);
-            rs.scc = b.ucmp(
-                Op_INotEqual,
-                b.ibin(Op_ShiftRightLogical, overflow, b.uconst(31)),
-                b.uconst(0));
-            break;
-        }
-        case 0x03: case 0x04: case 0x05: case 0x06:
-        case 0x07: case 0x08: {                      // s_cmpk_{eq,lg,gt,ge,lt,le}_i32
-            const uint32_t a = val(in.dst);
-            const uint32_t c = b.uconst((uint32_t)in.simm16);
-            switch (in.opcode) {
-                case 0x03: rs.scc = b.ucmp(Op_IEqual, a, c); break;
-                case 0x04: rs.scc = b.ucmp(Op_INotEqual, a, c); break;
-                case 0x05: rs.scc = b.scmp(Op_SGreaterThan, a, c); break;
-                case 0x06: rs.scc = b.scmp(Op_SGreaterThanEqual, a, c); break;
-                case 0x07: rs.scc = b.scmp(Op_SLessThan, a, c); break;
-                case 0x08: rs.scc = b.scmp(Op_SLessThanEqual, a, c); break;
-            }
-            break;
-        }
-        case 0x09: case 0x0A: case 0x0B:
-        case 0x0C: case 0x0D: case 0x0E: {           // s_cmpk_{eq,lg,gt,ge,lt,le}_u32
-            const uint32_t a = val(in.dst);
-            const uint32_t c = b.uconst((uint32_t)(uint16_t)in.simm16);
-            switch (in.opcode) {
-                case 0x09: rs.scc = b.ucmp(Op_IEqual, a, c); break;
-                case 0x0A: rs.scc = b.ucmp(Op_INotEqual, a, c); break;
-                case 0x0B: rs.scc = b.ucmp(Op_UGreaterThan, a, c); break;
-                case 0x0C: rs.scc = b.ucmp(Op_UGreaterThanEqual, a, c); break;
-                case 0x0D: rs.scc = b.ucmp(Op_ULessThan, a, c); break;
-                case 0x0E: rs.scc = b.ucmp(Op_ULessThanEqual, a, c); break;
-            }
-            break;
-        }
         // Scalar wait counters are SOPK on gfx10, NOT SOPP 0x7d. Loads/stores themselves
         // are synchronous SSA operations in SPIR-V, so vmcnt/expcnt/lgkmcnt remain no-ops.
         // A completed vscnt(0), however, is also the guest's publication point: GTA V writes
@@ -113,6 +53,20 @@ bool SopkLowering::lower() {
             break;
         default: ok = false;
     }
+    return true;
+}
+
+// s_movk_i32, s_addk_i32, s_mulk_i32 and s_cmpk_*: their IR definitions (ir/ops/scalar_alu.cpp,
+// ir/ops/scalar_compare.cpp). s_addk is the immediate form of s_add_i32 and shares its definition.
+bool SopkLowering::lower_data(const ScalarOpDef& def) {
+    const uint32_t s0 = def.operands == ScalarOperands::SimmSext ? 0 : val(in.dst);
+    const uint32_t s1 = b.uconst(scalar_op_simm16(def, in));
+    const ScalarOpIds result = emit_scalar_op(b, def, s0, s1, rs.scc);
+    if (result.d) {
+        rs.sreg[in.dst.value] = result.d;
+        rs.sreg_srt.erase(in.dst.value);
+    }
+    if (result.scc) rs.scc = result.scc;
     return true;
 }
 

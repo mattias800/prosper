@@ -3592,7 +3592,10 @@ if(TARGET prosper_core)
     LIBRARIES prosper_core)
 
   # The recompiler IR (ADR 0012): one focused test per piece under tests/gpu/recompiler/ir/.
-  foreach(ir_test ir_core)
+  # test_ir_scalar_alu_execution runs each scalar-op definition's SPIR-V in the integer interpreter
+  # against its own constant evaluation (#2514).
+  foreach(ir_test ir_core ir_scalar_alu_execution ir_scalar_fold
+                  ir_lower_sop1 ir_lower_sop2 ir_lower_sopc ir_lower_sopk)
     prosper_add_gtest(test_${ir_test}
       SOURCES tests/gpu/recompiler/ir/test_${ir_test}.cpp
       INCLUDES tests

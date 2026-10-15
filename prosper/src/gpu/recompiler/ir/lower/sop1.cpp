@@ -50,28 +50,21 @@ bool Sop1Lowering::lower_data() {
     // not recover the departed B64 predicate when numeric uniformity is unproved.
     // An independently tagged B32 low mask does not own the adjacent high DATA word.
     retire_scalar_data_word_mask(rs, in.dst.value);
-    switch (in.opcode) {
-        case 0x03: {                                // s_mov_b32
-            publish_s_mov_b32_word(rs, in, a, partial_vcc);
-            break;
-        }
-        case 0x07:                                  // s_not_b32 changes the descriptor word
-            // ISA op 7: "D = ~S0; SCC = (D != 0)". (s_brev_b32 below has NO SCC write.)
-            d = b.iun(Op_Not, a); rs.sreg_srt.erase(in.dst.value);
-            rs.scc = b.ucmp(Op_INotEqual, d, b.uconst(0)); break;
-        case kSop1OpcodeBrevB32:                     // s_brev_b32
-            d = b.iun(Op_BitReverse, a); rs.sreg_srt.erase(in.dst.value); break;
-        case 0x34: {                                // s_abs_i32
-            // Two's-complement absolute value.  OpISub deliberately preserves the ISA's
-            // INT_MIN -> INT_MIN wraparound; SCC is set iff the resulting bits are nonzero.
-            const uint32_t negative = b.scmp(Op_SLessThan, a, b.uconst(0));
-            d = b.sel(negative, b.ibin(Op_ISub, b.uconst(0), a), a);
-            rs.scc = b.ucmp(Op_INotEqual, d, b.uconst(0));
-            rs.sreg_srt.erase(in.dst.value);
-            break;
-        }
-        default: ok = false;
+    if (in.opcode == kSop1OpcodeMovB32) {
+        publish_s_mov_b32_word(rs, in, a, partial_vcc);
+        return true;
     }
+    // s_not_b32, s_brev_b32, s_abs_i32: their IR definitions (ir/ops/scalar_alu.cpp). Each changes
+    // the descriptor word, so a stale SRT tag on the destination goes.
+    const ScalarOpDef* def = find_scalar_op(in.fmt, in.opcode);
+    if (!def) {
+        ok = false;
+        return true;
+    }
+    const ScalarOpIds result = emit_scalar_op(b, *def, a, 0, rs.scc);
+    d = result.d;
+    rs.sreg_srt.erase(in.dst.value);
+    if (result.scc) rs.scc = result.scc;
     return true;
 }
 

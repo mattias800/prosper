@@ -34,6 +34,7 @@
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/ir/ops/scalar_alu.hpp"
 
 namespace prosper::gpu {
 
@@ -464,6 +465,40 @@ struct ShaderConstantValue {
 
 inline ShaderConstantValue shader_constant_operand(
         const std::vector<Rdna2Inst>& ins, size_t block_first, size_t use_index,
+        const Rdna2Inst& use, const Operand& operand, uint32_t depth);
+
+// The value `def` gives instruction `in` (at index `at`) when its operands are shader constants:
+// its result word, or with `want_scc` its SCC. SCC is never an input here: an operation that reads
+// it does not fold.
+inline ShaderConstantValue shader_constant_scalar_op(
+        const std::vector<Rdna2Inst>& ins, size_t block_first, size_t at, const Rdna2Inst& in,
+        const ir::ScalarOpDef& def, uint32_t depth, bool want_scc) {
+    const auto known = [&](const Operand& source) -> ir::Known {
+        const ShaderConstantValue value =
+            shader_constant_operand(ins, block_first, at, in, source, depth);
+        return value.known ? ir::Known(value.value) : std::nullopt;
+    };
+    ir::Known s0, s1;
+    switch (def.operands) {
+        case ir::ScalarOperands::Src0: s0 = known(in.src[0]); break;
+        case ir::ScalarOperands::Src0Src1:
+            s0 = known(in.src[0]);
+            s1 = known(in.src[1]);
+            break;
+        case ir::ScalarOperands::DstSimmSext:
+        case ir::ScalarOperands::DstSimmZext:
+            s0 = known(in.dst);
+            s1 = ir::scalar_op_simm16(def, in);
+            break;
+        case ir::ScalarOperands::SimmSext: s1 = ir::scalar_op_simm16(def, in); break;
+    }
+    const ir::ScalarOpValue value = ir::eval_scalar_op(def, s0, s1, std::nullopt);
+    const ir::Known& result = want_scc ? value.scc : value.d;
+    return result ? ShaderConstantValue{true, *result} : ShaderConstantValue{};
+}
+
+inline ShaderConstantValue shader_constant_operand(
+        const std::vector<Rdna2Inst>& ins, size_t block_first, size_t use_index,
         const Rdna2Inst& use, const Operand& operand, uint32_t depth) {
     if (depth > 16) return {};
     if (operand.kind == OperandKind::InlineInt)
@@ -505,44 +540,13 @@ inline ShaderConstantValue shader_constant_operand(
             return shader_constant_operand(
                 ins, block_first, i, writer, writer.src[0], depth + 1);
         }
-        if (writer.fmt != Rdna2Format::SOP2) return {};
-
-        const ShaderConstantValue lhs = shader_constant_operand(
-            ins, block_first, i, writer, writer.src[0], depth + 1);
-        const ShaderConstantValue rhs = shader_constant_operand(
-            ins, block_first, i, writer, writer.src[1], depth + 1);
-        if (!lhs.known || !rhs.known) return {};
-
-        switch (writer.opcode) {
-            case 0x00: return {true, lhs.value + rhs.value}; // s_add_u32
-            case 0x01: return {true, lhs.value - rhs.value}; // s_sub_u32
-            case 0x02: return {true, lhs.value + rhs.value}; // s_add_i32
-            case 0x03: return {true, lhs.value - rhs.value}; // s_sub_i32
-            case 0x0e: return {true, lhs.value & rhs.value}; // s_and_b32
-            case 0x10: return {true, lhs.value | rhs.value}; // s_or_b32
-            case 0x12: return {true, lhs.value ^ rhs.value}; // s_xor_b32
-            // Shifts take the amount from S1[4:0] -- RDNA2 ISA -- so the `& 31` is required.
-            //
-            // It is deliberately UNTESTED, because on this host it is untestable: x86 `shl` already
-            // masks its count to 5 bits, so an unmasked `lhs.value << rhs.value` yields the SAME
-            // answer here (measured: naive `5u << 32` prints 5). The mask is therefore not fixing a
-            // wrong result on x86; it is removing undefined behaviour that a compiler is entitled to
-            // exploit, and that would diverge on a host whose shift does not wrap. Do not add a
-            // regression arm claiming to prove it -- such an arm passes with the mask removed, which
-            // makes it a control that cannot fail. The arms below cover only what is observable:
-            // that these opcodes fold at all.
-            //
-            // Opcodes verified against llvm-mc (gfx1030), not against this file's own tables: the
-            // decoder that produces the listing you would otherwise check them with is upstream of
-            // them, so it cannot check them. #2481 records a mnemonic error that survived three
-            // internally consistent anchors and inverted a frontier conclusion.
-            case 0x1e: return {true, lhs.value << (rhs.value & 31u)};  // s_lshl_b32
-            case 0x20: return {true, lhs.value >> (rhs.value & 31u)};  // s_lshr_b32
-            case 0x22: return {true, static_cast<uint32_t>(            // s_ashr_i32
-                std::bit_cast<int32_t>(lhs.value) >> (rhs.value & 31u))};
-            case 0x26: return {true, lhs.value * rhs.value}; // s_mul_i32
-            default: return {};
-        }
+        // Every other writer folds through its one IR definition (ir/ops/scalar_alu.hpp), the same
+        // function the emitter lowers it with, so the fold cannot prove a value the emitted program
+        // does not compute (#2514). An operation without a definition, or one that reads SCC, is
+        // not a shader constant.
+        const ir::ScalarOpDef* def = ir::find_scalar_op(writer.fmt, writer.opcode);
+        if (!def) return {};
+        return shader_constant_scalar_op(ins, block_first, i, writer, *def, depth + 1, false);
     }
     // No in-block writer means an entry/user SGPR or other runtime state. Never specialize it.
     return {};
@@ -551,30 +555,13 @@ inline ShaderConstantValue shader_constant_operand(
 inline bool shader_constant_compare(const std::vector<Rdna2Inst>& ins, size_t block_first,
                              size_t compare_index, bool& result) {
     const Rdna2Inst& compare = ins[compare_index];
-    if (compare.fmt != Rdna2Format::SOPC || compare.opcode > 0x0b) return false;
-    const ShaderConstantValue lhs = shader_constant_operand(
-        ins, block_first, compare_index, compare, compare.src[0], 0);
-    const ShaderConstantValue rhs = shader_constant_operand(
-        ins, block_first, compare_index, compare, compare.src[1], 0);
-    if (!lhs.known || !rhs.known) return false;
-    const int32_t signed_lhs = std::bit_cast<int32_t>(lhs.value);
-    const int32_t signed_rhs = std::bit_cast<int32_t>(rhs.value);
-
-    switch (compare.opcode) {
-        case 0x00: result = signed_lhs == signed_rhs; break;
-        case 0x01: result = signed_lhs != signed_rhs; break;
-        case 0x02: result = signed_lhs >  signed_rhs; break;
-        case 0x03: result = signed_lhs >= signed_rhs; break;
-        case 0x04: result = signed_lhs <  signed_rhs; break;
-        case 0x05: result = signed_lhs <= signed_rhs; break;
-        case 0x06: result = lhs.value == rhs.value; break;
-        case 0x07: result = lhs.value != rhs.value; break;
-        case 0x08: result = lhs.value >  rhs.value; break;
-        case 0x09: result = lhs.value >= rhs.value; break;
-        case 0x0a: result = lhs.value <  rhs.value; break;
-        case 0x0b: result = lhs.value <= rhs.value; break;
-        default: return false;
-    }
+    if (compare.fmt != Rdna2Format::SOPC) return false;
+    const ir::ScalarOpDef* def = ir::find_scalar_op(compare.fmt, compare.opcode);
+    if (!def) return false;
+    const ShaderConstantValue scc = shader_constant_scalar_op(
+        ins, block_first, compare_index, compare, *def, 0, true);
+    if (!scc.known) return false;
+    result = scc.value != 0;
     return true;
 }
 
