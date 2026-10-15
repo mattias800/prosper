@@ -183,6 +183,77 @@ struct Interpreter {
   // follows the SPIR-V 1.6 / GLSL.std.450 definition; an undefined shift or bitfield range fails.
   // SPIR-V 1.6 OpFAdd/FSub/FMul, GLSL.std.450 NMin/NMax: scalar binary32 only.
   // Undefined inputs and unspecified NaN/zero-sign choices fail instead of inventing a word.
+  // GLSL.std.450 unary math and core OpFDiv (136), nominal binary32 host reference.
+  // See registry.khronos.org/SPIR-V/specs/unified1/GLSL.std.450.html. Approximation bits
+  // and implicit device FP modes are not established by this interpreter.
+  bool unary_float_alu_op(Lane& l, uint32_t op, const std::vector<uint32_t>& a) {
+      const bool divide = op == 136;
+      if (!divide && (op != 12 || a.size() != 5 || !glsl || a[2] != glsl)) return false;
+      if (!divide) switch (a[3]) {
+              case 2:
+              case 3:
+              case 8:
+              case 9:
+              case 10:
+              case 13:
+              case 14:
+              case 29:
+              case 30:
+              case 31:
+              case 32: break;
+              default: return false;
+          }
+      if ((divide && a.size() != 4) || ty(a[0]).op != 22 || ty(a[0]).a != std::vector<uint32_t>{32})
+          fail("unsupported unary float type");
+      const auto input = value(l, a[divide ? 2 : 4]);
+      if (input.type != a[0] || !input.defined || input.words.size() != 1)
+          fail("undefined unary float input");
+      const float x = std::bit_cast<float>(input.words[0]);
+      float result;
+      if (!std::isfinite(x)) fail("unsupported nonfinite unary float input");
+      if (divide) {
+          const auto divisor = value(l, a[3]);
+          if (divisor.type != a[0] || !divisor.defined || divisor.words.size() != 1)
+              fail("undefined float divisor");
+          const float y = std::bit_cast<float>(divisor.words[0]);
+          if (!std::isfinite(y) || y == 0.0f) fail("undefined float division domain");
+          result = x / y;
+      } else
+          switch (a[3]) {
+              case 2: {
+                  double whole;
+                  const double frac = std::modf(double(x), &whole);
+                  result = std::trunc(x);
+                  if (std::fabs(frac) > 0.5 ||
+                      (std::fabs(frac) == 0.5 && std::fmod(std::fabs(whole), 2.0) != 0.0))
+                      result += std::copysign(1.0f, x);
+                  break;
+              }
+              case 3: result = std::trunc(x); break;
+              case 8: result = std::floor(x); break;
+              case 9: result = std::ceil(x); break;
+              case 10: result = x - std::floor(x); break;
+              case 13: result = std::sin(x); break;
+              case 14: result = std::cos(x); break;
+              case 29: result = std::exp2(x); break;
+              case 30:
+                  if (x <= 0.0f) fail("undefined log2 domain");
+                  result = std::log2(x);
+                  break;
+              case 31:
+                  if (x < 0.0f) fail("undefined sqrt domain");
+                  result = std::sqrt(x);
+                  break;
+              case 32:
+                  if (x <= 0.0f) fail("undefined inverse sqrt domain");
+                  result = 1.0f / std::sqrt(x);
+                  break;
+              default: fail("missing unary float instruction");
+          }
+      if (!std::isfinite(result)) fail("unsupported nonfinite unary float result");
+      set(l, a[1], a[0], {std::bit_cast<uint32_t>(result)});
+      return true;
+  }
   bool float_alu_op(Lane& l, uint32_t op, const std::vector<uint32_t>& a) {
       const bool arithmetic = op == 129 || op == 131 || op == 133;
       const bool minmax =
@@ -522,7 +593,9 @@ struct Interpreter {
           continue;
       }
       ++l.pc;
-      if (half_alu_op(l, op, a) || float_alu_op(l, op, a) || scalar_alu_op(l, op, a)) continue;
+      if (unary_float_alu_op(l, op, a) || half_alu_op(l, op, a) || float_alu_op(l, op, a) ||
+          scalar_alu_op(l, op, a))
+          continue;
       if (op == 248) {
         l.label = a.at(0);
         std::vector<std::pair<uint32_t, Value>> phis;

@@ -76,6 +76,18 @@ enum class Opcode : uint8_t {
     F32Clamp01,
     PackHalfLo,
     FfbhU32, // leading zero count; all ones for a zero word
+    F32Fract,
+    F32Trunc,
+    F32Ceil,
+    F32RoundEven,
+    F32Floor,
+    F32Exp2,
+    F32Log2,
+    F32Rcp,
+    F32InverseSqrt,
+    F32Sqrt,
+    F32Sin,
+    F32Cos,
 };
 
 struct OpcodeInfo {

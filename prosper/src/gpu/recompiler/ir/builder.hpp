@@ -49,6 +49,20 @@ public:
     Value f32mul(Value a, Value b) { return u32(Opcode::F32Mul, a, b); }
     Value f32nmin(Value a, Value b) { return u32(Opcode::F32NMin, a, b); }
     Value f32nmax(Value a, Value b) { return u32(Opcode::F32NMax, a, b); }
+    Value f32fract(Value a) { return block_.append({Opcode::F32Fract, Type::U32, 0, {a}}); }
+    Value f32trunc(Value a) { return block_.append({Opcode::F32Trunc, Type::U32, 0, {a}}); }
+    Value f32ceil(Value a) { return block_.append({Opcode::F32Ceil, Type::U32, 0, {a}}); }
+    Value f32roundeven(Value a) { return block_.append({Opcode::F32RoundEven, Type::U32, 0, {a}}); }
+    Value f32floor(Value a) { return block_.append({Opcode::F32Floor, Type::U32, 0, {a}}); }
+    Value f32exp2(Value a) { return block_.append({Opcode::F32Exp2, Type::U32, 0, {a}}); }
+    Value f32log2(Value a) { return block_.append({Opcode::F32Log2, Type::U32, 0, {a}}); }
+    Value f32rcp(Value a) { return block_.append({Opcode::F32Rcp, Type::U32, 0, {a}}); }
+    Value f32inversesqrt(Value a) {
+        return block_.append({Opcode::F32InverseSqrt, Type::U32, 0, {a}});
+    }
+    Value f32sqrt(Value a) { return block_.append({Opcode::F32Sqrt, Type::U32, 0, {a}}); }
+    Value f32sin(Value a) { return block_.append({Opcode::F32Sin, Type::U32, 0, {a}}); }
+    Value f32cos(Value a) { return block_.append({Opcode::F32Cos, Type::U32, 0, {a}}); }
     Value bfe_u(Value base, Value offset, Value count) {
         return block_.append({Opcode::BfeU, Type::U32, 0, {base, offset, count}});
     }

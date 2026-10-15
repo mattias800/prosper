@@ -25,6 +25,18 @@ uint32_t emit_one(SpirvCompute& b, const Inst& inst, const uint32_t* x) {
         case Opcode::F32NMin: return b.fext2(Glsl_NMin, x[0], x[1]);
         case Opcode::F32NMax: return b.fext2(Glsl_NMax, x[0], x[1]);
         case Opcode::FfbhU32: return b.ffbh_u32(x[0]);
+        case Opcode::F32Fract: return b.fext1(Glsl_Fract, x[0]);
+        case Opcode::F32Trunc: return b.fext1(Glsl_Trunc, x[0]);
+        case Opcode::F32Ceil: return b.fext1(Glsl_Ceil, x[0]);
+        case Opcode::F32RoundEven: return b.fext1(Glsl_RoundEven, x[0]);
+        case Opcode::F32Floor: return b.fext1(Glsl_Floor, x[0]);
+        case Opcode::F32Exp2: return b.fext1(Glsl_Exp2, x[0]);
+        case Opcode::F32Log2: return b.fext1(Glsl_Log2, x[0]);
+        case Opcode::F32Rcp: return b.frcp(x[0]);
+        case Opcode::F32InverseSqrt: return b.fext1(Glsl_InverseSqrt, x[0]);
+        case Opcode::F32Sqrt: return b.fext1(Glsl_Sqrt, x[0]);
+        case Opcode::F32Sin: return b.fext1(Glsl_Sin, x[0]);
+        case Opcode::F32Cos: return b.fext1(Glsl_Cos, x[0]);
         case Opcode::IAdd: return b.ibin(Op_IAdd, x[0], x[1]);
         case Opcode::ISub: return b.ibin(Op_ISub, x[0], x[1]);
         case Opcode::IMul: return b.ibin(Op_IMul, x[0], x[1]);

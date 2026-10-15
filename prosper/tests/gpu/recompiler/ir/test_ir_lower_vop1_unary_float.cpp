@@ -5,7 +5,6 @@
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <gtest/gtest.h>
-#include <cstdint>
 using namespace prosper::gpu;
 using namespace prosper::test::ir;
 TEST(IrLowerVop1UnaryFloat, FractEmitsTheExistingBitcastsAndExtendedInstruction) {
