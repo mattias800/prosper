@@ -1,6 +1,7 @@
 // scalar_alu.cpp — definitions of the SOP1, SOP2 and SOPK scalar data operations.
 //
-// Semantics from AMD "RDNA 2" ISA (doc 70648) 12.1-12.3. Each definition appends its instructions in
+// Semantics from AMD "RDNA 2" ISA (doc 70648) 12.1-12.3; opcode numbers from the instruction-effects
+// table, which was cross-checked against llvm-mc. Each definition appends its instructions in
 // the order the pre-IR emitter called SpirvCompute, and with the same expression nesting, so the
 // emitted SPIR-V is byte-identical (HOW_TO_ADD_A_FAMILY.md, "byte-identical").
 #include "gpu/recompiler/ir/ops/scalar_alu.hpp"
@@ -35,7 +36,8 @@ Out sub_i32(Builder& ir, const In& x) {
     return {d, sign_bit_set(ir, o)};
 }
 
-// s_addc_u32: D = S0 + S1 + SCC, SCC = carry out of the 33-bit sum.
+// s_addc_u32: D = S0 + S1 + SCC, SCC = carry out of the 33-bit sum; the high half of a 64-bit add.
+// llvm-mc gfx1010: 0x82252580 is s_addc_u32 s37, 0, s37.
 Out addc_u32(Builder& ir, const In& x) {
     const Value carry_in = ir.select(x.scc, ir.c32(1), ir.c32(0));
     const Value sum = ir.iadd(x.s0, x.s1);
@@ -109,8 +111,10 @@ constexpr ScalarOpDef kDefs[] = {
     {F::SOP2, 0x03, O::Src0Src1, sub_i32},
     {F::SOP2, 0x04, O::Src0Src1, addc_u32},
     {F::SOP2, 0x05, O::Src0Src1, subb_u32},
-    // s_min/s_max: SCC = "S0 was selected", strict in both directions (ISA 12.1 ops 6-9, #879).
-    // SCC is appended before D, the old emitter's order.
+    // s_min/s_max: SCC = "S0 was selected", strict in both directions, so a tie gives SCC = 0
+    // (ISA 12.1 ops 6-9, re-derived from the PDF in #879 after #397 made max non-strict). llvm-mc
+    // gfx1010: 0x83000201 / 0x83800201 / 0x84000201 / 0x84800201. SCC is appended before D, the
+    // old emitter's order.
     {F::SOP2, 0x06, O::Src0Src1, [](Builder& ir, const In& x) -> Out {
          const Value scc = ir.slt(x.s0, x.s1);
          return {ir.smin(x.s0, x.s1), scc};
