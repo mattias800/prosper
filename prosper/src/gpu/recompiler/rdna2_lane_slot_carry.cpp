@@ -85,8 +85,9 @@ LaneSlotEdge LaneSlotEdge::of(const RegState& rs, uint32_t block) {
         rs.lds_addtid,      rs.lds_addtid_marks};
 }
 
-void join_lane_slots(SpirvCompute& b, RegState& rs, const LaneSlotEdge& first,
-                     const LaneSlotEdge& second, uint32_t branch_pc) {
+namespace {
+void join_addtid_slots(SpirvCompute& b, RegState& rs, const LaneSlotEdge& first,
+                       const LaneSlotEdge& second) {
     rs.lds_addtid.clear();
     rs.lds_addtid_marks.clear();
     // CONFIDENCE: HIGH -- a graphics ADDTID reload must select the value of its actual incoming
@@ -105,6 +106,21 @@ void join_lane_slots(SpirvCompute& b, RegState& rs, const LaneSlotEdge& first,
         union_source_marks(marks, cm->second);
         rs.lds_addtid_marks[key] = std::move(marks);
     }
+}
+
+// A loop header may use its seed proof before the back edge has been emitted. Refuse if the
+// back edge would weaken it: that would make a later iteration consume an unproved word.
+bool same_addtid_proof(const ScalarSourceMarks& a, const ScalarSourceMarks& c) {
+    return a.placeholder == c.placeholder && a.hard == c.hard &&
+           a.blanket_roots == c.blanket_roots && a.outside_exec == c.outside_exec &&
+           a.scoped_complete_word == c.scoped_complete_word &&
+           a.scoped_blanket_roots == c.scoped_blanket_roots && a.arbitrary == c.arbitrary;
+}
+}   // namespace
+
+void join_lane_slots(SpirvCompute& b, RegState& rs, const LaneSlotEdge& first,
+                     const LaneSlotEdge& second, uint32_t branch_pc) {
+    join_addtid_slots(b, rs, first, second);
     std::map<int, std::set<int>> lanes;   // ordered: deterministic phi emission
     for (const LaneSlotEdge* edge : {&first, &second})
         for (const auto* slots : {&edge->data, &edge->mask})
@@ -172,6 +188,24 @@ void LaneSlotLoopCarry::open(SpirvCompute& b, RegState& rs, const std::vector<Rd
                              uint32_t header_pc, uint32_t backedge_pc, uint32_t preheader) {
     header_pc_ = header_pc;
     slots_.clear();
+    addtid_slots_.clear();
+    // CONFIDENCE: HIGH -- existing graphics spills are loop-carried SSA state, including on a
+    // zero-trip exit. Ordered keys keep phi emission deterministic. A slot first written in the
+    // body has no seed and cannot become available on the zero-trip edge.
+    std::set<uint64_t> addtid_keys;
+    for (const auto& [key, value] : rs.lds_addtid) addtid_keys.insert(key);
+    for (uint64_t key : addtid_keys) {
+        const auto marks = rs.lds_addtid_marks.find(key);
+        if (marks == rs.lds_addtid_marks.end() || !rs.lds_addtid.at(key)) {
+            rs.lds_addtid.erase(key);
+            rs.lds_addtid_marks.erase(key);
+            continue;
+        }
+        size_t patch = 0;
+        const auto phi = b.emit_phi2(b.t_u32, rs.lds_addtid.at(key), preheader, patch);
+        addtid_slots_.push_back({key, phi, patch, marks->second, {}});
+        rs.lds_addtid[key] = phi;
+    }
     std::map<std::pair<int, int>, bool> statically_mask;
     read_in_loop_.clear();
     for (const auto& in : ins) {
@@ -201,6 +235,8 @@ void LaneSlotLoopCarry::open(SpirvCompute& b, RegState& rs, const std::vector<Rd
 }
 
 void LaneSlotLoopCarry::record_check(const RegState& rs) {
+    addtid_check_.addtid = rs.lds_addtid;
+    addtid_check_.addtid_marks = rs.lds_addtid_marks;
     for (Slot& slot : slots_) {
         const uint32_t* value = find_slot(slot.mask ? rs.vgpr_lane_mask_slots : rs.vgpr_lane_slots,
                                           slot.vgpr, slot.lane);
@@ -211,6 +247,22 @@ void LaneSlotLoopCarry::record_check(const RegState& rs) {
 }
 
 bool LaneSlotLoopCarry::patch_backedge(SpirvCompute& b, const RegState& rs, uint32_t cont) {
+    for (auto& slot : addtid_slots_) {
+        const auto value = rs.lds_addtid.find(slot.key);
+        const auto marks = rs.lds_addtid_marks.find(slot.key);
+        auto meet = slot.seed_marks;
+        if (marks != rs.lds_addtid_marks.end()) union_source_marks(meet, marks->second);
+        if (value == rs.lds_addtid.end() || !value->second || marks == rs.lds_addtid_marks.end() ||
+            !same_addtid_proof(meet, slot.seed_marks)) {
+            log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
+                                     "ADDTID loop back edge loses its header source proof "
+                                     "(header pc=%u)",
+                                     header_pc_);
+            return false;
+        }
+        b.patch_phi(slot.patch, value->second, cont);
+        slot.backedge_marks = marks->second;
+    }
     for (Slot& slot : slots_) {
         const uint32_t* same = find_slot(slot.mask ? rs.vgpr_lane_mask_slots : rs.vgpr_lane_slots,
                                          slot.vgpr, slot.lane);
@@ -258,6 +310,23 @@ void LaneSlotLoopCarry::refine_exit_marks(RegState& rs) const {
 
 bool LaneSlotLoopCarry::finish_exit(SpirvCompute& b, RegState& rs, bool body_edge,
                                     uint32_t check_end, uint32_t body_end) const {
+    LaneSlotEdge check = addtid_check_;
+    for (const auto& slot : addtid_slots_) {
+        const auto value = check.addtid.find(slot.key);
+        if (value != check.addtid.end() && value->second == slot.phi)
+            union_source_marks(check.addtid_marks.at(slot.key), slot.backedge_marks);
+    }
+    if (body_edge) {
+        LaneSlotEdge body;
+        body.block = body_end;
+        body.addtid = rs.lds_addtid;
+        body.addtid_marks = rs.lds_addtid_marks;
+        check.block = check_end;
+        join_addtid_slots(b, rs, check, body);
+    } else {
+        rs.lds_addtid = std::move(check.addtid);
+        rs.lds_addtid_marks = std::move(check.addtid_marks);
+    }
     struct Exit {
         const Slot* slot;
         uint32_t value;

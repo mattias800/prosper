@@ -639,3 +639,28 @@ TEST(UnloadedLaunchVgpr, PublicFragmentAddtidReloadMeetsBothBranchPredecessors) 
     accepted(compile_fragment(program(mov6_3), 8, &kBaryPosX));
     refused(compile_fragment(program(mov6_v1), 8, &kBaryPosX));
 }
+
+// The scalar loop is top-tested and takes zero trips. Its body must not replace the pre-loop
+// spill's proof. Nesting a second loop selects the general structured route as well as counted.
+TEST(UnloadedLaunchVgpr, PublicFragmentAddtidReloadMeetsZeroTripLoopPredecessor) {
+    constexpr uint32_t m0_zero = 0xb07c0000u;
+    const Words spill_v6{0xdac00000u, 0x00000600u};
+    const Words reload_v8{0xdac40000u, 0x08000000u};
+    const auto loop = [&](uint32_t counter, const Words& body) {
+        const auto n = static_cast<uint32_t>(body.size());
+        return cat({{0xbe800380u | (counter << 16), 0xbf0a8000u | counter, 0xbf840000u | (n + 2)},
+                    body,
+                    {0x80008100u | (counter << 16) | counter,
+                     0xbf820000u | ((0x10000u - n - 4) & 0xffffu)}});
+    };
+    for (bool nested : {false, true}) {
+        auto body = cat({{mov6_3}, spill_v6});
+        if (nested) body = loop(21, body);
+        const auto program = [&](uint32_t initial) {
+            return cat(
+                {{mov8_v1, m0_zero, initial}, spill_v6, loop(20, body), {cmpx_x4_v2}, reload_v8});
+        };
+        accepted(compile_fragment(program(mov6_3), 8, &kBaryPosX));
+        refused(compile_fragment(program(mov6_v1), 8, &kBaryPosX));
+    }
+}
