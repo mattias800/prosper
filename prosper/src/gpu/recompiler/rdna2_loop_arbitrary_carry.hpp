@@ -53,10 +53,12 @@ bool loop_may_hold_weakly(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32
 // returns the VGPRs that condition reads, whose headers keep no arbitrary property, and marks the
 // condition strict (SpirvCompute::strict_loop_condition), where a fresh predicate may not rest
 // on an arbitrary lane. Otherwise it returns nothing. A weak hold acts at the back edge, after the
-// condition, and is unaffected. A live-out wave scalar is routed by what the loop is
-// (refuse_wave_scalar_loop, #5201), so this gate is no longer what routes it. The gate stays because
-// it also refuses the arbitrary variant of a loop that widens EXEC in its body, which the
-// structured route miscompiles; the defined-data variant is #5206. Delete the gate with that rule.
+// condition, and is unaffected. A live-out wave scalar and a body that can re-enable a departed
+// lane are routed by what the loop is (refuse_per_invocation_loop, #5201 / #5206), so this gate
+// is no longer what routes them. The gate stays because it also refuses the arbitrary variant of
+// a loop that observes a departed lane through a cross-lane read or a mask reduction, which the
+// structured route cannot reproduce. The defined-data variant is #5211. Delete the gate together
+// with that rule.
 std::set<int> retry_gate(SpirvCompute& b, const std::vector<Rdna2Inst>& ins, const DivLoop& loop,
                          const LoopExecSubset& proof);
 

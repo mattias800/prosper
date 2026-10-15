@@ -491,9 +491,12 @@ ComputeShaderConfig loop_config(unsigned mode, uint32_t path) {
     if (mode == 1) c.user_sgprs.clear();   // no launch s0 before the sole body producer
     return c;
 }
-// s0 is live after the loop, so the structured route refuses the loop itself (#5201) and the
-// exact attempt is the one that must refuse the fabricated data.
-void live_scalar_loop_refuses(const std::vector<uint32_t>& p, unsigned mode) {
+// The structured route refuses these loops themselves -- s0 is live after the loop (#5201), or
+// the body re-enables every lane (#5206) -- and the exact attempt is the one that must refuse
+// the fabricated data.
+void routed_loop_refuses(const std::vector<uint32_t>& p, unsigned mode,
+                         const char* structured = "wave-scalar-loop-live-out",
+                         const char* exact_reason = "fabricated-fresh-mask-source") {
     const auto resources = table();
     for (uint32_t path : {0u, 1u}) {
         for (bool exact : {false, true}) {
@@ -503,14 +506,13 @@ void live_scalar_loop_refuses(const std::vector<uint32_t>& p, unsigned mode) {
             EXPECT_TRUE(recompile_compute(p.data(), p.size(), &resources, c).empty());
             std::string reason;
             for (const auto& [tag, payload] : capture.take()) reason += tag + payload;
-            EXPECT_NE(reason.find(exact ? "fabricated-fresh-mask-source" : "wave-scalar-loop-live-out"),
-                      std::string::npos)
+            EXPECT_NE(reason.find(exact ? exact_reason : structured), std::string::npos)
                 << "exact " << exact << ": " << reason;
         }
     }
 }
 void loop_refuses(unsigned mode) {
-    live_scalar_loop_refuses(numeric_direct_break_loop(mode), mode);
+    routed_loop_refuses(numeric_direct_break_loop(mode), mode);
 }
 void loop_values(unsigned mode, uint32_t expected) {
     const auto p = numeric_direct_break_loop(mode);
@@ -928,7 +930,7 @@ void delayed_body_root_values(unsigned variant, uint32_t expected) {
 }
 }   // namespace
 TEST(NativeCfgSavedMaskData, DelayedBodyRootCannotBorrowAValidCheckRootAtLoopExit) {
-    live_scalar_loop_refuses(delayed_body_root_loop(0), 6);
+    routed_loop_refuses(delayed_body_root_loop(0), 6);
 }
 TEST(NativeCfgSavedMaskData, GenuineDelayedBodyRootKeepsTheActualZeroValue) {
     delayed_body_root_values(1, 0);
@@ -964,8 +966,9 @@ void delayed_vector_body_root_values(unsigned variant, uint32_t expected) {
         const auto c = loop_config(6, path);
         const auto module = recompile_compute(p.data(), p.size(), &resources, c);
         ASSERT_FALSE(module.empty());
-        ASSERT_TRUE(has_op(module, 246)) << "must exercise the structured loop join";
-        ASSERT_FALSE(has_op(module, 251)) << "dispatcher must not hide the exit join";
+        // The check sets EXEC to -1 every iteration, which re-enables any lane that left at the
+        // direct break: the loop takes the exact route (#5206). Its values are the same contract.
+        ASSERT_TRUE(has_op(module, 251)) << "a widening loop takes the exact route";
         bpermute_oracle::Interpreter vm(module);
         vm.native_subgroup_width = 64;
         vm.push_constants = c.user_sgprs;
@@ -978,20 +981,17 @@ void delayed_vector_body_root_values(unsigned variant, uint32_t expected) {
 }
 }   // namespace
 TEST(NativeCfgSavedMaskData, DelayedVectorBodyRootCannotBorrowACleanCheckWordAtLoopExit) {
-    const auto p = delayed_vector_body_root_loop(0);
-    const auto resources = table();
-    for (uint32_t path : {0u, 1u}) {
-        TerminalRejectCapture capture;
-        EXPECT_TRUE(
-            recompile_compute(p.data(), p.size(), &resources, loop_config(6, path)).empty());
-        std::string reason;
-        for (const auto& [tag, payload] : capture.take()) reason += tag + payload;
-        EXPECT_NE(reason.find("fabricated-fresh-mask-sourcepc=23"), std::string::npos) << reason;
-    }
+    routed_loop_refuses(delayed_vector_body_root_loop(0), 6, "exec-loop-widens",
+                        "fabricated-fresh-mask-sourcepc=23");
 }
 TEST(NativeCfgSavedMaskData, GenuineDelayedVectorBodyRootKeepsTheActualZeroValue) {
     delayed_vector_body_root_values(1, 0);
 }
 TEST(NativeCfgSavedMaskData, FullCurrentVectorReplacementEndsTheDelayedInvalidBodyRoot) {
-    delayed_vector_body_root_values(2, 7);
+    // CONFIDENCE: HIGH (coverage cost, #5206) -- this loop's exits are wave-uniform, so its
+    // structured module was exact, but the widening proof is code-only and cannot see uniformity.
+    // The exact route's data proof does not yet see the full v6 replacement after the restore,
+    // so the program is refused on both routes. Before #5206 it compiled with value 7.
+    routed_loop_refuses(delayed_vector_body_root_loop(2), 6, "exec-loop-widens",
+                        "fabricated-fresh-mask-sourcepc=24");
 }
