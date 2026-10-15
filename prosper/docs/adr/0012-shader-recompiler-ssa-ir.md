@@ -29,6 +29,20 @@ with each guest instruction lowered by a small function. Structural references o
 3. Each lowering is a function small enough to test alone, so `emit_alu` shrinks to a dispatch table.
 4. Depends on ADR 0006: the recompiler must be a pure function first, so before/after comparison is
    a property of the input, not of the process environment.
+5. **Small files and small functions are an acceptance criterion of every family, not later cleanup**
+   (owner, 2026-10-15). Today `rdna2_emit_alu.cpp` is about 9,400 lines and `rdna2_emit_cfg.cpp`
+   about 7,400. Files that size cannot be tested in pieces, and every edit recompiles one huge
+   translation unit, which costs build and CI time. So:
+   - New code lives under `gpu/recompiler/ir/`, split by role (IR core, lowering, passes, SPIR-V
+     emission), with one file per instruction family or sub-family.
+   - A file aims at 500 lines or fewer and must not pass 1,000. A function aims at 80 lines or fewer.
+     The first family's PR adds a directory-scoped ratchet rule for the 1,000-line cap, so CI holds
+     the line.
+   - Each lowering has its own focused test file.
+   - Each family PR deletes the cases it migrated from the old emitter, quotes the old files' line
+     counts before and after, and lowers their ratchet rows with `--update`.
+   - A mechanical split of an existing large file, done with `tools/refactor/`, is welcome along the
+     way, in its own commit and kept apart from behaviour changes.
 
 Adds spec rule `GPU-3`.
 
