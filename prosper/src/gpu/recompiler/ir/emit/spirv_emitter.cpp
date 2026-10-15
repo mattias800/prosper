@@ -24,6 +24,7 @@ uint32_t emit_one(SpirvCompute& b, const Inst& inst, const uint32_t* x) {
         case Opcode::F32Mul: return b.fbin(Op_FMul, x[0], x[1]);
         case Opcode::F32NMin: return b.fext2(Glsl_NMin, x[0], x[1]);
         case Opcode::F32NMax: return b.fext2(Glsl_NMax, x[0], x[1]);
+        case Opcode::FfbhU32: return b.ffbh_u32(x[0]);
         case Opcode::IAdd: return b.ibin(Op_IAdd, x[0], x[1]);
         case Opcode::ISub: return b.ibin(Op_ISub, x[0], x[1]);
         case Opcode::IMul: return b.ibin(Op_IMul, x[0], x[1]);
