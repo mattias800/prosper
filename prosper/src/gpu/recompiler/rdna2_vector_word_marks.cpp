@@ -59,10 +59,11 @@ bool complete_full_word_write(const Rdna2Inst& in) {
 // True for the ordinary memory reads, beyond the buffer loads complete_full_word_write already
 // names, whose admitted lowering writes every result dword in each EXEC lane from that lane's own
 // address and predicates only inactive lanes back to the old word (rdna2_emit_alu.cpp): the plain
-// LDS reads, and the typed buffer loads that share the untyped format-load path. Their address
-// inputs are the source marks, as for a buffer load. GDS, swizzle, bpermute, append/consume, the
-// M0/TID-addressed forms, D16 packing and TFE status writes are excluded: their result depends on
-// other lanes, on state these marks do not describe, or keeps part of the old word.
+// LDS reads, the typed buffer loads that share the untyped format-load path, and
+// ds_read_addtid_b32. Their address inputs are the source marks, as for a buffer load; ADDTID's
+// only address input is M0, which vector_source_marks checks (#5183). GDS, swizzle, bpermute,
+// append/consume, ds_write_addtid, D16 packing and TFE status writes are excluded: their result
+// depends on other lanes, on state these marks do not describe, or keeps part of the old word.
 bool memory_read_completes_active_word(const Rdna2Inst& in) {
     if (in.fmt == Rdna2Format::MTBUF) return in.opcode <= 0x03 && !in.mtbuf_tfe;
     if (in.fmt != Rdna2Format::DS || in.ds_gds) return false;
@@ -73,7 +74,14 @@ bool memory_read_completes_active_word(const Rdna2Inst& in) {
         case 0x76:   // ds_read_b64
         case 0x77:   // ds_read2_b64
         case 0xfe:   // ds_read_b96
-        case 0xff: return true;   // ds_read_b128
+        case 0xff:   // ds_read_b128
+        // CONFIDENCE: HIGH -- ds_read_addtid_b32 (RDNA2 ISA 70648 DS, 0xB1) reads one dword per
+        // EXEC lane at LDS_BASE + offset + M0[15:0] + TID*4: the lane's own id, no VGPR address
+        // and no other lane's data. It has no D16, TFE or multi-dword form. The compute lowering
+        // loads that address per active lane; the graphics spill model returns the slot the
+        // matching ds_write_addtid stored under the same M0 value. Both predicate inactive lanes
+        // back to the old word (rdna2_emit_alu.cpp). Kena cs 0x5008e80000 pc1248/pc1260 (#5183).
+        case 0xb1: return true;
         default: return false;
     }
 }
@@ -370,6 +378,19 @@ ScalarSourceMarks vector_source_marks(const RegState& rs, const Rdna2Inst& in) {
                     marks.blanket_roots.insert(rs.scc_loop_blanket.begin(),
                                                rs.scc_loop_blanket.end());
                 }
+            }
+        }
+        if (in.fmt == Rdna2Format::DS && in.opcode == 0xb1 && !in.ds_gds) {
+            // CONFIDENCE: HIGH -- M0 is ADDTID's whole address input. A missing, fabricated or
+            // saved-mask M0 cannot address genuine data (the emitter refuses only a missing
+            // one); a loop-assumption M0 adds its roots, as an SOFFSET word does above (#5183).
+            if (!rs.sreg.contains(124) || rs.unavailable_saved_mask_words.contains(124)) {
+                missing_address();
+            } else if (sreg_word_blanket_only(rs, 124)) {
+                const auto& roots = rs.sreg_loop_blanket.at(124);
+                if (!marks.hard) marks.blanket_roots.insert(roots.begin(), roots.end());
+            } else if (sreg_word_may_be_fabricated(rs, 124)) {
+                missing_address();
             }
         }
         if (in.fmt != Rdna2Format::DS) return marks;
