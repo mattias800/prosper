@@ -11,6 +11,7 @@
 
 #include "gpu/recompiler/ir/lower/lowering_context.hpp"
 #include "gpu/recompiler/ir/lower/vector_alu_lowering.hpp"
+#include "gpu/recompiler/ir/ops/vector_alu.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_dpp_row_shr.hpp"
 #include "gpu/recompiler/rdna2_dpp_row_ror8.hpp"

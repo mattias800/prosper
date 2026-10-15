@@ -3595,7 +3595,8 @@ if(TARGET prosper_core)
   # test_ir_scalar_alu_execution runs each scalar-op definition's SPIR-V in the integer interpreter
   # against its own constant evaluation (#2514).
   foreach(ir_test ir_core ir_scalar_alu_execution ir_scalar_fold
-                  ir_lower_sop1 ir_lower_sop2 ir_lower_sopc ir_lower_sopk)
+                  ir_lower_sop1 ir_lower_sop2 ir_lower_sopc ir_lower_sopk
+                  ir_vector_alu_execution ir_lower_vop2)
     prosper_add_gtest(test_${ir_test}
       SOURCES tests/gpu/recompiler/ir/test_${ir_test}.cpp
       INCLUDES tests

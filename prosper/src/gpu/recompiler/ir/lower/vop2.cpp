@@ -37,6 +37,11 @@ bool Vop2Lowering::lower() {
 
 // The operation itself, on the already-transformed sources.
 std::optional<bool> Vop2Lowering::compute(uint32_t& d) {
+    // The integer and bitwise group goes through its IR definition (ir/ops/vector_alu.cpp).
+    if (const VectorOpDef* def = find_vector_op(in.fmt, in.opcode)) {
+        d = emit_vector_op(b, *def, a, c);
+        return std::nullopt;
+    }
     switch (in.opcode) {
         case 0x01: {                                         // v_cndmask_b32: dst = vcc ? src1 : src0
             if (!vcc) { ok = false; return true; }
@@ -61,14 +66,6 @@ std::optional<bool> Vop2Lowering::compute(uint32_t& d) {
         case 0x08:                                          // v_mul_f32
             b.observe_fragment_arithmetic_site(in.pc, FragmentArithmeticFamily::Mul);
             d = b.fbin(Op_FMul, a, c); break;
-        case 0x0B: {                                        // v_mul_u32_u24
-            // Only the low 24 bits of each source participate; the result is the low
-            // 32 bits of the unsigned product (AMD RDNA2 ISA 11.6).
-            const uint32_t mask = b.uconst(0x00FFFFFFu);
-            d = b.ibin(Op_IMul, b.ibin(Op_BitwiseAnd, a, mask),
-                                  b.ibin(Op_BitwiseAnd, c, mask));
-            break;
-        }
         // v_min/v_max: hardware returns the OTHER operand when exactly one input is NaN
         // (ISA 12.7 ops 15/16: "if (S0 == NaN) D = S1; ..."), which is GLSL NMin/NMax.
         // Plain FMin/FMax are NaN-UNDEFINED — llvmpipe propagates a second-operand NaN, so
@@ -76,23 +73,6 @@ std::optional<bool> Vop2Lowering::compute(uint32_t& d) {
         // yields the bound.
         case 0x0F: d = b.fext2(Glsl_NMin, a, c); break;       // v_min_f32
         case 0x10: d = b.fext2(Glsl_NMax, a, c); break;       // v_max_f32
-        case 0x11: d = b.sext2(Glsl_SMin, a, c); break;       // v_min_i32
-        case 0x12: d = b.sext2(Glsl_SMax, a, c); break;       // v_max_i32
-        case 0x13: d = b.uext2(Glsl_UMin, a, c); break;       // v_min_u32
-        case 0x14: d = b.uext2(Glsl_UMax, a, c); break;       // v_max_u32
-        case 0x16: { uint32_t sh = b.ibin(Op_BitwiseAnd, a, b.uconst(31));   // v_lshrrev_b32
-                     d = b.ibin(Op_ShiftRightLogical, c, sh); break; }       // dst = src1 >> (src0 & 31)
-        case 0x18: { uint32_t sh = b.ibin(Op_BitwiseAnd, a, b.uconst(31));   // v_ashrrev_i32
-                     d = b.sbin(Op_ShiftRightArithmetic, c, sh); break; }    // dst = src1 >>a (src0 & 31)
-        case 0x1A: { uint32_t sh = b.ibin(Op_BitwiseAnd, a, b.uconst(31));   // v_lshlrev_b32
-                     d = b.ibin(Op_ShiftLeftLogical, c, sh); break; }        // dst = src1 << (src0 & 31)
-        case 0x1B: d = b.ibin(Op_BitwiseAnd, a, c); break;    // v_and_b32
-        case 0x1C: d = b.ibin(Op_BitwiseOr,  a, c); break;    // v_or_b32
-        case 0x1D: d = b.ibin(Op_BitwiseXor, a, c); break;    // v_xor_b32
-        case 0x1E: d = b.iun(Op_Not, b.ibin(Op_BitwiseXor, a, c)); break; // v_xnor_b32
-        case 0x25: d = b.ibin(Op_IAdd, a, c); break;          // v_add_nc_u32
-        case 0x26: d = b.ibin(Op_ISub, a, c); break;          // v_sub_nc_u32
-        case 0x27: d = b.ibin(Op_ISub, c, a); break;          // v_subrev_nc_u32 (reverse: src1 - src0)
         // Carry ops (VOP2 e32 form): carry-in + carry-out are VCC. v_add_co_ci(0x28)/
         // v_sub_co_ci(0x29)/v_subrev_co_ci(0x2a). Mirrors the VOP3B 0x128/129/12A logic with VCC.
         case 0x28: case 0x29: case 0x2A: {
