@@ -511,3 +511,18 @@ TEST(LoopExecWidening, WithoutANativeEntryAWideningLoopIsRefused) {
     EXPECT_TRUE(r.module.empty());
     EXPECT_NE(r.reason.find("exec-loop-widens"), std::string::npos) << r.reason;
 }
+
+TEST(LoopExecWidening, APortableBarrierPhaseKeepsAnExactRouteForNestedExecRestores) {
+    // The outer body restores pre-loop EXEC after its inner loop exits. Its portable phase
+    // dispatcher can reproduce that widening; a late structured refusal must not hide the route.
+    const std::vector<uint32_t> words = {
+        0xbe82047eu, 0x7e040280u, 0x7e060280u, 0xbf880003u, 0x7e040281u, 0xbefe0480u,
+        0xbf82fffcu, 0xbefe0402u, 0x7e040287u, 0xbefe0480u, 0xbf89fff7u, 0xbefe0402u,
+        0xbf8a0000u, 0xbefe0402u, 0xbf880004u, 0xd8d80000u, 0x03000000u, 0xbefe0480u,
+        0xbf82fffbu, 0xbefe0402u, 0xbefe0402u, 0xbf880004u, 0xd8d80000u, 0x04000000u,
+        0xbefe0480u, 0xbf82fffbu, 0xbefe0402u, 0x7e040d02u, kEnd};
+    const auto module = recompile_valu(words.data(), words.size(), 1, 2);
+    ASSERT_FALSE(module.empty());
+    EXPECT_TRUE(has_op(module, 251u)) << "the phase uses the exact dispatcher";
+    EXPECT_TRUE(has_op(module, 224u)) << "the proved guest barrier separates phases";
+}
