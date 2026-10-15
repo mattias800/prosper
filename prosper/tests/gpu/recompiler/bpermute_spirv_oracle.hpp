@@ -9,6 +9,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -177,6 +178,33 @@ struct Interpreter {
   // Signed compares, arithmetic shift, signed extended multiply, GLSL SMin/SMax, BitFieldUExtract
   // and BitReverse: what the IR scalar-ALU definitions emit (test_ir_scalar_alu_execution). Each
   // follows the SPIR-V 1.6 / GLSL.std.450 definition; an undefined shift or bitfield range fails.
+  // SPIR-V 1.6 OpFAdd/FSub/FMul, GLSL.std.450 NMin/NMax: scalar binary32 only.
+  // Undefined inputs and unspecified NaN/zero-sign choices fail instead of inventing a word.
+  bool float_alu_op(Lane& l, uint32_t op, const std::vector<uint32_t>& a) {
+      const bool arithmetic = op == 129 || op == 131 || op == 133;
+      const bool minmax =
+          op == 12 && a.size() == 6 && glsl && a[2] == glsl && (a[3] == 79 || a[3] == 80);
+      if (!arithmetic && !minmax) return false;
+      if ((arithmetic && a.size() != 4) || ty(a[0]).op != 22 ||
+          ty(a[0]).a != std::vector<uint32_t>{32})
+          fail("unsupported float ALU type");
+      const auto x = value(l, a[arithmetic ? 2 : 4]);
+      const auto y = value(l, a[arithmetic ? 3 : 5]);
+      if (x.type != a[0] || y.type != a[0] || !x.defined || !y.defined || x.words.size() != 1 ||
+          y.words.size() != 1)
+          fail("undefined float ALU input");
+      const float f = std::bit_cast<float>(x.words[0]), g = std::bit_cast<float>(y.words[0]);
+      if (minmax && ((std::isnan(f) && std::isnan(g)) || (f == 0 && g == 0)))
+          fail("unspecified float ALU result");
+      const float result = op == 129    ? f + g
+                           : op == 131  ? f - g
+                           : op == 133  ? f * g
+                           : a[3] == 79 ? std::fmin(f, g)
+                                        : std::fmax(f, g);
+      if (std::isnan(result)) fail("unspecified float ALU NaN payload");
+      set(l, a[1], a[0], {std::bit_cast<uint32_t>(result)});
+      return true;
+  }
   bool scalar_alu_op(Lane &l, uint32_t op, const std::vector<uint32_t> &a) {
     const auto i32 = [](uint32_t v) { return std::bit_cast<int32_t>(v); };
     // OpSLessThan (177) keeps its own arm below, which propagates an undefined operand.
@@ -429,7 +457,7 @@ struct Interpreter {
           continue;
       }
       ++l.pc;
-      if (scalar_alu_op(l, op, a)) continue;
+      if (float_alu_op(l, op, a) || scalar_alu_op(l, op, a)) continue;
       if (op == 248) {
         l.label = a.at(0);
         std::vector<std::pair<uint32_t, Value>> phis;

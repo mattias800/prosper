@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 
 namespace prosper::gpu::ir {
 
@@ -33,6 +34,25 @@ Known evaluate_op(Opcode op, uint32_t imm, uint32_t a, uint32_t b, uint32_t c) {
         case Opcode::ConstU32: return imm;
         case Opcode::ConstTrue: return 1u;
         case Opcode::ConstFalse: return 0u;
+        case Opcode::F32Add:
+        case Opcode::F32Sub:
+        case Opcode::F32Mul:
+        case Opcode::F32NMin:
+        case Opcode::F32NMax: {
+            const float x = std::bit_cast<float>(a), y = std::bit_cast<float>(b);
+            // No payload guess for an unspecified two-NaN result, nor a zero-sign guess
+            // for GLSL NMin/NMax. This evaluator is not added to the guest constant folder.
+            const bool minmax = op == Opcode::F32NMin || op == Opcode::F32NMax;
+            if (minmax && ((std::isnan(x) && std::isnan(y)) || (x == 0 && y == 0)))
+                return std::nullopt;
+            const float d = op == Opcode::F32Add    ? x + y
+                            : op == Opcode::F32Sub  ? x - y
+                            : op == Opcode::F32Mul  ? x * y
+                            : op == Opcode::F32NMin ? std::fmin(x, y)
+                                                    : std::fmax(x, y);
+            if (std::isnan(d)) return std::nullopt;
+            return std::bit_cast<uint32_t>(d);
+        }
         case Opcode::IAdd: return a + b;
         case Opcode::ISub: return a - b;
         case Opcode::IMul: return a * b;

@@ -38,6 +38,11 @@ public:
     Value smax(Value a, Value b) { return u32(Opcode::SMax, a, b); }
     Value umin(Value a, Value b) { return u32(Opcode::UMin, a, b); }
     Value umax(Value a, Value b) { return u32(Opcode::UMax, a, b); }
+    Value f32add(Value a, Value b) { return u32(Opcode::F32Add, a, b); }
+    Value f32sub(Value a, Value b) { return u32(Opcode::F32Sub, a, b); }
+    Value f32mul(Value a, Value b) { return u32(Opcode::F32Mul, a, b); }
+    Value f32nmin(Value a, Value b) { return u32(Opcode::F32NMin, a, b); }
+    Value f32nmax(Value a, Value b) { return u32(Opcode::F32NMax, a, b); }
     Value bfe_u(Value base, Value offset, Value count) {
         return block_.append({Opcode::BfeU, Type::U32, 0, {base, offset, count}});
     }
