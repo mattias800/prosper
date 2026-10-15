@@ -279,11 +279,11 @@ int main() {
     // while v_cvt_f32_u32 reads the two current buffer words. Two independent byte inputs make
     // constant/zero substitution fail this actual GPU execution check.
     const uint32_t raw_vcc_data[] = {
-        0x7da80484u,                 // old VCC compare
+        0x7da80084u,                 // old VCC compare (v_cmp_*_u32 vcc, 4, v0)
         0xf4041a80u, 0xfa000008u,   // s_load_dwordx2 vcc, s[0:1], 0x08
         0x7e000c6au,                 // v_cvt_f32_u32 v0, vcc_lo
         0x7e020c6bu,                 // v_cvt_f32_u32 v1, vcc_hi
-        0x7d042509u,                 // new VCC compare
+        0x7d040300u,                 // new VCC compare (v_cmp_*_f32 vcc, v0, v1)
         0x06000300u,                 // v_add_f32 v0, v0, v1
         0xbf810000u,
     };
@@ -1448,9 +1448,13 @@ int main() {
         0xbf870001u,              // force the whole shader through the CFG dispatcher
         0xbf82fffdu, 0xbf810000u,
     };
+    // pc11..15 read s12 and s14, which the captured kernel receives as user SGPRs; without them
+    // the pc15 compare is formed from words hardware never loaded (#5039).
+    ComputeShaderConfig vcc_low_dispatch_cfg17d = native_cfg17d;
+    vcc_low_dispatch_cfg17d.user_sgprs.assign(15, 0u);
     CHECK(!recompile_compute(code17d1_vcc_low_dispatch,
                              std::size(code17d1_vcc_low_dispatch), nullptr,
-                             native_cfg17d).empty(),
+                             vcc_low_dispatch_cfg17d).empty(),
           "GTA Wave64 VCC_LO scalar scratch resolves the live dispatcher ambiguity");
 
     // GTA 0x205b654a00 pc114 uses another inline pair, 1/-1. The liveness proof, rather than the
@@ -1473,7 +1477,10 @@ int main() {
     // each, both on the byte-identical instruction below. A literal is a 32-bit constant dword
     // embedded in the instruction stream, so it is uniform across the wave BY CONSTRUCTION -- the
     // strongest scalar source of the set, not a weaker one.
+    // VCC is not initialized at wave launch, so the select's VCC_LO source needs a producer; give
+    // it an ordinary scalar one (#5039).
     const uint32_t code17d1_vcc_low_literal[] = {
+        0xbeea0380u,               // s_mov_b32 vcc_lo, 0
         0xbe8f0380u, 0xbf08800fu,
         0x856aff6au, 0x00000000u,  // exact HotD2 pc297: s_cselect_b32 vcc_lo, vcc_lo, lit(0)
         0x7e02026au,               // one-dword scalar consumer
@@ -1540,11 +1547,16 @@ int main() {
         0xb00803fbu,                         // exact pc282: s_movk_i32 s8,1019
         0xbeea047eu,                         // exact pc284 complete VCC replacement
     };
+    // pc238/pc239 read s14 and s21, which the captured kernel receives as user SGPRs. Load them as
+    // such: with no user SGPRs those words are never loaded, and VCC_LO would be computed from
+    // register-file leftovers the recompiler cannot stand in for (#5039).
+    ComputeShaderConfig add3_cfg17d = native_cfg17d;
+    add3_cfg17d.user_sgprs.assign(22, 0u);
     code17d1_vcc_low_add3.insert(
         code17d1_vcc_low_add3.end(), std::begin(code17d), std::end(code17d));
     CHECK(!recompile_compute(code17d1_vcc_low_add3.data(),
                              code17d1_vcc_low_add3.size(), nullptr,
-                             native_cfg17d).empty(),
+                             add3_cfg17d).empty(),
           "Wave64 dispatcher preserves GTA's scalar SCC into the VCC_LO select");
     std::vector<uint32_t> code17d1_vcc_low_add3_pair_read =
         code17d1_vcc_low_add3;
@@ -1552,14 +1564,14 @@ int main() {
     code17d1_vcc_low_add3_pair_read[12] = 0x01a9826au; // same site: cndmask reads full VCC pair
     CHECK(recompile_compute(code17d1_vcc_low_add3_pair_read.data(),
                             code17d1_vcc_low_add3_pair_read.size(), nullptr,
-                            native_cfg17d).empty(),
+                            add3_cfg17d).empty(),
           "same-site pair-reading mutation keeps a live VCC_HI fail-visible");
     std::vector<uint32_t> code17d1_vcc_low_cselect_pair_read =
         code17d1_vcc_low_add3;
     code17d1_vcc_low_cselect_pair_read[8] = 0x858a6af2u; // same pc237 site: CSELECT_B64
     CHECK(recompile_compute(code17d1_vcc_low_cselect_pair_read.data(),
                             code17d1_vcc_low_cselect_pair_read.size(), nullptr,
-                            native_cfg17d).empty(),
+                            add3_cfg17d).empty(),
           "same-site B64 CSELECT mutation observes VCC_HI and remains fail-visible");
     // THESE TWO ARMS ARE INVERTED DELIBERATELY, and the reason is an ISA fact rather than a
     // convenience. Both used to require a decline, which was correct while the dead-sibling proof
@@ -1599,13 +1611,13 @@ int main() {
     code17d1_vcc_low_sopk_write[15] = 0xbbeb0000u; // same opcode: VCC_HI replaces NULL source
     CHECK(!recompile_compute(code17d1_vcc_low_sopk_write.data(),
                              code17d1_vcc_low_sopk_write.size(), nullptr,
-                             native_cfg17d).empty(),
+                             add3_cfg17d).empty(),
           "a non-null WAIT source reads VCC_HI as scalar data and is admitted");
     std::vector<uint32_t> code17d1_vcc_low_sopk_rmw = code17d1_vcc_low_add3;
     code17d1_vcc_low_sopk_rmw[17] = 0xb70803fbu; // same pc282 site: s_cmpk_le_u32 s8, 1019
     CHECK(!recompile_compute(code17d1_vcc_low_sopk_rmw.data(),
                              code17d1_vcc_low_sopk_rmw.size(), nullptr,
-                             native_cfg17d).empty(),
+                             add3_cfg17d).empty(),
           "an SOPK scalar-data compare is admitted by the MaskDomainOnly data-read rule");
 
     // COMPANION DECLINE ARMS, and the reason they exist is a weakness of the two arms above rather
@@ -1626,13 +1638,13 @@ int main() {
     code17d1_vcc_low_mask_read_15[15] = 0x02000100u;
     CHECK(recompile_compute(code17d1_vcc_low_mask_read_15.data(),
                             code17d1_vcc_low_mask_read_15.size(), nullptr,
-                            native_cfg17d).empty(),
+                            add3_cfg17d).empty(),
           "a mask-domain VCC read at the WAIT site still declines, so the walk reaches it");
     std::vector<uint32_t> code17d1_vcc_low_mask_read_17 = code17d1_vcc_low_add3;
     code17d1_vcc_low_mask_read_17[17] = 0x02000100u;
     CHECK(recompile_compute(code17d1_vcc_low_mask_read_17.data(),
                             code17d1_vcc_low_mask_read_17.size(), nullptr,
-                            native_cfg17d).empty(),
+                            add3_cfg17d).empty(),
           "a mask-domain VCC read at the compare site still declines, so the walk reaches it");
 
     // The complete captured CFG is essential here. Its pc213 VOPC replaces both physical VCC
@@ -2247,10 +2259,10 @@ int main() {
         0x7e3002c1u,              // v_mov_b32 v24,-1
         0x7e3202c1u,              // v_mov_b32 v25,-1
         0xd7600006u, 0x00010b1fu, // exact pc261: v_readlane s6,v31,5
-        0xbf060000u,              // make the following dispatcher edge deterministic
+        0xbf068080u,              // s_cmp_eq_u32 0,0: make the following dispatcher edge deterministic
         0xbf840000u,              // same target/fallthrough, but force an SGPR reload
         0xd761001fu, 0x00010a06u, // write the restored EXEC_LO half back through s6
-        0xbf060000u,
+        0xbf068080u,              // s_cmp_eq_u32 0,0
         0xbf840000u,              // force a second reload before the observing readlane
         0xd7600006u, 0x00010b1fu, // restore lane 5 again after the alias write
         0x36023006u,              // exact pc263: v_and_b32 v1,s6,v24
@@ -2429,13 +2441,19 @@ int main() {
     code17d1s.insert(code17d1s.end(), std::begin(code17d), std::end(code17d));
     const std::vector<uint32_t> native_spv17d32 = recompile_compute(
         code17d, std::size(code17d), nullptr, native_cfg17d1);
+    // s21, s25 and s26 are Astro's user SGPRs; load them as such so the three compares read genuine
+    // scalar words rather than registers hardware never loads, and declare the raw launch that
+    // supplies the native vote authority the final B32 SCC branch needs (#5039).
+    ComputeShaderConfig traversal_cfg17d1 = native_cfg17d1;
+    traversal_cfg17d1.user_sgprs.assign(27, 0u);
+    prosper::test::complete_compute_launch(traversal_cfg17d1);
     const std::vector<uint32_t> native_spv17d1s = recompile_compute(
-        code17d1s.data(), code17d1s.size(), nullptr, native_cfg17d1);
+        code17d1s.data(), code17d1s.size(), nullptr, traversal_cfg17d1);
     CHECK(!native_spv17d32.empty() && !native_spv17d1s.empty() &&
               count_spirv_opcode(native_spv17d1s, 335) ==
                   count_spirv_opcode(native_spv17d32, 335) + 1,
           "Wave32 mask SCC branch emits only the final live subgroup-any vote");
-    ComputeShaderConfig portable_cfg17d1s = native_cfg17d1;
+    ComputeShaderConfig portable_cfg17d1s = traversal_cfg17d1;
     portable_cfg17d1s.native_subgroup_size = 0;
     CHECK(recompile_compute(code17d1s.data(), code17d1s.size(), nullptr,
                             portable_cfg17d1s).empty(),
@@ -2482,7 +2500,7 @@ int main() {
         0x7d8416f9u, 0x06869480u, // pc44: v_cmp_eq_u32_sdwa s20,0,v11
         0x7d840100u,              // v_cmp_eq_u32 vcc,v0,v0
         0x876bff7eu, 0x0fffffffu, // pc57: s_and_b32 vcc_hi,exec_lo,0x0fffffff
-        0xbf068000u,              // synthetic scalar condition keeps the exact lifetime at a join
+        0xbf068080u,              // s_cmp_eq_u32 0,0 keeps the exact lifetime at a join
         0xbf840001u,              // s_cbranch_scc0 +1
         0xbf800000u,              // alternate-path work
         0x876aff6au, 0x7ffffffeu, // pc59: s_and_b32 vcc_lo,vcc_lo,0x7ffffffe
@@ -2534,7 +2552,7 @@ int main() {
         0x7e160280u,              // v_mov_b32 v11,0
         0x7d8416f9u, 0x06869480u, // v_cmp_eq_u32_sdwa s20,0,v11: full saved mask
         0x881a7f14u,              // s_or_b32 s26,s20,exec_hi: scalar 0xffffffff
-        0xbf068000u,              // s_cmp_eq_u32 0,0
+        0xbf068080u,              // s_cmp_eq_u32 0,0
         0xbf840000u,              // same target/fallthrough forces a dispatcher reload
         0x7e02021au,              // v_mov_b32 v1,s26: observe the reloaded scalar dword
         0xe0702000u, 0x80020100u, // buffer_store_dword v1,v0,s[8:11] idxen
@@ -3242,7 +3260,7 @@ int main() {
     // the final XOR pins the simultaneous scalar-data lifetime instead of testing only the mask view.
     const uint32_t code17d1c[] = {
         0xbe8403ffu, 0x80000009u, // s_mov_b32 s4, 0x80000009
-        0xbf060000u,              // s_cmp_eq_u32 s0, s0 (SCC=1)
+        0xbf068080u,              // s_cmp_eq_u32 0, 0 (SCC=1; no SGPR is loaded)
         0x7e020287u,              // v_mov_b32 v1, 7
         0x856a8004u,              // s_cselect_b32 vcc_lo, s4, 0 (exact GTA V packet)
         0x061212f2u,              // PC1310 packet between the cselect and implicit consumer
@@ -6093,7 +6111,7 @@ int main() {
         code[19] = 0xbefe046au; // restore EXEC from VCC
         code[20] = 0xbe8604c1u; // s_mov_b64 s[6:7], -1 (captured pc257 restore source)
         for (uint32_t branch_pc : {76u, 83u, 145u, 152u}) {
-            code[branch_pc - 1] = 0xbf060000u; // s_cmp_eq_u32 s0,s0
+            code[branch_pc - 1] = 0xbf068080u; // s_cmp_eq_u32 0,0 (no SGPR is loaded)
             code[branch_pc] = 0xbf850001u;     // skip the following captured trap
             code[branch_pc + 1] = 0xbf920001u;
         }
@@ -12519,7 +12537,7 @@ int main() {
         0x7e280300u,                         // v_mov_b32 v20,v0
         0x7e260301u,                         // v_mov_b32 v19,v1
         0x4a2826fau, 0xaf00e414u,            // exact GTA V partial-row DPP add
-        0x7d840000u,
+        0x7d840080u,                         // v_cmp_eq_u32 vcc,0,v0 (no SGPR is loaded)
         0xd4e4006au, 0x0001006au,
         0xbea0047eu,
         0x87ea6a20u,
@@ -12528,7 +12546,7 @@ int main() {
         0x7d840100u,
         0x02020100u,
         0xbf860002u,
-        0xbf060000u,
+        0xbf068080u,                         // s_cmp_eq_u32 0,0
         0xbf850001u,
         0x7e020280u,
         0x7e000314u,                         // v_mov_b32 v0,v20
@@ -13382,9 +13400,14 @@ int main() {
             0x7E040C00u,               //  9: v_cvt_f32_u32 v2, s0
             0xBF810000u,               // 10: s_endpgm
         };
+        // The guards compare user SGPR s0 with local id Y (v1): an 8x8 group loads Y only with
+        // TIDIG_COMP_CNT >= 1, and s0 only as a user SGPR (#5039).
+        ComputeShaderConfig linearizedVotePolicyConfig = portableVotePolicyConfig;
+        linearizedVotePolicyConfig.user_sgprs.assign(1, 0u);
+        linearizedVotePolicyConfig.tidig_comp_cnt = 1;
         const std::vector<uint32_t> linearizedVotePolicySpv = recompile_compute(
             linearized_vote_policy_cs, std::size(linearized_vote_policy_cs), nullptr,
-            portableVotePolicyConfig);
+            linearizedVotePolicyConfig);
         CHECK(compute_shader_prefers_native_multiwave(
                   vote_heavy_policy_cs, std::size(vote_heavy_policy_cs)) &&
                   !compute_shader_prefers_native_multiwave(
