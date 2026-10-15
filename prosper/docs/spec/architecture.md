@@ -117,8 +117,10 @@ Enforcement: ratchet:getenv, ci:switch-registry, review: (the registry checks th
 
 A source file stays under the ratchet's line cap. Files already over it may shrink, never grow;
 split with `tools/refactor/split_file.py`, which proves the split moved bytes rather than changed them.
+Directory-specific hard caps also apply: C-family files under `src/gpu/recompiler/ir/` MUST NOT exceed
+1,000 lines (ADR 0012).
 Status: accepted
-Enforcement: ratchet:file-size
+Enforcement: ratchet:file-size, ratchet:dir-file-cap, adr:0012
 
 ### FAIL-1 -- an unsupported operation fails visibly
 
