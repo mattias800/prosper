@@ -27,31 +27,60 @@ using namespace prosper::gpu;
 
 constexpr uint32_t kSkipDefinition = 0xbf850001u;   // s_cbranch_scc1 +1: skips v_mov_b32 v8, 0
 constexpr uint32_t kNop = 0xbf800000u;
-constexpr uint32_t kInnerAndn2 = 0x8afe6a5cu;       // s_andn2_b64 exec, s[92:93], vcc
-constexpr uint32_t kWidenedAndn2 = 0x8afe6a58u;     // s_andn2_b64 exec, s[88:89], vcc
+constexpr uint32_t kInnerAndn2 = 0x8afe6a5cu;   // s_andn2_b64 exec, s[92:93], vcc
+constexpr uint32_t kWidenedAndn2 = 0x8afe6a58u;   // s_andn2_b64 exec, s[88:89], vcc
 
 std::vector<uint32_t> program(bool skip_definition = false, bool widen_back_edge = false) {
     return {
-        0xbed40380u, 0xbed50380u, 0xbed8047eu,   // s84 = s85 = 0; s[88:89] = entry EXEC
-        0xd7650007u, 0x000100c1u, 0xd7660007u, 0x00020ec1u,   // v7 = lane id
-        0x36120e83u, 0x4a121281u, 0x36160e81u, 0x7e140280u,   // v9 = (v7&3)+1, v11 = v7&1, v10 = 0
+        0xbed40380u,
+        0xbed50380u,
+        0xbed8047eu,   // s84 = s85 = 0; s[88:89] = entry EXEC
+        0xd7650007u,
+        0x000100c1u,
+        0xd7660007u,
+        0x00020ec1u,   // v7 = lane id
+        0x36120e83u,
+        0x4a121281u,
+        0x36160e81u,
+        0x7e140280u,   // v9 = (v7&3)+1, v11 = v7&1, v10 = 0
         0xbf88001bu,   // outer header: s_cbranch_execz -> exit
         0xbf068080u,   // s_cmp_eq_u32 0, 0
         skip_definition ? kSkipDefinition : kNop,
         0x7e100280u,   // v_mov_b32 v8, 0: the definition made before the inner loop
-        0xd4c2005cu, 0x0002150bu, 0xbefe045cu, 0xbed6047eu,   // EXEC = parity lanes
+        0xd4c2005cu,
+        0x0002150bu,
+        0xbefe045cu,
+        0xbed6047eu,   // EXEC = parity lanes
         0xbf88000du,   // inner header: s_cbranch_execz -> inner exit
-        0xd4c6005cu, 0x00010109u, 0x8ac47e54u, 0xbeea045cu, 0x88d4445cu, 0xbefe045cu,
+        0xd4c6005cu,
+        0x00010109u,
+        0x8ac47e54u,
+        0xbeea045cu,
+        0x88d4445cu,
+        0xbefe045cu,
         0xbf860006u,   // s_cbranch_vccz: interior break
         0x4a101081u,   // v_add_nc_u32 v8, 1, v8: accumulated inside the loop
         0x7d8c1308u,   // v_cmp_ge_u32 vcc, v8, v9: the fresh predicate reading it
         widen_back_edge ? kWidenedAndn2 : kInnerAndn2,
-        0x8aea5c54u, 0x88d46a5cu,
+        0x8aea5c54u,
+        0x88d46a5cu,
         0xbf89fff2u,   // inner back edge: s_cbranch_execnz -> inner header
-        0xbefe0458u, 0x4a141481u, 0xd4c1006au, 0x0001050au, 0xbefe046au,
+        0xbefe0458u,
+        0x4a141481u,
+        0xd4c1006au,
+        0x0001050au,
+        0xbefe046au,
         0xbf89ffe4u,   // outer back edge: s_cbranch_execnz -> outer header
-        0xbefe0458u, 0x87ea5854u, 0xd5010000u, 0x01a9e480u, 0x7e0202f2u, 0x7e040280u,
-        0x7e0602f2u, 0xf800080fu, 0x03020100u, 0xbf810000u,
+        0xbefe0458u,
+        0x87ea5854u,
+        0xd5010000u,
+        0x01a9e480u,
+        0x7e0202f2u,
+        0x7e040280u,
+        0x7e0602f2u,
+        0xf800080fu,
+        0x03020100u,
+        0xbf810000u,
     };
 }
 
@@ -67,10 +96,12 @@ Result compile(const std::vector<uint32_t>& code, uint64_t address) {
     return {std::move(module), capture.take()};
 }
 
-// A terminal refusal names `reason` as its tag or inside its payload.
-bool rejected_with(const Result& result, const std::string& reason) {
+// Match the reason and, when supplied, the instruction detail in the same terminal refusal.
+bool rejected_with(const Result& result, const std::string& reason,
+                   const std::string& detail = {}) {
     return std::any_of(result.rejects.begin(), result.rejects.end(), [&](const auto& reject) {
-        return reject.first == reason || reject.second.find(reason) != std::string::npos;
+        return (reject.first == reason || reject.second.find(reason) != std::string::npos) &&
+               reject.second.find(detail) != std::string::npos;
     });
 }
 
@@ -91,6 +122,6 @@ TEST(LoopExecSubset, ABackEdgeThatWidensExecIsRefused) {
 TEST(LoopExecSubset, ADefinitionOnOnlyOnePreheaderPathIsRefused) {
     const auto result = compile(program(true, false), 0x50390003u);
     EXPECT_TRUE(result.module.empty());
-    EXPECT_TRUE(rejected_with(result, "fabricated-fresh-mask-source"))
+    EXPECT_TRUE(rejected_with(result, "fabricated-fresh-mask-source", "pc=28 "))
         << testing::PrintToString(result.rejects);
 }

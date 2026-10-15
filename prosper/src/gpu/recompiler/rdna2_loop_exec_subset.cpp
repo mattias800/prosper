@@ -42,8 +42,7 @@ bool narrowing_exec_form(const Rdna2Inst& in) {
     if (in.has_literal) return false;
     if (in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeAndSaveexecB64) return true;
     if (in.dst.value != 126) return false;
-    if (in.fmt == Rdna2Format::SOP1)
-        return in.opcode == kSop1OpcodeMovB64 && sgpr_pair(in.src[0]);
+    if (in.fmt == Rdna2Format::SOP1) return in.opcode == kSop1OpcodeMovB64 && sgpr_pair(in.src[0]);
     if (in.fmt == Rdna2Format::SOP2) return in.opcode == 0x0fu || in.opcode == 0x15u;
     return false;
 }
@@ -95,8 +94,9 @@ bool LoopExecSubset::holds(SpirvCompute& b, const RegState& rs) const {
     // within P (directly or through H), every header value is within P.
     // An un-narrowed preheader EXEC is the whole wave, which contains every EXEC value.
     if (rs.exec && (preheader_full_ || exec_within(rs, rs.exec, preheader_exec_))) return true;
-    log_recompile_diagnostic(b.diagnostic, "loop-exec-subset-unproved", "terminal",
-                             "a loop's back-edge EXEC is not a proved subset of its preheader EXEC");
+    log_recompile_diagnostic(
+        b.diagnostic, "loop-exec-subset-unproved", "terminal",
+        "a loop's back-edge EXEC is not a proved subset of its preheader EXEC");
     return false;
 }
 
