@@ -28,7 +28,8 @@ TEST(IrLowerVop2F16, PlainHalfResultKeepsTheHighHalf) {
     EXPECT_NE(t.rs.vreg[kVdst], t.b.uconst(0x12344200));
 }
 
-TEST(IrLowerVop2F16, PackedRtzHasFiniteOverflowSaturation) {
+// Numerical overflow is checked by IrVectorF16Execution.HandWorkedIsaArithmeticAndRtzCases.
+TEST(IrLowerVop2F16, PackedRtzEmitsTheFiniteOverflowBound) {
     HalfVop2 t;
     ASSERT_TRUE(t.lower(0x2f));
     EXPECT_TRUE(t.ok);
