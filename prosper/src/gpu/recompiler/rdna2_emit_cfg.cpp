@@ -2145,7 +2145,8 @@ bool emit_cfg_state_machine(
             if (track_active_vectors) {
                 advance_active_vector_words(halves.active_vectors, in, scalar_writes, vector_writes,
                                             mask_write, relay_sources.active_defined,
-                                            vector_write_completes_active_word(in));
+                                            vector_write_completes_active_word(in) ||
+                                                vector_read_completes_active_word(in));
                 if (record_compare) active_vectors_after[in.pc] = halves.active_vectors.current;
             }
             if (track_spilled_halves)

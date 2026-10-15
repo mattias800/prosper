@@ -1,7 +1,9 @@
 #include "gpu/recompiler/rdna2_active_vector_words.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_vector_old_word.hpp"
+#include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
 #include <algorithm>
@@ -132,9 +134,53 @@ bool active_vector_sources_defined(const ActiveVectorWords& state, const Rdna2In
     const auto vector = [&](int word) {
         return !relayed_vectors.contains(word) || state.current.contains(word);
     };
-    if (in.fmt == Rdna2Format::MUBUF) {
-        if (in.opcode < 0x0c || in.opcode > 0x0f || in.mubuf_tfe || in.mubuf_lds || in.n_src < 3)
+    const auto scalar_range = [&](const Operand& operand, uint32_t width) {
+        if (operand.kind != OperandKind::SGPR || operand.value < 0 ||
+            operand.value + static_cast<int>(width) > 106)
             return false;
+        for (uint32_t word = 0; word < width; ++word) {
+            const int reg = operand.value + static_cast<int>(word);
+            if (!scalar_words.contains(reg) || relayed_words.contains(reg)) return false;
+        }
+        return true;
+    };
+    // CONFIDENCE: HIGH -- an ordinary LDS read writes every result dword of each EXEC lane from
+    // that lane's own address (vector_read_completes_active_word names the same forms the emitter
+    // counts as complete). Its only vector input is ADDR; GDS, swizzle and the M0/TID forms are
+    // excluded there.
+    if (in.fmt == Rdna2Format::DS)
+        return vector_read_completes_active_word(in) && in.src[0].kind == OperandKind::VGPR &&
+               in.src[0].value >= 0 && in.src[0].value < 256 && vector(in.src[0].value);
+    // CONFIDENCE: HIGH -- an image read with a complete DMASK writes every selected dword of each
+    // EXEC lane from that lane's own addresses (RDNA2 ISA 70648 MIMG). Every address VGPR the
+    // encoding names must be genuine in those lanes, and so must the T#/S# words; a shape whose
+    // address layout rdna2_mimg_read_address_count does not know is not admitted. The addresses
+    // must be POSITIVELY current: the register inventory (shader_max_vgpr) counts only VADDR, so
+    // a further consecutive or NSA address that nothing else names is absent from the relay MAY
+    // facts as well, and "not relayed" would read a never-written word as genuine.
+    if (in.fmt == Rdna2Format::MIMG) {
+        const uint32_t addresses = rdna2_mimg_read_address_count(in);
+        if (!addresses || !vector_write_completes_active_word(in) ||
+            !scalar_range(in.src[1], in.mimg_r128 ? 4u : 8u) ||
+            (rdna2_mimg_reads_sampler(in) && !scalar_range(in.src[2], 4u)))
+            return false;
+        for (uint32_t index = 0; index < addresses; ++index) {
+            const int reg = rdna2_mimg_address_vgpr(in, index);
+            if (reg < 0 || reg > 255 || !state.current.contains(reg)) return false;
+        }
+        return true;
+    }
+    // CONFIDENCE: HIGH -- the untyped and typed FORMAT loads (MUBUF/MTBUF 0x00-0x03) share the
+    // dword loads' per-lane addressing and write every component dword of each EXEC lane.
+    const bool format_load = in.opcode <= 0x03;
+    if (in.fmt == Rdna2Format::MTBUF) {
+        if (!format_load || in.mtbuf_tfe || in.n_src < 3) return false;
+    } else if (in.fmt == Rdna2Format::MUBUF) {
+        if ((!format_load && (in.opcode < 0x0c || in.opcode > 0x0f)) || in.mubuf_tfe ||
+            in.mubuf_lds || in.n_src < 3)
+            return false;
+    }
+    if (in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF) {
         const uint32_t address_words = ((in.literal >> 12) & 1u) + ((in.literal >> 13) & 1u);
         if (address_words && in.src[0].kind != OperandKind::VGPR) return false;
         for (uint32_t word = 0; word < address_words; ++word)

@@ -56,6 +56,11 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   shells retain their existing supplied/partial bindings and seeding; `shader_inspect
   --inputs` prints the same inventory. A new system-value binding changes this file and its shell
   together.
+- `rdna2_active_vector_words` — the compute Wave64 CFG MUST set of vector words genuine in every lane of
+  the CURRENT EXEC. The dispatcher re-anchors those words to the reloaded EXEC at every case entry, so this,
+  not the emitter's per-block marks, is what carries a word's EXEC confinement across a block edge (#5173).
+  A writer joins the set only when `active_vector_sources_defined` proves its inputs; an EXEC write that is
+  not a proved narrowing clears it.
 - `rdna2_smem_pointer_provenance` — the once-per-program SMEM pointer and raw-data provenance seed
   every compute and fragment shell runs before emission; it only fills `RegState` facts.
 - `rdna2_dead_wave_masks` — the liveness proof that lets the CFG emitter elide a 64-bit VCC mask

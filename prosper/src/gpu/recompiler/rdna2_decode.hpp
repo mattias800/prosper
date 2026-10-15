@@ -594,6 +594,19 @@ bool rdna2_mimg_zero_mip_shape(const Rdna2Inst& in, uint32_t* mip_vgpr = nullptr
 // operand can select.
 bool rdna2_mimg_dynamic_mip_shape(const Rdna2Inst& in, uint32_t* mip_vgpr = nullptr);
 
+// The address VGPRs an ordinary image READ consumes, in RDNA2 ISA 70648 MIMG address order:
+// [offset] [bias] [z-compare] body coordinates [lod | clamp | mip]. Covers IMAGE_LOAD and
+// IMAGE_LOAD_MIP over every dimension, and the sample/gather families (0x20-0x5F) without
+// derivatives over the non-MSAA dimensions, all with 32-bit addresses. Returns 0 for anything
+// else (A16, derivative/CD forms, get_lod, msaa_load, resinfo, BVH, packed loads, stores and
+// atomics), and for an NSA packet whose extra dwords do not carry exactly that many addresses
+// with zero padding. CONFIDENCE: HIGH -- every shape was checked against the vaddr range llvm-mc
+// gfx1030 prints for the consecutive encoding (test_rdna2_decode).
+uint32_t rdna2_mimg_read_address_count(const Rdna2Inst& in);
+// The VGPR holding image address `index`: VADDR + index in the consecutive encoding, else VADDR
+// for index 0 and one register per byte of the NSA dwords, low byte first. -1 past the encoding.
+int rdna2_mimg_address_vgpr(const Rdna2Inst& in, uint32_t index);
+
 // Minimum byte range touched by immediate s_load_dword[xN] operations whose 64-bit SBASE begins at
 // `sgpr_base`. Unlike s_buffer_load, s_load consumes an address pair rather than a bounded V#; callers
 // use this to size pointer-backed user-data tables from the shader's actual accesses.

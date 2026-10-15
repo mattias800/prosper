@@ -2700,6 +2700,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_fresh_mask_lane_wise_relay.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_dispatcher_entry_active_words
+    SOURCES tests/gpu/recompiler/test_dispatcher_entry_active_words.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_vintrp_scalar_liveness
     SOURCES tests/gpu/recompiler/test_vintrp_scalar_liveness.cpp
     INCLUDES tests
