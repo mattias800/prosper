@@ -2708,6 +2708,9 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_dispatcher_arbitrary_relay.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_loop_exec_subset
+    SOURCES tests/gpu/recompiler/test_loop_exec_subset.cpp
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_dispatcher_entry_active_words
     SOURCES tests/gpu/recompiler/test_dispatcher_entry_active_words.cpp
     INCLUDES tests

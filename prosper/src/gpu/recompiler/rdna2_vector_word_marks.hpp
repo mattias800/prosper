@@ -92,6 +92,12 @@ ScalarSourceMarks vector_lane_read_marks(const RegState& rs, const Rdna2Inst& in
 // A fresh comparison/carry predicate cannot authenticate fabricated input storage. Genuine memory
 // data and checked loop-header assumptions remain separate from unavailable-source placeholders.
 bool fresh_mask_sources_defined(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in);
+// True when the EXEC value named by reader is the owner value or a subset of it, by the derivation
+// facts in RegState::exec_subset_of. A placeholder confined outside owner is then also outside reader.
+bool exec_within(const RegState& rs, uint32_t reader, uint32_t owner);
+// A VOPC result as the architecture writes it: EXEC & comparison (ISA 70648 3.9). Under a narrowed
+// EXEC the result is a fresh value, recorded as a subset of that EXEC (rdna2_loop_exec_subset.cpp).
+uint32_t exec_masked_predicate(SpirvCompute& b, RegState& rs, uint32_t cmp);
 void record_native_interpolation_publication(const SpirvCompute& b, RegState& rs,
                                              const Rdna2Inst& in);
 void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSourceMarks& source);

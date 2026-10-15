@@ -663,11 +663,40 @@ bool closed_compute_store_loop_data_retry(const SpirvCompute& b, const RegState&
                                           size_t dwords);
 uint32_t make_narrowing_loop_exec_phi(SpirvCompute& b, RegState& rs, uint32_t preheader,
                                       std::size_t& patch, bool admitted);
+// The header EXEC phi is a subset of the preheader EXEC when every back edge carries a subset of
+// it (induction over iterations). Two certificates grant that fact: the code-only compute one
+// (narrowing_loop_exec_admission), and a checked one for fragment loops whose EXEC writes are
+// all narrowing forms: assumed at the header, then verified at the back edge from the
+// EXEC subset facts the body actually recorded. A failed check refuses the loop (#5039).
+// Implemented in rdna2_loop_exec_subset.cpp.
+class LoopExecSubset {
+public:
+    LoopExecSubset(const SpirvCompute& b, const std::vector<Rdna2Inst>& ins, const DivLoop& loop,
+                   const RegState& entry);
+    bool admitted() const { return certified_ || checked_; }
+    void open(const RegState& preheader) {
+        preheader_exec_ = preheader.exec;
+        preheader_full_ = !preheader.exec_narrowed;
+    }
+    // At the back edge, with `rs` holding the body's final EXEC.
+    bool holds(SpirvCompute& b, const RegState& rs) const;
+
+private:
+    bool certified_ = false;
+    bool checked_ = false;
+    uint32_t preheader_exec_ = 0;
+    bool preheader_full_ = false;
+};
+// The EXEC phi at a one-armed structured if's merge. When the taken arm only narrowed the skipped
+// edge's EXEC, the merge is a subset of it too (rdna2_loop_exec_subset.cpp).
+uint32_t merge_exec_arm(SpirvCompute& b, RegState& rs, uint32_t skipped_exec,
+                        uint32_t skipped_block, uint32_t taken_exec, uint32_t taken_block);
 template <class PhiRecords>
 void open_narrowing_loop_exec_phi(SpirvCompute& b, RegState& rs, uint32_t preheader,
-                                  PhiRecords& phis, bool admitted) {
+                                  PhiRecords& phis, LoopExecSubset& proof) {
     std::size_t patch;
-    const uint32_t phi = make_narrowing_loop_exec_phi(b, rs, preheader, patch, admitted);
+    proof.open(rs);
+    const uint32_t phi = make_narrowing_loop_exec_phi(b, rs, preheader, patch, proof.admitted());
     phis.push_back({0, 4, phi, patch});
 }
 
