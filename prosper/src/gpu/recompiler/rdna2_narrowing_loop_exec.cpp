@@ -301,9 +301,10 @@ uint32_t make_narrowing_loop_exec_phi(SpirvCompute& b, RegState& rs, uint32_t pr
     const uint32_t phi = b.emit_phi2(b.t_bool, entry_exec, preheader, patch);
     // CONFIDENCE: HIGH -- induction over the real preheader and every audited backedge: CMPX
     // computes EXEC & comparison, so neither incoming phi value can enable a lane outside entry.
-    // The current compute loop leaves per invocation. Do not expose a surviving wave-scalar
-    // result, or admit an in-loop cross-lane/side-effect shape, solely through this new DATA proof.
-    if (b.is_compute && admitted) rs.exec_subset_of[phi] = entry_exec;
+    // The caller decides `admitted`: the code-only compute certificate below (whose loops leave
+    // per invocation, so it must not expose a surviving wave-scalar result or admit an in-loop
+    // cross-lane/side-effect shape), or LoopExecSubset's back-edge check.
+    if (admitted) rs.exec_subset_of[phi] = entry_exec;
     rs.exec = phi;
     return phi;
 }

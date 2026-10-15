@@ -86,8 +86,8 @@ bool memory_read_completes_active_word(const Rdna2Inst& in) {
     }
 }
 
-// True when the EXEC value named by reader is the owner value or a subset of it, by the derivation
-// facts recorded at v_cmpx. A placeholder confined outside owner is then also outside reader.
+}   // namespace
+
 bool exec_within(const RegState& rs, uint32_t reader, uint32_t owner) {
     uint32_t current = reader;
     for (int hop = 0; hop < 64 && current != 0; ++hop) {
@@ -98,6 +98,8 @@ bool exec_within(const RegState& rs, uint32_t reader, uint32_t owner) {
     }
     return false;
 }
+
+namespace {
 
 // CONFIDENCE: MED -- the arbitrary property of a meet (#5185, decision on the issue): a meet
 // is hard exactly when one of its inputs is. It is the same for the inputs one instruction reads

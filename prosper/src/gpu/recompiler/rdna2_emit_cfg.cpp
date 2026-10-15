@@ -6867,7 +6867,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             rs.scalar_presence_has_no_placeholders = false;
             const bool entry_exec_narrowed = rs.exec_narrowed;
             const uint32_t loop_entry_exec = rs.exec;
-            const bool narrowing_exec = b.is_compute && narrowing_loop_exec_admission(ins, L, rs);
+            LoopExecSubset exec_proof(b, ins, L, rs);
             std::set<int> cv, cs, condv, conds, scalar_may_writes;
             loop_written_regs(ins, L.header_pc, L.backedge_pc, cv, cs);
             loop_written_regs(ins, L.header_pc, L.exit_branch_pc, condv, conds);
@@ -6910,7 +6910,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             // A poisoned SCC live-in uses bfalse; loop headers reproduce SCC before any read.
             { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.scc ? rs.scc : b.bfalse(), preheader, p); rs.scc = ph; phis.push_back({0, 2, ph, p}); }
             if (rs.vcc) { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.vcc, preheader, p); rs.vcc = ph; phis.push_back({0, 3, ph, p}); }
-            open_narrowing_loop_exec_phi(b, rs, preheader, phis, narrowing_exec);
+            open_narrowing_loop_exec_phi(b, rs, preheader, phis, exec_proof);
             std::vector<int> mask_keys;                        // saved masks live at entry: loop-carried bools
             for (auto& kv : rs.sreg_bool) mask_keys.push_back(kv.first);
             std::sort(mask_keys.begin(), mask_keys.end());     // deterministic emission order
@@ -7006,7 +7006,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 if (!nv && pr.dom == 2) nv = b.bfalse();
                 b.patch_phi(pr.patch, nv, cont);
             }
-            if (!lane_slots.patch_backedge(b, rs, cont)) return false;
+            if (!lane_slots.patch_backedge(b, rs, cont) || !exec_proof.holds(b, rs)) return false;
             b.emit_branch(hdr);
             b.emit_label(merge);
             // Freeze both actual phi inputs before publishing any exit register or its marks.
@@ -7225,7 +7225,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                             b.t_bool, pre_vcc, preblock, then_vcc, thenEnd);
                     // EXEC changed inside the arm (saveexec / v_cmpx / restore): merge it like any value.
                     // Narrowed-ness is sticky (either edge narrowed → post-merge writes stay predicated).
-                    if (then_exec != pre_exec) rs.exec = b.emit_phi_2way(b.t_bool, pre_exec, preblock, then_exec, thenEnd);
+                    if (then_exec != pre_exec) rs.exec = merge_exec_arm(b, rs, pre_exec, preblock, then_exec, thenEnd);
                     rs.exec_narrowed = pre_narrowed || then_narrowed;
                     if (!join_structured_saved_masks(b, rs, pre_masks, then_masks, preblock,
                                                      thenEnd, ins, F.branch_pc, F.target_pc))

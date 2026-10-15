@@ -4176,7 +4176,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // spills) from seeing phantom bits from inactive lanes. No-op when EXEC is full.
                     // This is architectural predication, not scalar mask arithmetic: an inactive
                     // lane writes defined zero even when its unevaluated comparison can be poison.
-                    const uint32_t masked = rs.exec_narrowed ? b.bsel(rs.exec, cmp, b.bfalse()) : cmp;
+                    const uint32_t masked = exec_masked_predicate(b, rs, cmp);
                     if (in.dst.kind == OperandKind::SGPR && in.dst.value <= 105) {
                         rs.sreg_bool[in.dst.value] = masked; rs.sreg_bool_narrowed[in.dst.value] = true;
                         if (b.allow_b32_masks &&
