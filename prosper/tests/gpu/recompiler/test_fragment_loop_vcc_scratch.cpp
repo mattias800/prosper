@@ -382,21 +382,24 @@ TEST(FragmentLoopVccScratch, WaveVotedBoundCompilesToo) {
 
     const PixelSystemInputMapping absent{};
     const PixelSystemInputMapping disabled{.ena = 0, .addr = inputs.addr};
+    // Displaced puts POS_X at v0, so v2 is a word hardware never loads: v1 relays an arbitrary
+    // value, which the header's meet with the loop-carried s0 now keeps with its loop obligations
+    // (#5193; this used to stay hard at the pc5 compare).
     const PixelSystemInputMapping displaced{.ena = inputs.ena, .addr = inputs.ena};
+    EXPECT_FALSE(compile(varying, 0x4508A10Aull, false, &displaced).spirv.empty());
+    // Displaced behind POS_Y and POS_FIXED_PT puts the latter at v2: hardware loads it and the
+    // backend does not supply it (#5160), so the bound is hard. The other three are unknown
+    // launch profiles, where v2 is hard too.
+    const PixelSystemInputMapping fixed_point{.ena = (1u << 8) | (1u << 9) | (1u << 15),
+                                              .addr = (1u << 8) | (1u << 9) | (1u << 15)};
     uint64_t address = 0x4508A106ull;
     for (const auto* missing :
-         {static_cast<const PixelSystemInputMapping*>(nullptr), &absent, &disabled, &displaced}) {
+         {static_cast<const PixelSystemInputMapping*>(nullptr), &absent, &disabled, &fixed_point}) {
         const Compiled rejected = compile(varying, address++, false, missing);
         EXPECT_TRUE(rejected.spirv.empty());
-        // Displaced puts POS_X at v0, so v2 is a word hardware never loads: v1 relays an
-        // arbitrary value and the pre-loop compare at pc4 is admitted (#5185). The header compare
-        // at pc5 still refuses: it meets v1 with the loop-carried s0, a loop assumption, and that
-        // meet stays hard (conservative; an arbitrary value with loop obligations is not modelled).
-        // The other three are unknown launch profiles, where v2 is hard.
-        const char* expected = missing == &displaced
-                                   ? "fabricated-fresh-mask-source pc=5 words=7d020200 "
-                                   : "fabricated-fresh-mask-source pc=4 words=7d020200 ";
-        EXPECT_NE(rejected.reason.find(expected), std::string::npos) << rejected.reason;
+        EXPECT_NE(rejected.reason.find("fabricated-fresh-mask-source pc=4 words=7d020200 "),
+                  std::string::npos)
+            << rejected.reason;
     }
 }
 

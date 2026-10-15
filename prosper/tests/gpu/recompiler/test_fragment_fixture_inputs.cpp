@@ -95,8 +95,18 @@ TEST(FragmentFixtureInputs, DepthInputSuppliesTheVaryingLoopBound) {
     ASSERT_FALSE(module.empty()) << last_terminal_reject_reason(0x50630007u);
     EXPECT_EQ(fragment_spirv_required_subgroup_size(module), 64u);
     EXPECT_TRUE(fragment_spirv_required_subgroup_reasons(module) & kFragmentWaveReasonWaveAny);
-    EXPECT_TRUE(prosper::test::compile_fragment_control_flow_fixture(
-                    code, {RecompileDiagnosticStage::Fragment, 0x50630008u}, false)
+    // Without the depth input v2 is a word hardware never loads: an arbitrary bound, which the
+    // loop header now keeps (#5193). The refused twin loads POS_FIXED_PT into v2 instead: hardware
+    // loads it and the backend does not supply it (#5160), so the bound is hard.
+    EXPECT_FALSE(prosper::test::compile_fragment_control_flow_fixture(
+                     code, {RecompileDiagnosticStage::Fragment, 0x50630009u}, false)
+                     .empty())
+        << last_terminal_reject_reason(0x50630009u);
+    auto fixed_point = prosper::test::fragment_compare_kill::position_inputs();
+    fixed_point.ena = fixed_point.addr = fixed_point.ena | (1u << 15);
+    EXPECT_TRUE(recompile_fragment(code, std::size(code), nullptr, &fixed_point, UINT32_MAX,
+                                   nullptr, false,
+                                   {RecompileDiagnosticStage::Fragment, 0x50630008u})
                     .empty());
     const auto reason = last_terminal_reject_reason(0x50630008u);
     EXPECT_NE(reason.find("fabricated-fresh-mask-source"), std::string::npos) << reason;
@@ -158,10 +168,11 @@ TEST(StructuralFixtureInputs, VccHighScratchCompareRequiresItsActualVectorInput)
         EXPECT_FALSE(compile(missing).empty()) << last_terminal_reject_reason(address);
         missing[2] = 0x7e16031fu;   // v_mov_b32 v11, v31
         EXPECT_FALSE(compile(missing).empty()) << last_terminal_reject_reason(address);
-        // A HARD producer still reaches the guard at the compare: LDS data read at the
-        // never-written address v31, which #5185 keeps hard (ds_read_b32 v11, v31).
+        // A HARD producer still reaches the guard at the compare: the old LDS word an atomic
+        // returns at the never-written address v31 (ds_add_rtn_u32 v11, v31, v0). #5193 makes a
+        // plain read there arbitrary; an atomic at an arbitrary address stays hard.
         std::vector<uint32_t> hard(code.begin(), code.end());
-        hard[2] = 0xd8d80000u;
+        hard[2] = 0xd8800000u;
         hard.insert(hard.begin() + 3, (11u << 24) | 31u);
         EXPECT_TRUE(compile(hard).empty());
         const auto reason = last_terminal_reject_reason(address);

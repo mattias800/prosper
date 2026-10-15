@@ -104,7 +104,10 @@ TEST(FlatActiveWord, CompleteLoadedActiveLanesCanSupplyTheComparison) {
 TEST(FlatActiveWord, RestoringInactiveLanesDoesNotDefineTheirLoadedWord) {
     auto code = program();
     code.insert(code.begin() + 6, 0xbefe0404u); // restore saved full EXEC before the comparison
-    missing(compile(code, true), 7, true);
+    // The inactive lanes must hold a HARD old v3: v3 = s30 (no launch loads it). Never written,
+    // they would be arbitrary, which the restored compare may read (#5185, #5193).
+    code.insert(code.begin(), 0x7e06021eu);
+    missing(compile(code, true), 8, true);
 }
 
 TEST(FlatActiveWord, MissingLowAddressCannotSupplyTheComparison) {
@@ -286,7 +289,7 @@ TEST(FlatActiveWord, BoundBufferAlsoRequiresTheActualCurrentAddressWord) {
 
 TEST(FlatActiveWord, ABufferBindingCannotInventTheMissingAddressWord) {
     auto code = buffer_address();
-    code[2] = 0xbf800000u;
+    code[2] = 0x7e02021eu;   // v1 = s30, never loaded: hard (never written, v1 is arbitrary, #5193)
     missing(compile(code, true), 8, true);
 }
 
@@ -376,7 +379,9 @@ void accepted(const Compilation& result, bool dispatcher) {
 std::vector<uint32_t> whole_entry_buffer(bool typed, bool missing_address) {
     return {
         0x7e060281u, // whole-entry genuine old v3
-        missing_address ? 0xbf800000u : 0x7e020280u,
+        // A missing address is v1 = s30, which no launch loads: hard on every route. A never-
+        // written v1 would be arbitrary, and a bounded read there admissible (#5193).
+        missing_address ? 0x7e02021eu : 0x7e020280u,
         0xbe84047eu,
         0x7daa0080u,
         typed ? 0xe8b01000u : 0xe0301000u,
@@ -494,8 +499,10 @@ TEST(FlatActiveWord, BothSelectedBufferAddressWordsMustBeCurrentBeforeOverwrite)
             for (unsigned destination : {3u, 0u})
                 for (unsigned missing_word : {0u, 1u, 2u}) {
                     std::vector<uint32_t> code{
-                        missing_word == 1 ? 0xbf800000u : 0x7e020280u,
-                        missing_word == 2 ? 0xbf800000u : 0x7e040280u,
+                        // A missing word relays s30 (no launch loads it): hard on every route,
+                        // where a never-written word would be arbitrary (#5193).
+                        missing_word == 1 ? 0x7e02021eu : 0x7e020280u,
+                        missing_word == 2 ? 0x7e04021eu : 0x7e040280u,
                         0xbe84047eu,
                         0x7daa0080u,
                         typed ? 0xe8b03000u : 0xe0303000u,

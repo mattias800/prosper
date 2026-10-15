@@ -76,11 +76,11 @@ Compilation compile_consumer(const uint32_t* code, std::size_t count, uint32_t w
 // wrote. Hardware holds an earlier wave's value there, so the guard admits it as arbitrary; these
 // arms were refusals before that decision made them over-refusals. #5185 extends that to values
 // computed from such words, so relaying one (v_mov from v31) is admitted too. Each test keeps a
-// twin with a HARD producer that reaches the guard at the actual consumer: LDS data read at the
-// never-written address v31 (ds_read_b32), which #5185 keeps hard because loaded data is no
-// function of its address alone.
+// twin with a HARD producer that reaches the guard at the actual consumer: the old LDS word an
+// atomic returns at the never-written address v31 (ds_add_rtn_u32). An atomic at an arbitrary
+// address stays hard (#5193); a plain LDS read there would be arbitrary.
 constexpr std::array<uint32_t, 2> lds_from_v31(uint32_t vgpr) {
-    return {0xd8d80000u, (vgpr << 24) | 31u};
+    return {0xd8800000u, (vgpr << 24) | 31u};
 }
 
 void missing_predicate(const Compilation& result, uint32_t pc) {

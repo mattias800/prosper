@@ -44,6 +44,9 @@ constexpr uint32_t xor8 = 0x3a100f06u;   // v8 = v6 ^ v7
 constexpr uint32_t fmac6 = 0x560c0ef2u;   // v_fmac_f32 v6, 1.0, v7 (reads the old v6)
 constexpr uint32_t compare6 = 0x7d840d06u, compare8 = 0x7d841108u;
 constexpr uint32_t ds_read_v8 = 0xd8d80000u;   // ds_read_b32 v8, v0 (dword1 below)
+// ds_add_rtn_u32 v8, vADDR, v0: the old LDS word an atomic returns. At the never-written address
+// v19 it is HARD (#5193); a plain read there would be arbitrary.
+constexpr uint32_t ds_add_rtn_v8 = 0xd8800000u;
 constexpr uint32_t end = 0xbf810000u;
 
 Words cat(std::initializer_list<Words> pieces) {
@@ -208,8 +211,12 @@ TEST(FreshMaskLaneWiseRelay, ASoftWordWithoutRootsStillVetoesTheOwner) {
 TEST(FreshMaskLaneWiseRelay, PublicCompilerAdmitsTheLoopRelayAndRefusesItsWiderTwin) {
     // v7 is rewritten every iteration, so the loop carries it; v6 is complete only under A.
     accepted(compile(counted_loop({mov7}, {cmpx_a, mov6, xor8, compare8, full_exec, mov7})));
-    // The same relay read after EXEC was widened again observes v6's missing lanes.
-    refused(compile(counted_loop({mov7}, {cmpx_a, mov6, full_exec, xor8, compare8, mov7})), 9);
+    // The same relay read after EXEC was widened again observes v6's missing lanes. They must
+    // be HARD: v6 = s30 (no launch loads it) first. Never written, they would be arbitrary, which
+    // the loop header now keeps (#5193).
+    refused(compile(counted_loop({0x7e0c021eu, mov7},
+                                 {cmpx_a, mov6, full_exec, xor8, compare8, mov7})),
+            10);
 }
 
 // ---- 2. Ordinary memory reads complete their active lanes --------------------------------------
@@ -269,9 +276,10 @@ TEST(FreshMaskLaneWiseRelay, PublicCompilerAdmitsAnLdsReadRelayAndRefusesItsWide
     accepted(compile({cmpx_a, ds_read_v8, 0x08000000u, full_exec, compare8}));
     // #5185: an old v8 relayed from v19, itself never written, is arbitrary outside A too.
     accepted(compile({0x7e100313u, cmpx_a, ds_read_v8, 0x08000000u, full_exec, compare8}));
-    // A hard old v8 (LDS data read at the never-written address v19) survives outside A: refused.
+    // A hard old v8 (an LDS atomic's return at the never-written address v19) survives outside
+    // A: refused.
     refused(
-        compile({ds_read_v8, 0x08000013u, cmpx_a, ds_read_v8, 0x08000000u, full_exec, compare8}),
+        compile({ds_add_rtn_v8, 0x08000013u, cmpx_a, ds_read_v8, 0x08000000u, full_exec, compare8}),
         6);
 }
 
@@ -321,9 +329,9 @@ TEST(FreshMaskLaneWiseRelay, PublicCompilerAdmitsThePartitionAndRefusesItsOneArm
     accepted(compile(cat({if_else({mov6}, {mov7}), {compare6}})));
     // #5185: an old v6 relayed from v19, itself never written, is arbitrary there too.
     accepted(compile(cat({{0x7e0c0313u}, if_else({mov6}, {mov7}), {compare6}})));
-    // With a hard old v6 (LDS data read at the never-written address v19) the second arm's lanes
-    // keep it: refused.
-    refused(compile(cat({{0xd8d80000u, 0x06000013u}, if_else({mov6}, {mov7}), {compare6}})), 9);
+    // With a hard old v6 (the old LDS word an atomic returns at the never-written address v19;
+    // #5193 makes a plain read there arbitrary) the second arm's lanes keep it: refused.
+    refused(compile(cat({{0xd8800000u, 0x06000013u}, if_else({mov6}, {mov7}), {compare6}})), 9);
 }
 
 // ---- 4. A structured merge meets nested owners at the narrower one ------------------------------
@@ -358,9 +366,10 @@ TEST(FreshMaskLaneWiseRelay, PublicCompilerAdmitsTheNestedMergeAndRefusesItsUnre
     const Words one_arm{0xbf068004u, 0xbf840001u, fmac6};
     accepted(compile(cat({{cmpx_a, mov6, cmpx_b, mov7}, one_arm, {compare6}})));
     // v6's lanes of B outside A were never written: arbitrary, so the unrelated owners no longer
-    // refuse (#5185). With a hard old v6 (LDS data at the never-written address v19) they do.
+    // refuse (#5185). With a hard old v6 (an LDS atomic's return at the never-written address v19,
+    // #5193) they do.
     accepted(compile(cat({{cmpx_a, mov6, full_exec, cmpx_b, mov7}, one_arm, {compare6}})));
-    refused(compile(cat({{0xd8d80000u, 0x06000013u, cmpx_a, mov6, full_exec, cmpx_b, mov7},
+    refused(compile(cat({{0xd8800000u, 0x06000013u, cmpx_a, mov6, full_exec, cmpx_b, mov7},
                          one_arm,
                          {compare6}})),
             10);
@@ -453,21 +462,24 @@ TEST(FreshMaskLaneWiseRelay, ADispatcherAddtidReadNeedsAGenuineUnrelayedM0) {
 }
 
 TEST(FreshMaskLaneWiseRelay, PublicCompilerAdmitsAnAddtidReadOverAHardOldWord) {
-    // v8 first holds LDS data read at the never-written address v19 (hard, #5185); under A the
-    // ADDTID read replaces every active lane, so the compare under A reads only genuine lanes.
+    // v8 first holds an LDS atomic's return at the never-written address v19 (hard, #5193); under
+    // A the ADDTID read replaces every active lane, so the compare under A reads only genuine
+    // lanes.
     accepted(
-        compile({ds_read_v8, 0x08000013u, m0_zero, cmpx_a, addtid_v8, addtid_v8_dst, compare8}));
+        compile({ds_add_rtn_v8, 0x08000013u, m0_zero, cmpx_a, addtid_v8, addtid_v8_dst, compare8}));
     // Read under the full EXEC again, the hard lanes outside A are observed.
-    refused(compile({ds_read_v8, 0x08000013u, m0_zero, cmpx_a, addtid_v8, addtid_v8_dst, full_exec,
+    refused(compile({ds_add_rtn_v8, 0x08000013u, m0_zero, cmpx_a, addtid_v8, addtid_v8_dst,
+                     full_exec,
                      compare8}),
             7);
     // M0 written on one path only (s_cmp_eq_u32 s4, 0; s_cbranch_scc1 over the write): the read
     // may address through a fabricated M0, so it completes nothing.
-    refused(compile({ds_read_v8, 0x08000013u, 0xbf068004u, 0xbf840001u, m0_zero, cmpx_a, addtid_v8,
+    refused(compile({ds_add_rtn_v8, 0x08000013u, 0xbf068004u, 0xbf840001u, m0_zero, cmpx_a,
+                     addtid_v8,
                      addtid_v8_dst, compare8}),
             8);
     // M0 written on both paths with different values: a genuine phi, admitted.
     accepted(
-        compile({ds_read_v8, 0x08000013u, m0_zero, 0xbf068004u, 0xbf840001u,
+        compile({ds_add_rtn_v8, 0x08000013u, m0_zero, 0xbf068004u, 0xbf840001u,
                  0xb07c0004u /* s_movk_i32 m0, 4 */, cmpx_a, addtid_v8, addtid_v8_dst, compare8}));
 }

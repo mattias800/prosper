@@ -94,6 +94,19 @@ void missing(const Result& result, uint32_t pc) {
         << result.reason;
 }
 
+// #5039 / #5193: a lane no write reaches is ARBITRARY, which a fresh predicate may read, and a
+// loop header keeps that property. The refusals below are about HARD lanes, so these arms first
+// relay s30 -- which no launch loads -- into v1 and v9 under the full entry EXEC: every lane the
+// program never writes is then hard on every route. The prefix shifts each pc by two.
+Result compile_hard(const std::vector<uint32_t>& code, uint32_t native_width = 64,
+                    bool complete_launch = true, uint32_t wave_size = 64) {
+    std::vector<uint32_t> prefixed{0x7e02021eu, 0x7e12021eu};   // v1 = s30; v9 = s30
+    prefixed.insert(prefixed.end(), code.begin(), code.end());
+    return compile(prefixed, native_width, complete_launch, wave_size);
+}
+void missing_hard(const Result& result, uint32_t pc) {
+    missing(result, pc + 2);
+}
 std::vector<Rdna2Inst> decode(const std::vector<uint32_t>& code) {
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code.data(), code.size(), ins);
@@ -210,13 +223,13 @@ TEST(NarrowingLoopExec, NativeWave32RetainsItsOwnPreheaderSubset) {
 TEST(NarrowingLoopExec, MissingPreheaderWordIsNotCreatedByAnExecPhi) {
     auto code = program();
     code[2] = kNop;
-    missing(compile(code), 3);
+    missing_hard(compile_hard(code), 3);
 }
 
 TEST(NarrowingLoopExec, MissingPreheaderSourceIsNotCreatedByAnExecPhi) {
     auto code = program();
     code[2] = 0x7e020309u;   // v1 = absent v9
-    missing(compile(code), 3);
+    missing_hard(compile_hard(code), 3);
 }
 
 TEST(NarrowingLoopExec, APreheaderScalarPlaceholderIsNotLaneData) {
@@ -228,12 +241,12 @@ TEST(NarrowingLoopExec, APreheaderScalarPlaceholderIsNotLaneData) {
 TEST(NarrowingLoopExec, MissingBackedgeSourceRetainsTheCarriedObligation) {
     auto code = program();
     code[5] = 0x7e020309u;
-    const auto result = compile(code);
+    const auto result = compile_hard(code);
     EXPECT_TRUE(result.module.empty());
     EXPECT_NE(result.reason.find("loop-carried v1 is fabricated on the back edge"),
               std::string::npos)
         << result.reason;
-    EXPECT_NE(result.reason.find("header pc=3"), std::string::npos) << result.reason;
+    EXPECT_NE(result.reason.find("header pc=5"), std::string::npos) << result.reason;
 }
 
 TEST(NarrowingLoopExec, GenuineBackedgeRelayRetainsThePreheaderDataDomain) {
@@ -245,12 +258,12 @@ TEST(NarrowingLoopExec, GenuineBackedgeRelayRetainsThePreheaderDataDomain) {
 TEST(NarrowingLoopExec, BackedgeRelayCannotLaunderAnAbsentWordIntoTheHeader) {
     auto code = body_instruction(0x7e020302u);
     code[5] = 0x7e040309u;   // v2 = absent v9 before v1 = v2
-    const auto result = compile(code);
+    const auto result = compile_hard(code);
     EXPECT_TRUE(result.module.empty());
     EXPECT_NE(result.reason.find("loop-carried v1 is fabricated on the back edge"),
               std::string::npos)
         << result.reason;
-    EXPECT_NE(result.reason.find("header pc=3"), std::string::npos) << result.reason;
+    EXPECT_NE(result.reason.find("header pc=5"), std::string::npos) << result.reason;
 }
 
 TEST(NarrowingLoopExec, BothPredecessorsCanSupplyThePreheaderWord) {
@@ -258,7 +271,7 @@ TEST(NarrowingLoopExec, BothPredecessorsCanSupplyThePreheaderWord) {
 }
 
 TEST(NarrowingLoopExec, OnePredecessorCannotSupplyThePreheaderWord) {
-    missing(compile(predecessor_writes(false)), 8);
+    missing_hard(compile_hard(predecessor_writes(false)), 8);
 }
 
 TEST(NarrowingLoopExec, GenuineRawMaskWordCanSupplyThePreheaderData) {
@@ -286,13 +299,13 @@ TEST(NarrowingLoopExec, DeadScalarLoopResultDoesNotBlockGenuineVectorData) {
 }
 
 TEST(NarrowingLoopExec, AScalarLiveoutCannotBorrowNewPerLaneLoopAdmission) {
-    missing(compile(scalar_counter(true)), 4);
+    missing_hard(compile_hard(scalar_counter(true)), 4);
 }
 
 TEST(NarrowingLoopExec, AScalarRelayBeforeAnOverwriteStillObservesTheLoopResult) {
     auto code = scalar_counter(true);
     code.insert(code.end() - 1, 0xbe860380u);
-    missing(compile(code), 4);
+    missing_hard(compile_hard(code), 4);
 }
 
 TEST(NarrowingLoopExec, BothExitPathsCanReplaceTheOldScalarResultBeforeReadingIt) {
@@ -300,7 +313,7 @@ TEST(NarrowingLoopExec, BothExitPathsCanReplaceTheOldScalarResultBeforeReadingIt
 }
 
 TEST(NarrowingLoopExec, OneExitPathCannotHideASurvivingScalarResult) {
-    missing(compile(scalar_exit_paths(false)), 4);
+    missing_hard(compile_hard(scalar_exit_paths(false)), 4);
 }
 
 TEST(NarrowingLoopExec, DeadSccLoopResultDoesNotBlockGenuineVectorData) {
@@ -308,7 +321,7 @@ TEST(NarrowingLoopExec, DeadSccLoopResultDoesNotBlockGenuineVectorData) {
 }
 
 TEST(NarrowingLoopExec, AnSccLiveoutCannotBorrowNewPerLaneLoopAdmission) {
-    missing(compile(scc_counter(true)), 5);
+    missing_hard(compile_hard(scc_counter(true)), 5);
 }
 
 TEST(NarrowingLoopExec, DeadVccLoopResultDoesNotBlockGenuineVectorData) {
@@ -316,7 +329,7 @@ TEST(NarrowingLoopExec, DeadVccLoopResultDoesNotBlockGenuineVectorData) {
 }
 
 TEST(NarrowingLoopExec, AVccLiveoutCannotBorrowNewPerLaneLoopAdmission) {
-    missing(compile(mask_result(true)), 5);
+    missing_hard(compile_hard(mask_result(true)), 5);
 }
 
 TEST(NarrowingLoopExec, DeadSavedMaskLoopResultDoesNotBlockGenuineVectorData) {
@@ -324,7 +337,7 @@ TEST(NarrowingLoopExec, DeadSavedMaskLoopResultDoesNotBlockGenuineVectorData) {
 }
 
 TEST(NarrowingLoopExec, ASavedMaskRestoreCannotBorrowNewPerLaneLoopAdmission) {
-    missing(compile(mask_result(true, true)), 6);
+    missing_hard(compile_hard(mask_result(true, true)), 6);
 }
 
 TEST(NarrowingLoopExec, GenuineInLoopScalarBroadcastKeepsTheObservableVectorResult) {
@@ -338,7 +351,7 @@ TEST(NarrowingLoopExec, DeadReadfirstScalarCannotExposeAnInLoopVectorRelay) {
     ASSERT_EQ(ins[7].opcode, 0x02u);
     ASSERT_EQ(ins[7].dst.value, 6);
     ASSERT_TRUE(sgpr_dead_at_merge(ins, 12, 6));
-    missing(compile(code), 5);
+    missing_hard(compile_hard(code), 5);
 }
 
 TEST(NarrowingLoopExec, APreheaderReadfirstRelayCannotGainUniformityFromItsScalarPhi) {
@@ -350,7 +363,7 @@ TEST(NarrowingLoopExec, APreheaderReadfirstRelayCannotGainUniformityFromItsScala
     code[6] = 0xbf880004u;
     code[10] = 0xbf82fffau;
     code[12] = kNop;   // keep the actual in-loop vector result
-    missing(compile(code), 5);
+    missing_hard(compile_hard(code), 5);
 }
 
 TEST(NarrowingLoopExec, AnIndependentSccReplacementBeforeItsReadClosesTheExitPath) {
@@ -362,7 +375,7 @@ TEST(NarrowingLoopExec, AnIndependentSccReplacementBeforeItsReadClosesTheExitPat
 TEST(NarrowingLoopExec, AnImplicitCarryReadCannotKillTheOldSccBeforeObservingIt) {
     auto code = scc_counter(false);
     code.insert(code.end() - 1, 0x82068080u);   // s_addc_u32 s6,0,0 consumes old SCC first
-    missing(compile(code), 5);
+    missing_hard(compile_hard(code), 5);
 }
 
 TEST(NarrowingLoopExec, ABodyMaskCannotBecomeAnObservableScalarReduction) {
@@ -381,7 +394,7 @@ TEST(NarrowingLoopExec, ABodyMaskCannotBecomeAnObservableScalarReduction) {
     ASSERT_EQ(ins[6].dst.kind, OperandKind::SGPR);
     ASSERT_EQ(ins[6].dst.value, 16);
     ASSERT_TRUE(sgpr_dead_at_merge(ins, 13, 16));
-    missing(compile(code, 32, true, 32), 4);
+    missing_hard(compile_hard(code, 32, true, 32), 4);
 }
 
 TEST(NarrowingLoopExec, ADeadPreheaderMaskCannotReduceOnlySurvivingHostLanes) {
@@ -389,31 +402,31 @@ TEST(NarrowingLoopExec, ADeadPreheaderMaskCannotReduceOnlySurvivingHostLanes) {
                                      0x7daa0080u, 0x7e020300u, 0x7daa0280u, 0xbf880004u,
                                      0xbf138008u, 0x4a0e0efdu, 0x4e020281u, 0xbf82fffau,
                                      0xbefe0404u, 0xbf068080u, 0x7d280e80u, kEnd};
-    missing(compile(code, 32, true, 32), 6);
+    missing_hard(compile_hard(code, 32, true, 32), 6);
 }
 
 TEST(NarrowingLoopExec, FullExecRestoreInsideTheLoopDoesNotReceiveTheCertificate) {
     const auto code = body_instruction(0xbefe0404u);
     EXPECT_FALSE(structured_loop_only_narrows_exec(decode(code), extended_loop()));
-    missing(compile(code), 3);
+    missing_hard(compile_hard(code), 3);
 }
 
 TEST(NarrowingLoopExec, PartialExecLowWriteDoesNotReceiveTheCertificate) {
     const auto code = body_instruction(0xbefe0381u);
     EXPECT_FALSE(structured_loop_only_narrows_exec(decode(code), extended_loop()));
-    missing(compile(code), 3);
+    missing_hard(compile_hard(code), 3);
 }
 
 TEST(NarrowingLoopExec, PartialExecHighWriteDoesNotReceiveTheCertificate) {
     const auto code = body_instruction(0xbeff0380u);
     EXPECT_FALSE(structured_loop_only_narrows_exec(decode(code), extended_loop()));
-    missing(compile(code), 3);
+    missing_hard(compile_hard(code), 3);
 }
 
 TEST(NarrowingLoopExec, RestoringEntryAfterTheLoopDoesNotInitializeInactiveWords) {
     auto code = program();
     code.insert(code.end() - 1, 0x7d280280u);   // fresh compare of v1 after wider entry restore
-    missing(compile(code), 8);
+    missing_hard(compile_hard(code), 8);
 }
 
 TEST(NarrowingLoopExec, PlainCmpxCertificateUsesActualDecodedExecReduction) {
