@@ -80,6 +80,8 @@ void NativeBarrierHalfProof::seed_entry(SpilledMaskHalves& into, SpillSlotDomain
     into.lane_written_vgprs.insert(marks_.lane_written_vgprs.begin(),
                                    marks_.lane_written_vgprs.end());
     into.relayed_vectors.insert(marks_.relayed_vectors.begin(), marks_.relayed_vectors.end());
+    into.nonarbitrary_vectors.insert(marks_.nonarbitrary_vectors.begin(),
+                                     marks_.nonarbitrary_vectors.end());
     into.memory_vectors.insert(marks_.memory_vectors.begin(), marks_.memory_vectors.end());
     into.memory_words.insert(marks_.memory_words.begin(), marks_.memory_words.end());
     into.memory_slots.insert(marks_.memory_slots.begin(), marks_.memory_slots.end());

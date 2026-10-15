@@ -2704,6 +2704,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_unloaded_launch_vgpr.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_dispatcher_arbitrary_relay
+    SOURCES tests/gpu/recompiler/test_dispatcher_arbitrary_relay.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_dispatcher_entry_active_words
     SOURCES tests/gpu/recompiler/test_dispatcher_entry_active_words.cpp
     INCLUDES tests

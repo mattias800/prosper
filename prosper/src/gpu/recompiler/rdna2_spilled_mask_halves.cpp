@@ -63,6 +63,8 @@ void meet_spilled_mask_halves(SpilledMaskHalves& into, const SpilledMaskHalves& 
     into.lane_written_vgprs.insert(incoming.lane_written_vgprs.begin(),
                                    incoming.lane_written_vgprs.end());
     into.relayed_vectors.insert(incoming.relayed_vectors.begin(), incoming.relayed_vectors.end());
+    into.nonarbitrary_vectors.insert(incoming.nonarbitrary_vectors.begin(),
+                                     incoming.nonarbitrary_vectors.end());
     into.memory_vectors.insert(incoming.memory_vectors.begin(), incoming.memory_vectors.end());
     into.memory_words.insert(incoming.memory_words.begin(), incoming.memory_words.end());
     into.memory_slots.insert(incoming.memory_slots.begin(), incoming.memory_slots.end());
@@ -211,7 +213,15 @@ SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& st
                                       scalar_words, relayed, definite_scc);
     const bool active_complete = active_defined && (vector_write_completes_active_word(in) ||
                                                     vector_read_completes_active_word(in));
-    return {vector_relay, relays, memory, active_defined, active_complete};
+    // CONFIDENCE: MED -- #5185 policy, as the structured walk applies it (vector_write_source_marks
+    // in rdna2_vector_word_marks.cpp): a vector result stays arbitrary only when every relayed
+    // input it reads is an arbitrary VECTOR word. A load or LDS read result is real memory; scalar,
+    // SCC and M0-relative inputs carry no arbitrary property.
+    const bool nonarbitrary = missing_scc || missing_scalar_word || load ||
+                              (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x43) ||
+                              reads_relayed_word(relayed, in) ||
+                              vector_any(state.nonarbitrary_vectors);
+    return {vector_relay, relays, memory, nonarbitrary, active_defined, active_complete};
 }
 
 void advance_defined_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
@@ -263,10 +273,18 @@ void advance_defined_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
         // this, a relay MAY fact on a source that is genuine wherever it is read (a word last
         // completed under a narrower EXEC) taints a destination whose old lanes are genuine, and
         // the dispatcher reloads it as a placeholder in every lane (#5173).
-        if (vector_relay && !source.active_complete)
+        if (vector_relay && !source.active_complete) {
+            // A preserved old word keeps its own lanes, so its nonarbitrary fact survives.
+            const bool old_nonarbitrary = preserve && state.nonarbitrary_vectors.contains(vgpr);
             state.relayed_vectors.insert(vgpr);
-        else if (!preserve)
+            if (source.nonarbitrary || old_nonarbitrary)
+                state.nonarbitrary_vectors.insert(vgpr);
+            else
+                state.nonarbitrary_vectors.erase(vgpr);
+        } else if (!preserve) {
             state.relayed_vectors.erase(vgpr);
+            state.nonarbitrary_vectors.erase(vgpr);
+        }
         if (memory)
             state.memory_vectors.insert(vgpr);
         else if (!preserve)
@@ -322,10 +340,17 @@ void mark_relayed_words(const SpilledMaskHalves& entry, RegState& rs) {
     for (int reg : entry.relayed_vectors) {
         auto& mark = rs.vreg_source_marks[reg];
         mark.placeholder = mark.hard = true;
+        mark.arbitrary = !entry.nonarbitrary_vectors.contains(reg);
     }
     for (int reg : entry.memory_vectors) rs.vreg_source_marks[reg].memory = true;
     rs.sreg_memory_pattern.insert(entry.memory_words.begin(), entry.memory_words.end());
     rs.lane_slot_memory_pattern.insert(entry.memory_slots.begin(), entry.memory_slots.end());
+}
+
+void forget_vector_relay(SpilledMaskHalves& state, int vgpr) {
+    state.relayed_vectors.erase(vgpr);
+    state.nonarbitrary_vectors.erase(vgpr);
+    state.memory_vectors.erase(vgpr);
 }
 
 bool reassembles_spilled_mask_pair(const SpilledMaskHalves& state, const Rdna2Inst& in) {

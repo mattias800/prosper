@@ -2157,8 +2157,7 @@ bool emit_cfg_state_machine(
             if (quad_or.contains(in.pc) && compute_dpp_quad_or(in)) {
                 // The authenticated per-lane coverage proof also owns the complete result.
                 // Preserve that refinement through the mandatory dispatcher storage reload.
-                halves.relayed_vectors.erase(in.dst.value);
-                halves.memory_vectors.erase(in.dst.value);
+                forget_vector_relay(halves, in.dst.value);
             }
             // The #5175 retry spills a half of a saved-mask instance as the pair's Bool: the high
             // half is typed MaskHi, and a reload of either half from such a slot is a proven half

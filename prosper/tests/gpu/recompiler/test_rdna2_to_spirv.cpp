@@ -2340,10 +2340,36 @@ int main() {
                   count_spirv_composite_extract_index(native_linear_spv17d, 1) + 2,
           "same-site alias mutation selects EXEC_HI instead of the proved EXEC_LO half");
 
+    // `fixture` is a prefix ending by moving a restored pair into EXEC, followed by the kernel-17d
+    // tail. Insert a store of 1 from every lane that EXEC enables before the tail, restore EXEC,
+    // and run it. Returns whether it compiled, and the stored words.
+    const auto run_restored_exec_pair = [&](const std::vector<uint32_t>& fixture) {
+        std::vector<uint32_t> code(fixture.begin(), fixture.end() - std::size(code17d));
+        code.push_back(0x7e020281u);                            // v_mov_b32 v1, 1
+        code.push_back(0xe0702000u); code.push_back(0x80020100u); // buffer_store_dword v1, v0
+        code.push_back(0xbefe04c1u);                            // s_mov_b64 exec, -1
+        code.insert(code.end(), std::begin(code17d), std::end(code17d));
+        std::vector<uint32_t> got;
+        const auto spv = recompile_compute(code.data(), code.size(), &rt17d1,
+                                           native_linear_cfg17d);
+        if (!spv.empty())
+            prosper::test::run_compute(spv, std::vector<float>(64, 0.0f), 64, 64, {},
+                                       std::vector<uint32_t>(64, 0u), &got);
+        return std::make_pair(!spv.empty(), got);
+    };
+    const auto lanes_exactly = [](const std::vector<uint32_t>& got, uint32_t first, uint32_t last) {
+        if (got.size() != 64) return false;
+        for (uint32_t lane = 0; lane < 64; ++lane)
+            if (got[lane] != (lane >= first && lane <= last ? 1u : 0u)) return false;
+        return true;
+    };
+
     // A restored half is scalar data plus a dedicated re-spill Bool, never a complete B64 mask.
     // Make s7 differ from the original EXEC_HI, cross a dispatcher edge, then consume s[6:7] as a
     // pair. Publishing the half through ordinary sreg_bool would silently restore the original
-    // EXEC predicate and ignore s7; until the scalar EXEC move supports this pair, reject visibly.
+    // EXEC predicate (lanes 0..32) and ignore s7. The scalar EXEC move now reads both physical
+    // words, so the pair is admitted and must enable exactly lanes 0..31 (#5039: this arm used to
+    // demand a refusal, and only passed because the shared tail read a VGPR it never loaded).
     std::vector<uint32_t> code17d1_mask_half_b64_consumer = {
         0x7d8800a1u,              // EXEC source: low=ffffffff, high=1
         0xbefe046au,              // s_mov_b64 exec,vcc
@@ -2356,15 +2382,21 @@ int main() {
     };
     code17d1_mask_half_b64_consumer.insert(
         code17d1_mask_half_b64_consumer.end(), std::begin(code17d), std::end(code17d));
-    CHECK(recompile_compute(code17d1_mask_half_b64_consumer.data(),
-                            code17d1_mask_half_b64_consumer.size(), nullptr,
-                            native_linear_cfg17d).empty(),
-          "Wave64 mask-half alias cannot masquerade as a complete B64 predicate");
+    CHECK(!recompile_compute(code17d1_mask_half_b64_consumer.data(),
+                             code17d1_mask_half_b64_consumer.size(), nullptr,
+                             native_linear_cfg17d).empty(),
+          "Wave64 mask-half alias consumed as a pair compiles through the dispatcher");
+    if (can_execute_mask_half_spill) {
+        const auto [compiled, got] = run_restored_exec_pair(code17d1_mask_half_b64_consumer);
+        CHECK(compiled && lanes_exactly(got, 0, 31),
+              "Wave64 mask-half alias cannot masquerade as a complete B64 predicate");
+    }
 
     // Restoring both adjacent halves may legitimately promote them to a complete B64 predicate,
     // but an intervening ordinary scalar write ends the first half's lifetime.  The runtime state
     // must mirror the CFG MUST transfer: retaining s6's old dedicated Bool would combine it with
-    // the fresh s7 half and make S_MOV_B64 ignore the hardware zero written to s6.
+    // the fresh s7 half and make S_MOV_B64 ignore the hardware zero written to s6. EXEC must
+    // therefore enable lane 32 alone (#5039: as above, this arm used to demand a refusal).
     std::vector<uint32_t> code17d1_mask_half_between_overwrite = {
         0x7d8800a1u,              // EXEC source: low=ffffffff, high=1
         0xbefe046au,              // s_mov_b64 exec,vcc
@@ -2378,10 +2410,15 @@ int main() {
     };
     code17d1_mask_half_between_overwrite.insert(
         code17d1_mask_half_between_overwrite.end(), std::begin(code17d), std::end(code17d));
-    CHECK(recompile_compute(code17d1_mask_half_between_overwrite.data(),
-                            code17d1_mask_half_between_overwrite.size(), nullptr,
-                            native_linear_cfg17d).empty(),
-          "scalar overwrite between Wave64 half reloads prevents stale pair promotion");
+    CHECK(!recompile_compute(code17d1_mask_half_between_overwrite.data(),
+                             code17d1_mask_half_between_overwrite.size(), nullptr,
+                             native_linear_cfg17d).empty(),
+          "a scalar overwrite between Wave64 half reloads compiles through the dispatcher");
+    if (can_execute_mask_half_spill) {
+        const auto [compiled, got] = run_restored_exec_pair(code17d1_mask_half_between_overwrite);
+        CHECK(compiled && lanes_exactly(got, 32, 32),
+              "scalar overwrite between Wave64 half reloads prevents stale pair promotion");
+    }
     std::vector<uint32_t> code17d1_mask_half_between_overwrite_mutated =
         code17d1_mask_half_between_overwrite;
     code17d1_mask_half_between_overwrite_mutated[9] =
