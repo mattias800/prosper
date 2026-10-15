@@ -67,9 +67,12 @@ void forget_vgpr(SpillSlotDomains& state, int vgpr) {
 
 // A V_READLANE from a typed slot. Its generic transfer already made the destination a scalar word.
 void retype_reload(const SpillSlotDomains& state, const Rdna2Inst& in,
-                   const SpillSlotMustSets& sets, const SpillSlotContext& context) {
+                   const SpillSlotMustSets& sets, const SpillSlotContext& context,
+                   bool proven_half_reload) {
     // A proven mask-half reload publishes the exact ballot word as scalar data (emit_alu).
-    if (!constant_lane(in) || context.proven_half_readlane_pcs.contains(in.pc)) return;
+    if (!constant_lane(in) || proven_half_reload ||
+        context.proven_half_readlane_pcs.contains(in.pc))
+        return;
     const auto slot = state.find({in.src[0].value, in.src[1].value});
     if (slot == state.end()) return;
     const int dst = in.dst.value;
@@ -127,7 +130,8 @@ bool spill_source_is_scalar_data(const Rdna2Inst& in, const std::set<int>& masks
 void advance_spill_slot_domains(SpillSlotDomains& state, const Rdna2Inst& in,
                                 const SpillSlotMustSets& sets, const SpillSlotContext& context,
                                 const std::vector<int>& vector_writes,
-                                std::unordered_set<uint32_t>* mask_writelane_pcs) {
+                                std::unordered_set<uint32_t>* mask_writelane_pcs,
+                                bool proven_half_reload) {
     const bool lane_op =
         in.fmt == Rdna2Format::VOP3 && (in.opcode == kOpWritelane || in.opcode == kOpReadlane);
     if (!lane_op) {
@@ -135,7 +139,7 @@ void advance_spill_slot_domains(SpillSlotDomains& state, const Rdna2Inst& in,
         return;
     }
     if (in.opcode == kOpReadlane) {
-        retype_reload(state, in, sets, context);
+        retype_reload(state, in, sets, context, proven_half_reload);
         return;
     }
     if (!constant_lane(in)) {

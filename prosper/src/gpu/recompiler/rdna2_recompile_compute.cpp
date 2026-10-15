@@ -29,6 +29,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
@@ -641,7 +642,8 @@ recompile_compute_once(const uint32_t* code, size_t dwords, const ShaderResource
                        const ComputeShaderConfig& config, RecompileDiagnosticContext diagnostic,
                        const PortableEntryExecRoot& entry, bool fold_constants = true,
                        ComputeConstantFoldAttempt* fold_attempt = nullptr,
-                       std::vector<uint32_t>* store_loop_data_retry = nullptr);
+                       std::vector<uint32_t>* store_loop_data_retry = nullptr,
+                       bool spilled_mask_bool_halves = false);
 }   // namespace
 
 std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
@@ -685,11 +687,44 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     // This never recovers old words from a late ballot or grants an incomplete launch authority.
     const uint64_t local_count = uint64_t{std::max(1u, config.local_x)} *
                                  std::max(1u, config.local_y) * std::max(1u, config.local_z);
-    if (module.empty() && fold_attempt.changed && fold_attempt.missing_mask_words &&
-        config.wave_size == 64 && config.native_subgroup_size == 64 && local_count % 64 == 0 &&
-        compute_dispatch_has_complete_groups(config)) {
+    const bool fold_retry = module.empty() && fold_attempt.changed &&
+                            fold_attempt.missing_mask_words && config.wave_size == 64 &&
+                            config.native_subgroup_size == 64 && local_count % 64 == 0 &&
+                            compute_dispatch_has_complete_groups(config);
+    // #5175, CONFIDENCE: MED. A refused exact native Wave64 program may spill saved-mask halves
+    // whose producers have no physical words (no participation proof for a ballot). One retry
+    // spills each half as the pair's Bool and reloads it as a proven half, which publishes the
+    // half's ballot word under the same authenticated-launch contract as an EXEC half. Only a
+    // refused program is retried, so every module accepted today is unchanged.
+    std::vector<uint32_t> bool_half_module;
+    if (module.empty() && !fold_retry && !config.force_exchange_dispatcher &&
+        config.wave_size == 64 && config.native_subgroup_size == 64) {
+        RecompileDiagnosticAttempt bool_half_diagnostics;
+        bool_half_module = recompile_compute_once(code, dwords, rt, config, diagnostic, entry, true,
+                                                  nullptr, nullptr, true);
+        bool_half_diagnostics.discard();
+    }
+    if (fold_retry) {
         attempt_diagnostics.discard();
+        RecompileDiagnosticAttempt original_diagnostics;
         module = recompile_compute_once(code, dwords, rt, config, diagnostic, entry, false);
+        if (module.empty() && !config.force_exchange_dispatcher) {
+            // Recovering original physical words can expose an independent word-less saved-mask
+            // spill. Compose the Bool-half retry with that original stream; folding it again would
+            // lose the physical-word proof just restored. A failed retry keeps the original cause.
+            RecompileDiagnosticAttempt bool_half_diagnostics;
+            bool_half_module = recompile_compute_once(code, dwords, rt, config, diagnostic, entry,
+                                                      false, nullptr, nullptr, true);
+            bool_half_diagnostics.discard();
+            if (!bool_half_module.empty()) {
+                original_diagnostics.discard();
+                module = std::move(bool_half_module);
+            }
+        }
+        original_diagnostics.commit();
+    } else if (!bool_half_module.empty()) {
+        attempt_diagnostics.discard();
+        module = std::move(bool_half_module);
     } else {
         attempt_diagnostics.commit();
     }
@@ -720,7 +755,8 @@ recompile_compute_once(const uint32_t* code, size_t dwords, const ShaderResource
                        const ComputeShaderConfig& config, RecompileDiagnosticContext diagnostic,
                        const PortableEntryExecRoot& entry, bool fold_constants,
                        ComputeConstantFoldAttempt* fold_attempt,
-                       std::vector<uint32_t>* store_loop_data_retry) {
+                       std::vector<uint32_t>* store_loop_data_retry,
+                       bool spilled_mask_bool_halves) {
     if (!config.float_transport.canonical()) return {};
     const bool has_null_guarded_raw_store = rt &&
         std::any_of(rt->resources.begin(), rt->resources.end(),
@@ -807,6 +843,7 @@ recompile_compute_once(const uint32_t* code, size_t dwords, const ShaderResource
         return {};
     const StaticScratchLayout scratch = analyze_static_scratch(ins);
     SpirvCompute b;
+    b.spilled_mask_bool_halves = spilled_mask_bool_halves;
     b.atomicized_lds_store_pcs = lds_fminmax_synchronization.atomicized_store_pcs;
     b.diagnostic = diagnostic;
     b.float_transport = config.float_transport;
