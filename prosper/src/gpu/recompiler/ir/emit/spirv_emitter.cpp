@@ -16,6 +16,9 @@ uint32_t emit_one(SpirvCompute& b, const Inst& inst, const uint32_t* x) {
         case Opcode::ConstU32: return b.uconst(inst.imm);
         case Opcode::ConstTrue: return b.btrue();
         case Opcode::ConstFalse: return b.bfalse();
+        case Opcode::BoolAnd: return b.land(x[0], x[1]);
+        case Opcode::F32Clamp01: return b.clamp01(x[0]);
+        case Opcode::PackHalfLo: return b.pack_half_lo(x[0]);
         case Opcode::F32Add: return b.fbin(Op_FAdd, x[0], x[1]);
         case Opcode::F32Sub: return b.fbin(Op_FSub, x[0], x[1]);
         case Opcode::F32Mul: return b.fbin(Op_FMul, x[0], x[1]);

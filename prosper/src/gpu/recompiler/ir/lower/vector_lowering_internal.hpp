@@ -9,6 +9,7 @@
 // the opcodes that have a definition.
 #pragma once
 
+#include <cstdint>
 #include "gpu/recompiler/ir/lower/lowering_context.hpp"
 #include "gpu/recompiler/ir/lower/vector_alu_lowering.hpp"
 #include "gpu/recompiler/ir/ops/vector_alu.hpp"
@@ -45,6 +46,7 @@ private:
     std::optional<bool> compute(uint32_t& d);
     bool compute_float(uint32_t& d);
     bool compute_f16(uint32_t& d);
+    uint32_t half_source(uint32_t raw, const Operand& operand, uint8_t sel, int k);
     std::optional<bool> stage_sdwa_destination(uint32_t& d);
     std::optional<bool> stage_output_modifiers(uint32_t& d);
 };

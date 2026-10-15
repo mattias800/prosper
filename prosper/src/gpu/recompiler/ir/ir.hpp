@@ -72,6 +72,9 @@ enum class Opcode : uint8_t {
     F32Mul,
     F32NMin,
     F32NMax,   // raw binary32 bits -> raw bits
+    BoolAnd,
+    F32Clamp01,
+    PackHalfLo,
 };
 
 struct OpcodeInfo {
