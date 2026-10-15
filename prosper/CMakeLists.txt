@@ -208,6 +208,11 @@ endif()
 enable_testing()
 include(cmake/ProsperGTest.cmake)
 
+# CPU controls for the macOS codec fixture's probe/session disagreement and hardware policy.
+prosper_add_gtest(test_video_hardware_selection
+  SOURCES tests/frontend/test_video_hardware_selection.cpp
+  INCLUDES frontends/video_vt)
+
 # Pure selection/accounting policy behind the stable compute-timing hash filter. This must remain
 # runnable without prosper_core, a game dump, or Vulkan so a broken diagnostic cannot hide behind a
 # skipped execution test on a host without graphics support.
