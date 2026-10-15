@@ -7226,9 +7226,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     if (then_vcc != pre_vcc)
                         rs.vcc = !pre_vcc || !then_vcc ? 0u : b.emit_phi_2way(
                             b.t_bool, pre_vcc, preblock, then_vcc, thenEnd);
-                    // EXEC changed inside the arm (saveexec / v_cmpx / restore): merge it like any value.
-                    // Narrowed-ness is sticky (either edge narrowed → post-merge writes stay predicated).
-                    if (then_exec != pre_exec) rs.exec = merge_exec_arm(b, rs, pre_exec, preblock, then_exec, thenEnd);
+                    // Merge EXEC; narrowing on either edge keeps post-merge writes predicated.
+                    if (then_exec != pre_exec)
+                        rs.exec = merge_exec_arm(b, rs, pre_exec, preblock, then_exec, thenEnd);
                     rs.exec_narrowed = pre_narrowed || then_narrowed;
                     if (!join_structured_saved_masks(b, rs, pre_masks, then_masks, preblock,
                                                      thenEnd, ins, F.branch_pc, F.target_pc))
