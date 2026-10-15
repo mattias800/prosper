@@ -1,10 +1,10 @@
 // eval.cpp — the evaluation half of each IR opcode's definition (see ir.hpp).
-#include <cstdint>
 #include "gpu/recompiler/ir/eval.hpp"
 #include "gpu/recompiler/ir/eval_half.hpp"
 
 #include <algorithm>
 #include <bit>
+#include <cstdint>
 #include <cmath>
 
 namespace prosper::gpu::ir {
@@ -60,6 +60,7 @@ Known evaluate_op(Opcode op, uint32_t imm, uint32_t a, uint32_t b, uint32_t c) {
             if (std::isnan(d)) return std::nullopt;
             return std::bit_cast<uint32_t>(d);
         }
+        case Opcode::FfbhU32: return a ? uint32_t(std::countl_zero(a)) : 0xffffffffu;
         case Opcode::IAdd: return a + b;
         case Opcode::ISub: return a - b;
         case Opcode::IMul: return a * b;

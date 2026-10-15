@@ -24,9 +24,9 @@ constexpr OpcodeInfo kInfo[] = {
     {"sle", 2, Type::Bool},        {"sgt", 2, Type::Bool},         {"sge", 2, Type::Bool},
     {"f32.add", 2, Type::U32},     {"f32.sub", 2, Type::U32},      {"f32.mul", 2, Type::U32},
     {"f32.nmin", 2, Type::U32},    {"f32.nmax", 2, Type::U32},     {"bool.and", 2, Type::Bool},
-    {"f32.clamp01", 1, Type::U32}, {"pack.half.lo", 1, Type::U32},
+    {"f32.clamp01", 1, Type::U32}, {"pack.half.lo", 1, Type::U32}, {"ffbh.u32", 1, Type::U32},
 };
-static_assert(std::size(kInfo) == static_cast<size_t>(Opcode::PackHalfLo) + 1);
+static_assert(std::size(kInfo) == static_cast<size_t>(Opcode::FfbhU32) + 1);
 
 // The type argument `slot` of `op` must have.
 Type argument_type(Opcode op, size_t slot) {

@@ -30,6 +30,11 @@ inline uint32_t vop2(uint32_t op, uint32_t vdst = kVdst, uint32_t src0 = 256 + k
     return (op << 25) | (vdst << 17) | (vsrc1 << 9) | src0;
 }
 
+// VOP1 op v1,v2, with the same per-lane source/destination used by the binary harness.
+inline uint32_t vop1(uint32_t op, uint32_t vdst = kVdst, uint32_t src0 = 256 + kVsrc0) {
+    return 0x7e000000u | (vdst << 17) | (op << 9) | src0;
+}
+
 struct LaneInputs {
     std::vector<uint32_t> s0, s1, old_d;
     std::vector<bool> active;

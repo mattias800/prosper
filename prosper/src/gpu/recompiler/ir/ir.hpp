@@ -75,6 +75,7 @@ enum class Opcode : uint8_t {
     BoolAnd,
     F32Clamp01,
     PackHalfLo,
+    FfbhU32, // leading zero count; all ones for a zero word
 };
 
 struct OpcodeInfo {

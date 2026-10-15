@@ -1,15 +1,16 @@
-// Plain per-lane VOP1 integer cases, extracted verbatim with extract_case_routes.py.
+// VOP1 integer lowering: the relocated scan modifier guards, then the shared operation.
+// Slot 1 of emit_vector_op is deliberately unbound (id 0); no definition reads it.
 #include "gpu/recompiler/ir/lower/vop1_integer_lowering.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/ir/ops/vector_alu.hpp"
+#include "gpu/recompiler/ir/ops/vector_integer_unary.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <cstdint>
 namespace prosper::gpu::ir {
 bool lower_vop1_integer(SpirvCompute& b, const Rdna2Inst& in, uint32_t a, uint32_t& d, bool& ok) {
-    if (in.fmt != Rdna2Format::VOP1) return false;
+    const VectorOpDef* def = find_vector_integer_unary_op(in.fmt, in.opcode);
+    if (!def) return false;
     switch (in.opcode) {
-        case 0x01: d = a; break;                              // v_mov_b32
-        case 0x37: d = b.iun(Op_Not, a); break;               // v_not_b32
-        case 0x38: d = b.iun(Op_BitReverse, a); break;        // v_bfrev_b32
         case kVop1OpcodeFfbhU32: {                            // v_ffbh_u32 (plain e32)
             // AMD RDNA2 ISA: count the zeroes preceding the first set bit from the MSB;
             // return -1 when no bit is set. GLSL.std.450 FindUMsb instead returns the SET
@@ -19,14 +20,14 @@ bool lower_vop1_integer(SpirvCompute& b, const Rdna2Inst& in, uint32_t a, uint32
             // e32 packets 7e087304 / 7e047302 in its compute culling kernels.
             //
             // Keep SDWA out of this admission. The decoder's generic DWORD SDWA path can
-            // carry NEG/ABS, which the VOP1 prologue above applies in the f32 domain; that
+            // carry NEG/ABS, which the caller’s VOP1 prologue applies in the f32 domain; that
             // is not an integer source modifier and would silently change FFBH's operand.
             // DPP reaches and rejects in the stage-specific source-transform block above.
             if (in.has_sdwa || in.has_dpp) {
                 ok = false;
                 break;
             }
-            d = b.ffbh_u32(a);
+            d = emit_vector_op(b, *def, a, 0);
             break;
         }
         case kVop1OpcodeFfblB32: {   // v_ffbl_b32 (plain e32)
@@ -38,10 +39,10 @@ bool lower_vop1_integer(SpirvCompute& b, const Rdna2Inst& in, uint32_t a, uint32
                 ok = false;
                 break;
             }
-            d = b.ffbl_b32(a);
+            d = emit_vector_op(b, *def, a, 0);
             break;
         }
-        default: return false;
+        default: d = emit_vector_op(b, *def, a, 0); break;
     }
     return true;
 }
