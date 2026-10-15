@@ -141,7 +141,10 @@ void empty(const std::vector<uint32_t>& code, uint64_t address) {
 
 TEST(ExecSpillData, MissingVectorInputIsNotRepairedByTheMaskEquality) {
     auto code = persisted(Reduction::Ff1);
-    code[10] = 0xbf800000u; // missing v1 producer; the mask transport is otherwise complete
+    // The v1 producer reads s30, which no launch loads: its value is hard on every route. (A
+    // never-written v1 would not do: under #5185 it is arbitrary on every route, #5039.) The mask
+    // transport is otherwise complete.
+    code[10] = 0x7e02021eu;   // v_mov_b32 v1, s30
     empty(code, 0x5127001010ull);
     EXPECT_NE(last_terminal_reject_reason(0x5127001010ull).find("pc=24 "), std::string::npos);
 }
@@ -394,13 +397,19 @@ TEST(ExecSpillData, CurrentWordTransportAfterTheTransitionHasAUsableComparison) 
     retain(module, 0x5127002010ull);
     EXPECT_FALSE(module.empty()) << last_terminal_reject_reason(0x5127002010ull);
 }
+// v1 outside the lane40 writer holds a hard value: s30 is never loaded. A never-written v1 would
+// be arbitrary on every route under #5185 (#5039). Shifts every pc by one.
+std::vector<uint32_t> hard_old_v1(std::vector<uint32_t> code) {
+    code.insert(code.begin(), 0x7e02021eu);   // v_mov_b32 v1, s30
+    return code;
+}
 TEST(ExecSpillData, MixedGenerationRestoreCannotExposeAnUninitializedLowerLane) {
-    const auto code = mixed_generation(false);
+    const auto code = hard_old_v1(mixed_generation(false));
     const auto table = resources();
     EXPECT_TRUE(recompile_compute(code.data(), code.size(), &table, dispatcher_config(),
                                   {RecompileDiagnosticStage::Compute, 0x5127002020ull})
                     .empty());
-    EXPECT_NE(last_terminal_reject_reason(0x5127002020ull).find("pc=11 "), std::string::npos)
+    EXPECT_NE(last_terminal_reject_reason(0x5127002020ull).find("pc=12 "), std::string::npos)
         << last_terminal_reject_reason(0x5127002020ull);
 }
 
@@ -585,6 +594,7 @@ TEST(ExecSpillData, NumericPushWordsDoNotOriginateCurrentEquality) {
     code[1] = 0x00014a00u;
     code[5] = 0x00014a00u;
     code[7] = 0x00015001u;
+    code = hard_old_v1(code);
     const auto table = resources();
     auto c = dispatcher_config();
     c.user_sgprs = {0, 256};
@@ -592,6 +602,6 @@ TEST(ExecSpillData, NumericPushWordsDoNotOriginateCurrentEquality) {
     EXPECT_TRUE(recompile_compute(code.data(), code.size(), &table, c,
                                   {RecompileDiagnosticStage::Compute, address})
                     .empty());
-    EXPECT_NE(last_terminal_reject_reason(address).find("pc=13 "), std::string::npos)
+    EXPECT_NE(last_terminal_reject_reason(address).find("pc=14 "), std::string::npos)
         << last_terminal_reject_reason(address);
 }

@@ -514,9 +514,13 @@ TEST(ScalarPairMask, DispatcherComparisonsRequireBothCorrectlyPlacedPixelInputs)
 
     const PixelSystemInputMapping absent{};
     const PixelSystemInputMapping disabled{.ena = 0, .addr = kDispatcherPositionFields};
-    const PixelSystemInputMapping x_only{.ena = 1u << 8, .addr = kDispatcherPositionFields};
-    // A reserved disabled field before X shifts the enabled positions away from v0/v1.
-    const PixelSystemInputMapping displaced{.ena = kDispatcherPositionFields,
+    // A word the compare reads must be hard on every route, so each mapping puts a field there
+    // that hardware loads but the backend does not supply (#5160): POS_FIXED_PT after X alone,
+    // LINE_STIPPLE before X (which also shifts the positions away from v0/v1). An unloaded word
+    // would not do: under #5185 it is arbitrary on every route (#5039).
+    const PixelSystemInputMapping x_only{.ena = (1u << 8) | (1u << 15),
+                                         .addr = (1u << 8) | (1u << 15)};
+    const PixelSystemInputMapping displaced{.ena = kDispatcherPositionFields | (1u << 7),
                                             .addr = kDispatcherPositionFields | (1u << 7)};
     for (const auto* inputs : {static_cast<const PixelSystemInputMapping*>(nullptr), &absent,
                                &disabled, &x_only, &displaced}) {

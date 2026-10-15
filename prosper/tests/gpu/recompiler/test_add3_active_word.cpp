@@ -192,7 +192,7 @@ TEST(Add3ActiveWord, RestoredInactiveLanesCannotReadTheNarrowAddress) {
 }
 TEST(Add3ActiveWord, ScalarSelectionNeedsTheActualLoadedGeneration) {
     auto code = program();
-    code.insert(code.begin() + 8, 0x7e060309u);
+    code.insert(code.begin() + 8, 0x7e06021eu);   // v3 = s30: never loaded, hard (#5039)
     missing(code);
 }
 TEST(Add3ActiveWord, NoServiceProducerCannotBorrowItsOldScalarStorage) {

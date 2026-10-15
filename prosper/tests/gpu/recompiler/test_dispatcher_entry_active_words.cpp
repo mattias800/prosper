@@ -92,6 +92,21 @@ struct Result {
     std::string reason;
 };
 
+// Every VGPR but the v0 launch input starts with a hard value: s40 is not a user SGPR, so hardware
+// never loads it and its value is real but unknown. That is what a "never-written" word below
+// stands for. A truly never-written VGPR would not do: under #5185 it holds an arbitrary value
+// hardware could hold, which a fresh predicate may read on any route (#5039). Every pc a test
+// names is relative to the body, after this prefix.
+const Words& hard_prefix() {
+    static const Words prefix = [] {
+        Words words;
+        for (uint32_t vgpr = 1; vgpr < 32; ++vgpr)
+            words.push_back(0x7e000200u | (vgpr << 17u) | 40u);   // v_mov_b32 vN, s40
+        return words;
+    }();
+    return prefix;
+}
+
 // The CFG dispatcher, forced, so every conditional branch ends a case and every case entry reloads
 // the register file from storage. s0..s23 are user data, so the image's T# words are genuine.
 // With `natural`, the dispatcher is not forced: an irreducible loop after the body requires it
@@ -126,8 +141,8 @@ Result compile(const Words& body, bool natural = false) {
     // v9 = 13 is stored, so the program has an observable effect after the body.
     const Words irreducible{0x7e020280u, 0x7e040280u, 0x7c020300u, 0xbf860001u,
                             0x7e040281u, 0x7d840100u, 0xbf870001u, 0xbf82fffdu};
-    const Words code =
-        cat({body, natural ? irreducible : Words{}, {0x7e12028du, 0xe0702000u, 0x80020900u, end}});
+    const Words code = cat({hard_prefix(), body, natural ? irreducible : Words{},
+                            {0x7e12028du, 0xe0702000u, 0x80020900u, end}});
     static uint64_t next_address = 0x5173000000ull;
     const uint64_t address = ++next_address;
     auto module = recompile_compute(code.data(), code.size(), &table, config,
@@ -139,6 +154,7 @@ void accepted(const Result& result) {
 }
 void refused(const Result& result, uint32_t pc) {
     EXPECT_TRUE(result.module.empty());
+    pc += static_cast<uint32_t>(hard_prefix().size());   // fixture pcs name the body
     EXPECT_NE(result.reason.find("pc=" + std::to_string(pc) + " "), std::string::npos)
         << result.reason;
 }

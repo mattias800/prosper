@@ -155,6 +155,13 @@ TEST(Wave32ExecBoundary, GenuineEntryDataAndAFullRestoreActuallyWriteTheBuffer) 
 }
 
 namespace {
+// v1 in the lanes no writer covers: hard on every route. s30 is not a user SGPR, so hardware never
+// loads it. (A never-written v1 would not do: under #5185 it holds an arbitrary value hardware
+// could hold, which a fresh predicate may read on any route, #5039.)
+std::vector<uint32_t> hard_old_v1(std::vector<uint32_t> code) {
+    code.insert(code.begin(), 0x7e02021eu);   // v_mov_b32 v1, s30
+    return code;
+}
 void missing(const std::vector<uint32_t>& code, uint64_t address, bool original = false) {
     EXPECT_TRUE(compile(code, original, address).empty());
     const auto reason = last_terminal_reject_reason(address);
@@ -182,11 +189,11 @@ bpermute_oracle::Interpreter isolated(const std::vector<uint32_t>& module, uint3
 TEST(Wave32ExecBoundary, MissingVectorProducerStaysRefusedAtTheOriginalConsumer) {
     auto code = original_code();
     code[10] = 0xbf800000u;
-    missing(code, 0x5138000100ull, true);
+    missing(hard_old_v1(code), 0x5138000100ull, true);
 }
 TEST(Wave32ExecBoundary, MissingWriterSourceCannotBorrowCurrent) {
     auto code = store_code(false);
-    *std::find(code.begin(), code.end(), 0x7e020300u) = 0x7e020309u;
+    *std::find(code.begin(), code.end(), 0x7e020300u) = 0x7e02021eu;
     missing(code, 0x5138000101ull);
 }
 TEST(Wave32ExecBoundary, AFullRestoreCannotReviveDataOnlyWrittenInEmptyExec) {
@@ -194,34 +201,34 @@ TEST(Wave32ExecBoundary, AFullRestoreCannotReviveDataOnlyWrittenInEmptyExec) {
     const auto at = std::find(code.begin(), code.end(), 0x7da40080u);
     ASSERT_NE(at, code.end());
     code.insert(at, 0xbefe03c1u);
-    missing(code, 0x5138000102ull);
+    missing(hard_old_v1(code), 0x5138000102ull);
 }
 TEST(Wave32ExecBoundary, SwappedTransportWordsCannotPreserveCurrent) {
     auto code = store_code(false);
     std::iter_swap(std::find(code.begin(), code.end(), 0x00014b13u),
                    std::find(code.begin(), code.end(), 0x00015113u));
-    missing(code, 0x5138000103ull);
+    missing(hard_old_v1(code), 0x5138000103ull);
 }
 TEST(Wave32ExecBoundary, PhysicalLowSlotAliasEndsTheActualEquality) {
     auto code = store_code(false);
     before_read(code, {0xd7610013u, 0x00010a81u});   // lane5 overwrites physical37&31
-    missing(code, 0x5138000104ull);
+    missing(hard_old_v1(code), 0x5138000104ull);
 }
 TEST(Wave32ExecBoundary, PhysicalHighSlotAliasEndsTheActualEquality) {
     auto code = store_code(false);
     before_read(code, {0xd7610013u, 0x00011081u});   // lane8 overwrites physical40&31
-    missing(code, 0x5138000105ull);
+    missing(hard_old_v1(code), 0x5138000105ull);
 }
 TEST(Wave32ExecBoundary, ChangedExecGenerationCannotUseTheOldSlotTransport) {
     auto code = store_code(false);
     before_read(code, {0x7da40080u});
-    missing(code, 0x5138000106ull);
+    missing(hard_old_v1(code), 0x5138000106ull);
 }
 TEST(Wave32ExecBoundary, MissingSourceOnTheBackedgeCannotBorrowThePreheader) {
     auto code = store_code(false);
     const auto at = std::find(code.begin(), code.end(), 0x80048104u);
     ASSERT_NE(at, code.end());
-    code.insert(at, 0x7e020309u);
+    code.insert(at, 0x7e02021eu);
     // The insertion lies inside the loop: keep its VCC exit and scalar exit/backedge targets exact.
     const auto exit = std::find(code.begin(), code.end(), 0xbf860004u);
     ASSERT_NE(exit, code.end());
@@ -309,7 +316,7 @@ TEST(Wave32ExecBoundary, OracleRejectsAStoreToAnotherSubgroupsOrLanesSlot) {
 TEST(Wave32ExecBoundary, ApproximateReadfirstCannotAuthenticateThisNewDataRecovery) {
     auto code = store_code(false);
     code.insert(code.begin(), 0x7e400500u);   // s32=this lane fallback
-    missing(code, 0x5138000300ull);
+    missing(hard_old_v1(code), 0x5138000300ull);
 }
 TEST(Wave32ExecBoundary, ARealScalarMoveDoesNotDisableTheMatchedRecovery) {
     auto code = store_code(false);
@@ -335,7 +342,7 @@ std::vector<uint32_t> scalar_relay_loop(bool readfirst) {
 }
 }   // namespace
 TEST(Wave32ExecBoundary, AnApproximateScalarRelayCannotAuthenticateANonemptyCurrentWord) {
-    missing(scalar_relay_loop(true), 0x5138000302ull);
+    missing(hard_old_v1(scalar_relay_loop(true)), 0x5138000302ull);
 }
 TEST(Wave32ExecBoundary, TheMatchedRealScalarValueProducesTheActualEmptySink) {
     observes(scalar_relay_loop(false), 0xdeadbeefu, 0x5138000303ull);
@@ -356,14 +363,14 @@ TEST(Wave32ExecBoundary, ACurrentTransportInsideTheHeaderKeepsItsActualInstructi
 TEST(Wave32ExecBoundary, UnprovidedImplicitVccCannotPublishTheNewCurrentDataFact) {
     auto code = store_code(false);
     *std::find(code.begin(), code.end(), 0x7e020300u) = 0x02020680u;   // CNDMASK v1,0,v3,initialVCC
-    missing(code, 0x5138000401ull);
+    missing(hard_old_v1(code), 0x5138000401ull);
 }
 
 TEST(Wave32ExecBoundary, UnprovidedImplicitCarryCannotPublishTheNewCurrentDataFact) {
     auto code = store_code(false);
     *std::find(code.begin(), code.end(), 0x7e020300u) =
         0x50020680u;   // ADD_CO_CI v1,0,v3,initialVCC
-    missing(code, 0x5138000402ull);
+    missing(hard_old_v1(code), 0x5138000402ull);
 }
 TEST(Wave32ExecBoundary, ARealNumericWordKeepsTheMatchedCurrentDataRoute) {
     auto code = store_code(false);
@@ -457,7 +464,7 @@ std::vector<uint32_t> vcc_control_code(bool produced) {
 }
 }   // namespace
 TEST(Wave32ExecBoundary, UnprovidedVccCannotChooseNewCurrentDataWriters) {
-    missing(vcc_control_code(false), 0x5138000320ull);
+    missing(hard_old_v1(vcc_control_code(false)), 0x5138000320ull);
 }
 TEST(Wave32ExecBoundary, ARealVccCompareKeepsTheMatchedCurrentDataWriters) {
     const auto code = vcc_control_code(true);
@@ -491,7 +498,7 @@ std::vector<uint32_t> vcc_relay_control_code(bool explicit_mask, bool real_move)
 }
 }   // namespace
 TEST(Wave32ExecBoundary, AFullExecImplicitMaskRelayCannotAuthenticateLaterControl) {
-    missing(vcc_relay_control_code(false, false), 0x5138000330ull);
+    missing(hard_old_v1(vcc_relay_control_code(false, false)), 0x5138000330ull);
 }
 TEST(Wave32ExecBoundary, AFullExecExplicitMaskRelayCannotAuthenticateLaterControl) {
     const auto code = vcc_relay_control_code(true, false);
@@ -508,13 +515,13 @@ TEST(Wave32ExecBoundary, AWholeExecVectorCopyCannotEraseTheUnprovidedMaskDepende
     auto code = vcc_relay_control_code(false, false);
     code.insert(code.begin() + 4, 0x7e080302u);   // v4=v2 while EXEC is still full
     *std::find(code.begin(), code.end(), 0x7d840480u) = 0x7d840880u;
-    missing(code, 0x5138000333ull);
+    missing(hard_old_v1(code), 0x5138000333ull);
 }
 TEST(Wave32ExecBoundary, OverwritingTheRelayDoesNotRepairTheUnprovedReadHistory) {
     auto code = vcc_relay_control_code(false, false);
     code.insert(code.begin() + 4,
                 0x7e040280u);   // independent overwrite after the unsupported read
-    missing(code, 0x5138000334ull);
+    missing(hard_old_v1(code), 0x5138000334ull);
 }
 TEST(Wave32ExecBoundary, TheMatchedOtherLiteralActuallyWritesTheActiveBuffer) {
     auto code = vcc_relay_control_code(false, true);

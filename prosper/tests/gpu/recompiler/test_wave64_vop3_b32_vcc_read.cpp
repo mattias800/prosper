@@ -96,8 +96,12 @@ std::vector<uint32_t> compile(const std::vector<uint32_t>& code, Rejections* rej
     config.tidig_comp_cnt = tidig_comp_cnt;
     // The later straight-line fallback also refuses at PC1. Capture all terminal attempts so
     // that its final diagnostic cannot conceal a missing CFG ambiguity guard.
+    // Without local Y, v1 is never loaded and so arbitrary under #5185 on every route; give it a
+    // hard value from s30, which no launch loads either (#5039). Shifts every pc by one.
+    std::vector<uint32_t> words = code;
+    if (tidig_comp_cnt == 0) words.insert(words.begin(), 0x7e02021eu);   // v_mov_b32 v1, s30
     TerminalRejectCapture capture;
-    auto spirv = recompile_compute(code.data(), code.size(), nullptr, config);
+    auto spirv = recompile_compute(words.data(), words.size(), nullptr, config);
     if (rejections) *rejections = capture.take();
     return spirv;
 }
@@ -139,12 +143,12 @@ TEST(Wave64Vop3B32VccRead, MissingLocalYCannotFabricateCompareMask) {
     Rejections rejections;
     EXPECT_TRUE(compile(program(kBfeVccLo0, kBfeVccLo1, true), &rejections, 0).empty());
     const std::pair<std::string, std::string> expected{
-        "fabricated-fresh-mask-source", "pc=0 a fresh predicate requires defined inputs"};
+        "fabricated-fresh-mask-source", "pc=1 a fresh predicate requires defined inputs"};
     EXPECT_NE(std::find(rejections.begin(), rejections.end(), expected), rejections.end())
         << testing::PrintToString(rejections);
     EXPECT_TRUE(std::any_of(rejections.begin(), rejections.end(), [](const auto& rejection) {
         return rejection.first == "cfg-recompile-reject" &&
-               rejection.second.find("pc=0 words=7c020300 ") != std::string::npos;
+               rejection.second.find("pc=1 words=7c020300 ") != std::string::npos;
     })) << testing::PrintToString(rejections);
 }
 

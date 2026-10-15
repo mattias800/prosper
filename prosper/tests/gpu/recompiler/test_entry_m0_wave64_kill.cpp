@@ -112,6 +112,9 @@ std::vector<uint32_t> compile(const uint32_t (&prefix)[N], bool local_y = true,
                               uint64_t program = 0x49900001ull) {
     std::vector<uint32_t> code(std::begin(prefix), std::end(prefix));
     code.insert(code.end(), std::begin(kTail), std::end(kTail));
+    // Without local Y, v1 is never loaded and so arbitrary under #5185 on every route; give it a
+    // hard value from s30, which no launch loads either (#5039). Shifts every pc by one.
+    if (!local_y) code.insert(code.begin(), 0x7e02021eu);   // v_mov_b32 v1, s30
     ComputeShaderConfig config;
     config.local_x = 64;
     config.wave_size = 64;
@@ -197,7 +200,7 @@ TEST(EntryM0Wave64Kill, MissingLocalYRefusesAtTheTailCompare) {
     constexpr uint64_t program = 0x49900003ull;
     EXPECT_TRUE(compile(kDataWriteOnEveryPath, false, program).empty());
     EXPECT_NE(
-        last_terminal_reject_reason(program).find("mode=unresolved-operand pc=12 words=7c020300"),
+        last_terminal_reject_reason(program).find("mode=unresolved-operand pc=13 words=7c020300"),
         std::string::npos);
 }
 

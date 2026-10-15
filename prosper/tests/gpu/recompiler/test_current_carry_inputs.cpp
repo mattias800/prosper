@@ -126,7 +126,9 @@ TEST(CurrentCarryInputs, MissingVectorSourceCannotBorrowTheFreshPredicate) {
     for (uint32_t op : carry_ops) {
         SCOPED_TRACE(op);
         auto code = program(op);
-        code[6] = 17u | (258u << 9u) | (12u << 18u); // actual v2 absent
+        // The second source is the absent s18: never loaded, so hard on every route. (A never-
+        // written v2 would not do: under #5185 it is arbitrary on every route, #5039.)
+        code[6] = 17u | (18u << 9u) | (12u << 18u);
         refused(compile(code), 5);
     }
 }

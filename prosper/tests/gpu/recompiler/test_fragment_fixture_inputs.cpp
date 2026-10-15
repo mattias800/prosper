@@ -73,8 +73,11 @@ TEST(FragmentFixtureInputs, OneNamedInputCannotInitializeTheOtherCoordinate) {
     ASSERT_FALSE(prosper::test::compile_fragment_control_flow_fixture(
                      ballot_spill, {RecompileDiagnosticStage::Fragment, 0x50630005u})
                      .empty());
+    // X alone leaves v1 unloaded, which #5185 makes arbitrary on every route (#5039). Enable
+    // POS_FIXED_PT too: hardware loads it into v1, and the backend does not supply it (#5160), so
+    // the coordinate the compare reads is hard.
     PixelSystemInputMapping only_x;
-    only_x.ena = only_x.addr = 1u << 8;
+    only_x.ena = only_x.addr = (1u << 8) | (1u << 15);
     EXPECT_TRUE(compile_without_mapping(ballot_spill, 0x50630006u, &only_x).empty());
     const auto reason = last_terminal_reject_reason(0x50630006u);
     EXPECT_NE(reason.find("cfg-recompile-reject mode=unresolved-operand"), std::string::npos)
@@ -185,8 +188,10 @@ TEST(StructuralFixtureInputs, TwoSourceCarryRequiresTheOriginalComparedWord) {
     const auto module = compile(0x50630300u);
     ASSERT_FALSE(module.empty()) << last_terminal_reject_reason(0x50630300u);
     EXPECT_TRUE(has_opcode(module, 251)) << "the original join retains its CFG dispatcher";
-    // v3 supplies the original SDWA predicate. An unrelated v27 producer cannot replace it.
-    code[4] = 0xbf800000u;
+    // v3 supplies the original SDWA predicate. An unrelated v27 producer cannot replace it: a v3
+    // relayed from s30, which no launch loads, is hard on every route. (A never-written v3 would
+    // be arbitrary under #5185 on every route, #5039.)
+    code[4] = 0x7e06021eu;   // v_mov_b32 v3, s30
     EXPECT_TRUE(compile(0x50630301u).empty());
     const auto reason = last_terminal_reject_reason(0x50630301u);
     EXPECT_NE(reason.find("fabricated-fresh-mask-source"), std::string::npos) << reason;

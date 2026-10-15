@@ -15,6 +15,14 @@
 
 namespace {
 using namespace prosper::gpu;
+// The old value of the read word in the lanes no writer covers: hard on every route. s2 is not
+// loaded at launch here (no user SGPR or system value names it), so its value is real but unknown.
+// A never-written VGPR would not do: under #5185 it holds an arbitrary value hardware could hold,
+// which a fresh predicate may read on any route (#5039). Shifts every pc by one.
+std::vector<uint32_t> hard_old(std::vector<uint32_t> code, uint32_t vgpr) {
+    code.insert(code.begin(), 0x7e000200u | (vgpr << 17u) | 2u);   // v_mov_b32 vN, s2
+    return code;
+}
 
 struct Result {
     std::vector<uint32_t> module;
@@ -64,7 +72,7 @@ std::vector<uint32_t> unchanged_mask(bool genuine = true) {
     return {
         0x7daa0080u, // A = actual incoming EXEC & (local-ID != 0)
         0xbe84047eu, // s[4:5] = actual A, before the word is written
-        genuine ? 0x7e040281u : 0x7e040309u,
+        genuine ? 0x7e040281u : 0x7e040202u,
         0x7da40080u, // another narrowing cannot remove DATA already genuine throughout A
         0xbefe0404u, // restore the unchanged A
         0x7d280480u,
@@ -116,7 +124,7 @@ TEST(SavedExecData, ACurrentSubsetCannotRefreshItsWiderSavedParent) {
     auto code = unchanged_mask();
     code.insert(code.begin(), 0xbe86047eu); // retain wider ENTRY before A is selected
     code[5] = 0xbefe0406u;
-    missing(compile(code), 6);
+    missing(compile(hard_old(code, 2)), 7);
 }
 
 TEST(SavedExecData, EveryScalarPredecessorRetainsTheSameActualMask) {
@@ -124,7 +132,7 @@ TEST(SavedExecData, EveryScalarPredecessorRetainsTheSameActualMask) {
 }
 
 TEST(SavedExecData, OneScalarPredecessorCannotBorrowTheOthersEquality) {
-    missing(compile(both_paths_equal(false)), 9);
+    missing(compile(hard_old(both_paths_equal(false), 2)), 10);
 }
 
 TEST(SavedExecData, WiderReplacementCannotUseTheRetiredParentEquality) {
@@ -132,7 +140,7 @@ TEST(SavedExecData, WiderReplacementCannotUseTheRetiredParentEquality) {
     code.insert(code.begin(), 0xbe86047eu);
     code.insert(code.begin() + 3,
                 0xbe840406u); // replace s[4:5] with wider ENTRY while A stays active
-    missing(compile(code), 7);
+    missing(compile(hard_old(code, 2)), 8);
 }
 
 TEST(SavedExecData, IndependentEqualCopySurvivesTheOriginalPairReplacement) {
@@ -159,13 +167,13 @@ TEST(SavedExecData, OrOfTheSameActualMaskRetainsEquality) {
 TEST(SavedExecData, AndWithANarrowerValueCannotRefreshTheWiderOperand) {
     auto code = unchanged_mask();
     code.insert(code.begin() + 2, {0x7da40081u, 0x87fe047eu});
-    missing(compile(code), 7);
+    missing(compile(hard_old(code, 2)), 8);
 }
 
 TEST(SavedExecData, ReversedAndOperandsCannotAuthenticateTheWiderMask) {
     auto code = unchanged_mask();
     code.insert(code.begin() + 2, {0x7da40081u, 0x87fe7e04u});
-    missing(compile(code), 7);
+    missing(compile(hard_old(code, 2)), 8);
 }
 
 TEST(SavedExecData, AndOfDistinctValuesCannotTreatEitherAsTheResult) {
@@ -174,7 +182,7 @@ TEST(SavedExecData, AndOfDistinctValuesCannotTreatEitherAsTheResult) {
         0x87fe7e06u, // B & A is empty, while saved B itself still enables lane 1
         0x7e040281u, 0xbefe0406u, 0x7d280480u, 0xbf810000u,
     };
-    missing(compile(code), 10);
+    missing(compile(hard_old(code, 2)), 11);
 }
 
 TEST(SavedExecData, AndOfIdenticalSavedValuesWritesThroughoutThatActualValue) {
@@ -196,7 +204,7 @@ TEST(SavedExecData, SaveexecWithAnEqualOperandCapturesTheSameCurrentValue) {
 TEST(SavedExecData, SaveexecWithAWiderOperandCannotRefreshThatOperand) {
     auto code = unchanged_mask();
     code.insert(code.begin() + 2, {0x7da40081u, 0xbe862404u});
-    missing(compile(code), 7);
+    missing(compile(hard_old(code, 2)), 8);
 }
 
 TEST(SavedExecData, OverlappingDestinationCopiesTheOldSourceBeforeRetirement) {
@@ -220,7 +228,7 @@ std::vector<uint32_t> backedge(bool genuine) {
         0x7e040281u,
         0xbe860380u,
         0x7d280480u, // header must consume the CURRENT generation, not its preheader writer
-        genuine ? 0x7e040281u : 0x7e040309u,
+        genuine ? 0x7e040281u : 0x7e040202u,
         0xbefe0404u,
         0x80068106u,
         0xbf0a8206u,
@@ -362,7 +370,7 @@ namespace {
 // v2 belongs to A before C is saved. ANDN1 selects nonempty A\C, whereas ORN1 may
 // enable lanes outside A. Neither instruction's old-EXEC destination is its result.
 std::vector<uint32_t> andn1_subset(bool genuine = true, bool widening = false) {
-    return {0x7daa0080u, 0xbe84047eu, genuine ? 0x7e040281u : 0x7e040309u,  0x7da40081u,
+    return {0x7daa0080u, 0xbe84047eu, genuine ? 0x7e040281u : 0x7e040202u,  0x7da40081u,
             0xbe86047eu, 0xbefe0404u, widening ? 0xbe883806u : 0xbe883706u, 0x7d280480u,
             0xbf810000u};
 }
@@ -391,7 +399,7 @@ TEST(SavedExecData, Andn1CannotAuthenticateAMissingWriterSource) {
 }
 
 TEST(SavedExecData, Andn1MatchedOrn1WideningCannotBorrowOldExecData) {
-    missing(compile(andn1_subset(true, true)), 7);
+    missing(compile(hard_old(andn1_subset(true, true), 2)), 8);
 }
 
 TEST(SavedExecData, Andn1SourceDestinationAliasUsesTheOldSourceValue) {
@@ -410,7 +418,7 @@ TEST(SavedExecData, Andn1OldValueCannotReceiveANewSubsetOnlyWord) {
     auto code = andn1_subset();
     code.insert(code.begin() + 7, {0x7e060281u, 0xbefe0408u});
     code[9] = 0x7d280680u;
-    missing(compile(code), 9);
+    missing(compile(hard_old(code, 3)), 10);
 }
 
 TEST(SavedExecData, Andn1BothPredecessorsRetainCurrentData) {
