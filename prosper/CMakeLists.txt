@@ -333,6 +333,11 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME refactor_split_file
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/refactor/split_file.py" --selftest)
+  # extract_case_routes moves a giant `case` body into member-function routes (ADR 0012's SALU
+  # relocation); its selftest makes each of its tiling/indent/balance/escape checks fail once.
+  add_test(NAME refactor_extract_case_routes
+           COMMAND "${Python3_EXECUTABLE}"
+                   "${CMAKE_SOURCE_DIR}/tools/refactor/extract_case_routes.py" --selftest)
   add_test(NAME refactor_map_symbols_clusters
            COMMAND "${Python3_EXECUTABLE}"
                    "${CMAKE_SOURCE_DIR}/tools/refactor/map_symbols.py" --selftest)

@@ -14,6 +14,7 @@ each one does a transformation whose correctness can be *checked*, not merely re
 | `split_file.py` | splits one translation unit into several along a region partition |
 | `outline_methods.py` | moves a class's method BODIES out of its header into a .cpp — the one transformation a class-shaped region needs |
 | `extract_function.py` | drives clangd's `ExtractFunction` over AST-derived statement runs |
+| `extract_case_routes.py` | moves a giant `case` body into member-function routes, one per top-level statement run, and proves the move was textual |
 | `classify_tests.py` | proposes a folder for each test from its own includes |
 | `check_include_paths.py` | finds targets that reach a project include they cannot resolve |
 
