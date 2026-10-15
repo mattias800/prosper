@@ -124,6 +124,15 @@ void wave_maximum(const Result& r) {
         EXPECT_EQ(stores[lane], lane - 1u)
             << "lane " << lane << " retains its own final masked iteration";
 }
+// The old value of `vgpr` in every lane before the program: hard on every route. s30 is neither a
+// user SGPR nor written by the programs here, so hardware never loads it. A never-written VGPR
+// would not do: under #5185 it holds an arbitrary value hardware could hold, which a fresh
+// predicate may read on any route (#5039). Shifts every pc by one.
+Program hard_old(Program p, uint32_t vgpr) {
+    p.words.insert(p.words.begin(), 0x7e00021eu | (vgpr << 17u));   // v_mov_b32 vN, s30
+    ++p.header;
+    return p;
+}
 void missing(const Result& r, uint32_t pc) {
     EXPECT_TRUE(r.module.empty());
     EXPECT_NE(r.reason.find("fabricated-fresh-mask-source"), std::string::npos) << r.reason;
@@ -173,11 +182,12 @@ TEST(ComputeLoopDataRoute, ExplicitExactDispatcherCalibratesWaveMaximum) {
 TEST(ComputeLoopDataRoute, UnwrittenPreheaderWordStaysMissing) {
     auto p = program();
     p.words[2] = kNop;
+    p = hard_old(p, 1);
     missing(compile(p), p.header);
 }
 TEST(ComputeLoopDataRoute, FabricatedPreheaderRelayStaysMissing) {
     auto p = program();
-    p.words[2] = 0x7e020309u;
+    p.words[2] = 0x7e02021eu;   // v1 = s30, never loaded: hard on every route (#5039)
     missing(compile(p), p.header);
 }
 TEST(ComputeLoopDataRoute, MissingScalarBoundIsNotVectorData) {
@@ -187,12 +197,12 @@ TEST(ComputeLoopDataRoute, MissingScalarBoundIsNotVectorData) {
 }
 TEST(ComputeLoopDataRoute, UnwrittenBackedgeWordStaysMissing) {
     auto p = program();
-    p.words[11] = 0x7e020309u;
+    p.words[11] = 0x7e02021eu;   // v1 = s30, never loaded: hard on every route (#5039)
     missing(compile(p), p.header);
 }
 TEST(ComputeLoopDataRoute, ExplicitDispatcherDoesNotInventBackedgeData) {
     auto p = program();
-    p.words[11] = 0x7e020309u;
+    p.words[11] = 0x7e02021eu;   // v1 = s30, never loaded: hard on every route (#5039)
     const auto result = compile(p, config(true));
     EXPECT_TRUE(result.module.empty());
     EXPECT_NE(
@@ -220,7 +230,7 @@ TEST(ComputeLoopDataRoute, BothPredecessorsSupplyTheCurrentGeneration) {
     wave_maximum(compile(predecessor(true)));
 }
 TEST(ComputeLoopDataRoute, OnePredecessorCannotSupplyMissingLoopEntryData) {
-    const auto p = predecessor(false);
+    const auto p = hard_old(predecessor(false), 1);
     missing(compile(p), p.header);
 }
 TEST(ComputeLoopDataRoute, GenuineBackedgeRelayRetainsActiveData) {
@@ -269,8 +279,9 @@ TEST(ComputeLoopDataRoute, RestoredExecCanReadGenuineEntryData) {
 TEST(ComputeLoopDataRoute, RestoredExecCannotReadInactiveBoundWords) {
     auto p = program();
     p.words.insert(p.words.end() - 1, 0x7d840480u);
-    missing(compile(p), 6);
-    cfg_missing(compile(p, config(true)), 17, 0x7d840480u);
+    p = hard_old(p, 2);
+    missing(compile(p), 7);
+    cfg_missing(compile(p, config(true)), 18, 0x7d840480u);
 }
 TEST(ComputeLoopDataRoute, AStatusBearingStoreDoesNotSelectThisRetry) {
     auto p = program();

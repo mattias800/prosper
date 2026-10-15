@@ -15,6 +15,14 @@
 
 namespace {
 using namespace prosper::gpu;
+// The old value of the read word in the lanes no writer covers: hard on every route. s30 is not
+// loaded at launch here (no user SGPR or system value names it), so its value is real but unknown.
+// A never-written VGPR would not do: under #5185 it holds an arbitrary value hardware could hold,
+// which a fresh predicate may read on any route (#5039). Shifts every pc by one.
+std::vector<uint32_t> hard_old(std::vector<uint32_t> code, uint32_t vgpr) {
+    code.insert(code.begin(), 0x7e000200u | (vgpr << 17u) | 30u);   // v_mov_b32 vN, s30
+    return code;
+}
 struct Result {
     std::vector<uint32_t> module;
     std::string reject;
@@ -55,16 +63,19 @@ void missing(const Result& result, uint32_t pc) {
         << result.reject;
 }
 
+// A missing half writes v2 from s1 (0x7e040201): only s0 is a user SGPR, so hardware never loads
+// s1 and the word is hard on every route. A never-loaded VGPR would be arbitrary under #5185 on
+// every route (#5039).
 std::vector<uint32_t> saved_complement(bool first = true, bool second = true) {
     return {
         0xbe84047eu, // P is the actual producer EXEC, not a width-derived full-wave certificate
         0x7da40080u, // A=P & (local-ID==0)
-        first ? 0x7e040281u : 0x7e040309u,
+        first ? 0x7e040281u : 0x7e040201u,
         0x8afe7e04u, // exact B=P & ~A
         0xbe86047eu, // save actual B before the nested EXEC change
         0x7da40081u, // C=B & (local-ID==1), a strict subset for the supplied 64-lane workgroup
         0xbefe0406u, // restore unchanged B, including its lanes outside C
-        second ? 0x7e040282u : 0x7e040309u,
+        second ? 0x7e040282u : 0x7e040201u,
         0xbefe0404u,
         0x7d280480u,
         0xbf810000u,
@@ -95,14 +106,14 @@ TEST(SavedComplementData, MissingSecondHalfCannotAuthenticateTheSavedParent) {
 TEST(SavedComplementData, InnerSubsetWithoutRestoreCannotCoverTheSavedComplement) {
     auto code = saved_complement();
     code[6] = 0xbf800000u;
-    missing(compile(code), 9);
+    missing(compile(hard_old(code, 2)), 10);
 }
 
 TEST(SavedComplementData, AnUnrelatedSavedMaskCannotRestoreComplementMembership) {
     auto code = saved_complement();
     code.insert(code.begin() + 3, 0xbe88047eu); // retain A separately before selecting B
     code[7] = 0xbefe0408u; // restoring A again leaves B's lanes unwritten
-    missing(compile(code), 10);
+    missing(compile(hard_old(code, 2)), 11);
 }
 
 TEST(SavedComplementData, CopyingTheSavedComplementRetainsItsEquation) {
@@ -116,7 +127,7 @@ TEST(SavedComplementData, ReplacingTheCopyByAnUnrelatedMaskCannotCoverTheParent)
     auto code = saved_complement();
     code.insert(code.begin() + 6, 0xbe8a047eu); // copy actual inner C, not the saved exact B
     code[7] = 0xbefe040au;
-    missing(compile(code), 10);
+    missing(compile(hard_old(code, 2)), 11);
 }
 
 namespace {
@@ -358,7 +369,7 @@ namespace {
 std::vector<uint32_t> backedge(bool genuine) {
     auto code = saved_complement();
     code.resize(9);   // both halves completed and the original P restored before the header
-    code.insert(code.end(), {0xbe8a0380u, 0x7d280480u, genuine ? 0x7e040281u : 0x7e040309u,
+    code.insert(code.end(), {0xbe8a0380u, 0x7d280480u, genuine ? 0x7e040281u : 0x7e040201u,
                              0x800a810au, 0xbf0a820au, 0xbf85fffbu, 0xbf810000u});
     return code;
 }

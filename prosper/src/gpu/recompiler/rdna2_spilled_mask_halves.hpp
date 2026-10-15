@@ -49,6 +49,12 @@ struct SpilledMaskHalves {
     // MAY provenance of ordinary vector relays and memory-pattern data (#4787). Storage reload
     // does not turn their placeholder bits into genuine scalar lane-mask inputs.
     std::set<int> relayed_vectors, memory_vectors, memory_words;
+    // The relayed vectors that may hold a lane which is NOT arbitrary (a MAY fact, union at joins;
+    // a subset of relayed_vectors). Every other relayed word is missing only in lanes holding an
+    // ARBITRARY value (ScalarSourceMarks::arbitrary, #5174 / #5185): a VGPR the launch inventory
+    // says hardware never loads, or a deterministic vector function of such words and defined
+    // ones. The dispatcher reload re-marks it arbitrary, as the structured walk keeps it.
+    std::set<int> nonarbitrary_vectors;
     std::set<std::pair<int, int>> memory_slots;
     ActiveVectorWords active_vectors;
     bool exec_known_full = false;
@@ -60,6 +66,9 @@ struct SpilledVectorSourceMarks {
     bool vector_relay = false;
     bool scalar_relay = false;
     bool memory = false;
+    // vector_relay may carry a lane that is not arbitrary: a scalar, SCC, memory or M0-relative
+    // input, or a relayed vector that is itself nonarbitrary.
+    bool nonarbitrary = false;
     bool active_defined = false;
     // active_defined, and the write completes every EXEC lane's result words: the result is
     // genuine in the current EXEC whatever the relay MAY facts say about its sources.
@@ -88,6 +97,9 @@ void advance_defined_slots(SpilledMaskHalves& state, const Rdna2Inst& in,
 // At a dispatcher block entry: the reloaded SGPR words (and SCC) that may be relayed fabricated
 // words get the emitter's merge-placeholder mark, as they carried inside the case they left.
 void mark_relayed_words(const SpilledMaskHalves& entry, RegState& rs);
+
+// A proof elsewhere owns `vgpr`'s complete result: drop its relay and memory MAY facts.
+void forget_vector_relay(SpilledMaskHalves& state, int vgpr);
 
 // True when `in` is `s_mov_b64 dst, s[N:N+1]` and sN / sN+1 hold the low / high half of the same
 // saved-mask instance. Evaluated BEFORE `in`'s own transfer.

@@ -138,7 +138,9 @@ TEST(Wave32MaskScc, MissingComparedScalarCannotBecomeAMaskCondition) {
 
 TEST(Wave32MaskScc, MissingComparedVectorCannotBecomeAMaskCondition) {
     auto code = program();
-    code[3] = 0xbf800000u;   // remove only v5's actual producer
+    // Replace only v5's actual producer by a relay of s30, which no launch loads: hard on every
+    // route. (A never-written v5 would be arbitrary under #5185 on every route, #5039.)
+    code[3] = 0x7e0a021eu;   // v_mov_b32 v5, s30
     missing_source(compile(code), 5);
 }
 

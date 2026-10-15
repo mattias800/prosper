@@ -15,15 +15,27 @@
 namespace {
 using namespace prosper::gpu;
 
+// A twin's missing word is s1: only s0 is a user SGPR, so hardware never loads s1, and its value
+// is hard on every route. (A never-loaded VGPR would not do: under #5185 it holds an arbitrary
+// value hardware could hold, which a fresh predicate may read on any route, #5039.)
+constexpr uint32_t kMovV2HardS1 = 0x7e040201u;   // v_mov_b32 v2, s1
+
+// Gives v2 a hard old value in every lane before `code`, for twins whose missing lanes are the
+// ones no writer covers. Shifts every pc by one.
+std::vector<uint32_t> hard_old_v2(std::vector<uint32_t> code) {
+    code.insert(code.begin(), kMovV2HardS1);
+    return code;
+}
+
 std::vector<uint32_t> partition(bool first = true, bool second = true) {
     return {
         0xbe84047eu, // save actual parent EXEC in s[4:5]
         0x7daa0080u, // A = parent & (genuine local-ID v0 != 0)
         0xbf880001u, // an empty A skips its writer, without creating a missing active lane
-        first ? 0x7e040281u : 0x7e040309u,
+        first ? 0x7e040281u : kMovV2HardS1,
         0x8afe7e04u, // B = parent & ~A
         0xbf880001u, // an empty B skips its writer
-        second ? 0x7e040282u : 0x7e040309u,
+        second ? 0x7e040282u : kMovV2HardS1,
         0xbefe0404u, // restore the same parent value
         0x7d280480u, // fresh predicate consumes the entire parent word v2
         0xbf810000u,
@@ -92,7 +104,7 @@ std::vector<uint32_t> scalar_first_half(bool alternate_genuine) {
     return {
         0xbe84047eu, 0x7daa0080u, 0xbf060000u,
         0xbf840002u, // independent genuine SCC, not an EXEC-empty condition
-        0x7e040281u, 0xbf820001u, alternate_genuine ? 0x7e040281u : 0x7e040309u,
+        0x7e040281u, 0xbf820001u, alternate_genuine ? 0x7e040281u : kMovV2HardS1,
         0x8afe7e04u, 0xbf880001u, 0x7e040282u,
         0xbefe0404u, 0x7d280480u, 0xbf810000u,
     };
@@ -124,7 +136,7 @@ TEST(ComplementaryExecData, PartialSecondWriterCannotDefineTheRestoredParent) {
     code[5] = 0xbf880002u; // skip the entire two-dword SDWA writer when B is empty
     code[6] = 0x7e0402f9u;
     code.insert(code.begin() + 7, 0x00851480u); // WORD_0 / UNUSED_PRESERVE
-    missing(compile(code), 9);
+    missing(compile(hard_old_v2(code)), 10);
 }
 
 namespace {
@@ -135,7 +147,7 @@ std::vector<uint32_t> partition_backedge(bool genuine) {
                 {
                     0xbe860380u, // genuine scalar counter s6=0
                     0x7d280480u, // header: compare current v2 under the restored parent
-                    genuine ? 0x7e040281u : 0x7e040309u,
+                    genuine ? 0x7e040281u : kMovV2HardS1,
                     0x80068106u,
                     0xbf0a8206u,
                     0xbf85fffbu, // counter++; counter<2; backedge -> compare
@@ -172,11 +184,11 @@ std::vector<uint32_t> execnz_partition(bool first, bool second) {
         0x7daa0080u,
         0xbf890001u,
         0xbf820001u,
-        first ? 0x7e040281u : 0x7e040309u,
+        first ? 0x7e040281u : kMovV2HardS1,
         0x8afe7e04u,
         0xbf890001u,
         0xbf820001u,
-        second ? 0x7e040282u : 0x7e040309u,
+        second ? 0x7e040282u : kMovV2HardS1,
         0xbefe0404u,
         0x7d280480u,
         0xbf810000u,
@@ -189,10 +201,12 @@ std::vector<uint32_t> accumulating_partition(bool first, bool second, bool expli
     code.resize(8);
     code.push_back(0x7daa0080u); // narrow again to A, with genuine DATA retained in both halves
     if (e64) {
-        code.push_back(0xd51f0002u); // v_mac_f32_e64 v2, v0/v2, v0/v9 (implicit old v2)
-        code.push_back((alias ? 0x102u : 0x100u) | (explicit_source ? 0x20000u : 0x21200u));
+        code.push_back(0xd51f0002u); // v_mac_f32_e64 v2, v0/v2, v0/s1 (implicit old v2)
+        code.push_back((alias ? 0x102u : 0x100u) | (explicit_source ? 0x20000u : 0x200u));
+    } else if (explicit_source) {
+        code.push_back(0x3e040000u | (alias ? 0x102u : 0x100u));   // v_mac_f32 v2, v0/v2, v0
     } else {
-        code.push_back(0x3e040000u | (alias ? 0x102u : 0x100u) | (explicit_source ? 0u : 0x1200u));
+        code.push_back(0x3e040001u | (alias ? 0x400u : 0u));   // v_mac_f32 v2, s1, v0/v2
     }
     code.insert(code.end(), {0xbefe0404u, 0x7d280480u, 0xbf810000u});
     return code;
@@ -262,7 +276,7 @@ std::vector<uint32_t> mac_backedge(bool genuine) {
                                 0xbe860380u,
                                 0x3e040100u,
                                 0x7d280480u,
-                                genuine ? 0x7e040281u : 0x7e040309u,
+                                genuine ? 0x7e040281u : kMovV2HardS1,
                                 0x80068106u,
                                 0xbf0a8206u,
                                 0xbf85fffau,
@@ -304,13 +318,13 @@ TEST(ComplementaryExecData, SavedParentCopySurvivesAnUnrelatedHighWordOverwrite)
 }
 
 TEST(ComplementaryExecData, SavedParentHighWordOverwriteCannotReviveCoverage) {
-    missing(compile(overwritten_parent(false)), 11);
+    missing(compile(hard_old_v2(overwritten_parent(false))), 12);
 }
 
 TEST(ComplementaryExecData, RepeatingTheFirstMaskCannotCoverTheParent) {
     auto code = partition();
     code[4] = 0x87fe7e04u;   // parent & old EXEC repeats A instead of selecting parent & ~A
-    missing(compile(code));
+    missing(compile(hard_old_v2(code)), 9);
 }
 
 TEST(ComplementaryExecData, SelectedLaneWriterCannotReplaceTheMissingComplement) {
@@ -359,7 +373,7 @@ TEST(ComplementaryExecData, NewParentValueCannotReuseAnEarlierComplement) {
                 {0xbe86047eu, 0x7da40080u});   // preserve ENTRY, then narrow parent to lane 0
     code.insert(code.begin() + 7,
                 0xbe840406u);   // while old B is active, replace parent by wider ENTRY
-    missing(compile(code), 11);
+    missing(compile(hard_old_v2(code)), 12);
 }
 
 // Exercise the actual DATA MUST boundary without an independent spill/relay emission refusal
