@@ -33,6 +33,7 @@
 // CONFIDENCE: HIGH for loops (the header phi is the standard loop-carried form, and the merge value
 // is the one that reaches the exit). HIGH for if merges with the placeholder caveat above.
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -56,6 +57,10 @@ struct LaneSlotEdge {
     std::unordered_map<int, std::unordered_map<int, uint32_t>> data, mask;
     std::unordered_set<int> invalidated;
     uint32_t block = 0;
+    // Graphics ADDTID spills are per-lane SSA slots too. Capture both planes before emitting
+    // another predecessor; neither its value nor its source proof may survive from one arm only.
+    std::unordered_map<uint64_t, uint32_t> addtid;
+    std::unordered_map<uint64_t, ScalarSourceMarks> addtid_marks;
     static LaneSlotEdge of(const RegState& rs, uint32_t block);
 };
 
@@ -68,12 +73,13 @@ struct LaneSlotEdge {
 void join_lane_slots(SpirvCompute& b, RegState& rs, const LaneSlotEdge& first,
                      const LaneSlotEdge& second, uint32_t branch_pc);
 
-// The loop-carried slots of one structured loop.
+// The loop-carried V_WRITELANE and graphics ADDTID slots of one structured loop.
 class LaneSlotLoopCarry {
 public:
     // Constructed BEFORE mark_loop_carried(): records which slots were fabricated-marked on the
     // preheader edge.
     explicit LaneSlotLoopCarry(const RegState& rs);
+    // Existing ADDTID slots also get header phis; their source proof must hold on the back edge.
     // At the header label, after the other header phis: one phi per slot written in
     // [header_pc, backedge_pc), seeded from the preheader (a placeholder when it is unwritten there).
     void open(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins, uint32_t header_pc,
@@ -110,6 +116,14 @@ private:
         bool seed_marked;   // the preheader value is fabricated (or the lane was unwritten there)
         bool backedge_marked;   // the body's value on the back edge is fabricated
     };
+    struct AddtidSlot {
+        uint64_t key;
+        uint32_t phi;
+        size_t patch;
+        ScalarSourceMarks seed_marks, backedge_marks;
+    };
+    std::vector<AddtidSlot> addtid_slots_;
+    LaneSlotEdge addtid_check_;   // only the ADDTID value and proof maps are populated
     std::vector<Slot> slots_;
     std::set<std::pair<int, int>> preheader_marks_;
     std::set<std::pair<int, int>> read_in_loop_;   // constant-lane V_READLANEs in the loop

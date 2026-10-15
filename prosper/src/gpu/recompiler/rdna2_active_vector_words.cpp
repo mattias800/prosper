@@ -158,6 +158,12 @@ bool active_vector_sources_defined(const ActiveVectorWords& state, const Rdna2In
     // that lane's own address (vector_read_completes_active_word names the same forms the emitter
     // counts as complete). Its only vector input is ADDR; GDS, swizzle and the M0/TID forms are
     // excluded there.
+    // CONFIDENCE: HIGH -- ds_read_addtid_b32 has no VGPR address: each EXEC lane reads at
+    // M0 + offset + its own lane id. M0 must be a MUST scalar word that no relay fabricated
+    // (#5183); a missing or relayed M0 addresses nothing genuine.
+    if (in.fmt == Rdna2Format::DS && in.opcode == 0xb1)
+        return vector_read_completes_active_word(in) && scalar_words.contains(124) &&
+               !relayed_words.contains(124);
     if (in.fmt == Rdna2Format::DS)
         return vector_read_completes_active_word(in) && in.src[0].kind == OperandKind::VGPR &&
                in.src[0].value >= 0 && in.src[0].value < 256 && vector(in.src[0].value);

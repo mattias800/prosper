@@ -598,3 +598,69 @@ TEST(UnloadedLaunchVgpr, ASourceUndefinedInsideTheWriteExecIsNotMadeDefined) {
         EXPECT_FALSE(e.defined(compare8)) << std::hex << write;
     }
 }
+
+// ---- #5183: a graphics ADDTID reload carries the spilled word's provenance ---------------------
+// In a graphics stage ds_write_addtid_b32 / ds_read_addtid_b32 are a per-lane VGPR spill: the
+// reload returns the word the matching write stored under the same M0. Now that the reload is a
+// complete active-lane read, it must not look genuine when the spilled word was not.
+
+TEST(UnloadedLaunchVgpr, PublicFragmentAddtidReloadCarriesTheSpilledWord) {
+    constexpr uint32_t m0_zero = 0xb07c0000u;   // s_movk_i32 m0, 0
+    const Words spill_v6{0xdac00000u, 0x00000600u};   // ds_write_addtid_b32 v6
+    const Words reload_v8{0xdac40000u, 0x08000000u};   // ds_read_addtid_b32 v8
+    // v8 first relays the unsupplied v1, so only the reload can make the compare genuine.
+    accepted(compile_fragment(cat({{mov8_v1, m0_zero, mov6_3}, spill_v6, {cmpx_x4_v2}, reload_v8}),
+                              8, &kBaryPosX));
+    // The spilled word relays v1 itself: the reload is as hard as it.
+    refused(compile_fragment(cat({{mov8_v1, m0_zero, mov6_v1}, spill_v6, {cmpx_x4_v2}, reload_v8}),
+                             8, &kBaryPosX));
+    // Spilled under P, reloaded under the restored mask: lanes outside P never wrote their slot.
+    refused(compile_fragment(cat({{mov8_v1, m0_zero, mov6_3, save_exec, cmpx_x4_v2},
+                                  spill_v6,
+                                  {restore_exec},
+                                  reload_v8}),
+                             8, &kBaryPosX));
+}
+
+TEST(UnloadedLaunchVgpr, PublicFragmentAddtidReloadMeetsBothBranchPredecessors) {
+    constexpr uint32_t m0_zero = 0xb07c0000u;
+    const Words spill_v6{0xdac00000u, 0x00000600u};
+    const Words reload_v8{0xdac40000u, 0x08000000u};
+    // A VCC vote guards a three-dword arm independently of the later narrowed EXEC. The skipped edge
+    // retains the pre-branch spill; only the taken edge replaces it with a genuine word.
+    const auto program = [&](uint32_t initial) {
+        return cat({{mov8_v1, m0_zero, initial},
+                    spill_v6,
+                    {0x7c0204f6u, 0xbf870003u, mov6_3},
+                    spill_v6,
+                    {cmpx_x4_v2},
+                    reload_v8});
+    };
+    accepted(compile_fragment(program(mov6_3), 8, &kBaryPosX));
+    refused(compile_fragment(program(mov6_v1), 8, &kBaryPosX));
+}
+
+// The scalar loop is top-tested and takes zero trips. Its body must not replace the pre-loop
+// spill's proof. Nesting a second loop selects the general structured route as well as counted.
+TEST(UnloadedLaunchVgpr, PublicFragmentAddtidReloadMeetsZeroTripLoopPredecessor) {
+    constexpr uint32_t m0_zero = 0xb07c0000u;
+    const Words spill_v6{0xdac00000u, 0x00000600u};
+    const Words reload_v8{0xdac40000u, 0x08000000u};
+    const auto loop = [&](uint32_t counter, const Words& body) {
+        const auto n = static_cast<uint32_t>(body.size());
+        return cat({{0xbe800380u | (counter << 16), 0xbf0a8000u | counter, 0xbf840000u | (n + 2)},
+                    body,
+                    {0x80008100u | (counter << 16) | counter,
+                     0xbf820000u | ((0x10000u - n - 4) & 0xffffu)}});
+    };
+    for (bool nested : {false, true}) {
+        auto body = cat({{mov6_3}, spill_v6});
+        if (nested) body = loop(21, body);
+        const auto program = [&](uint32_t initial) {
+            return cat(
+                {{mov8_v1, m0_zero, initial}, spill_v6, loop(20, body), {cmpx_x4_v2}, reload_v8});
+        };
+        accepted(compile_fragment(program(mov6_3), 8, &kBaryPosX));
+        refused(compile_fragment(program(mov6_v1), 8, &kBaryPosX));
+    }
+}

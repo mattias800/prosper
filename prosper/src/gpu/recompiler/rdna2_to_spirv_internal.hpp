@@ -3215,6 +3215,9 @@ struct RegState {
     // + the instruction offset (uconst is interned, so equal constant M0s share one id). A read of a
     // never-written slot rejects (fail-visible).
     std::unordered_map<uint64_t, uint32_t> lds_addtid;
+    // The provenance of each slot's spilled word (addtid_spill_marks), so the reload carries the
+    // spilled word's missing lanes instead of looking genuine (#5183).
+    std::unordered_map<uint64_t, ScalarSourceMarks> lds_addtid_marks;
 };
 
 // Cache and live realization derive owned source authority from the original code. A selected

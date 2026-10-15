@@ -9054,11 +9054,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if (in.opcode == 0xb0 || in.opcode == 0xb1) {
                 auto m0 = rs.sreg.find(124);
                 if (in.opcode == 0xb0) {
-                    if (m0 != rs.sreg.end()) {
-                        auto vr = rs.vreg.find(in.src[1].value);
-                        rs.lds_addtid[((uint64_t)m0->second << 32) | in.literal] =
-                            vr != rs.vreg.end() ? vr->second : b.uconst(0);
-                    }
+                    if (m0 != rs.sreg.end()) record_addtid_spill(b, rs, in, m0->second);
                     return true;   // spill: unobservable beyond the tracked slot
                 }
                 if (m0 == rs.sreg.end()) { ok = false; return true; }

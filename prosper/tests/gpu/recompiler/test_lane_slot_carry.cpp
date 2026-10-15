@@ -348,3 +348,111 @@ TEST(LaneSlotCarry, JoinPhisDiffersPlaceholdsAbsenceAndDropsConflicts) {
         EXPECT_FALSE(rs.vgpr_lane_mask_slots.contains(vgpr)) << "v" << vgpr << " keeps no mask";
     }
 }
+
+TEST(LaneSlotCarry, AddtidJoinSelectsValuesMeetsMarksAndDropsAbsentSlots) {
+    using namespace prosper::gpu;
+    SpirvCompute b;
+    b.begin(0);
+    const uint32_t seven = b.uconst(7), hundred = b.uconst(100);
+    for (bool hard_first : {false, true}) {
+        LaneSlotEdge first, second;
+        first.block = 11;
+        second.block = 12;
+        first.addtid = {{1, seven}, {2, seven}, {3, seven}, {4, seven}};
+        second.addtid = {{1, hundred}, {2, seven}, {4, seven}};
+        first.addtid_marks = {{1, {}}, {2, {}}, {3, {}}, {4, {}}};
+        second.addtid_marks = {{1, {}}, {2, {}}};   // key 4 has no proof on this edge
+        auto& hard = (hard_first ? first : second).addtid_marks.at(1);
+        hard.placeholder = hard.hard = true;
+        RegState rs;
+        join_lane_slots(b, rs, first, second, 6);
+        ASSERT_EQ(rs.lds_addtid.size(), 2u);
+        EXPECT_NE(rs.lds_addtid.at(1), seven);
+        EXPECT_NE(rs.lds_addtid.at(1), hundred) << "the actual predecessor selects the value";
+        EXPECT_EQ(rs.lds_addtid.at(2), seven);
+        EXPECT_TRUE(rs.lds_addtid_marks.at(1).hard) << "either predecessor can supply a hard word";
+        EXPECT_FALSE(rs.lds_addtid_marks.at(2).placeholder);
+        EXPECT_FALSE(rs.lds_addtid.contains(3)) << "a never-written edge has unknown LDS data";
+        EXPECT_FALSE(rs.lds_addtid.contains(4)) << "value presence alone is not a source proof";
+    }
+}
+
+TEST(LaneSlotCarry, AddtidLoopSelectsTheExitCheckAndCarriesTheBackedgeValue) {
+    using namespace prosper::gpu;
+    for (bool check_writes : {false, true}) {
+        SpirvCompute b;
+        b.begin(0);
+        RegState rs;
+        const auto seed = b.uconst(7), body = b.uconst(100), checked = b.uconst(300);
+        rs.lds_addtid[1] = seed;
+        rs.lds_addtid_marks[1] = {};
+        LaneSlotLoopCarry loop(rs);
+        loop.open(b, rs, {}, 4, 9, 11);
+        const auto phi = rs.lds_addtid.at(1);
+        ASSERT_NE(phi, seed);
+        if (check_writes) rs.lds_addtid[1] = checked;
+        loop.record_check(rs);
+        rs.lds_addtid[1] = body;
+        ASSERT_TRUE(loop.patch_backedge(b, rs, 12));
+        ASSERT_TRUE(loop.finish_exit(b, rs, false, 0, 0));
+        EXPECT_EQ(rs.lds_addtid.at(1), check_writes ? checked : phi);
+        // The header phi selects the real zero-trip seed or the last iteration's body value.
+        bool found = false;
+        for (size_t i = 0; i < b.code.size(); i += b.code[i] >> 16) {
+            if ((b.code[i] & 0xffffu) != 245 || b.code[i + 2] != phi) continue;
+            ASSERT_EQ(b.code[i] >> 16, 7u);
+            EXPECT_EQ(b.code[i + 3], seed);
+            EXPECT_EQ(b.code[i + 4], 11u);
+            EXPECT_EQ(b.code[i + 5], body);
+            EXPECT_EQ(b.code[i + 6], 12u);
+            found = true;
+        }
+        EXPECT_TRUE(found);
+    }
+}
+
+TEST(LaneSlotCarry, AddtidLoopDropsBodyOnlySlotsAndMeetsDirectBreakEdges) {
+    using namespace prosper::gpu;
+    for (bool direct_break : {false, true}) {
+        SpirvCompute b;
+        b.begin(0);
+        RegState rs;
+        rs.lds_addtid[1] = b.uconst(7);
+        rs.lds_addtid_marks[1] = {};
+        LaneSlotLoopCarry loop(rs);
+        loop.open(b, rs, {}, 4, 9, 11);
+        const auto header = rs.lds_addtid.at(1);
+        loop.record_check(rs);
+        rs.lds_addtid[1] = b.uconst(100);
+        rs.lds_addtid[2] = b.uconst(300);
+        rs.lds_addtid_marks[2] = {};
+        ASSERT_TRUE(loop.patch_backedge(b, rs, 12));
+        ASSERT_TRUE(loop.finish_exit(b, rs, direct_break, 21, 22));
+        EXPECT_FALSE(rs.lds_addtid.contains(2)) << "zero trips never write the body-only slot";
+        if (direct_break)
+            EXPECT_NE(rs.lds_addtid.at(1), header) << "the direct exit selects the body's value";
+        else
+            EXPECT_EQ(rs.lds_addtid.at(1), header);
+    }
+}
+
+TEST(LaneSlotCarry, AddtidLoopRefusesALostOrWeakerBackedgeSourceProof) {
+    using namespace prosper::gpu;
+    for (int arm : {0, 1, 2}) {
+        SpirvCompute b;
+        b.begin(0);
+        RegState rs;
+        rs.lds_addtid[1] = b.uconst(7);
+        rs.lds_addtid_marks[1] = {};
+        LaneSlotLoopCarry loop(rs);
+        loop.open(b, rs, {}, 4, 9, 11);
+        loop.record_check(rs);
+        if (arm == 1) {
+            rs.lds_addtid_marks[1].placeholder = true;
+            rs.lds_addtid_marks[1].hard = true;
+        } else if (arm == 2) {
+            rs.lds_addtid.erase(1);
+        }
+        EXPECT_EQ(loop.patch_backedge(b, rs, 12), arm == 0) << arm;
+    }
+}

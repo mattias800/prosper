@@ -21,6 +21,13 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-10-15
 
+### Kena's title world holds on every frame, on a default build
+
+The default build now renders *Kena*'s sunlit title world on every frame, with no noise frames, because the compute program behind the flicker compiles ([#5183](https://github.com/mattias800/prosper/issues/5183), [#5175](https://github.com/mattias800/prosper/issues/5175)).
+
+<p align="center"><img src="assets/screenshots/issue-5183-kena-title-default-odd-frame.webp" alt="Kena: Bridge of Spirits title menu over the sunlit forest shrine with light shafts; Linux RADV prosper-app, default build, PROSPER_NULL_PAGE=1 and -force-gfx-direct, pad flip 241 (an odd present, which was noise before)"></p>
+<p align="center"><img src="assets/screenshots/issue-5183-kena-title-main-vs-candidate.webp" alt="Four consecutive presents, flips 240 to 243. Top row, main c3c1b4699: world and full-screen noise alternate. Bottom row, this change: the lit world on all four"></p>
+
 ### Kena's title world renders on a default build, every other frame
 
 With the fresh-mask guard on, *Kena*'s title menu now draws over its forest-shrine world; the odd frames stay noise until the flicker fix ([#5175](https://github.com/mattias800/prosper/issues/5175)) can reach its compute program, which a separate dispatcher refusal still blocks ([#5181](https://github.com/mattias800/prosper/issues/5181)).

@@ -10,6 +10,7 @@
 //      (ps 0x5006bd0000 pc85-pc105);
 //   4. a structured merge meets two nested owners at the narrower one (ps 0x500aed0000).
 #include "fixtures/checked_compute_launch.hpp"
+#include "gpu/recompiler/rdna2_active_vector_words.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
@@ -363,4 +364,110 @@ TEST(FreshMaskLaneWiseRelay, PublicCompilerAdmitsTheNestedMergeAndRefusesItsUnre
                          one_arm,
                          {compare6}})),
             10);
+}
+
+// ---- 6. ds_read_addtid_b32 completes its active lanes when M0 is genuine (#5183) ----------------
+// Each EXEC lane reads LDS at M0 + offset + its own lane id: no VGPR address, no other lane. M0 is
+// the whole address input, so the read is complete exactly when M0 is genuine. Kena cs
+// 0x5008e80000 pc1248/pc1260 (under s_movk_i32 m0, 0) fed its last refusal at pc1335.
+
+namespace {
+constexpr uint32_t addtid_v8 = 0xdac40000u;   // ds_read_addtid_b32 v8 (dword1 below)
+constexpr uint32_t addtid_v8_dst = 0x08000000u;
+constexpr uint32_t m0_zero = 0xb07c0000u;   // s_movk_i32 m0, 0
+}   // namespace
+
+TEST(FreshMaskLaneWiseRelay, AddtidEncodingNamesTheFormItClaims) {
+    const auto read = decode({addtid_v8, addtid_v8_dst, m0_zero});
+    ASSERT_EQ(read.size(), 2u);
+    EXPECT_EQ(read[0].fmt, Rdna2Format::DS);
+    EXPECT_EQ(read[0].opcode, 0xb1u);
+    EXPECT_FALSE(read[0].ds_gds);
+    EXPECT_EQ(read[0].dst.value, 8);
+    EXPECT_EQ(read[1].fmt, Rdna2Format::SOPK);
+    EXPECT_EQ(read[1].dst.value, 124);
+}
+
+TEST(FreshMaskLaneWiseRelay, AnAddtidReadWithAGenuineM0ConfinesItsMissingLanes) {
+    Emitter e;
+    ASSERT_TRUE(e.emit({cmpx_a}));
+    e.rs.sreg[124] = e.b.uconst(0);
+    e.record({addtid_v8, addtid_v8_dst});
+    EXPECT_EQ(e.rs.vreg_source_marks.at(8).outside_exec, e.rs.exec);
+    EXPECT_TRUE(e.defined(compare8));
+    ASSERT_TRUE(e.emit({full_exec}));
+    EXPECT_FALSE(e.defined(compare8)) << "full EXEC reads the never-written lanes";
+}
+
+TEST(FreshMaskLaneWiseRelay, AnAddtidReadWithAMissingOrFabricatedM0ConfinesNothing) {
+    for (const int arm : {0, 1, 2}) {
+        Emitter e;
+        ASSERT_TRUE(e.emit({cmpx_a}));
+        if (arm == 1) {   // one path never wrote M0
+            e.rs.sreg[124] = e.b.uconst(0);
+            e.rs.sreg_merge_placeholder.insert(124);
+        } else if (arm == 2) {   // M0 holds a saved EXEC half no dword can stand for, even
+            e.rs.sreg[124] = e.b.uconst(0);   // under a loop assumption
+            e.rs.unavailable_saved_mask_words.insert(124);
+            e.rs.sreg_loop_blanket[124] = {blanket_root(0, 124)};
+        }   // arm 0: M0 was never written
+        e.record({addtid_v8, addtid_v8_dst});
+        EXPECT_EQ(e.rs.vreg_source_marks.at(8).outside_exec, 0u) << arm;
+        EXPECT_FALSE(e.defined(compare8)) << arm;
+    }
+}
+
+TEST(FreshMaskLaneWiseRelay, AnAddtidReadOnALoopAssumedM0OwesTheLoopItsCheck) {
+    Emitter e;
+    ASSERT_TRUE(e.emit({cmpx_a}));
+    e.rs.sreg[124] = e.b.uconst(0);
+    e.rs.sreg_merge_placeholder.insert(124);
+    const uint64_t root = blanket_root(0, 124);
+    e.rs.sreg_loop_blanket[124] = {root};
+    e.record({addtid_v8, addtid_v8_dst});
+    ASSERT_TRUE(e.defined(compare8));
+    EXPECT_TRUE(e.b.loop_blanket_roots_read.contains(root));
+}
+
+TEST(FreshMaskLaneWiseRelay, AddtidWritesAndGdsReadsStayIncomplete) {
+    // ds_write_addtid_b32 v8 (0xb0) writes no VGPR; the GDS-bit read is device-global data.
+    for (const Words& words :
+         {Words{0xdac00000u, 0x00000800u}, Words{0xdac60000u, addtid_v8_dst}}) {
+        const auto in = decode(words);
+        ASSERT_EQ(in.size(), 1u);
+        EXPECT_FALSE(vector_read_completes_active_word(in[0])) << std::hex << words[0];
+    }
+    EXPECT_TRUE(vector_read_completes_active_word(decode({addtid_v8, addtid_v8_dst})[0]));
+}
+
+TEST(FreshMaskLaneWiseRelay, ADispatcherAddtidReadNeedsAGenuineUnrelayedM0) {
+    const auto read = decode({addtid_v8, addtid_v8_dst});
+    ASSERT_EQ(read.size(), 1u);
+    const ActiveVectorWords state;
+    const std::set<int> none;
+    EXPECT_TRUE(active_vector_sources_defined(state, read[0], none, none, {124}, none, true));
+    EXPECT_FALSE(active_vector_sources_defined(state, read[0], none, none, {}, none, true))
+        << "M0 is not a MUST scalar word";
+    EXPECT_FALSE(active_vector_sources_defined(state, read[0], none, none, {124}, {124}, true))
+        << "M0 was relayed from a possibly fabricated source";
+}
+
+TEST(FreshMaskLaneWiseRelay, PublicCompilerAdmitsAnAddtidReadOverAHardOldWord) {
+    // v8 first holds LDS data read at the never-written address v19 (hard, #5185); under A the
+    // ADDTID read replaces every active lane, so the compare under A reads only genuine lanes.
+    accepted(
+        compile({ds_read_v8, 0x08000013u, m0_zero, cmpx_a, addtid_v8, addtid_v8_dst, compare8}));
+    // Read under the full EXEC again, the hard lanes outside A are observed.
+    refused(compile({ds_read_v8, 0x08000013u, m0_zero, cmpx_a, addtid_v8, addtid_v8_dst, full_exec,
+                     compare8}),
+            7);
+    // M0 written on one path only (s_cmp_eq_u32 s4, 0; s_cbranch_scc1 over the write): the read
+    // may address through a fabricated M0, so it completes nothing.
+    refused(compile({ds_read_v8, 0x08000013u, 0xbf068004u, 0xbf840001u, m0_zero, cmpx_a, addtid_v8,
+                     addtid_v8_dst, compare8}),
+            8);
+    // M0 written on both paths with different values: a genuine phi, admitted.
+    accepted(
+        compile({ds_read_v8, 0x08000013u, m0_zero, 0xbf068004u, 0xbf840001u,
+                 0xb07c0004u /* s_movk_i32 m0, 4 */, cmpx_a, addtid_v8, addtid_v8_dst, compare8}));
 }
