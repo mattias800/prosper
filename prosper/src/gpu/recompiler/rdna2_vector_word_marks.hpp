@@ -11,6 +11,7 @@
 
 namespace prosper::gpu {
 
+struct LaunchVgpr;
 struct RegState;
 struct SpirvCompute;
 
@@ -31,6 +32,18 @@ struct ScalarSourceMarks {
     // global blanket_roots may additionally depend on the inactive old generation. Hard marks
     // continue to carry their active-domain obligations in blanket_roots.
     std::set<uint64_t> scoped_blanket_roots;
+    // #5174: every lane of this HARD mark that is not defined holds the launch value of a VGPR
+    // the stage's explicit launch inventory (rdna2_launch_vgprs) says hardware does not load, and
+    // no instruction on any path to here has written that lane. On hardware such a lane holds
+    // whatever an earlier wave left in the register file, so no guest-visible result can depend
+    // on it and the recompiler's zero is one of the values hardware could hold: a fresh predicate
+    // may read it. Only seed_vector_word_definedness sets this, and only from the inventory; every
+    // transfer that cannot prove it clears it.
+    bool unloaded = false;
+    // ...and, stronger, every lane outside outside_exec (every lane when it is 0) is such a
+    // never-written lane on this path. A path join needs this: a lane one path wrote and the
+    // other did not is a word with a write on some path, which #5174 keeps hard.
+    bool untouched = false;
 };
 using VectorWordMarks = std::map<int, ScalarSourceMarks>;
 
@@ -60,8 +73,12 @@ void union_source_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other)
 void record_exec_mask_subset(RegState& rs, uint32_t result, uint32_t left, uint32_t right,
                              uint32_t opcode, uint32_t previous_exec);
 // Call only at a producing stage entry, after its actual input VGPRs have been published.
+// `launch` is the stage's explicit launch-VGPR inventory (rdna2_launch_vgprs). Only with it is an
+// absent word one hardware does not load (ScalarSourceMarks::unloaded); without it, as for an
+// unknown launch profile, every absent word stays a hard placeholder.
 void seed_vector_word_definedness(RegState& rs, const std::vector<Rdna2Inst>& instructions,
-                                  bool native_interpolation = false, uint32_t wave_size = 64);
+                                  bool native_interpolation = false, uint32_t wave_size = 64,
+                                  const std::vector<LaunchVgpr>* launch = nullptr);
 ScalarSourceMarks vector_source_marks(const RegState& rs, const Rdna2Inst& in);
 ScalarSourceMarks vector_relative_source_marks(const SpirvCompute& b, const RegState& rs,
                                                const Rdna2Inst& in);
@@ -76,6 +93,11 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
 // `current` holds (exec_subset_of); without it, owners must be equal.
 void join_vector_word_marks(VectorWordMarks& into, const VectorWordMarks& other,
                             const RegState* current = nullptr);
+// The skipped edge of a forward s_cbranch_execz is taken only when `empty_exec` holds in no lane
+// it reaches. Re-express each hard mark on that edge under the owner the taken edge carries, where
+// that is provable from the empty EXEC (#5174 case c), before join_vector_word_marks meets them.
+void confine_execz_skip_marks(const RegState& rs, VectorWordMarks& skipped,
+                              const VectorWordMarks& taken, uint32_t empty_exec);
 void retire_vector_word_roots(ScalarSourceMarks& marks, const std::set<uint64_t>& violated);
 bool vector_word_defined_in_exec(const RegState& rs, const ScalarSourceMarks& marks, uint32_t exec);
 void begin_mimg_source_proof(RegState& rs, uint32_t pc);

@@ -3457,6 +3457,9 @@ struct MergeEdgeMarks {
     std::set<std::pair<int, int>> slot_fabricated, slot_memory;
     VectorWordMarks vectors;
     bool vector_full_exec = false;
+    // Nonzero when this is the skipped edge of a forward s_cbranch_execz: the EXEC value that is
+    // empty in every lane reaching it (confine_execz_skip_marks).
+    uint32_t execz_skip_exec = 0;
 };
 template <class Registers>
 MergeEdgeMarks merge_edge_marks(const RegState& rs, const Registers& registers) {
@@ -3491,7 +3494,13 @@ inline void join_merge_edge(RegState& rs, int r, const MergeEdgeMarks& other) {
 // Join SCC and the spill slots at the same merge (a poisoned SCC edge merges as bfalse, which is
 // fabricated too; a slot marked on either edge is marked after it).
 inline void join_merge_scc_and_slots(RegState& rs, const MergeEdgeMarks& other) {
-    join_vector_word_marks(rs.vreg_source_marks, other.vectors, &rs);
+    if (other.execz_skip_exec) {
+        VectorWordMarks skipped = other.vectors;
+        confine_execz_skip_marks(rs, skipped, rs.vreg_source_marks, other.execz_skip_exec);
+        join_vector_word_marks(rs.vreg_source_marks, skipped, &rs);
+    } else {
+        join_vector_word_marks(rs.vreg_source_marks, other.vectors, &rs);
+    }
     rs.vector_full_exec = rs.vector_full_exec && other.vector_full_exec;
     rs.unavailable_saved_mask_words.insert(other.unavailable_saved_mask_words.begin(),
                                            other.unavailable_saved_mask_words.end());

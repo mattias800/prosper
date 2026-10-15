@@ -1173,12 +1173,15 @@ int main(int argc, char** argv) {
           "a guest barrier inside a PROVED workgroup-uniform scalar arm compiles");
     CHECK(final_reject_log.find("program=0x2468ace000005577") == std::string::npos,
           "the proved-uniform scalar barrier emits no compute-cfg-reject of any reason");
+    // With TIDIG_COMP_CNT = 0 hardware does not load v1 and nothing writes it, so #5174 admits
+    // the compare as an arbitrary value; this control was a refusal before that decision made it
+    // an over-refusal. The positive above still needs v1 bound from the real local Y.
     auto uniform_missing_local_y = uniform_scc_config;
     uniform_missing_local_y.tidig_comp_cnt = 0;
-    CHECK(recompile_compute(kUniformSccBarrierCompiles, std::size(kUniformSccBarrierCompiles),
-                            nullptr, uniform_missing_local_y)
-              .empty(),
-          "the uniform barrier control cannot borrow an absent local-Y v1 input");
+    CHECK(!recompile_compute(kUniformSccBarrierCompiles, std::size(kUniformSccBarrierCompiles),
+                             nullptr, uniform_missing_local_y)
+               .empty(),
+          "an unloaded, never-written local-Y v1 is an arbitrary value (#5174)");
 
     CHECK(count_occurrences(
               final_reject_log,
@@ -2165,10 +2168,19 @@ int main(int argc, char** argv) {
     // satisfy this negative.
     auto flat_missing_offset_table = flat_table;
     flat_missing_offset_table.resources[0].fetch_pc = 4;
-    CHECK(recompile_compute(kFlatCompute + 1, std::size(kFlatCompute) - 1,
-                            &flat_missing_offset_table, flat_config)
+    // #5174: v6 is then never written and compute does not load it, an arbitrary value the
+    // guard admits (a refusal before that decision made it an over-refusal). Relaying another
+    // never-loaded word into v6 is a write, which the decision keeps hard.
+    CHECK(!recompile_compute(kFlatCompute + 1, std::size(kFlatCompute) - 1,
+                             &flat_missing_offset_table, flat_config)
+               .empty(),
+          "the FLAT cache control admits an unloaded, never-written v6 byte offset");
+    auto flat_relayed_offset = std::vector<uint32_t>(std::begin(kFlatCompute), std::end(kFlatCompute));
+    flat_relayed_offset[0] = 0x7e0c031fu;   // v_mov_b32 v6, v31
+    CHECK(recompile_compute(flat_relayed_offset.data(), flat_relayed_offset.size(), &flat_table,
+                            flat_config)
               .empty(),
-          "the FLAT cache control cannot borrow an undefined v6 byte offset");
+          "the FLAT cache control cannot borrow a relayed undefined v6 byte offset");
 
     clear_shader_recompile_cache();
     // GFX9+ may install a vertex-fetch prolog separately from the main merged shader. Both immutable

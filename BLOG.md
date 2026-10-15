@@ -19,6 +19,15 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-10-15
+
+### Kena's title world renders on a default build, every other frame
+
+With the fresh-mask guard still on, *Kena*'s title menu now draws over its forest-shrine world; the odd frames are still block noise, the separate flicker defect ([#5174](https://github.com/mattias800/prosper/issues/5174)).
+
+<p align="center"><img src="assets/screenshots/issue-5174-kena-title-world.webp" alt="Kena: Bridge of Spirits title menu over the forest shrine world; Linux RADV prosper-app, default guard, PROSPER_NULL_PAGE=1 and -force-gfx-direct, pad flip 251"></p>
+<p align="center"><img src="assets/screenshots/issue-5174-kena-title-flicker-sheet.webp" alt="Contact sheet of 65 frames from flips 220 to 420 of the same run: 32 show the world, 33 show full-screen block noise under the menu"></p>
+
 ## 2026-10-14
 
 ### Kena's title world is back underneath its remaining black-screen cause

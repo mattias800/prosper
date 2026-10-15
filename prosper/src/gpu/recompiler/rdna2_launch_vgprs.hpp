@@ -7,7 +7,9 @@
 // PARTIAL reports the existing incomplete ANCILLARY binding; it does not claim a complete
 // architectural word or repair that backend gap (#5160). Every other
 // VGPR -- never loaded, reserved by ADDR only, or loaded by hardware but not supplied here -- keeps
-// its placeholder mark, and a predicate formed from it is refused instead of reading a zero.
+// its placeholder mark. A predicate formed from a loaded-but-unsupplied word is refused instead of
+// reading a zero; one formed from a word hardware never loads, and nothing wrote, reads an
+// arbitrary value that a zero faithfully stands for (#5174, ScalarSourceMarks::unloaded).
 //
 // Pixel stage (RDNA2 ISA 70648, PS input VGPRs; SPI_PS_INPUT_ENA / SPI_PS_INPUT_ADDR): sixteen
 // fields packed in field order. ADDR reserves each field's width even when ENA is clear, so a
@@ -50,6 +52,13 @@ inline constexpr uint8_t kPixelLaunchFieldWidths[kPixelLaunchFields] = {2, 2, 2,
 std::vector<LaunchVgpr> pixel_launch_vgprs(const PixelSystemInputMapping& inputs,
                                            bool interpolation_geometry);
 std::vector<LaunchVgpr> compute_launch_vgprs(uint32_t tidig_comp_cnt);
+
+// Whether every VGPR outside a launch inventory's loaded words is known not to be loaded (#5174).
+// Unknown: an empty pixel ENA (not a PS launch hardware performs; it is how an unrecorded mapping
+// reads), an ENA bit outside ADDR (no slot), and a partial profile -- one whose inventory binds a
+// loaded word only in part (ANCILLARY, #5160). The #5174 decision keeps all of them hard.
+bool pixel_launch_profile_known(const PixelSystemInputMapping& inputs);
+bool launch_profile_complete(const std::vector<LaunchVgpr>& inventory);
 
 const char* pixel_launch_field_name(uint32_t field);
 const char* launch_vgpr_state_name(LaunchVgprState state);

@@ -1048,7 +1048,8 @@ recompile_compute_once(const uint32_t* code, size_t dwords, const ShaderResource
 
     // TIDIG_COMP_CNT decides which thread-id VGPRs the wave starts with (rdna2_launch_vgprs). A
     // component it does not load stays absent, so seeding marks that VGPR a placeholder.
-    for (const auto& launch : compute_launch_vgprs(config.tidig_comp_cnt))
+    const auto launch_inventory = compute_launch_vgprs(config.tidig_comp_cnt);
+    for (const auto& launch : launch_inventory)
         rs.vreg[static_cast<int>(launch.vgpr)] = b.localid_comp[launch.field];
 
     int system_sgpr = static_cast<int>(config.user_sgprs.size());
@@ -1062,7 +1063,7 @@ recompile_compute_once(const uint32_t* code, size_t dwords, const ShaderResource
     // per-invocation scalar inputs and therefore cannot inherit this launch contract.
     b.native_logical_uniform_launch = true;
     b.guest_compute_launch = compute_dispatch_launch_profile(config);
-    seed_vector_word_definedness(rs, ins, false, b.wave_size);
+    seed_vector_word_definedness(rs, ins, false, b.wave_size, &launch_inventory);
 
     auto safe_branches = safe_execz_branches(ins);
     for (uint32_t wpc : waterfall_branches(ins)) safe_branches.insert(wpc);

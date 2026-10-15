@@ -554,13 +554,18 @@ std::vector<uint32_t> recompile_fragment_impl(
     // Gates the fragment SCC re-arm after mask ops so only shaders that actually consume SCC pay the
     // exact-wave-vote's subgroup-size requirement.
     rs.reads_scc = shader_reads_scc(ins);
+    // The explicit launch inventory, when this draw supplies its PS input registers. Without it
+    // the launch profile is unknown and no absent word may be called unloaded (#5174).
+    std::vector<LaunchVgpr> launch_inventory;
+    if (system_inputs)
+        launch_inventory =
+            pixel_launch_vgprs(*system_inputs, derived_interpolation.requires_geometry);
     if (system_inputs) {
         // Retain supplied and partial launch bindings (rdna2_launch_vgprs). Reserved,
         // and loaded-but-unsupplied, words stay absent so seeding marks them placeholders. Vulkan
         // exposes the four floating-point position terms as FragCoord.xyzw, except that the
         // guest's W is FragCoord.w's reciprocal (guest_pixel_position_component).
-        for (const auto& launch :
-             pixel_launch_vgprs(*system_inputs, derived_interpolation.requires_geometry)) {
+        for (const auto& launch : launch_inventory) {
             if (launch.state != LaunchVgprState::Supplied &&
                 launch.state != LaunchVgprState::Partial)
                 continue;
@@ -663,7 +668,9 @@ std::vector<uint32_t> recompile_fragment_impl(
     // cmpx is now ALLOWED (allow_exec_update=true): a fragment divergent-if (v_cmpx ... s_mov exec,saved)
     // is handled by EXEC predication like compute, and the export is guarded above. Memory ops need a
     // resource table. Loops (if any) are reconstructed by emit_body.
-    seed_vector_word_definedness(rs, ins, /*native_interpolation=*/true, b.wave_size);
+    seed_vector_word_definedness(
+        rs, ins, /*native_interpolation=*/true, b.wave_size,
+        system_inputs && pixel_launch_profile_known(*system_inputs) ? &launch_inventory : nullptr);
     SavedMaskCopyFragmentDispatchScope copy_dispatch_scope(b, rs, ins, code, dwords,
                                                            pcrel_dispatch_target);
     if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true, /*allow_smem*/rt != nullptr, exp_fn, code, dwords)) {
