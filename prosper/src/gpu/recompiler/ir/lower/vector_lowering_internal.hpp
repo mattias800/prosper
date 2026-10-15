@@ -44,6 +44,7 @@ private:
     std::optional<bool> stage_source_modifiers();
     std::optional<bool> compute(uint32_t& d);
     bool compute_float(uint32_t& d);
+    bool compute_f16(uint32_t& d);
     std::optional<bool> stage_sdwa_destination(uint32_t& d);
     std::optional<bool> stage_output_modifiers(uint32_t& d);
 };
