@@ -18,6 +18,7 @@
 #include "gpu/recompiler/rdna2_exec_skip_region.hpp"
 #include "gpu/recompiler/rdna2_lane_slot_carry.hpp"
 #include "gpu/recompiler/rdna2_loop_vcc_carry.hpp"
+#include "gpu/recompiler/rdna2_loop_wave_scalar_route.hpp"
 #include "gpu/recompiler/rdna2_mask_half_alias.hpp"
 #include "gpu/recompiler/rdna2_barrier_mask_halves.hpp"
 #include "gpu/recompiler/rdna2_spill_slot_domain.hpp"
@@ -6982,6 +6983,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             active_direct_wave_loop = prior_direct_wave_loop;
             active_direct_wave_continue = prior_direct_wave_continue;
             if (!body_ok || !blanket_check.holds(b, rs, check_marks)) return false;
+            if (refuse_wave_scalar_loop(b, ins, L, exec_proof, code, dwords)) return false;
             const bool body_exec_narrowed = rs.exec_narrowed;
             if (idx < ins.size() && ins[idx].pc == L.backedge_pc) ++idx;      // consume the back-edge
             const uint32_t body_end = b.cur_block;

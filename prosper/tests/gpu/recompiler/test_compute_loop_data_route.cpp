@@ -333,3 +333,76 @@ TEST(ComputeLoopDataRoute, AClosedOriginalWithTheSameConstantConditionCanRetry) 
     p.header += 1;
     wave_maximum(compile(p));
 }
+
+// #5201: the same loop with every vector word DEFINED (v1, v2 written under the full entry EXEC).
+// No header read refuses, so what routes it is what the loop is: no narrowing certificate (its body
+// stores) and a wave scalar, s6, live after it. Per-invocation trip counts would leave s6 at each
+// lane's own count; hardware leaves the wave maximum.
+namespace {
+Program defined_data() {
+    return {{0xbe94047eu, 0x7e020280u, 0x7e040300u, 0x7daa0080u, 0xbe860380u, 0x7e0e02c0u,
+             0x7da20501u, 0xbf880005u, 0x80068106u, 0xe0102000u, 0x80030100u, 0x4a020281u,
+             0xbf82fff9u, 0xbefe0414u, 0x7e060206u, 0xe0702000u, 0x80020300u, kEnd},
+            6};
+}
+// The structured route, and output2 (binding 2) for every lane.
+std::vector<uint32_t> structured(const Result& r) {
+    EXPECT_FALSE(r.module.empty()) << r.reason;
+    if (r.module.empty()) return {};
+    EXPECT_TRUE(has_op(r.module, 246u)) << "OpLoopMerge";
+    EXPECT_FALSE(has_op(r.module, 251u)) << "no dispatcher OpSwitch";
+    bpermute_oracle::Interpreter vm(r.module);
+    vm.native_subgroup_width = 64;
+    vm.push_constants = config().user_sgprs;
+    vm.extra_writable_bindings = {3};
+    auto values = vm.run_buffers(
+        64,
+        {{2, std::vector<uint32_t>(64, 0xdeadbeefu)}, {3, std::vector<uint32_t>(64, 0xdeadbeefu)}},
+        2);
+    EXPECT_TRUE(vm.error.empty()) << vm.error;
+    return values;
+}
+} // namespace
+
+TEST(LoopWaveScalarRoute, ALiveWaveScalarTakesTheExactRouteWithDefinedData) {
+    wave_maximum(compile(defined_data()));
+}
+TEST(LoopWaveScalarRoute, ADeadWaveScalarKeepsTheStructuredRoute) {
+    auto p = defined_data();
+    p.words[14] = 0x7e060280u;   // v3 = 0: s6 (and the SCC its add writes) dead after the loop
+    const auto values = structured(compile(p));
+    ASSERT_EQ(values.size(), 64u);
+    for (uint32_t lane = 0; lane < 64; ++lane) EXPECT_EQ(values[lane], 0u) << lane;
+}
+TEST(LoopWaveScalarRoute, VectorResultsAloneKeepTheStructuredRoute) {
+    auto p = defined_data();
+    p.words[8] = kNop;           // no scalar write in the body
+    p.words[14] = 0x7e060301u;   // v3 = v1, each lane's own final count
+    const auto values = structured(compile(p));
+    ASSERT_EQ(values.size(), 64u);
+    for (uint32_t lane = 0; lane < 64; ++lane) EXPECT_EQ(values[lane], lane) << lane;
+}
+TEST(LoopWaveScalarRoute, ACertifiedNarrowingLoopKeepsTheStructuredRoute) {
+    auto p = defined_data();
+    p.words[8] = p.words[9] = p.words[10] = kNop;   // a lane-local body: the certificate holds
+    p.words[14] = 0x7e060280u;
+    const auto values = structured(compile(p));
+    ASSERT_EQ(values.size(), 64u);
+    for (uint32_t lane = 0; lane < 64; ++lane) EXPECT_EQ(values[lane], 0u) << lane;
+}
+TEST(LoopWaveScalarRoute, ALiveSccTakesTheExactRoute) {
+    auto p = defined_data();
+    // s7 = SCC ? 1 : 0 after the loop: SCC from the body's s6 add is live; s6 itself is dead.
+    p.words[14] = 0x7e060207u;   // v3 = s7
+    p.words.insert(p.words.begin() + 14, 0x85078180u);   // s_cselect_b32 s7, 1, 0
+    const auto r = compile(p);
+    ASSERT_FALSE(r.module.empty()) << r.reason;
+    EXPECT_TRUE(has_op(r.module, 251u)) << "exact synchronized dispatcher route";
+}
+TEST(LoopWaveScalarRoute, WithoutANativeEntryALiveWaveScalarIsRefused) {
+    auto c = config();
+    c.native_subgroup_size = 0;
+    const auto r = compile(defined_data(), c);
+    EXPECT_TRUE(r.module.empty());
+    EXPECT_NE(r.reason.find("wave-scalar-loop-live-out"), std::string::npos) << r.reason;
+}

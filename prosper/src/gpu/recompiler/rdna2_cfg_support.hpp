@@ -656,6 +656,14 @@ struct DivLoop {
 bool structured_loop_only_narrows_exec(const std::vector<Rdna2Inst>& ins, const DivLoop& loop);
 bool narrowing_loop_exec_admission(const std::vector<Rdna2Inst>& ins, const DivLoop& loop,
                                    const RegState& entry);
+// A wave-scalar word the loop [header, back edge] may write that is live at its exit: an SGPR,
+// VCC or M0 word (a mask pair counts, as scalar data), or kLoopLiveScc. -1 when there is none.
+// The narrowing certificate requires -1; rdna2_loop_wave_scalar_route.cpp routes the others.
+constexpr int kLoopLiveScc = 253;
+int loop_live_wave_scalar(const std::vector<Rdna2Inst>& ins, const DivLoop& loop);
+// The launch and stream a fresh exact-dispatcher attempt of this program would compile: an
+// authentic native Wave64 compute entry whose original words are `code`.
+bool native_exact_retry_authentic(const SpirvCompute& b, const uint32_t* code, size_t dwords);
 // A refused native store-loop header may select the existing exact dispatcher. This proves
 // only eligibility to try a fresh builder, never DATA, scalar, resource or effect admission.
 bool closed_compute_store_loop_data_retry(const SpirvCompute& b, const RegState& rs,

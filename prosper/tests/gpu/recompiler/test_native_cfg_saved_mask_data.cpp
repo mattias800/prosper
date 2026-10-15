@@ -491,17 +491,26 @@ ComputeShaderConfig loop_config(unsigned mode, uint32_t path) {
     if (mode == 1) c.user_sgprs.clear();   // no launch s0 before the sole body producer
     return c;
 }
-void loop_refuses(unsigned mode) {
-    const auto p = numeric_direct_break_loop(mode);
+// s0 is live after the loop, so the structured route refuses the loop itself (#5201) and the
+// exact attempt is the one that must refuse the fabricated data.
+void live_scalar_loop_refuses(const std::vector<uint32_t>& p, unsigned mode) {
     const auto resources = table();
     for (uint32_t path : {0u, 1u}) {
-        TerminalRejectCapture capture;
-        EXPECT_TRUE(
-            recompile_compute(p.data(), p.size(), &resources, loop_config(mode, path)).empty());
-        std::string reason;
-        for (const auto& [tag, payload] : capture.take()) reason += tag + payload;
-        EXPECT_NE(reason.find("fabricated-fresh-mask-source"), std::string::npos) << reason;
+        for (bool exact : {false, true}) {
+            auto c = loop_config(mode, path);
+            c.force_exchange_dispatcher = exact;
+            TerminalRejectCapture capture;
+            EXPECT_TRUE(recompile_compute(p.data(), p.size(), &resources, c).empty());
+            std::string reason;
+            for (const auto& [tag, payload] : capture.take()) reason += tag + payload;
+            EXPECT_NE(reason.find(exact ? "fabricated-fresh-mask-source" : "wave-scalar-loop-live-out"),
+                      std::string::npos)
+                << "exact " << exact << ": " << reason;
+        }
     }
+}
+void loop_refuses(unsigned mode) {
+    live_scalar_loop_refuses(numeric_direct_break_loop(mode), mode);
 }
 void loop_values(unsigned mode, uint32_t expected) {
     const auto p = numeric_direct_break_loop(mode);
@@ -510,8 +519,9 @@ void loop_values(unsigned mode, uint32_t expected) {
         const auto c = loop_config(mode, path);
         const auto module = recompile_compute(p.data(), p.size(), &resources, c);
         ASSERT_FALSE(module.empty());
-        ASSERT_TRUE(has_op(module, 246)) << "must exercise the structured loop join";
-        ASSERT_FALSE(has_op(module, 251)) << "dispatcher must not hide the exit join";
+        // s0 is written in the loop and read after it: a compute loop leaves per invocation, so
+        // the wave's final s0 needs the exact route (#5201). Its values are the same contract.
+        ASSERT_TRUE(has_op(module, 251)) << "a live-out wave scalar takes the exact route";
         bpermute_oracle::Interpreter vm(module);
         vm.native_subgroup_width = 64;
         vm.push_constants = c.user_sgprs;
@@ -903,8 +913,9 @@ void delayed_body_root_values(unsigned variant, uint32_t expected) {
         const auto c = loop_config(6, path);
         const auto module = recompile_compute(p.data(), p.size(), &resources, c);
         ASSERT_FALSE(module.empty());
-        ASSERT_TRUE(has_op(module, 246)) << "must exercise the structured loop join";
-        ASSERT_FALSE(has_op(module, 251)) << "dispatcher must not hide the exit join";
+        // s0 is written in the loop and read after it: a compute loop leaves per invocation, so
+        // the wave's final s0 needs the exact route (#5201). Its values are the same contract.
+        ASSERT_TRUE(has_op(module, 251)) << "a live-out wave scalar takes the exact route";
         bpermute_oracle::Interpreter vm(module);
         vm.native_subgroup_width = 64;
         vm.push_constants = c.user_sgprs;
@@ -917,16 +928,7 @@ void delayed_body_root_values(unsigned variant, uint32_t expected) {
 }
 }   // namespace
 TEST(NativeCfgSavedMaskData, DelayedBodyRootCannotBorrowAValidCheckRootAtLoopExit) {
-    const auto p = delayed_body_root_loop(0);
-    const auto resources = table();
-    for (uint32_t path : {0u, 1u}) {
-        TerminalRejectCapture capture;
-        EXPECT_TRUE(
-            recompile_compute(p.data(), p.size(), &resources, loop_config(6, path)).empty());
-        std::string reason;
-        for (const auto& [tag, payload] : capture.take()) reason += tag + payload;
-        EXPECT_NE(reason.find("fabricated-fresh-mask-source"), std::string::npos) << reason;
-    }
+    live_scalar_loop_refuses(delayed_body_root_loop(0), 6);
 }
 TEST(NativeCfgSavedMaskData, GenuineDelayedBodyRootKeepsTheActualZeroValue) {
     delayed_body_root_values(1, 0);
