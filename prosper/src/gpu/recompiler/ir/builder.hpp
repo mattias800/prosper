@@ -38,6 +38,11 @@ public:
     Value smax(Value a, Value b) { return u32(Opcode::SMax, a, b); }
     Value umin(Value a, Value b) { return u32(Opcode::UMin, a, b); }
     Value umax(Value a, Value b) { return u32(Opcode::UMax, a, b); }
+    Value booland_(Value a, Value b) {
+        return block_.append({Opcode::BoolAnd, Type::Bool, 0, {a, b}});
+    }
+    Value f32clamp01(Value a) { return block_.append({Opcode::F32Clamp01, Type::U32, 0, {a}}); }
+    Value pack_half_lo(Value a) { return block_.append({Opcode::PackHalfLo, Type::U32, 0, {a}}); }
     Value f32add(Value a, Value b) { return u32(Opcode::F32Add, a, b); }
     Value f32sub(Value a, Value b) { return u32(Opcode::F32Sub, a, b); }
     Value f32mul(Value a, Value b) { return u32(Opcode::F32Mul, a, b); }

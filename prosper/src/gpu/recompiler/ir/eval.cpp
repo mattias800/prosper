@@ -1,5 +1,7 @@
 // eval.cpp — the evaluation half of each IR opcode's definition (see ir.hpp).
+#include <cstdint>
 #include "gpu/recompiler/ir/eval.hpp"
+#include "gpu/recompiler/ir/eval_half.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -34,6 +36,11 @@ Known evaluate_op(Opcode op, uint32_t imm, uint32_t a, uint32_t b, uint32_t c) {
         case Opcode::ConstU32: return imm;
         case Opcode::ConstTrue: return 1u;
         case Opcode::ConstFalse: return 0u;
+        case Opcode::BoolAnd: return uint32_t(bool(a) && bool(b));
+        case Opcode::F32Clamp01:
+            return std::bit_cast<uint32_t>(
+                std::fmin(std::fmax(std::bit_cast<float>(a), 0.0f), 1.0f));
+        case Opcode::PackHalfLo: return pack_half_rte(a);
         case Opcode::F32Add:
         case Opcode::F32Sub:
         case Opcode::F32Mul:

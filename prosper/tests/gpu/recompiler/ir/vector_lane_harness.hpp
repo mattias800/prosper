@@ -64,7 +64,7 @@ inline uint64_t lane_harness_address() {
 }
 
 inline LaneRun run_vector_op_per_lane(const std::vector<uint32_t>& op_words, const LaneInputs& in,
-                                      uint32_t wave = 64) {
+                                      uint32_t wave = 64, bool half_rte_preserve_denorm = false) {
     using namespace prosper::gpu;
     const uint32_t lanes = static_cast<uint32_t>(in.lanes());
     const auto load = [&](uint32_t vdata, uint32_t array) -> std::vector<uint32_t> {
@@ -107,6 +107,7 @@ inline LaneRun run_vector_op_per_lane(const std::vector<uint32_t>& op_words, con
     for (const auto* array : {&in.s0, &in.s1, &in.old_d}) buffer.insert(buffer.end(), array->begin(), array->end());
     for (bool active : in.active) buffer.push_back(active ? 1u : 0u);
     bpermute_oracle::Interpreter vm(module);
+    vm.half_rte_preserve_denorm = half_rte_preserve_denorm;
     auto out = vm.run_buffers(lanes, {{3, buffer}}, 3);
     if (!vm.error.empty()) return {{}, vm.error};
     out.resize(lanes);

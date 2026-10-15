@@ -4,6 +4,7 @@
 // oracle. It executes the entrypoint, dispatcher/phis, typed memory and common
 // barriers; unsupported operations, poison reads, invalid pointers and split
 // barriers fail.
+#include <utility>
 #include <array>
 #include <algorithm>
 #include <bit>
@@ -47,46 +48,48 @@ struct Lane {
   bool done = false;
 };
 struct Interpreter {
-  std::vector<Inst> ins;
-  std::map<uint32_t, Type> types;
-  std::map<uint32_t, Value> constants;
-  std::map<uint32_t, uint32_t> builtins, bindings;
-  std::map<std::pair<uint32_t, uint32_t>, std::vector<uint32_t>> decorations;
-  std::map<std::array<uint32_t, 3>, std::vector<uint32_t>> member_decorations;
-  std::map<uint32_t, size_t> labels;
-  std::map<uint32_t, Memory> shared;
-  std::map<uint32_t, bool> readonly_storage;
-  std::map<uint32_t, uint32_t> extra_writable_roots;   // binding -> storage variable
-  std::vector<Inst> globals;
+  // Closed test profile for GLSL half conversions: RTE packing, preserved subnormals.
+    bool half_rte_preserve_denorm = false;
+    std::vector<Inst> ins;
+    std::map<uint32_t, Type> types;
+    std::map<uint32_t, Value> constants;
+    std::map<uint32_t, uint32_t> builtins, bindings;
+    std::map<std::pair<uint32_t, uint32_t>, std::vector<uint32_t>> decorations;
+    std::map<std::array<uint32_t, 3>, std::vector<uint32_t>> member_decorations;
+    std::map<uint32_t, size_t> labels;
+    std::map<uint32_t, Memory> shared;
+    std::map<uint32_t, bool> readonly_storage;
+    std::map<uint32_t, uint32_t> extra_writable_roots;   // binding -> storage variable
+    std::vector<Inst> globals;
   // Optional fixture-owned words for the closed uint32 array PushConstant ABI. The default
   // supplies nothing: a declared block cannot read invented zeros or infer a launch value.
-  std::vector<uint32_t> supplied_push_constants;
-  uint32_t main = 0, storage = 0;
+    std::vector<uint32_t> supplied_push_constants;
+    uint32_t main = 0, storage = 0;
   // Default compute fixtures stay strict set 0. Actual NGG modules explicitly select their
   // separate set-2 launch/export ABI; no module words or resource ownership are rewritten.
-  uint32_t storage_descriptor_set = 0;
+    uint32_t storage_descriptor_set = 0;
   // Explicit legacy shell fixture ABI: binding 0/1 may carry raw bits in scalar float32 slots.
   // This permits loads, stores and bitcasts only; unsupported float arithmetic still fails.
-  bool legacy_float_word_storage = false;
-  void use_ngg_shell_storage() { storage_descriptor_set = 2; }
-  size_t entry = 0;
-  std::string error;
+    bool legacy_float_word_storage = false;
+    void use_ngg_shell_storage() { storage_descriptor_set = 2; }
+    size_t entry = 0;
+    std::string error;
   // An explicit fixture contract, never inferred from a declared native builtin or vote.
-  uint32_t native_subgroup_width = 0;
+    uint32_t native_subgroup_width = 0;
   // Fixture-supplied dispatch extent. Nonzero opts into exact (32,1,1) workgroups;
   // the module's own entrypoint LocalSize must agree before any builtin is supplied.
-  uint32_t native32_workgroup_count = 0;
+    uint32_t native32_workgroup_count = 0;
   // Opt-in, store-only evaluation of one native32 subgroup in an actual Local64 workgroup.
   // No shared memory, barriers, atomics or storage reads: the other subgroup cannot affect it.
-  bool native32_isolated_local64 = false;
-  uint32_t native32_subgroup_index = 0;
-  std::map<uint32_t, std::vector<uint32_t>> local_sizes;
-  std::set<uint32_t> specialized_local_sizes;
-  std::vector<uint32_t> push_constants;
-  struct SampledMip {
-    uint32_t width = 0, height = 0;
-    std::vector<std::array<uint32_t, 4>> texels;
-  };
+    bool native32_isolated_local64 = false;
+    uint32_t native32_subgroup_index = 0;
+    std::map<uint32_t, std::vector<uint32_t>> local_sizes;
+    std::set<uint32_t> specialized_local_sizes;
+    std::vector<uint32_t> push_constants;
+    struct SampledMip {
+        uint32_t width = 0, height = 0;
+        std::vector<std::array<uint32_t, 4>> texels;
+    };
   uint32_t glsl = 0;
   // Independent fixture-owned texels for ONLY exact-center, integral-LOD nearest sampling.
   std::map<uint32_t, std::vector<SampledMip>> sampled_images;
@@ -203,6 +206,68 @@ struct Interpreter {
                                         : std::fmax(f, g);
       if (std::isnan(result)) fail("unspecified float ALU NaN payload");
       set(l, a[1], a[0], {std::bit_cast<uint32_t>(result)});
+      return true;
+  }
+  uint32_t unpack_half_bits(uint32_t half) {
+      const uint32_t sign = (half & 0x8000u) << 16;
+      const uint32_t exp = (half >> 10) & 31u;
+      uint32_t fraction = half & 1023u;
+      if (exp == 31) {
+          if (fraction) fail("unspecified half NaN payload");
+          return sign | 0x7f800000u;
+      }
+      if (exp) return sign | ((exp + 112u) << 23) | (fraction << 13);
+      if (!fraction) return sign;
+      uint32_t exponent = 113;
+      while (!(fraction & 1024u)) {
+          fraction <<= 1;
+          --exponent;
+      }
+      return sign | (exponent << 23) | ((fraction & 1023u) << 13);
+  }
+  uint32_t pack_half_bits(uint32_t word) {
+      const uint32_t sign = (word >> 16) & 0x8000u;
+      const uint32_t exp = (word >> 23) & 255u;
+      const uint32_t fraction = word & 0x7fffffu;
+      if (exp == 255) {
+          if (fraction) fail("unspecified packed half NaN payload");
+          return sign | 0x7c00u;
+      }
+      if (exp > 142) return sign | 0x7c00u;
+      if (exp >= 113) {
+          // Include the biased exponent in this addition, so a rounded significand carries.
+          const uint32_t rounded = (word & 0x7fffffffu) + 0xfffu + ((word >> 13) & 1u);
+          return sign | ((rounded >> 13) - 0x1c000u);
+      }
+      if (exp < 102) return sign;
+      const uint32_t shift = 126 - exp, significand = fraction | 0x800000u;
+      uint32_t rounded = significand >> shift;
+      const uint32_t remainder = significand & ((1u << shift) - 1u), tie = 1u << (shift - 1);
+      if (remainder > tie || (remainder == tie && (rounded & 1u))) ++rounded;
+      return sign | rounded;
+  }
+  // GLSL.std.450 PackHalf2x16 (58) / UnpackHalf2x16 (62), selected RTE profile only.
+  bool half_alu_op(Lane& l, uint32_t op, const std::vector<uint32_t>& a) {
+      if (!half_rte_preserve_denorm || op != 12 || a.size() != 5 || !glsl || a[2] != glsl ||
+          (a[3] != 58 && a[3] != 62))
+          return false;
+      const auto x = value(l, a[4]);
+      if (!x.defined) fail("undefined half conversion input");
+      const auto vec2f = [&](uint32_t type) {
+          const auto& t = ty(type);
+          return t.op == 23 && t.a.size() == 2 && t.a[1] == 2 && ty(t.a[0]).op == 22 &&
+                 ty(t.a[0]).a == std::vector<uint32_t>{32};
+      };
+      if (a[3] == 58) {
+          if (!uint_type(a[0]) || !vec2f(x.type) || x.words.size() != 2)
+              fail("unsupported PackHalf2x16 types");
+          set(l, a[1], a[0], {pack_half_bits(x.words[0]) | (pack_half_bits(x.words[1]) << 16)});
+      } else {
+          if (!vec2f(a[0]) || !uint_type(x.type) || x.words.size() != 1)
+              fail("unsupported UnpackHalf2x16 types");
+          set(l, a[1], a[0],
+              {unpack_half_bits(x.words[0] & 0xffffu), unpack_half_bits(x.words[0] >> 16)});
+      }
       return true;
   }
   bool scalar_alu_op(Lane &l, uint32_t op, const std::vector<uint32_t> &a) {
@@ -457,7 +522,7 @@ struct Interpreter {
           continue;
       }
       ++l.pc;
-      if (float_alu_op(l, op, a) || scalar_alu_op(l, op, a)) continue;
+      if (half_alu_op(l, op, a) || float_alu_op(l, op, a) || scalar_alu_op(l, op, a)) continue;
       if (op == 248) {
         l.label = a.at(0);
         std::vector<std::pair<uint32_t, Value>> phis;
