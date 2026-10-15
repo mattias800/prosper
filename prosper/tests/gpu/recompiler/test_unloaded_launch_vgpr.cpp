@@ -621,3 +621,21 @@ TEST(UnloadedLaunchVgpr, PublicFragmentAddtidReloadCarriesTheSpilledWord) {
                                   reload_v8}),
                              8, &kBaryPosX));
 }
+
+TEST(UnloadedLaunchVgpr, PublicFragmentAddtidReloadMeetsBothBranchPredecessors) {
+    constexpr uint32_t m0_zero = 0xb07c0000u;
+    const Words spill_v6{0xdac00000u, 0x00000600u};
+    const Words reload_v8{0xdac40000u, 0x08000000u};
+    // A VCC vote guards a three-dword arm independently of the later narrowed EXEC. The skipped edge
+    // retains the pre-branch spill; only the taken edge replaces it with a genuine word.
+    const auto program = [&](uint32_t initial) {
+        return cat({{mov8_v1, m0_zero, initial},
+                    spill_v6,
+                    {0x7c0204f6u, 0xbf870003u, mov6_3},
+                    spill_v6,
+                    {cmpx_x4_v2},
+                    reload_v8});
+    };
+    accepted(compile_fragment(program(mov6_3), 8, &kBaryPosX));
+    refused(compile_fragment(program(mov6_v1), 8, &kBaryPosX));
+}

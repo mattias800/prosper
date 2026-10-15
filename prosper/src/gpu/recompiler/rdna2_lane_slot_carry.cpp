@@ -3,6 +3,7 @@
 
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -79,12 +80,31 @@ std::set<std::pair<int, int>> lane_slots_written(const std::vector<Rdna2Inst>& i
 }
 
 LaneSlotEdge LaneSlotEdge::of(const RegState& rs, uint32_t block) {
-    return LaneSlotEdge{rs.vgpr_lane_slots, rs.vgpr_lane_mask_slots, rs.invalidated_vgpr_lane_slots,
-                        block};
+    return LaneSlotEdge{
+        rs.vgpr_lane_slots, rs.vgpr_lane_mask_slots, rs.invalidated_vgpr_lane_slots, block,
+        rs.lds_addtid,      rs.lds_addtid_marks};
 }
 
 void join_lane_slots(SpirvCompute& b, RegState& rs, const LaneSlotEdge& first,
                      const LaneSlotEdge& second, uint32_t branch_pc) {
+    rs.lds_addtid.clear();
+    rs.lds_addtid_marks.clear();
+    // CONFIDENCE: HIGH -- a graphics ADDTID reload must select the value of its actual incoming
+    // edge. Keep only slots present on both edges: a missing edge has real, unknown LDS content,
+    // not an arbitrary register value. A later reload of a dropped slot refuses in emit_alu.
+    // Ordered keys keep phi emission deterministic despite the emitter's unordered slot maps.
+    std::set<uint64_t> addtid_keys;
+    for (const auto& [key, value] : first.addtid)
+        if (second.addtid.contains(key)) addtid_keys.insert(key);
+    for (uint64_t key : addtid_keys) {
+        const uint32_t a = first.addtid.at(key), c = second.addtid.at(key);
+        const auto am = first.addtid_marks.find(key), cm = second.addtid_marks.find(key);
+        if (!a || !c || am == first.addtid_marks.end() || cm == second.addtid_marks.end()) continue;
+        rs.lds_addtid[key] = a == c ? a : b.emit_phi_2way(b.t_u32, a, first.block, c, second.block);
+        auto marks = am->second;
+        union_source_marks(marks, cm->second);
+        rs.lds_addtid_marks[key] = std::move(marks);
+    }
     std::map<int, std::set<int>> lanes;   // ordered: deterministic phi emission
     for (const LaneSlotEdge* edge : {&first, &second})
         for (const auto* slots : {&edge->data, &edge->mask})

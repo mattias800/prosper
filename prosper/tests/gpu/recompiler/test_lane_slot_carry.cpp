@@ -348,3 +348,31 @@ TEST(LaneSlotCarry, JoinPhisDiffersPlaceholdsAbsenceAndDropsConflicts) {
         EXPECT_FALSE(rs.vgpr_lane_mask_slots.contains(vgpr)) << "v" << vgpr << " keeps no mask";
     }
 }
+
+TEST(LaneSlotCarry, AddtidJoinSelectsValuesMeetsMarksAndDropsAbsentSlots) {
+    using namespace prosper::gpu;
+    SpirvCompute b;
+    b.begin(0);
+    const uint32_t seven = b.uconst(7), hundred = b.uconst(100);
+    for (bool hard_first : {false, true}) {
+        LaneSlotEdge first, second;
+        first.block = 11;
+        second.block = 12;
+        first.addtid = {{1, seven}, {2, seven}, {3, seven}, {4, seven}};
+        second.addtid = {{1, hundred}, {2, seven}, {4, seven}};
+        first.addtid_marks = {{1, {}}, {2, {}}, {3, {}}, {4, {}}};
+        second.addtid_marks = {{1, {}}, {2, {}}};   // key 4 has no proof on this edge
+        auto& hard = (hard_first ? first : second).addtid_marks.at(1);
+        hard.placeholder = hard.hard = true;
+        RegState rs;
+        join_lane_slots(b, rs, first, second, 6);
+        ASSERT_EQ(rs.lds_addtid.size(), 2u);
+        EXPECT_NE(rs.lds_addtid.at(1), seven);
+        EXPECT_NE(rs.lds_addtid.at(1), hundred) << "the actual predecessor selects the value";
+        EXPECT_EQ(rs.lds_addtid.at(2), seven);
+        EXPECT_TRUE(rs.lds_addtid_marks.at(1).hard) << "either predecessor can supply a hard word";
+        EXPECT_FALSE(rs.lds_addtid_marks.at(2).placeholder);
+        EXPECT_FALSE(rs.lds_addtid.contains(3)) << "a never-written edge has unknown LDS data";
+        EXPECT_FALSE(rs.lds_addtid.contains(4)) << "value presence alone is not a source proof";
+    }
+}

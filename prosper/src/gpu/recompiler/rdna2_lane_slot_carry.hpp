@@ -33,6 +33,7 @@
 // CONFIDENCE: HIGH for loops (the header phi is the standard loop-carried form, and the merge value
 // is the one that reaches the exit). HIGH for if merges with the placeholder caveat above.
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -56,6 +57,10 @@ struct LaneSlotEdge {
     std::unordered_map<int, std::unordered_map<int, uint32_t>> data, mask;
     std::unordered_set<int> invalidated;
     uint32_t block = 0;
+    // Graphics ADDTID spills are per-lane SSA slots too. Capture both planes before emitting
+    // another predecessor; neither its value nor its source proof may survive from one arm only.
+    std::unordered_map<uint64_t, uint32_t> addtid;
+    std::unordered_map<uint64_t, ScalarSourceMarks> addtid_marks;
     static LaneSlotEdge of(const RegState& rs, uint32_t block);
 };
 
