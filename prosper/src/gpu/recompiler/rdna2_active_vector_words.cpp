@@ -50,6 +50,8 @@ EntryDomain logical_domain(uint32_t op, EntryDomain a, EntryDomain b) {
         case 0x15: return {false, a.within}; // ANDN2
         case 0x11: return {(a.equal && b.within) || (b.equal && a.within), a.within && b.within};
         case 0x13: return {false, a.within && b.within}; // XOR
+        // S_CSELECT_B64 yields one operand whole: a property both operands share survives.
+        case 0x0b: return {a.equal && b.equal, a.within && b.within};
         default: return {};
     }
 }
@@ -61,6 +63,10 @@ void publish_entry_domain(ActiveVectorWords& state, int mask, EntryDomain domain
         auto& words = state.masks[mask];
         words.insert(state.entry_words.begin(), state.entry_words.end());
     }
+}
+
+bool zero_mask(const Operand& operand) {
+    return operand.kind == OperandKind::InlineInt && operand.value == 0;
 }
 
 bool mask_operand(const Operand& operand) {
@@ -99,15 +105,19 @@ void meet_active_vector_words(ActiveVectorWords& into, const ActiveVectorWords& 
     into.entry_masks = intersect(std::move(into.entry_masks), incoming.entry_masks);
     into.within_entry_masks =
         intersect(std::move(into.within_entry_masks), incoming.within_entry_masks);
-    for (auto mask = into.masks.begin(); mask != into.masks.end();) {
-        const auto other = incoming.masks.find(mask->first);
-        if (other == incoming.masks.end()) {
-            mask = into.masks.erase(mask);
-        } else {
-            mask->second = intersect(std::move(mask->second), other->second);
-            ++mask;
+    const auto meet_keyed = [](auto& into_sets, const auto& incoming_sets) {
+        for (auto set = into_sets.begin(); set != into_sets.end();) {
+            const auto other = incoming_sets.find(set->first);
+            if (other == incoming_sets.end()) {
+                set = into_sets.erase(set);
+            } else {
+                set->second = intersect(std::move(set->second), other->second);
+                ++set;
+            }
         }
-    }
+    };
+    meet_keyed(into.masks, incoming.masks);
+    meet_keyed(into.instances, incoming.instances);
 }
 
 void restore_active_vector_words(const std::set<int>& current, RegState& state) {
@@ -155,9 +165,10 @@ bool active_vector_sources_defined(const ActiveVectorWords& state, const Rdna2In
     // EXEC lane from that lane's own addresses (RDNA2 ISA 70648 MIMG). Every address VGPR the
     // encoding names must be genuine in those lanes, and so must the T#/S# words; a shape whose
     // address layout rdna2_mimg_read_address_count does not know is not admitted. The addresses
-    // must be POSITIVELY current: the register inventory (shader_max_vgpr) counts only VADDR, so
-    // a further consecutive or NSA address that nothing else names is absent from the relay MAY
-    // facts as well, and "not relayed" would read a never-written word as genuine.
+    // must be POSITIVELY current. This was required because the register inventory
+    // (shader_max_vgpr) counted only VADDR, leaving a further address that nothing else names
+    // outside the relay MAY facts; it now counts every address (#5182), and the stricter rule is
+    // kept until relaxing it has its own corpus evidence.
     if (in.fmt == Rdna2Format::MIMG) {
         const uint32_t addresses = rdna2_mimg_read_address_count(in);
         if (!addresses || !vector_write_completes_active_word(in) ||
@@ -221,6 +232,20 @@ bool active_vector_sources_defined(const ActiveVectorWords& state, const Rdna2In
                 if (!definite_scc || relayed_words.contains(253)) return false;
                 continue;
             }
+            // CONFIDENCE: MED -- V_CNDMASK_B32's SRC2 is a lane mask: each lane selects with its
+            // own bit (RDNA2 ISA 70648). A live MUST mask pair with no relayed word is taken as a
+            // genuine per-lane Bool, exactly as the implicit VCC read above already is and as the
+            // emitter's own marks treat this operand (rdna2_cfg_support.hpp, CNDMASK's third
+            // operand). The MUST set does not itself certify each lane's bit: that rests on every
+            // fresh predicate refusing undefined inputs, the same assumption the VCC rule makes.
+            // Kena cs 0x5008e80000 pc562 selects with the VOPC result s[28:29] (#5181).
+            if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x101 && source == 2 &&
+                ((operand.kind == OperandKind::SGPR && operand.value >= 0 &&
+                  operand.value <= 104) ||
+                 (operand.kind == OperandKind::Special && operand.value == 106)) &&
+                masks.contains(operand.value) && !relayed_words.contains(operand.value) &&
+                !relayed_words.contains(operand.value + 1))
+                continue;
             const auto width = scalar_alu_source_words(in, source);
             if (!width || width == UINT32_MAX || operand.value < 0 || operand.value > 124)
                 return false;
@@ -275,6 +300,16 @@ void advance_active_vector_words(ActiveVectorWords& state, const Rdna2Inst& in,
         } else if (in.opcode == 0x11 || in.opcode == 0x13) {
             result = intersect(left, right);   // A|B and A^B may enable either operand's lanes.
             has_result = true;
+        } else if (in.opcode == 0x0b) {
+            // CONFIDENCE: HIGH -- S_CSELECT_B64 (RDNA2 ISA 70648 SOP2) writes S0 or S1 whole,
+            // whatever SCC holds, so a word genuine under both operands' lanes is genuine under
+            // the result's. A zero operand enables no lane and constrains nothing: Kena's
+            // `s_cselect_b64 vcc, exec, 0` (cs 0x5008e80000 pc299) is a subset of EXEC carrying
+            // EXEC's words (#5181). Any other operand contributes only its own proven words.
+            result = zero_mask(in.src[0]) ? right
+                     : zero_mask(in.src[1]) ? left
+                                            : intersect(left, right);
+            has_result = true;
         }
     }
 
@@ -295,6 +330,8 @@ void advance_active_vector_words(ActiveVectorWords& state, const Rdna2Inst& in,
         }
     }
     if (mask_write >= 0) retire_pair(mask_write, 2);
+    // A definition at this pc is a new saved-mask instance; the older one's spill slots end too.
+    if (mask_write >= 0) state.instances.erase(in.pc);
     if (mask_write >= 0)
         std::erase_if(state.masks, [&](const auto& mask) {
             return mask.first <= mask_write + 1 && mask.first + 1 >= mask_write;
@@ -364,6 +401,7 @@ void advance_active_vector_words(ActiveVectorWords& state, const Rdna2Inst& in,
             state.current.erase(word);
             state.entry_words.erase(word);
             for (auto& [mask, words] : state.masks) words.erase(word);
+            for (auto& [instance, words] : state.instances) words.erase(word);
         } else if (complete_active_word) {
             state.current.insert(word);
             refresh_equal_saved_exec_word(state, word);
