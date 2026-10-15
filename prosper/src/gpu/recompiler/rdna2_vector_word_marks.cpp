@@ -91,30 +91,24 @@ bool exec_within(const RegState& rs, uint32_t reader, uint32_t owner) {
     return false;
 }
 
-// How union_marks meets two marks: the inputs one instruction reads in the same lane, or the
-// same word arriving along two paths.
-enum class MarkMeet { Operands, Paths };
-
-// CONFIDENCE: HIGH -- the unloaded property of a meet (#5174). Operands: each undefined lane of
-// the result is an undefined lane of one input, so it is never written exactly when every
-// placeholder input is unloaded; a soft input is a loop assumption, not a launch value, and an
-// input's obligations must not be dropped with an unconfined owner. Paths: a lane undefined on one
-// path may have been written on the other, so both paths must be untouched outside the same owner.
-bool meet_unloaded(const ScalarSourceMarks& a, const ScalarSourceMarks& b, MarkMeet meet) {
+// CONFIDENCE: MED -- the arbitrary property of a meet (#5185, decision on the issue): a meet
+// is hard exactly when one of its inputs is. It is the same for the inputs one instruction reads
+// in one lane and for one word arriving along two paths. Each lane of the result holds, on the
+// path or in the operand it came from, a defined value or an arbitrary one, and a deterministic
+// function of those is a value hardware could produce; a lane one path wrote from such values is
+// no different from one it did not write. A soft input is a loop assumption, not an arbitrary
+// value, and an input's obligations must not be dropped with an unconfined owner (below).
+bool meet_arbitrary(const ScalarSourceMarks& a, const ScalarSourceMarks& b) {
     const auto arbitrary = [](const ScalarSourceMarks& m) {
-        return m.placeholder && m.hard && m.unloaded;
+        return m.placeholder && m.hard && m.arbitrary;
     };
-    if (meet == MarkMeet::Paths)
-        return arbitrary(a) && arbitrary(b) && a.untouched && b.untouched &&
-               a.outside_exec == b.outside_exec;
     return (a.placeholder || b.placeholder) && (!a.placeholder || arbitrary(a)) &&
            (!b.placeholder || arbitrary(b));
 }
 
 void union_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other,
-                 const RegState* current = nullptr, bool explicit_sources = false,
-                 MarkMeet meet = MarkMeet::Operands) {
-    bool unloaded = meet_unloaded(into, other, meet);
+                 const RegState* current = nullptr, bool explicit_sources = false) {
+    bool arbitrary = meet_arbitrary(into, other);
     const bool had_roots = !into.blanket_roots.empty() || !other.blanket_roots.empty();
     const uint32_t into_side = into.hard || into.scoped_complete_word ? into.outside_exec : 0u;
     const uint32_t other_side = other.hard || other.scoped_complete_word ? other.outside_exec : 0u;
@@ -180,10 +174,8 @@ void union_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other,
     if (into.hard || !into.outside_exec) into.scoped_blanket_roots.clear();
     // An unconfined hard result drops its inputs' active-domain obligations above; a lane read
     // through it would then owe nothing to the loop proof those obligations name.
-    if (!into.outside_exec && had_roots) unloaded = false;
-    into.unloaded = unloaded && into.placeholder && into.hard;
-    // Only a path meet of two untouched marks with one owner keeps the stronger claim.
-    into.untouched = into.unloaded && meet == MarkMeet::Paths;
+    if (!into.outside_exec && had_roots) arbitrary = false;
+    into.arbitrary = arbitrary && into.placeholder && into.hard;
 }
 
 const std::set<uint64_t>& source_roots_in_exec(const RegState& rs, const ScalarSourceMarks& marks,
@@ -304,7 +296,7 @@ void seed_vector_word_definedness(RegState& rs, const std::vector<Rdna2Inst>& in
         auto& mark = rs.vreg_source_marks[reg];
         mark.placeholder = mark.hard = true;
         mark.blanket_roots.clear();
-        mark.unloaded = mark.untouched = launch && !loaded.contains(reg);
+        mark.arbitrary = launch && !loaded.contains(reg);
     }
 }
 
@@ -386,10 +378,18 @@ ScalarSourceMarks vector_source_marks(const RegState& rs, const Rdna2Inst& in) {
         for (uint32_t word = 0; word < vector_provenance_source_span(in, source); ++word)
             union_marks(marks, vector_word(rs, in.src[source].value + static_cast<int>(word)), &rs,
                         true);
+    // CONFIDENCE: HIGH (conservative) -- #5185 decided computed values, not loaded ones. Data
+    // read at an address with an arbitrary lane is real memory at an address prosper formed, and
+    // that it equals what hardware could have read there is a further claim about the memory model
+    // (bounds, mapping), not about the address. So loaded data stays hard pending its own
+    // decision. LDS exchanges (swizzle, permute) are DS forms too and stay hard with it.
+    if (memory_result(in)) marks.arbitrary = false;
     // Relative indexing can select an absent word beyond the decoder's storage inventory. A
     // constant current M0 may refine this at the actual emission boundary; maps alone cannot.
+    // That word may be a loaded-but-unsupplied input, so the result is hard (#5185).
     if (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x43) {
         marks.placeholder = marks.hard = true;
+        marks.arbitrary = false;
         marks.blanket_roots.clear();
     }
     return marks;
@@ -453,12 +453,13 @@ bool fresh_mask_sources_defined(SpirvCompute& b, const RegState& rs, const Rdna2
         b.loop_blanket_roots_read.insert(roots.begin(), roots.end());
         return true;
     }
-    if (marks.hard && marks.unloaded) {
-        // CONFIDENCE: MED -- #5174 policy (decision on the issue, 2026-10-15): every lane this
-        // read may find missing holds the launch value of a VGPR hardware never loaded, never
-        // written on any path. Hardware holds an earlier wave's leftovers there, so the guest
-        // cannot depend on it and the zero supplied here is a value hardware could hold: there
-        // is no lane identity to fabricate. Defined lanes still owe their loop obligations.
+    if (marks.hard && marks.arbitrary) {
+        // CONFIDENCE: MED -- #5174 / #5185 policy (decisions on the issues, 2026-10-15): every
+        // lane this read may find missing holds an arbitrary value -- the launch value of a VGPR
+        // hardware never loaded and nothing wrote, or a deterministic function of such values and
+        // defined ones. Hardware holds an earlier wave's leftovers there, and the value supplied
+        // here is one hardware could hold: there is no lane identity to fabricate. Defined lanes
+        // still owe their loop obligations.
         b.loop_blanket_roots_read.insert(marks.blanket_roots.begin(), marks.blanket_roots.end());
         return true;
     }
@@ -526,12 +527,21 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
     for (int reg = in.dst.value; reg < end; ++reg) {
         const auto old = vector_word(rs, reg);
         ScalarSourceMarks result = source;
-        // Any write clears the unloaded property unless the narrowed-complete case below proves
-        // the result's undefined lanes are lanes this write left as they were (#5174).
-        bool unloaded = false, untouched = false;
         // CONFIDENCE: HIGH -- RDNA2 70648's ordinary VALU writes retain inactive lanes; WRITELANE
         // replaces one selected lane regardless of EXEC. Partial/relative writes retain old bits.
         if (preserve) union_marks(result, old, &rs);
+        // CONFIDENCE: MED -- #5185: each written lane is a deterministic function of the lanes the
+        // instruction reads -- its own lane for a lane-wise form, others for DPP, permlane or
+        // WRITELANE -- and a kept lane is the old word's. The source meet and the old-word meet
+        // above are per word, so they cover every lane a cross-lane form can read: the result is
+        // arbitrary exactly when no word it read (old word included) carries a hard lane. An
+        // M0-relative write gives each word of its range the source or the old word, so the same
+        // meet covers it -- but only while M0 is genuine: these marks do not carry M0, and a
+        // fabricated one replaces a different word than hardware did. Loaded data
+        // (vector_source_marks) stays hard.
+        const bool m0_unknown =
+            relative && (!rs.sreg.contains(124) || sreg_word_may_be_fabricated(rs, 124));
+        bool arbitrary = result.arbitrary && !m0_unknown && !memory_result(in);
         // Only a complete write can grant new confinement. An incomplete lane-mapped write keeps
         // the existing meet of source and old-word confinement; selected-lane, relative and
         // cross-lane writes cannot retain that proof.
@@ -576,13 +586,9 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
                 }
                 // CONFIDENCE: HIGH -- every lane inside EXEC is written here from defined
                 // sources, so each undefined lane of the result is an undefined lane of the old
-                // word outside EXEC, still never written when the old word's were (#5174). The
-                // result is untouched outside its owner only if every lane the old word defined
-                // lies inside the new owner (no owner: the old word defined none).
-                unloaded = old.placeholder && old.hard && old.unloaded;
-                untouched = unloaded && old.untouched &&
-                            (old.outside_exec == 0 ||
-                             exec_within(rs, old.outside_exec, result.outside_exec));
+                // word outside EXEC, as arbitrary as the old word's were (#5174). A source's own
+                // undefined lanes lie outside EXEC, where this write reads nothing.
+                arbitrary = old.placeholder && old.hard && old.arbitrary;
                 // CONFIDENCE: HIGH -- a defined old word leaves no missing lane outside EXEC,
                 // and inside it the sources are defined with no loop obligation: the result
                 // misses no lane at all. Narrowing the owner to EXEC here lost exactly that
@@ -604,22 +610,22 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
             result.outside_exec = 0;
             result.blanket_roots.clear();
         }
+        // An unconfined hard result drops the obligations its defined lanes owe a loop proof
+        // (as in union_marks): a lane read through it would then be unchecked, so it is hard.
+        if (result.hard && !result.outside_exec && !result.blanket_roots.empty()) arbitrary = false;
         if (result.hard && !result.outside_exec) result.blanket_roots.clear();
         if (result.hard || !result.outside_exec) result.scoped_complete_word = false;
         if (!result.scoped_complete_word) result.scoped_blanket_roots.clear();
-        result.unloaded = unloaded && result.placeholder && result.hard;
-        result.untouched = untouched && result.unloaded;
+        result.arbitrary = arbitrary && result.placeholder && result.hard;
         set_word(rs.vreg_source_marks, reg, std::move(result));
     }
 }
 
 void join_vector_word_marks(VectorWordMarks& into, const VectorWordMarks& other,
                             const RegState* current) {
-    // A word with no mark on the other path is defined there: written, or a supplied input.
-    for (auto& [reg, marks] : into)
-        if (!other.contains(reg)) marks.unloaded = marks.untouched = false;
-    for (const auto& [reg, source] : other)
-        union_marks(into[reg], source, current, false, MarkMeet::Paths);
+    // A word with no mark on the other path is defined there: written, or a supplied input. That
+    // adds no hard lane, so the arbitrary property of a mark on this path survives (#5185).
+    for (const auto& [reg, source] : other) union_marks(into[reg], source, current, false);
 }
 
 void confine_execz_skip_marks(const RegState& rs, VectorWordMarks& skipped,
@@ -668,10 +674,8 @@ void confine_execz_skip_marks(const RegState& rs, VectorWordMarks& skipped,
                     break;
                 }
         if (!chosen || chosen == prior) continue;
+        // Which lanes are undefined does not change, so neither does arbitrary.
         marks.outside_exec = chosen;
-        // The lanes it defined lie inside X; the mark is untouched outside the new owner only if
-        // X is within it. Which lanes are undefined does not change, so neither does unloaded.
-        marks.untouched = marks.untouched && (!prior || exec_within(rs, prior, chosen));
     }
 }
 
@@ -681,7 +685,7 @@ void retire_vector_word_roots(ScalarSourceMarks& marks, const std::set<uint64_t>
                            [&](uint64_t root) { return violated.contains(root); });
     };
     if (invalid(marks.blanket_roots)) {
-        marks.unloaded = marks.untouched = false;   // a defined lane relied on the assumption
+        marks.arbitrary = false;   // a defined lane relied on the assumption
         const bool scoped = !marks.hard && marks.scoped_complete_word && marks.outside_exec &&
                             !invalid(marks.scoped_blanket_roots);
         marks.blanket_roots = scoped ? marks.scoped_blanket_roots : std::set<uint64_t>{};
@@ -763,8 +767,9 @@ void mark_vector_loop_carried(RegState& rs, const std::vector<Rdna2Inst>& ins, u
             source.hard = true;
             source.blanket_roots.clear();
         }
-        // The loop writes this word, so its back edge may carry a written value into any lane.
-        source.unloaded = source.untouched = false;
+        // The loop writes this word, so its back edge may carry a value into any lane, and this
+        // header cannot yet know whether the body computes it from a hard input (#5185).
+        source.arbitrary = false;
         source.placeholder = true;
         rs.vreg_source_marks[reg] = std::move(source);
     }

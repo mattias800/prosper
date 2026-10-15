@@ -151,14 +151,19 @@ TEST(StructuralFixtureInputs, VccHighScratchCompareRequiresItsActualVectorInput)
         missing[2] =
             0xbf800000u; // Preserve the original comparison PC while omitting its producer.
         // Without a producer v11 is a never-written VGPR compute does not load: #5174 admits it
-        // as an arbitrary value. Relaying another such word into v11 is a write, which the
-        // decision keeps hard, so that twin still reaches the guard at the same PC.
+        // as an arbitrary value, and #5185 admits a relay of another such word too.
         EXPECT_FALSE(compile(missing).empty()) << last_terminal_reject_reason(address);
         missing[2] = 0x7e16031fu;   // v_mov_b32 v11, v31
-        EXPECT_TRUE(compile(missing).empty());
+        EXPECT_FALSE(compile(missing).empty()) << last_terminal_reject_reason(address);
+        // A HARD producer still reaches the guard at the compare: LDS data read at the
+        // never-written address v31, which #5185 keeps hard (ds_read_b32 v11, v31).
+        std::vector<uint32_t> hard(code.begin(), code.end());
+        hard[2] = 0xd8d80000u;
+        hard.insert(hard.begin() + 3, (11u << 24) | 31u);
+        EXPECT_TRUE(compile(hard).empty());
         const auto reason = last_terminal_reject_reason(address);
         EXPECT_NE(reason.find("fabricated-fresh-mask-source"), std::string::npos) << reason;
-        EXPECT_NE(reason.find("pc=3 words=7d841680"), std::string::npos) << reason;
+        EXPECT_NE(reason.find("pc=4 words=7d841680"), std::string::npos) << reason;
     }
 }
 

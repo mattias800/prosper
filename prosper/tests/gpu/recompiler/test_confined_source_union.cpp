@@ -35,6 +35,13 @@ constexpr uint32_t xor8 = 0x3a100f06u, xor8_reverse = 0x3a100d07u;
 constexpr uint32_t compare8 = 0x7d841108u, compare6 = 0x7d840d06u;
 constexpr uint32_t full_exec = 0xbefe04c1u, end = 0xbf810000u;
 constexpr uint32_t fmac6 = 0x560c0ef2u; // v_fmac_f32 v6, 1.0, v7; old v6 is implicit
+// #5185: a word relayed from, or accumulated over, a never-written VGPR compute does not load is
+// arbitrary, so the public refusals below need a HARD producer: LDS data read at the never-written
+// address v20 (ds_read_b32 vD, v20). #5185 keeps loaded data hard whatever its address. (They used
+// v_mov_b32 v7, v20 or an absent accumulator, which are admitted as arbitrary now.)
+Words lds_hard(uint32_t vgpr) {
+    return {0xd8d80000u, (vgpr << 24) | 20u};
+}
 
 Words cat(std::initializer_list<Words> pieces) {
     Words code;
@@ -350,36 +357,49 @@ TEST(ConfinedSourceUnion, PublicCompilerProducesTheNestedAccumulatorModule) {
 
 TEST(ConfinedSourceUnion, PublicCompilerRejectsAnUnconfinedRelayAtItsFreshCompare) {
     accepted(compile(cat({nested(xor8, {0x7e0e0307u}), {compare8}})));
-    refused(compile(cat({nested(xor8, {0x7e0e0314u}), {compare8}})), 6);
+    accepted(compile(cat({nested(xor8, {0x7e0e0314u}), {compare8}})));   // relays arbitrary v20
+    refused(compile(cat({nested(xor8, lds_hard(7)), {compare8}})), 7);
 }
 
 TEST(ConfinedSourceUnion, PublicCompilerRejectsAnAbsentImplicitAccumulator) {
     accepted(compile(cat({nested(fmac6), {compare6}})));
-    refused(compile({cmpx_a, mov6, cmpx_b, mov7, 0x56100ef2u, compare8}), 5);
+    // An absent accumulator is arbitrary (#5185); a hard one is refused.
+    accepted(compile({cmpx_a, mov6, cmpx_b, mov7, 0x56100ef2u, compare8}));
+    refused(compile(cat({lds_hard(8), {cmpx_a, mov6, cmpx_b, mov7, 0x56100ef2u, compare8}})), 7);
 }
 
 TEST(ConfinedSourceUnion, PublicCompilerRejectsIncomparableOwnersAtTheCompare) {
     accepted(compile(cat({nested(), {compare8}})));
-    refused(compile({cmpx_a, mov6, full_exec, cmpx_b, mov7, xor8, compare8}), 6);
+    // v6's lanes of B outside A were never written: arbitrary, so admitted (#5185). With a hard
+    // old v6 those lanes reach the compare.
+    accepted(compile({cmpx_a, mov6, full_exec, cmpx_b, mov7, xor8, compare8}));
+    refused(compile(cat({lds_hard(6), {cmpx_a, mov6, full_exec, cmpx_b, mov7, xor8, compare8}})),
+            8);
 }
 
 TEST(ConfinedSourceUnion, PublicCompilerRejectsAFullExecReadAfterNestedWrites) {
     accepted(compile(cat({nested(), {compare8}})));
     // Outside B, v8 was never written and compute never loads it: #5174 admits that read as an
-    // arbitrary value (a refusal before the decision made it an over-refusal). When v8 first
-    // holds a written value, its lanes outside B keep that old value and the read stays refused.
+    // arbitrary value (a refusal before the decision made it an over-refusal), and #5185 admits
+    // it when v8 first relays another such word. When v8 first holds a hard value, its lanes
+    // outside B keep that old value and the read stays refused.
     accepted(compile(cat({nested(), {full_exec, compare8}})));
-    refused(compile(cat({{0x7e10031fu /* v_mov_b32 v8, v31 */}, nested(), {full_exec, compare8}})),
-            7);
+    accepted(
+        compile(cat({{0x7e10031fu /* v_mov_b32 v8, v31 */}, nested(), {full_exec, compare8}})));
+    refused(compile(cat({lds_hard(8), nested(), {full_exec, compare8}})), 8);
 }
 
 TEST(ConfinedSourceUnion, OneArmWriterCannotSupplyTheOtherPredecessor) {
     // Dynamic s4 makes both edges reachable; only the writer differs between these two shapes.
     accepted(compile(
         {0xbf068004u, 0xbf840002u, mov7, 0xbf820001u, mov7, cmpx_a, mov6, cmpx_b, xor8, compare8}));
-    refused(compile({0xbf068004u, 0xbf840002u, mov7, 0xbf820001u, 0xbf800000u, cmpx_a, mov6, cmpx_b,
-                     xor8, compare8}),
-            9);
+    // The other edge leaves v7 never written: arbitrary (#5185). Leaving it hard is refused.
+    accepted(compile({0xbf068004u, 0xbf840002u, mov7, 0xbf820001u, 0xbf800000u, cmpx_a, mov6,
+                      cmpx_b, xor8, compare8}));
+    refused(compile(cat({lds_hard(7),
+                         {0xbf068004u, 0xbf840002u, mov7, 0xbf820001u, 0xbf800000u, cmpx_a, mov6,
+                          cmpx_b, xor8, compare8}})),
+            11);
 }
 
 TEST(ConfinedSourceUnion, ALoopBackedgeCannotLaunderAnAbsentCurrentGeneration) {
@@ -393,8 +413,8 @@ TEST(ConfinedSourceUnion, ALoopBackedgeCannotLaunderAnAbsentCurrentGeneration) {
 TEST(ConfinedSourceUnion, FreshProfilesAndCodeDoNotReuseTheEarlierWordGeneration) {
     accepted(compile(cat({nested(), {compare8}})));
     for (uint32_t native : {0u, 32u, 64u})
-        refused(compile(cat({nested(xor8, {0x7e0e0314u}), {compare8}}), native), 6);
-    refused(compile(cat({nested(xor8, {0x7e0e0314u}), {compare8}}), 64, false), 6);
+        refused(compile(cat({nested(xor8, lds_hard(7)), {compare8}}), native), 7);
+    refused(compile(cat({nested(xor8, lds_hard(7)), {compare8}}), 64, false), 7);
     accepted(compile(cat({nested(), {compare8}})));
 }
 

@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <iterator>
 #include <string>
@@ -73,11 +74,13 @@ Compilation compile_consumer(const uint32_t* code, std::size_t count, uint32_t w
 
 // #5174: a consumer whose producer is simply absent reads a VGPR compute never loads and nothing
 // wrote. Hardware holds an earlier wave's value there, so the guard admits it as arbitrary; these
-// arms were refusals before that decision made them over-refusals. Relaying another never-loaded
-// word into the same register is a write, which the decision keeps hard, so each test keeps a
-// twin that reaches the guard at the actual consumer.
-constexpr uint32_t relay_from_v31(uint32_t vgpr) {
-    return 0x7e00031fu | (vgpr << 17);
+// arms were refusals before that decision made them over-refusals. #5185 extends that to values
+// computed from such words, so relaying one (v_mov from v31) is admitted too. Each test keeps a
+// twin with a HARD producer that reaches the guard at the actual consumer: LDS data read at the
+// never-written address v31 (ds_read_b32), which #5185 keeps hard because loaded data is no
+// function of its address alone.
+constexpr std::array<uint32_t, 2> lds_from_v31(uint32_t vgpr) {
+    return {0xd8d80000u, (vgpr << 24) | 31u};
 }
 
 void missing_predicate(const Compilation& result, uint32_t pc) {
@@ -106,12 +109,12 @@ TEST(ComputeCoverageInputs, MissingOffsetRefusesAtTheActualCarry) {
     const auto absent =
         compile(inputs::flat_consumer.data(), inputs::flat_consumer.size(), 0x5047000200ull, true);
     EXPECT_FALSE(absent.module.empty()) << absent.reason;
-    const auto relayed = inputs::with_inputs(inputs::flat_consumer, std::array{relay_from_v31(6)});
+    const auto relayed = inputs::with_inputs(inputs::flat_consumer, lds_from_v31(6));
     const auto result = compile(relayed.data(), relayed.size(), 0x5047000201ull, true);
     EXPECT_TRUE(result.module.empty());
     EXPECT_NE(result.reason.find("fabricated-fresh-mask-source"), std::string::npos)
         << result.reason;
-    EXPECT_NE(result.reason.find("pc=1 "), std::string::npos) << result.reason;
+    EXPECT_NE(result.reason.find("pc=2 "), std::string::npos) << result.reason;
 }
 
 TEST(ComputeCoverageInputs, AnOffsetProducerDoesNotSupplyAMissingWindow) {
@@ -137,8 +140,8 @@ TEST(ComputeCoverageInputs, APhysicalVccVoteNeedsItsActualVectorWord) {
     EXPECT_FALSE(positive.module.empty()) << positive.reason;
     const auto absent = compile_consumer(missing.data(), missing.size(), 32);
     EXPECT_FALSE(absent.module.empty()) << absent.reason;
-    const auto relayed = inputs::with_inputs(missing, std::array{relay_from_v31(20)});
-    missing_predicate(compile_consumer(relayed.data(), relayed.size(), 32), 1);
+    const auto relayed = inputs::with_inputs(missing, lds_from_v31(20));
+    missing_predicate(compile_consumer(relayed.data(), relayed.size(), 32), 2);
 }
 
 TEST(ComputeCoverageInputs, SavedMaskMbcntKeepsItsRealCompareOnBothRoutes) {
@@ -165,8 +168,8 @@ TEST(ComputeCoverageInputs, MaskNorNeedsItsActualVectorCompareSource) {
     EXPECT_FALSE(positive.module.empty()) << positive.reason;
     const auto absent = compile_consumer(missing.data(), missing.size(), 64);
     EXPECT_FALSE(absent.module.empty()) << absent.reason;
-    const auto relayed = inputs::with_inputs(missing, std::array{relay_from_v31(6)});
-    missing_predicate(compile_consumer(relayed.data(), relayed.size(), 64), 1);
+    const auto relayed = inputs::with_inputs(missing, lds_from_v31(6));
+    missing_predicate(compile_consumer(relayed.data(), relayed.size(), 64), 2);
 }
 
 TEST(ComputeCoverageInputs, SavedMaskNotKeepsGenuineSccBeforeTheMerge) {
@@ -231,9 +234,10 @@ TEST(ComputeCoverageInputs, DescriptorLifetimeNeedsBothRealCompareInputsAndItsBr
         inputs::with_inputs(inputs::x16_wave_mask_consumer, std::array{0xbf068080u});
     const auto absent = compile_x16(missing_vectors, 1);
     EXPECT_FALSE(absent.module.empty()) << absent.reason;
+    const auto lds = lds_from_v31(10);
     const auto relayed_vectors = inputs::with_inputs(
-        inputs::x16_wave_mask_consumer, std::array{relay_from_v31(10), 0x7e240280u, 0xbf068080u});
-    missing_predicate(compile_x16(relayed_vectors, 3), 11);
+        inputs::x16_wave_mask_consumer, std::array{lds[0], lds[1], 0x7e240280u, 0xbf068080u});
+    missing_predicate(compile_x16(relayed_vectors, 4), 12);
     const auto missing_scc_prefix =
         inputs::with_inputs(inputs::x16_wave_mask_consumer, std::array{0x7e140300u, 0x7e240280u});
     std::vector<uint32_t> missing_scc(missing_scc_prefix.begin(), missing_scc_prefix.end());
@@ -257,8 +261,8 @@ TEST(ComputeCoverageInputs, AScalarDescriptorOffsetCompareNeedsTheDeclaredVector
     const auto& missing = inputs::scalar_offset_compare;
     const auto absent = compile_consumer(missing.data(), missing.size(), 64, false, true, 25);
     EXPECT_FALSE(absent.module.empty()) << absent.reason;
-    const auto relayed = inputs::with_inputs(missing, std::array{relay_from_v31(68)});
-    missing_predicate(compile_consumer(relayed.data(), relayed.size(), 64, false, true, 25), 1);
+    const auto relayed = inputs::with_inputs(missing, lds_from_v31(68));
+    missing_predicate(compile_consumer(relayed.data(), relayed.size(), 64, false, true, 25), 2);
 }
 
 TEST(ComputeCoverageInputs, EachFreshMaskNeedsTheActualComparedWords) {

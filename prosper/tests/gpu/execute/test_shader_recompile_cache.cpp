@@ -2169,8 +2169,8 @@ int main(int argc, char** argv) {
     auto flat_missing_offset_table = flat_table;
     flat_missing_offset_table.resources[0].fetch_pc = 4;
     // #5174: v6 is then never written and compute does not load it, an arbitrary value the
-    // guard admits (a refusal before that decision made it an over-refusal). Relaying another
-    // never-loaded word into v6 is a write, which the decision keeps hard.
+    // guard admits (a refusal before that decision made it an over-refusal). #5185 admits a relay
+    // of another never-loaded word too; LDS data read at that word as an address stays hard.
     CHECK(!recompile_compute(kFlatCompute + 1, std::size(kFlatCompute) - 1,
                              &flat_missing_offset_table, flat_config)
                .empty(),
@@ -2178,10 +2178,20 @@ int main(int argc, char** argv) {
     auto flat_relayed_offset =
         std::vector<uint32_t>(std::begin(kFlatCompute), std::end(kFlatCompute));
     flat_relayed_offset[0] = 0x7e0c031fu;   // v_mov_b32 v6, v31
-    CHECK(recompile_compute(flat_relayed_offset.data(), flat_relayed_offset.size(), &flat_table,
-                            flat_config)
+    CHECK(!recompile_compute(flat_relayed_offset.data(), flat_relayed_offset.size(), &flat_table,
+                             flat_config)
+               .empty(),
+          "the FLAT cache control admits a v6 byte offset relayed from never-written v31 (#5185)");
+    // ds_read_b32 v6, v31 is two dwords: move the resource PC with the instruction it names.
+    auto flat_hard_offset = flat_relayed_offset;
+    flat_hard_offset[0] = 0xd8d80000u;
+    flat_hard_offset.insert(flat_hard_offset.begin() + 1, (6u << 24) | 31u);
+    auto flat_hard_offset_table = flat_table;
+    flat_hard_offset_table.resources[0].fetch_pc = 6;
+    CHECK(recompile_compute(flat_hard_offset.data(), flat_hard_offset.size(),
+                            &flat_hard_offset_table, flat_config)
               .empty(),
-          "the FLAT cache control cannot borrow a relayed undefined v6 byte offset");
+          "the FLAT cache control cannot borrow a hard (LDS-loaded) v6 byte offset");
 
     clear_shader_recompile_cache();
     // GFX9+ may install a vertex-fetch prolog separately from the main merged shader. Both immutable
