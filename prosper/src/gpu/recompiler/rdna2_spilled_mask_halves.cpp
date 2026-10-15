@@ -347,6 +347,42 @@ int spilled_slot_half(const SpilledMaskHalves& state, const Rdna2Inst& in) {
     return slot == state.slots.end() ? -1 : slot->second.half;
 }
 
+namespace {
+
+void carry_spilled_mask_words(SpilledMaskHalves& state, const Rdna2Inst& in) {
+    // CONFIDENCE: HIGH -- `slots`/`sregs` are MUST facts naming the instance (defining pc) whose
+    // half a slot or SGPR holds; every vector write to the slot VGPR, scalar write to the SGPR and
+    // redefinition at that pc ends them. Two reloaded halves of one instance therefore hold its
+    // value, and ActiveVectorWords.instances holds words genuine wherever that value enables a
+    // lane: a destroying vector write leaves it, an EXEC change never could (the words are
+    // relative to the mask, not to the EXEC current when it was saved or spilled).
+    ActiveVectorWords& active = state.active_vectors;
+    if (!active.enabled || in.fmt != Rdna2Format::VOP3 || !constant_lane(in)) return;
+    if (in.opcode == kOpWritelane) {
+        const auto slot = state.slots.find({in.dst.value, in.src[1].value});
+        if (slot == state.slots.end()) return;
+        const auto words = active.masks.find(slot->second.pair);
+        if (words != active.masks.end())
+            active.instances[slot->second.def_pc] = words->second;
+        else
+            active.instances.erase(slot->second.def_pc);
+        return;
+    }
+    // V_READLANE's destination field always names a scalar register (SGPRs, then VCC at 106).
+    if (in.opcode != kOpReadlane || in.dst.value < 0 || in.dst.value > 107) return;
+    const int pair = in.dst.value & ~1;
+    const auto low = state.sregs.find(pair);
+    const auto high = state.sregs.find(pair + 1);
+    if (low == state.sregs.end() || high == state.sregs.end() || low->second.half != 0 ||
+        high->second.half != 1 || low->second.pair != high->second.pair ||
+        low->second.def_pc != high->second.def_pc)
+        return;
+    const auto words = active.instances.find(low->second.def_pc);
+    if (words != active.instances.end()) active.masks[pair] = words->second;
+}
+
+}   // namespace
+
 void advance_spilled_mask_halves(SpilledMaskHalves& state, const Rdna2Inst& in,
                                  const std::set<int>& masks, const std::set<int>& mask_slot_keys,
                                  const std::vector<std::pair<int, uint32_t>>& scalar_writes,
@@ -406,6 +442,7 @@ void advance_spilled_mask_halves(SpilledMaskHalves& state, const Rdna2Inst& in,
         erase_instance(state.sregs, in.pc);
         state.pair_def_pc[mask_write] = in.pc;
     }
+    carry_spilled_mask_words(state, in);
 }
 
 }   // namespace prosper::gpu

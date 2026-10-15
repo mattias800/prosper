@@ -1,4 +1,5 @@
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
 namespace prosper::gpu {
@@ -15,6 +16,19 @@ int shader_max_vgpr(const std::vector<Rdna2Inst>& ins) {
         const uint32_t destination_span = rdna2_vgpr_destination_span(in);
         if (destination_span)
             highest = std::max(highest, in.dst.value + static_cast<int>(destination_span) - 1);
+        // CONFIDENCE: HIGH -- an image instruction names its further addresses only through the
+        // encoding (RDNA2 ISA 70648 MIMG): consecutive after VADDR, or one byte each in the NSA
+        // dwords. rdna2_vgpr_source_span charges VADDR alone, so an address register nothing
+        // else names was absent from dispatcher storage and from the relay MAY seeding (#5182).
+        // Every modelled read shape counts each address; every NSA byte names a register even
+        // when the shape is not modelled (zero padding names v0).
+        if (in.fmt == Rdna2Format::MIMG) {
+            const uint32_t addresses = rdna2_mimg_read_address_count(in);
+            for (uint32_t index = 0; index < addresses; ++index)
+                highest = std::max(highest, rdna2_mimg_address_vgpr(in, index));
+            for (uint32_t byte = 0; byte < 4u * in.mimg_nsa; ++byte)
+                highest = std::max(highest, rdna2_mimg_address_vgpr(in, byte + 1u));
+        }
     }
     return highest;
 }
