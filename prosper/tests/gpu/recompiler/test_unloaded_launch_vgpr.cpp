@@ -598,3 +598,26 @@ TEST(UnloadedLaunchVgpr, ASourceUndefinedInsideTheWriteExecIsNotMadeDefined) {
         EXPECT_FALSE(e.defined(compare8)) << std::hex << write;
     }
 }
+
+// ---- #5183: a graphics ADDTID reload carries the spilled word's provenance ---------------------
+// In a graphics stage ds_write_addtid_b32 / ds_read_addtid_b32 are a per-lane VGPR spill: the
+// reload returns the word the matching write stored under the same M0. Now that the reload is a
+// complete active-lane read, it must not look genuine when the spilled word was not.
+
+TEST(UnloadedLaunchVgpr, PublicFragmentAddtidReloadCarriesTheSpilledWord) {
+    constexpr uint32_t m0_zero = 0xb07c0000u;   // s_movk_i32 m0, 0
+    const Words spill_v6{0xdac00000u, 0x00000600u};   // ds_write_addtid_b32 v6
+    const Words reload_v8{0xdac40000u, 0x08000000u};   // ds_read_addtid_b32 v8
+    // v8 first relays the unsupplied v1, so only the reload can make the compare genuine.
+    accepted(compile_fragment(cat({{mov8_v1, m0_zero, mov6_3}, spill_v6, {cmpx_x4_v2}, reload_v8}),
+                              8, &kBaryPosX));
+    // The spilled word relays v1 itself: the reload is as hard as it.
+    refused(compile_fragment(cat({{mov8_v1, m0_zero, mov6_v1}, spill_v6, {cmpx_x4_v2}, reload_v8}),
+                             8, &kBaryPosX));
+    // Spilled under P, reloaded under the restored mask: lanes outside P never wrote their slot.
+    refused(compile_fragment(cat({{mov8_v1, m0_zero, mov6_3, save_exec, cmpx_x4_v2},
+                                  spill_v6,
+                                  {restore_exec},
+                                  reload_v8}),
+                             8, &kBaryPosX));
+}

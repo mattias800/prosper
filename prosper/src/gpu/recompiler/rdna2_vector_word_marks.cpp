@@ -392,6 +392,14 @@ ScalarSourceMarks vector_source_marks(const RegState& rs, const Rdna2Inst& in) {
             } else if (sreg_word_may_be_fabricated(rs, 124)) {
                 missing_address();
             }
+            // CONFIDENCE: HIGH -- the graphics lowering is a spill model: the reload returns the
+            // word the matching ds_write_addtid stored under the same M0 value, so it carries that
+            // word's provenance (the compute lowering reads real LDS and records no slot).
+            if (const auto m0 = rs.sreg.find(124); m0 != rs.sreg.end()) {
+                const auto slot = rs.lds_addtid_marks.find(
+                    (static_cast<uint64_t>(m0->second) << 32) | in.literal);
+                if (slot != rs.lds_addtid_marks.end()) union_marks(marks, slot->second);
+            }
         }
         if (in.fmt != Rdna2Format::DS) return marks;
     }
@@ -413,6 +421,26 @@ ScalarSourceMarks vector_source_marks(const RegState& rs, const Rdna2Inst& in) {
         marks.arbitrary = false;
         marks.blanket_roots.clear();
     }
+    return marks;
+}
+
+ScalarSourceMarks addtid_spill_marks(const RegState& rs, const Rdna2Inst& write) {
+    auto marks = vector_word(rs, write.src[1].value);
+    const auto value = rs.vreg.find(write.src[1].value);
+    if (value == rs.vreg.end() || !value->second) {
+        marks.placeholder = marks.hard = true;   // the spill stores the absent word's zero
+        marks.outside_exec = 0;
+        marks.blanket_roots.clear();
+    }
+    if (rs.exec_narrowed) {
+        // CONFIDENCE: HIGH -- lanes outside this EXEC do not write their slot; the model still
+        // hands them the spilled word, which is not what hardware's slot holds.
+        ScalarSourceMarks unwritten;
+        unwritten.placeholder = unwritten.hard = true;
+        unwritten.outside_exec = rs.exec;
+        union_marks(marks, unwritten, &rs);
+    }
+    // A stale slot is real LDS content, not an arbitrary value: the meet above made it hard.
     return marks;
 }
 

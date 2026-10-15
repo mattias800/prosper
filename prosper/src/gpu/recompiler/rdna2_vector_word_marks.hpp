@@ -81,6 +81,10 @@ void seed_vector_word_definedness(RegState& rs, const std::vector<Rdna2Inst>& in
                                   bool native_interpolation = false, uint32_t wave_size = 64,
                                   const std::vector<LaunchVgpr>* launch = nullptr);
 ScalarSourceMarks vector_source_marks(const RegState& rs, const Rdna2Inst& in);
+// The marks a graphics ds_write_addtid_b32 spill slot holds: the spilled word's own, and, under a
+// narrowed EXEC, missing outside it (that write fills only EXEC lanes' slots). The matching
+// ds_read_addtid_b32 reload carries them (#5183).
+ScalarSourceMarks addtid_spill_marks(const RegState& rs, const Rdna2Inst& write);
 ScalarSourceMarks vector_relative_source_marks(const SpirvCompute& b, const RegState& rs,
                                                const Rdna2Inst& in);
 ScalarSourceMarks vector_lane_read_marks(const RegState& rs, const Rdna2Inst& in);
