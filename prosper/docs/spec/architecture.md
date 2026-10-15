@@ -187,7 +187,7 @@ Enforcement: adr:0011
 
 RDNA2 instructions lower into an IR on which passes run before SPIR-V is emitted, one instruction
 family at a time, each family gated on byte-identical SPIR-V over a recorded corpus.
-Status: proposed (adr:0012)
+Status: accepted
 Enforcement: adr:0012
 
 ### GPU-4 -- descriptor provenance has one analysis, shared by recompiler and executor
