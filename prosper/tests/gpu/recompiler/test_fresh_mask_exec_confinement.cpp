@@ -376,8 +376,11 @@ TEST(FreshMaskExecConfinement, ALoadReadsItsAddressLoopObligationBeforeWritingTh
         ASSERT_EQ(ins.size(), 1u);
         const auto before = snapshot_saved_b64_masks(h.b, h.rs, ins[0]);
         EXPECT_TRUE(h.b.loop_blanket_roots_read.contains(root));
-        EXPECT_FALSE(before.source_marks.placeholder);
-        EXPECT_TRUE(before.source_marks.blanket_roots.empty());
+        // #5205: the loaded value keeps its address's VECTOR loop root, conditional on it, so a
+        // later strong address consumer charges the same obligation (a weak back edge makes it
+        // arbitrary). A scalar root still retires (ABufferSpecialOffset... above).
+        EXPECT_TRUE(before.source_marks.placeholder);
+        EXPECT_TRUE(before.source_marks.blanket_roots.contains(root));
         record_vector_word_marks(h.rs, ins[0], before.source_marks);
         EXPECT_TRUE(fresh_mask_sources_defined(h.b, h.rs, decode(kCmpV6V6)[0]));
     }
