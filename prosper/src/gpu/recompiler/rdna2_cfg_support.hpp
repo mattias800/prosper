@@ -1650,7 +1650,9 @@ inline ScalarSourceMarks scalar_source_marks(const RegState& rs, const Rdna2Inst
         const bool fabricated = sreg_word_may_be_fabricated(rs, r);
         marks.placeholder = marks.placeholder || fabricated;
         // A scalar word is unconfined: it may be absent in every lane, so no EXEC confinement survives it.
+        // Nor is it a never-loaded VGPR: scalar data stays hard under #5174.
         if (fabricated) marks.outside_exec = 0;
+        if (fabricated) marks.unloaded = marks.untouched = false;
         const auto blanket = rs.sreg_loop_blanket.find(r);
         if (fabricated && blanket == rs.sreg_loop_blanket.end())
             marks.hard = true;

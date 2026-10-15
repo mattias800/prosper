@@ -44,6 +44,16 @@ std::vector<LaunchVgpr> pixel_launch_vgprs(const PixelSystemInputMapping& inputs
     return out;
 }
 
+bool pixel_launch_profile_known(const PixelSystemInputMapping& inputs) {
+    return (inputs.ena & 0xffffu) != 0 && (inputs.ena & ~inputs.addr) == 0 && inputs.canonical();
+}
+
+bool launch_profile_complete(const std::vector<LaunchVgpr>& inventory) {
+    return std::none_of(inventory.begin(), inventory.end(), [](const LaunchVgpr& word) {
+        return word.state == LaunchVgprState::Partial;
+    });
+}
+
 std::vector<LaunchVgpr> compute_launch_vgprs(uint32_t tidig_comp_cnt) {
     // TIDIG_COMP_CNT is a two-bit field; 3 loads the same three components as 2.
     const uint32_t components = std::min(tidig_comp_cnt, 2u) + 1;

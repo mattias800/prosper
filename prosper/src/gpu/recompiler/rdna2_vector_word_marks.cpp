@@ -4,6 +4,7 @@
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
+#include "gpu/recompiler/rdna2_launch_vgprs.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_vector_old_word.hpp"
 
@@ -90,8 +91,31 @@ bool exec_within(const RegState& rs, uint32_t reader, uint32_t owner) {
     return false;
 }
 
+// How union_marks meets two marks: the inputs one instruction reads in the same lane, or the
+// same word arriving along two paths.
+enum class MarkMeet { Operands, Paths };
+
+// CONFIDENCE: HIGH -- the unloaded property of a meet (#5174). Operands: each undefined lane of
+// the result is an undefined lane of one input, so it is never written exactly when every
+// placeholder input is unloaded; a soft input is a loop assumption, not a launch value, and an
+// input's obligations must not be dropped with an unconfined owner. Paths: a lane undefined on one
+// path may have been written on the other, so both paths must be untouched outside the same owner.
+bool meet_unloaded(const ScalarSourceMarks& a, const ScalarSourceMarks& b, MarkMeet meet) {
+    const auto arbitrary = [](const ScalarSourceMarks& m) {
+        return m.placeholder && m.hard && m.unloaded;
+    };
+    if (meet == MarkMeet::Paths)
+        return arbitrary(a) && arbitrary(b) && a.untouched && b.untouched &&
+               a.outside_exec == b.outside_exec;
+    return (a.placeholder || b.placeholder) && (!a.placeholder || arbitrary(a)) &&
+           (!b.placeholder || arbitrary(b));
+}
+
 void union_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other,
-                 const RegState* current = nullptr, bool explicit_sources = false) {
+                 const RegState* current = nullptr, bool explicit_sources = false,
+                 MarkMeet meet = MarkMeet::Operands) {
+    bool unloaded = meet_unloaded(into, other, meet);
+    const bool had_roots = !into.blanket_roots.empty() || !other.blanket_roots.empty();
     const uint32_t into_side = into.hard || into.scoped_complete_word ? into.outside_exec : 0u;
     const uint32_t other_side = other.hard || other.scoped_complete_word ? other.outside_exec : 0u;
     auto scoped = into.placeholder && !into.hard ? into.scoped_blanket_roots : into.blanket_roots;
@@ -154,6 +178,12 @@ void union_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other,
             into.scoped_blanket_roots = std::move(scoped);
     }
     if (into.hard || !into.outside_exec) into.scoped_blanket_roots.clear();
+    // An unconfined hard result drops its inputs' active-domain obligations above; a lane read
+    // through it would then owe nothing to the loop proof those obligations name.
+    if (!into.outside_exec && had_roots) unloaded = false;
+    into.unloaded = unloaded && into.placeholder && into.hard;
+    // Only a path meet of two untouched marks with one owner keeps the stronger claim.
+    into.untouched = into.unloaded && meet == MarkMeet::Paths;
 }
 
 const std::set<uint64_t>& source_roots_in_exec(const RegState& rs, const ScalarSourceMarks& marks,
@@ -237,7 +267,8 @@ void record_exec_mask_subset(RegState& rs, uint32_t result, uint32_t left, uint3
 }
 
 void seed_vector_word_definedness(RegState& rs, const std::vector<Rdna2Inst>& instructions,
-                                  bool native_interpolation, uint32_t wave_size) {
+                                  bool native_interpolation, uint32_t wave_size,
+                                  const std::vector<LaunchVgpr>* launch) {
     // CONFIDENCE: HIGH -- operand_bits/vreg_old supply zero for absent ordinary VGPRs. That
     // placeholder is not a guest value. Seed before PHIs or dispatcher storage can hide absence;
     // later complete writers retire the mark, while preserved old bits/lanes retain it.
@@ -258,12 +289,22 @@ void seed_vector_word_definedness(RegState& rs, const std::vector<Rdna2Inst>& in
     }
     rs.vector_full_exec = rs.exec && !rs.exec_narrowed;
     rs.vector_native_interpolation = native_interpolation;
+    // CONFIDENCE: HIGH -- RDNA2 ISA 70648 loads only the PS input fields SPI_PS_INPUT_ENA enables
+    // and the compute thread-id components TIDIG_COMP_CNT names; every other VGPR starts with
+    // whatever an earlier wave left in the register file. A word the inventory lists as loaded
+    // (supplied or not) has a real hardware value and stays an ordinary hard placeholder.
+    if (launch && !launch_profile_complete(*launch)) launch = nullptr;
+    std::set<int> loaded;
+    if (launch)
+        for (const auto& word : *launch)
+            if (word.state != LaunchVgprState::Reserved) loaded.insert(static_cast<int>(word.vgpr));
     for (int reg = 0; reg <= highest; ++reg) {
         const auto value = rs.vreg.find(reg);
         if (value != rs.vreg.end() && value->second) continue;
         auto& mark = rs.vreg_source_marks[reg];
         mark.placeholder = mark.hard = true;
         mark.blanket_roots.clear();
+        mark.unloaded = mark.untouched = launch && !loaded.contains(reg);
     }
 }
 
@@ -400,12 +441,25 @@ bool fresh_mask_sources_defined(SpirvCompute& b, const RegState& rs, const Rdna2
     if (!marks.placeholder) return true;
     // The predicate reads only the lanes its own EXEC enables, and its result is masked by that EXEC,
     // so a placeholder confined to the lanes outside the same EXEC value is never observed.
-    if ((marks.hard || marks.scoped_complete_word) && marks.outside_exec != 0 && rs.exec_narrowed &&
+    // CONFIDENCE: HIGH -- an un-narrowed EXEC equal to the owner is the same immutable value, so
+    // the read enables exactly the owner's lanes (#5174 case c: a partition of the launch EXEC
+    // whose two arms rejoin and are read after the restore).
+    if ((marks.hard || marks.scoped_complete_word) && marks.outside_exec != 0 &&
+        (rs.exec_narrowed || rs.exec == marks.outside_exec) &&
         exec_within(rs, rs.exec, marks.outside_exec)) {
         // An unchanged SSA EXEC owner does not prove the next iteration's carried value. Record
         // the header obligation before accepting this scoped read; the back edge checks it.
         const auto& roots = source_roots_in_exec(rs, marks, rs.exec);
         b.loop_blanket_roots_read.insert(roots.begin(), roots.end());
+        return true;
+    }
+    if (marks.hard && marks.unloaded) {
+        // CONFIDENCE: MED -- #5174 policy (decision on the issue, 2026-10-15): every lane this
+        // read may find missing holds the launch value of a VGPR hardware never loaded, never
+        // written on any path. Hardware holds an earlier wave's leftovers there, so the guest
+        // cannot depend on it and the zero supplied here is a value hardware could hold: there
+        // is no lane identity to fabricate. Defined lanes still owe their loop obligations.
+        b.loop_blanket_roots_read.insert(marks.blanket_roots.begin(), marks.blanket_roots.end());
         return true;
     }
     if (marks.hard || marks.blanket_roots.empty()) return false;
@@ -472,6 +526,9 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
     for (int reg = in.dst.value; reg < end; ++reg) {
         const auto old = vector_word(rs, reg);
         ScalarSourceMarks result = source;
+        // Any write clears the unloaded property unless the narrowed-complete case below proves
+        // the result's undefined lanes are lanes this write left as they were (#5174).
+        bool unloaded = false, untouched = false;
         // CONFIDENCE: HIGH -- RDNA2 70648's ordinary VALU writes retain inactive lanes; WRITELANE
         // replaces one selected lane regardless of EXEC. Partial/relative writes retain old bits.
         if (preserve) union_marks(result, old, &rs);
@@ -517,18 +574,105 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
                     result.outside_exec = keep_wider ? old.outside_exec : partition->second.first;
                     result.blanket_roots.insert(old.blanket_roots.begin(), old.blanket_roots.end());
                 }
+                // CONFIDENCE: HIGH -- every lane inside EXEC is written here from defined
+                // sources, so each undefined lane of the result is an undefined lane of the old
+                // word outside EXEC, still never written when the old word's were (#5174). The
+                // result is untouched outside its owner only if every lane the old word defined
+                // lies inside the new owner (no owner: the old word defined none).
+                unloaded = old.placeholder && old.hard && old.unloaded;
+                untouched = unloaded && old.untouched &&
+                            (old.outside_exec == 0 ||
+                             exec_within(rs, old.outside_exec, result.outside_exec));
+                // CONFIDENCE: HIGH -- a defined old word leaves no missing lane outside EXEC,
+                // and inside it the sources are defined with no loop obligation: the result
+                // misses no lane at all. Narrowing the owner to EXEC here lost exactly that
+                // (#5174: Kena ps 0x5009050000 pc58, a hard source confined to the saved mask
+                // written under its second arm over a complete image result).
+                if (!old.placeholder && result.blanket_roots.empty()) {
+                    result.placeholder = result.hard = false;
+                    result.outside_exec = 0;
+                }
             }
+        } else if (narrowed_write && !relative && lane_wise_vector_op(in) && !old.placeholder &&
+                   vector_word_defined_in_exec(rs, source, rs.exec) &&
+                   source_roots_in_exec(rs, source, rs.exec).empty()) {
+            // CONFIDENCE: HIGH -- the same proof for an accumulating or partial lane-wise write:
+            // inside EXEC each lane combines its defined sources with its own defined old word,
+            // outside EXEC the defined old word survives. Kena ps 0x5006bd0000 pc365 (a v_mac
+            // under the cmpx owner over a word written clean before it) lost this.
+            result.placeholder = result.hard = false;
+            result.outside_exec = 0;
+            result.blanket_roots.clear();
         }
         if (result.hard && !result.outside_exec) result.blanket_roots.clear();
         if (result.hard || !result.outside_exec) result.scoped_complete_word = false;
         if (!result.scoped_complete_word) result.scoped_blanket_roots.clear();
+        result.unloaded = unloaded && result.placeholder && result.hard;
+        result.untouched = untouched && result.unloaded;
         set_word(rs.vreg_source_marks, reg, std::move(result));
     }
 }
 
 void join_vector_word_marks(VectorWordMarks& into, const VectorWordMarks& other,
                             const RegState* current) {
-    for (const auto& [reg, source] : other) union_marks(into[reg], source, current);
+    // A word with no mark on the other path is defined there: written, or a supplied input.
+    for (auto& [reg, marks] : into)
+        if (!other.contains(reg)) marks.unloaded = marks.untouched = false;
+    for (const auto& [reg, source] : other)
+        union_marks(into[reg], source, current, false, MarkMeet::Paths);
+}
+
+void confine_execz_skip_marks(const RegState& rs, VectorWordMarks& skipped,
+                              const VectorWordMarks& taken, uint32_t empty_exec) {
+    if (!empty_exec) return;
+    // CONFIDENCE: HIGH -- every lane reaching this edge lies outside E = empty_exec. A hard mark
+    // says "missing only outside X" (anywhere when X is 0), so on this edge it is also confined:
+    //  - outside E itself, since every lane here is;
+    //  - outside W, when E = W & ~P with P a proved subset of W (exec_complement_in) and P within
+    //    X: a missing lane is outside X, hence outside P, and outside E, so it is outside W. This
+    //    is #5172's partition rule for the join of the two arms: the second arm's empty EXEC
+    //    is the case where the first arm's owner already covered the whole saved mask.
+    // These facts relate immutable EXEC SSA values, so they hold on the skipped edge too.
+    const auto partition = rs.exec_complement_in.find(empty_exec);
+    for (auto& [reg, marks] : skipped) {
+        if (!marks.placeholder || !marks.hard) continue;
+        const uint32_t prior = marks.outside_exec;
+        std::vector<uint32_t> owners;
+        if (partition != rs.exec_complement_in.end() && prior &&
+            exec_within(rs, partition->second.second, prior))
+            owners.push_back(partition->second.first);
+        if (prior) owners.push_back(prior);
+        owners.push_back(empty_exec);
+        const auto found = taken.find(reg);
+        const uint32_t target = found != taken.end() && found->second.placeholder &&
+                                        (found->second.hard || found->second.scoped_complete_word)
+                                    ? found->second.outside_exec
+                                    : 0u;
+        // The meet keeps the narrower of two nested owners, so pick a candidate the taken
+        // edge's owner lies within (the meet is then exactly that owner), or else the widest
+        // candidate within it. Without a comparable candidate the mark is left as it was.
+        const bool taken_defined = found == taken.end() || !found->second.placeholder;
+        // A defined taken edge adds no missing lane: the meet keeps this edge's owner as is, so
+        // any provable one will do, and the partition's saved mask is the widest of them.
+        uint32_t chosen = taken_defined ? owners.front() : 0u;
+        if (target)
+            for (uint32_t owner : owners)
+                if (owner == target || exec_within(rs, target, owner)) {
+                    chosen = target;
+                    break;
+                }
+        if (!chosen && target)
+            for (uint32_t owner : owners)
+                if (exec_within(rs, owner, target)) {
+                    chosen = owner;
+                    break;
+                }
+        if (!chosen || chosen == prior) continue;
+        marks.outside_exec = chosen;
+        // The lanes it defined lie inside X; the mark is untouched outside the new owner only if
+        // X is within it. Which lanes are undefined does not change, so neither does unloaded.
+        marks.untouched = marks.untouched && (!prior || exec_within(rs, prior, chosen));
+    }
 }
 
 void retire_vector_word_roots(ScalarSourceMarks& marks, const std::set<uint64_t>& violated) {
@@ -537,6 +681,7 @@ void retire_vector_word_roots(ScalarSourceMarks& marks, const std::set<uint64_t>
                            [&](uint64_t root) { return violated.contains(root); });
     };
     if (invalid(marks.blanket_roots)) {
+        marks.unloaded = marks.untouched = false;   // a defined lane relied on the assumption
         const bool scoped = !marks.hard && marks.scoped_complete_word && marks.outside_exec &&
                             !invalid(marks.scoped_blanket_roots);
         marks.blanket_roots = scoped ? marks.scoped_blanket_roots : std::set<uint64_t>{};
@@ -618,6 +763,8 @@ void mark_vector_loop_carried(RegState& rs, const std::vector<Rdna2Inst>& ins, u
             source.hard = true;
             source.blanket_roots.clear();
         }
+        // The loop writes this word, so its back edge may carry a written value into any lane.
+        source.unloaded = source.untouched = false;
         source.placeholder = true;
         rs.vreg_source_marks[reg] = std::move(source);
     }

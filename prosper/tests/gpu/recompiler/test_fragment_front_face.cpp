@@ -175,9 +175,11 @@ TEST(FragmentFrontFace, EnabledInputCompilesInItsAddressedSlot) {
             const auto module = compile(slot, &inputs);
             ASSERT_FALSE(module.empty()) << "ADDR must reserve disabled preceding fields";
             EXPECT_TRUE(has_facing_input(module));
-            if (slot)
-                EXPECT_TRUE(compile(slot - 1, &inputs).empty())
-                    << "FRONT_FACE must not authenticate an adjacent reserved VGPR";
+            // The adjacent word is reserved by ADDR only: hardware loads nothing there, so
+            // #5174 admits a never-written read of it as an arbitrary value. The refusal this arm
+            // used to assert is an over-refusal under that decision; the addressed slot above and
+            // the unsupplied-encoding arms below still pin where FRONT_FACE is bound.
+            if (slot) EXPECT_FALSE(compile(slot - 1, &inputs).empty());
         }
     }
 }

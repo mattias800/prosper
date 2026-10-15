@@ -341,16 +341,15 @@ TEST(OwnedRawX2, CacheAdmissionIsDistinctFromReusableCode) {
     absent_y.tidig_comp_cnt = 0;
     uint64_t absent_y_identity = 0;
     constexpr uint64_t missing_local_y = 0x49960f01ull;
-    EXPECT_TRUE(recompile_compute_shader_cached(
-                    code.data(), code.size(), &table, absent_y, &absent_y_identity,
-                    {RecompileDiagnosticStage::Compute, missing_local_y})
-                    .empty())
-        << "warm code cannot supply an absent compare input";
+    // With TIDIG_COMP_CNT = 0 hardware does not load v1, so #5174 admits the compare over it as
+    // an arbitrary value (this arm was a refusal before that decision made it an over-refusal).
+    // The warm module must still not be reused: its v1 is the genuine local Y.
+    const auto absent_y_module = recompile_compute_shader_cached(
+        code.data(), code.size(), &table, absent_y, &absent_y_identity,
+        {RecompileDiagnosticStage::Compute, missing_local_y});
+    EXPECT_FALSE(absent_y_module.empty()) << last_terminal_reject_reason(missing_local_y);
+    EXPECT_NE(absent_y_module, first) << "warm code cannot supply an absent compare input";
     EXPECT_NE(absent_y_identity, valid) << "system input declarations change generated code";
-    const auto reason = last_terminal_reject_reason(missing_local_y);
-    EXPECT_NE(reason.find("reason=fabricated-fresh-mask-source pc=7 words=7d820204"),
-              std::string::npos)
-        << reason;
     EXPECT_EQ(recompile_compute_shader_cached(code.data(), code.size(), &table, config), first);
     words = {7, 11};
     table.resources[1].gpu_addr += 0x100;

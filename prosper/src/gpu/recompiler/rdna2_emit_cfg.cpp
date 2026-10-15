@@ -7172,7 +7172,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     std::set<int> pre_entry_m0;
                     for (int r : ifs)
                         if (entry_m0_live(rs, r)) pre_entry_m0.insert(r);
-                    const MergeEdgeMarks pre_marks = merge_edge_marks(rs, ifs);   // #4706
+                    const auto pre_marks = merge_edge_marks(rs, ifs, F.on_exec && F.on_scc0);
                     uint32_t pre_scc = rs.scc, pre_vcc = rs.vcc, pre_exec = rs.exec;
                     const bool pre_narrowed = rs.exec_narrowed;
                     // The SKIPPED edge keeps the pre-branch bits, so it keeps the pre-branch copy

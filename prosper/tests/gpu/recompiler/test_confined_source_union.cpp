@@ -365,7 +365,12 @@ TEST(ConfinedSourceUnion, PublicCompilerRejectsIncomparableOwnersAtTheCompare) {
 
 TEST(ConfinedSourceUnion, PublicCompilerRejectsAFullExecReadAfterNestedWrites) {
     accepted(compile(cat({nested(), {compare8}})));
-    refused(compile(cat({nested(), {full_exec, compare8}})), 6);
+    // Outside B, v8 was never written and compute never loads it: #5174 admits that read as an
+    // arbitrary value (a refusal before the decision made it an over-refusal). When v8 first
+    // holds a written value, its lanes outside B keep that old value and the read stays refused.
+    accepted(compile(cat({nested(), {full_exec, compare8}})));
+    refused(compile(cat({{0x7e10031fu /* v_mov_b32 v8, v31 */}, nested(), {full_exec, compare8}})),
+            7);
 }
 
 TEST(ConfinedSourceUnion, OneArmWriterCannotSupplyTheOtherPredecessor) {

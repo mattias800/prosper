@@ -263,7 +263,11 @@ TEST(FreshMaskLaneWiseRelay, ATypedBufferLoadIsCompleteButItsTfeAndD16FormsAreNo
 
 TEST(FreshMaskLaneWiseRelay, PublicCompilerAdmitsAnLdsReadRelayAndRefusesItsWiderTwin) {
     accepted(compile({cmpx_a, ds_read_v8, 0x08000000u, compare8}));
-    refused(compile({cmpx_a, ds_read_v8, 0x08000000u, full_exec, compare8}), 4);
+    // #5174: outside A, v8 was never written and compute never loads it, so the wider read is
+    // admitted as an arbitrary value (a refusal before that decision made it an over-refusal).
+    accepted(compile({cmpx_a, ds_read_v8, 0x08000000u, full_exec, compare8}));
+    // A written old v8 (relayed from v19, itself never written) survives outside A: refused.
+    refused(compile({0x7e100313u, cmpx_a, ds_read_v8, 0x08000000u, full_exec, compare8}), 5);
 }
 
 // ---- 3. The second arm of an if/else completes the saved mask ----------------------------------
@@ -307,7 +311,11 @@ TEST(FreshMaskLaneWiseRelay, ANarrowerSecondArmDoesNotCompleteThePartition) {
 
 TEST(FreshMaskLaneWiseRelay, PublicCompilerAdmitsThePartitionAndRefusesItsOneArmTwin) {
     accepted(compile(cat({if_else({mov6}, {mov6_3}), {compare6}})));
-    refused(compile(cat({if_else({mov6}, {mov7}), {compare6}})), 7);
+    // #5174: v6 was never written in the second arm's lanes and compute never loads it, so the
+    // one-arm read is admitted as an arbitrary value (an over-refusal under that decision).
+    accepted(compile(cat({if_else({mov6}, {mov7}), {compare6}})));
+    // With a written old v6 (relayed from v19) the second arm's lanes keep it: refused.
+    refused(compile(cat({{0x7e0c0313u}, if_else({mov6}, {mov7}), {compare6}})), 8);
 }
 
 // ---- 4. A structured merge meets nested owners at the narrower one ------------------------------

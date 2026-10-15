@@ -7,6 +7,9 @@
 //   - pixel: the SPI_PS_INPUT_ENA/ADDR fields, packed in field order, ADDR reserving widths.
 // Each accepted arm below has a refused twin that differs only in the launch contract, so neither
 // "every VGPR is defined" nor "no launch VGPR is defined" can pass the suite.
+// #5174: a VGPR hardware does NOT load (past the inventory, or reserved by ADDR only) and that
+// nothing wrote holds an earlier wave's leftovers; the guard admits it as an arbitrary value. The
+// refused twin is therefore a word hardware loads but this backend does not supply.
 #include "gpu/recompiler/rdna2_launch_vgprs.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include <gtest/gtest.h>
@@ -121,25 +124,31 @@ TEST(LaunchVgprCompare, ComputeThreadIdCompareIsAcceptedForEachLoadedComponent) 
             EXPECT_FALSE(compile_compute(vgpr, tidig, base + vgpr).empty())
                 << "tidig=" << tidig << " v" << vgpr << ": "
                 << last_terminal_reject_reason(base + vgpr);
-        // Negative control: the next VGPR is not loaded at this TIDIG_COMP_CNT.
+        // The next VGPR is not loaded at this TIDIG_COMP_CNT and nothing writes it: hardware
+        // holds an earlier wave's value there, so #5174 admits it as arbitrary. (This arm was a
+        // refusal before #5174; the decision on that issue makes it an over-refusal.)
         const uint64_t unloaded = base + 0x80u;
-        EXPECT_TRUE(compile_compute(tidig + 1, tidig, unloaded).empty()) << "tidig=" << tidig;
-        EXPECT_TRUE(refused_as_fresh_mask(unloaded)) << last_terminal_reject_reason(unloaded);
+        EXPECT_FALSE(compile_compute(tidig + 1, tidig, unloaded).empty())
+            << "tidig=" << tidig << ": " << last_terminal_reject_reason(unloaded);
     }
 }
 
-TEST(LaunchVgprCompare, PixelPositionCompareIsAcceptedOnlyWhereEnaLoadsIt) {
+TEST(LaunchVgprCompare, PixelCompareRefusesOnlyALoadedWordItCannotSupply) {
     // PERSP_CENTER in v0/v1 and POS_X in v2.
     const PixelSystemInputMapping loaded{0x102u, 0x102u};
     EXPECT_FALSE(compile_fragment(fragment_compare(2), loaded, 0x51461000u).empty())
         << last_terminal_reject_reason(0x51461000u);
-    // Same VGPR, POS_X reserved by ADDR only: hardware loads nothing into v2.
+    // v1 is PERSP_CENTER.J: hardware loads it, native interpolation has no value for it.
+    EXPECT_TRUE(compile_fragment(fragment_compare(1), loaded, 0x51461003u).empty());
+    EXPECT_TRUE(refused_as_fresh_mask(0x51461003u));
+    // Same v2, POS_X reserved by ADDR only: hardware loads nothing into it, and a VGPR past the
+    // launch set is not loaded either. Nothing writes them, so #5174 admits both as arbitrary
+    // values (they were refusals before that decision made them over-refusals).
     const PixelSystemInputMapping reserved{0x2u, 0x102u};
-    EXPECT_TRUE(compile_fragment(fragment_compare(2), reserved, 0x51461001u).empty());
-    EXPECT_TRUE(refused_as_fresh_mask(0x51461001u));
-    // A VGPR past the launch set was never written by anything.
-    EXPECT_TRUE(compile_fragment(fragment_compare(3), loaded, 0x51461002u).empty());
-    EXPECT_TRUE(refused_as_fresh_mask(0x51461002u));
+    EXPECT_FALSE(compile_fragment(fragment_compare(2), reserved, 0x51461001u).empty())
+        << last_terminal_reject_reason(0x51461001u);
+    EXPECT_FALSE(compile_fragment(fragment_compare(3), loaded, 0x51461002u).empty())
+        << last_terminal_reject_reason(0x51461002u);
 }
 
 TEST(LaunchVgprCompare, InterpolatedValueCompareIsAcceptedButRawBarycentricIsNot) {

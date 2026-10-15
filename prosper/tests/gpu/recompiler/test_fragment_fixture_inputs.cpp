@@ -150,6 +150,11 @@ TEST(StructuralFixtureInputs, VccHighScratchCompareRequiresItsActualVectorInput)
         auto missing = code;
         missing[2] =
             0xbf800000u; // Preserve the original comparison PC while omitting its producer.
+        // Without a producer v11 is a never-written VGPR compute does not load: #5174 admits it
+        // as an arbitrary value. Relaying another such word into v11 is a write, which the
+        // decision keeps hard, so that twin still reaches the guard at the same PC.
+        EXPECT_FALSE(compile(missing).empty()) << last_terminal_reject_reason(address);
+        missing[2] = 0x7e16031fu;   // v_mov_b32 v11, v31
         EXPECT_TRUE(compile(missing).empty());
         const auto reason = last_terminal_reject_reason(address);
         EXPECT_NE(reason.find("fabricated-fresh-mask-source"), std::string::npos) << reason;

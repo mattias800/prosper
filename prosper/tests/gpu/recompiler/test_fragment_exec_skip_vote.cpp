@@ -462,11 +462,14 @@ TEST(FragmentExecSkipEmitter, MissingPixelInputRefusesAtTheNarrowingCompare) {
     ASSERT_FALSE(compile_execz({kVCmpGtU32, kVMovOne}, &enabled).empty());
     const PixelSystemInputMapping absent{};
     const PixelSystemInputMapping disabled{.ena = 0, .addr = enabled.addr};
-    // Reserving disabled X before enabled Z places Z at v1, which the shader overwrites.
-    // v0 remains absent despite storage and an enabled input elsewhere.
+    // Reserving disabled X before enabled Z places Z at v1, which the shader overwrites. v0 is
+    // then reserved by ADDR only: hardware loads nothing into it, so #5174 admits the compare as
+    // an arbitrary value (a refusal before that decision made it an over-refusal). An absent or
+    // empty mapping is an unknown launch profile and keeps the refusal.
     const PixelSystemInputMapping displaced{.ena = enabled.ena, .addr = enabled.addr | (1u << 8)};
+    EXPECT_FALSE(compile_execz({kVCmpGtU32, kVMovOne}, &displaced).empty());
     for (const auto* inputs :
-         {static_cast<const PixelSystemInputMapping*>(nullptr), &absent, &disabled, &displaced}) {
+         {static_cast<const PixelSystemInputMapping*>(nullptr), &absent, &disabled}) {
         TerminalRejectCapture capture;
         EXPECT_TRUE(compile_execz({kVCmpGtU32, kVMovOne}, inputs).empty());
         std::string reason;
