@@ -39,7 +39,7 @@ TEST(IrLowerVop2, NarrowedExecKeepsTheOldVdst) {
 
 TEST(IrLowerVop2, UndefinedOpsStillTakeTheSwitch) {
     Vop2 f32;
-    ASSERT_TRUE(f32.lower(0x03));   // v_add_f32 has no IR definition yet
+    ASSERT_TRUE(f32.lower(0x03));   // v_add_f32 now uses its IR definition
     EXPECT_TRUE(f32.ok);
     Vop2 carry;
     carry.rs.vcc = 0;

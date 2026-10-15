@@ -1,4 +1,7 @@
 // VOP2 float lowering keeps source order, the EXEC predicate and the reserved VCC route.
+#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include <cstddef>
+#include <cstdint>
 #include "gpu/recompiler/ir/lowering_fixture.hpp"
 #include "gpu/recompiler/ir/lower/vector_alu_lowering.hpp"
 #include "gpu/recompiler/ir/vector_lane_harness.hpp"

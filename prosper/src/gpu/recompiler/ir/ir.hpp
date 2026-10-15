@@ -36,16 +36,42 @@ enum class Opcode : uint8_t {
     ConstU32,    // imm
     ConstTrue,
     ConstFalse,
-    IAdd, ISub, IMul,
-    UMulHi, SMulHi,   // high 32 bits of the 64-bit unsigned / signed product
-    And, Or, Xor, Not, BitReverse,
-    Shl, LShr, AShr,  // a shift count of 32 or more is undefined (SPIR-V): it evaluates to unknown
-    SMin, SMax, UMin, UMax,
-    BfeU,        // (base, offset, count) with SpirvCompute::bfe_u's clamps: min(offset, 32), then
-                 // min(count, 32 - offset); zero when the clamped count is zero
-    Select,      // (bool cond, u32 a, u32 b)
-    BoolSelect,  // (bool cond, bool a, bool b)
-    IEq, INe, ULt, ULe, UGt, UGe, SLt, SLe, SGt, SGe,   // u32 x u32 -> bool
+    IAdd,
+    ISub,
+    IMul,
+    UMulHi,
+    SMulHi,   // high 32 bits of the 64-bit unsigned / signed product
+    And,
+    Or,
+    Xor,
+    Not,
+    BitReverse,
+    Shl,
+    LShr,
+    AShr,  // a shift count of 32 or more is undefined (SPIR-V): it evaluates to unknown
+    SMin,
+    SMax,
+    UMin,
+    UMax,
+    BfeU,   // (base, offset, count) with SpirvCompute::bfe_u's clamps: min(offset, 32), then
+    // min(count, 32 - offset); zero when the clamped count is zero
+    Select,   // (bool cond, u32 a, u32 b)
+    BoolSelect,   // (bool cond, bool a, bool b)
+    IEq,
+    INe,
+    ULt,
+    ULe,
+    UGt,
+    UGe,
+    SLt,
+    SLe,
+    SGt,
+    SGe,   // u32 x u32 -> bool
+    F32Add,
+    F32Sub,
+    F32Mul,
+    F32NMin,
+    F32NMax,   // raw binary32 bits -> raw bits
 };
 
 struct OpcodeInfo {
