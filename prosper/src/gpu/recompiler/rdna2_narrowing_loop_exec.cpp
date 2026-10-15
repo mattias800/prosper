@@ -113,7 +113,7 @@ bool scc_dead_at_exit(const std::vector<Rdna2Inst>& ins, uint32_t exit) {
 
 bool new_loop_admission_is_lane_local(const std::vector<Rdna2Inst>& ins, const DivLoop& loop,
                                       const RegState& rs) {
-    std::set<int> written, mask_words;
+    std::set<int> mask_words;
     for (const auto& [base, value] : rs.sreg_bool) {
         (void)value;
         mask_words.insert(base);
@@ -134,7 +134,6 @@ bool new_loop_admission_is_lane_local(const std::vector<Rdna2Inst>& ins, const D
         if ((in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode)) || vop3_writes_mask_sdst(in))
             for_each_scalar_write(in, record_mask);
     }
-    bool writes_scc = false;
     for (const auto& in : ins) {
         // READFIRSTLANE/READLANE outside the loop can also supply a per-invocation scalar entry.
         // This proof does not authenticate a broadcast from such an existing approximation.
@@ -183,6 +182,16 @@ bool new_loop_admission_is_lane_local(const std::vector<Rdna2Inst>& ins, const D
                     return false;
             }
         }
+    }
+    return loop_live_wave_scalar(ins, loop) < 0;
+}
+}   // namespace
+
+int loop_live_wave_scalar(const std::vector<Rdna2Inst>& ins, const DivLoop& loop) {
+    std::set<int> written;
+    bool writes_scc = false;
+    for (const auto& in : ins) {
+        if (in.pc < loop.header_pc || in.pc > loop.backedge_pc) continue;
         const auto record = [&](int base, uint32_t width) {
             for (uint32_t word = 0; word < width; ++word)
                 written.insert(base + static_cast<int>(word));
@@ -195,11 +204,22 @@ bool new_loop_admission_is_lane_local(const std::vector<Rdna2Inst>& ins, const D
             record(106, 2);
         writes_scc |= scalar_instruction_writes_scc(in);
     }
-    for (int reg : written)
-        if (!sgpr_dead_at_merge(ins, loop.exit_pc, reg, ScalarMergeProof::AnyRead)) return false;
-    return !writes_scc || scc_dead_at_exit(ins, loop.exit_pc);
+    for (int reg : written) {
+        // NULL discards; EXEC is the loop's own per-lane condition, which the structured walk
+        // represents per invocation and an EXEC exit leaves empty on both routes.
+        if (reg >= 125) continue;
+        if (!sgpr_dead_at_merge(ins, loop.exit_pc, reg, ScalarMergeProof::AnyRead)) return reg;
+    }
+    return writes_scc && !scc_dead_at_exit(ins, loop.exit_pc) ? kLoopLiveScc : -1;
 }
-}   // namespace
+
+bool native_exact_retry_authentic(const SpirvCompute& b, const uint32_t* code, size_t dwords) {
+    return native_compute_has_complete_entry(b) && code && dwords &&
+           !b.saved_mask_original_fragment_entry &&
+           b.saved_mask_original_compute_launch == b.guest_compute_launch &&
+           dwords == b.saved_mask_original_words.size() &&
+           std::equal(b.saved_mask_original_words.begin(), b.saved_mask_original_words.end(), code);
+}
 
 bool structured_loop_only_narrows_exec(const std::vector<Rdna2Inst>& ins, const DivLoop& loop) {
     if (loop.condition != DivLoop::Condition::Exec || !loop.continue_on_set || loop.bottom_tested ||
@@ -250,11 +270,7 @@ bool closed_compute_store_loop_data_retry(const SpirvCompute& b, const RegState&
                                           const DivLoop& loop, const Rdna2Inst& header,
                                           uint32_t preheader_exec, const uint32_t* code,
                                           size_t dwords) {
-    if (!native_compute_has_complete_entry(b) || !code || !dwords || !preheader_exec ||
-        !rs.exec_narrowed || b.saved_mask_original_fragment_entry ||
-        b.saved_mask_original_compute_launch != b.guest_compute_launch ||
-        dwords != b.saved_mask_original_words.size() ||
-        !std::equal(b.saved_mask_original_words.begin(), b.saved_mask_original_words.end(), code) ||
+    if (!native_exact_retry_authentic(b, code, dwords) || !preheader_exec || !rs.exec_narrowed ||
         b.stage_reject_pc != loop.header_pc ||
         b.stage_reject_reason != "fabricated-fresh-mask-source" || header.pc != loop.header_pc ||
         !plain_cmpx(header))
