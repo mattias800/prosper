@@ -5,6 +5,7 @@
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_launch_vgprs.hpp"
+#include "gpu/recompiler/rdna2_loaded_arbitrary.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_vector_old_word.hpp"
 
@@ -107,19 +108,22 @@ namespace {
 // path or in the operand it came from, a defined value or an arbitrary one, and a deterministic
 // function of those is a value hardware could produce; a lane one path wrote from such values is
 // no different from one it did not write. A soft input is a loop assumption, not an arbitrary
-// value, and an input's obligations must not be dropped with an unconfined owner (below).
+// value: its lanes are defined once its roots hold, so it adds no hard lane, and the result keeps
+// those roots as the obligations of its defined lanes (#5193 companion rule; union_marks keeps
+// them). A soft mark without roots proves nothing.
 bool meet_arbitrary(const ScalarSourceMarks& a, const ScalarSourceMarks& b) {
     const auto arbitrary = [](const ScalarSourceMarks& m) {
         return m.placeholder && m.hard && m.arbitrary;
     };
-    return (a.placeholder || b.placeholder) && (!a.placeholder || arbitrary(a)) &&
-           (!b.placeholder || arbitrary(b));
+    const auto no_hard_lane = [&](const ScalarSourceMarks& m) {
+        return !m.placeholder || arbitrary(m) || (!m.hard && !m.blanket_roots.empty());
+    };
+    return (arbitrary(a) || arbitrary(b)) && no_hard_lane(a) && no_hard_lane(b);
 }
 
 void union_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other,
                  const RegState* current = nullptr, bool explicit_sources = false) {
-    bool arbitrary = meet_arbitrary(into, other);
-    const bool had_roots = !into.blanket_roots.empty() || !other.blanket_roots.empty();
+    const bool arbitrary = meet_arbitrary(into, other);
     const uint32_t into_side = into.hard || into.scoped_complete_word ? into.outside_exec : 0u;
     const uint32_t other_side = other.hard || other.scoped_complete_word ? other.outside_exec : 0u;
     auto scoped = into.placeholder && !into.hard ? into.scoped_blanket_roots : into.blanket_roots;
@@ -167,7 +171,11 @@ void union_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other,
     into.placeholder = into.placeholder || other.placeholder;
     into.memory = into.memory || other.memory;
     into.hard = into.hard || other.hard;
-    if (into.hard && !into.outside_exec)
+    // CONFIDENCE: MED -- an unconfined hard result has no defined domain to owe a loop proof,
+    // except an arbitrary one: each of its lanes is arbitrary or defined, and a defined lane still
+    // owes the roots it was defined under. It keeps them, so a read through it stays checked at
+    // the back edge (#5193; this used to drop them and clear the arbitrary property instead).
+    if (into.hard && !into.outside_exec && !arbitrary)
         into.blanket_roots.clear();
     else
         into.blanket_roots.insert(other.blanket_roots.begin(), other.blanket_roots.end());
@@ -182,9 +190,6 @@ void union_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other,
             into.scoped_blanket_roots = std::move(scoped);
     }
     if (into.hard || !into.outside_exec) into.scoped_blanket_roots.clear();
-    // An unconfined hard result drops its inputs' active-domain obligations above; a lane read
-    // through it would then owe nothing to the loop proof those obligations name.
-    if (!into.outside_exec && had_roots) arbitrary = false;
     into.arbitrary = arbitrary && into.placeholder && into.hard;
 }
 
@@ -326,20 +331,32 @@ ScalarSourceMarks vector_source_marks(const RegState& rs, const Rdna2Inst& in) {
     // MEMORY remains a separate classification, never proof that the address was supplied.
     if (memory_result(in)) {
         marks.memory = true;
-        const auto missing_address = [&] {
-            marks.placeholder = marks.hard = true;
-            marks.outside_exec = 0;
-            marks.blanket_roots.clear();
+        // Address inputs are charged separately, then folded in once below: a hard (unavailable)
+        // input makes the whole result hard; an arbitrary VGPR address word may leave it
+        // arbitrary (#5193); loop assumptions add their roots.
+        bool hard_address = false, arbitrary_address = false;
+        std::set<uint64_t> roots;
+        const auto missing_address = [&] { hard_address = true; };
+        const auto add_roots = [&](const std::set<uint64_t>& more) {
+            roots.insert(more.begin(), more.end());
         };
         const auto address_word = [&](int reg) {
             const auto value = rs.vreg.find(reg);
             const auto source = vector_word(rs, reg);
-            if (reg < 0 || reg > 255 || value == rs.vreg.end() || !value->second ||
-                !vector_word_defined_in_exec(rs, source, rs.exec)) {
+            if (reg >= 0 && reg <= 255 && vector_word_defined_in_exec(rs, source, rs.exec) &&
+                value != rs.vreg.end() && value->second) {
+                // A defined address reads its owner's lanes only (kArbitraryOutsideRootOffset).
+                for (uint64_t root : source.blanket_roots)
+                    if (!arbitrary_outside_root(root)) roots.insert(root);
+            } else if (reg >= 0 && reg <= 255 && source.placeholder && source.hard &&
+                       source.arbitrary) {
+                // CONFIDENCE: MED -- #5193 (decision on the issue): this lane's address is a value
+                // hardware could have held, so a bounded read there loads a value hardware could
+                // have loaded. Its defined lanes still owe their roots.
+                arbitrary_address = true;
+                add_roots(source.blanket_roots);
+            } else {
                 missing_address();
-            } else if (!marks.hard && !source.blanket_roots.empty()) {
-                marks.blanket_roots.insert(source.blanket_roots.begin(),
-                                           source.blanket_roots.end());
             }
         };
         if (in.fmt == Rdna2Format::FLAT && in.src[0].kind == OperandKind::VGPR) {
@@ -361,8 +378,7 @@ ScalarSourceMarks vector_source_marks(const RegState& rs, const Rdna2Inst& in) {
                 if (rs.unavailable_saved_mask_words.contains(offset.value)) {
                     missing_address();
                 } else if (sreg_word_blanket_only(rs, offset.value)) {
-                    const auto& roots = rs.sreg_loop_blanket.at(offset.value);
-                    if (!marks.hard) marks.blanket_roots.insert(roots.begin(), roots.end());
+                    add_roots(rs.sreg_loop_blanket.at(offset.value));
                 } else {
                     // An untracked VCC word is materialized from the current mask only by the
                     // emitter's exact native-wave gate. Its Bool presence grants no DATA here.
@@ -374,26 +390,36 @@ ScalarSourceMarks vector_source_marks(const RegState& rs, const Rdna2Inst& in) {
                         missing_address();
                 }
             } else if (offset.kind == OperandKind::Special && offset.value == 253) {
-                if (!rs.scc || (rs.scc_merge_placeholder && rs.scc_loop_blanket.empty())) {
+                if (!rs.scc || (rs.scc_merge_placeholder && rs.scc_loop_blanket.empty()))
                     missing_address();
-                } else if (rs.scc_merge_placeholder && !marks.hard) {
-                    marks.blanket_roots.insert(rs.scc_loop_blanket.begin(),
-                                               rs.scc_loop_blanket.end());
-                }
+                else if (rs.scc_merge_placeholder)
+                    add_roots(rs.scc_loop_blanket);
             }
         }
         if (in.fmt == Rdna2Format::DS && in.opcode == 0xb1 && !in.ds_gds) {
             // CONFIDENCE: HIGH -- M0 is ADDTID's whole address input. A missing, fabricated or
             // saved-mask M0 cannot address genuine data (the emitter refuses only a missing
             // one); a loop-assumption M0 adds its roots, as an SOFFSET word does above (#5183).
-            if (!rs.sreg.contains(124) || rs.unavailable_saved_mask_words.contains(124)) {
+            if (!rs.sreg.contains(124) || rs.unavailable_saved_mask_words.contains(124))
                 missing_address();
-            } else if (sreg_word_blanket_only(rs, 124)) {
-                const auto& roots = rs.sreg_loop_blanket.at(124);
-                if (!marks.hard) marks.blanket_roots.insert(roots.begin(), roots.end());
-            } else if (sreg_word_may_be_fabricated(rs, 124)) {
+            else if (sreg_word_blanket_only(rs, 124))
+                add_roots(rs.sreg_loop_blanket.at(124));
+            else if (sreg_word_may_be_fabricated(rs, 124))
                 missing_address();
-            }
+        }
+        if (hard_address) {
+            marks.placeholder = marks.hard = true;
+        } else if (arbitrary_address) {
+            // CONFIDENCE: MED -- #5193 conditions 1-3: a bounded, side-effect-free read through a
+            // genuine resource; every address lane defined or arbitrary. Otherwise as hard as a
+            // missing address.
+            marks.placeholder = marks.hard = true;
+            marks.arbitrary = arbitrary_read_form(in) && arbitrary_read_resource_genuine(rs, in);
+            if (marks.arbitrary) marks.blanket_roots = std::move(roots);
+        } else {
+            marks.blanket_roots = std::move(roots);
+        }
+        if (in.fmt == Rdna2Format::DS && in.opcode == 0xb1 && !in.ds_gds) {
             // CONFIDENCE: HIGH -- the graphics lowering is a spill model: the reload returns the
             // word the matching ds_write_addtid stored under the same M0 value, so it carries that
             // word's provenance (the compute lowering reads real LDS and records no slot).
@@ -409,12 +435,14 @@ ScalarSourceMarks vector_source_marks(const RegState& rs, const Rdna2Inst& in) {
         for (uint32_t word = 0; word < vector_provenance_source_span(in, source); ++word)
             union_marks(marks, vector_word(rs, in.src[source].value + static_cast<int>(word)), &rs,
                         true);
-    // CONFIDENCE: HIGH (conservative) -- #5185 decided computed values, not loaded ones. Data
-    // read at an address with an arbitrary lane is real memory at an address prosper formed, and
-    // that it equals what hardware could have read there is a further claim about the memory model
-    // (bounds, mapping), not about the address. So loaded data stays hard pending its own
-    // decision. LDS exchanges (swizzle, permute) are DS forms too and stay hard with it.
-    if (memory_result(in)) marks.arbitrary = false;
+    // #5185 decided computed values; #5193 decided loaded ones. Buffer and typed-buffer reads were
+    // charged above; a relocated GLOBAL read is admitted by note_memory_address, which holds the
+    // relocation proof.
+    // #5193: a plain LDS read at an address with arbitrary lanes (the union above) loads a value
+    // hardware could have loaded there; note_memory_address bounds its index. Every other DS form,
+    // including the LDS exchanges (swizzle, permute) and ADDTID's spill slots, stays hard.
+    if (memory_result(in) && !(in.fmt == Rdna2Format::DS && arbitrary_read_form(in)))
+        marks.arbitrary = false;
     // Relative indexing can select an absent word beyond the decoder's storage inventory. A
     // constant current M0 may refine this at the actual emission boundary; maps alone cannot.
     // That word may be a loaded-but-unsupplied input, so the result is hard (#5185).
@@ -502,11 +530,14 @@ bool fresh_mask_sources_defined(SpirvCompute& b, const RegState& rs, const Rdna2
         exec_within(rs, rs.exec, marks.outside_exec)) {
         // An unchanged SSA EXEC owner does not prove the next iteration's carried value. Record
         // the header obligation before accepting this scoped read; the back edge checks it.
-        const auto& roots = source_roots_in_exec(rs, marks, rs.exec);
-        b.loop_blanket_roots_read.insert(roots.begin(), roots.end());
+        // The lanes outside the owner are not read, so neither is their arbitrary-outside root.
+        for (uint64_t root : source_roots_in_exec(rs, marks, rs.exec))
+            if (!arbitrary_outside_root(root)) b.loop_blanket_roots_read.insert(root);
         return true;
     }
-    if (marks.hard && marks.arbitrary) {
+    const bool strict = in.pc >= b.strict_loop_condition.first &&
+                        in.pc < b.strict_loop_condition.second;
+    if (marks.hard && marks.arbitrary && !strict) {
         // CONFIDENCE: MED -- #5174 / #5185 policy (decisions on the issues, 2026-10-15): every
         // lane this read may find missing holds an arbitrary value -- the launch value of a VGPR
         // hardware never loaded and nothing wrote, or a deterministic function of such values and
@@ -590,11 +621,22 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
         // arbitrary exactly when no word it read (old word included) carries a hard lane. An
         // M0-relative write gives each word of its range the source or the old word, so the same
         // meet covers it -- but only while M0 is genuine: these marks do not carry M0, and a
-        // fabricated one replaces a different word than hardware did. Loaded data
-        // (vector_source_marks) stays hard.
+        // fabricated one replaces a different word than hardware did. Loaded lanes are defined
+        // when their address is (a clean source), and arbitrary only from a bounded read at an
+        // address with arbitrary lanes (#5193): the source marks say so for buffer, LDS and
+        // relocated GLOBAL reads (vector_source_marks, note_memory_address), and an image read's
+        // address is its source proof, its source marks being address-blind. Inactive lanes keep
+        // the old word, met above.
         const bool m0_unknown =
             relative && (!rs.sreg.contains(124) || sreg_word_may_be_fabricated(rs, 124));
-        bool arbitrary = result.arbitrary && !m0_unknown && !memory_result(in);
+        const bool loaded_arbitrary = in.fmt == Rdna2Format::MIMG
+                                          ? mimg_result_may_be_arbitrary(rs, in)
+                                          : !source.placeholder || source.arbitrary ||
+                                                (!source.hard && !source.blanket_roots.empty());
+        bool arbitrary =
+            result.arbitrary && !m0_unknown && (!memory_result(in) || loaded_arbitrary);
+        if (arbitrary && in.fmt == Rdna2Format::MIMG)
+            result.blanket_roots.insert(rs.mimg_sources.roots.begin(), rs.mimg_sources.roots.end());
         // Only a complete write can grant new confinement. An incomplete lane-mapped write keeps
         // the existing meet of source and old-word confinement; selected-lane, relative and
         // cross-lane writes cannot retain that proof.
@@ -642,6 +684,12 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
                 // word outside EXEC, as arbitrary as the old word's were (#5174). A source's own
                 // undefined lanes lie outside EXEC, where this write reads nothing.
                 arbitrary = old.placeholder && old.hard && old.arbitrary;
+                // CONFIDENCE: MED -- a soft old word adds no hard lane either: outside EXEC its
+                // lanes are defined once its roots hold, which the result now owes (#5193).
+                if (old.placeholder && !old.hard && !old.blanket_roots.empty()) {
+                    arbitrary = true;
+                    result.blanket_roots.insert(old.blanket_roots.begin(), old.blanket_roots.end());
+                }
                 // CONFIDENCE: HIGH -- a defined old word leaves no missing lane outside EXEC,
                 // and inside it the sources are defined with no loop obligation: the result
                 // misses no lane at all. Narrowing the owner to EXEC here lost exactly that
@@ -663,10 +711,9 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
             result.outside_exec = 0;
             result.blanket_roots.clear();
         }
-        // An unconfined hard result drops the obligations its defined lanes owe a loop proof
-        // (as in union_marks): a lane read through it would then be unchecked, so it is hard.
-        if (result.hard && !result.outside_exec && !result.blanket_roots.empty()) arbitrary = false;
-        if (result.hard && !result.outside_exec) result.blanket_roots.clear();
+        // An unconfined hard result keeps the obligations its defined lanes owe a loop proof only
+        // while it is arbitrary (as in union_marks); otherwise it is hard with nothing to owe.
+        if (result.hard && !result.outside_exec && !arbitrary) result.blanket_roots.clear();
         if (result.hard || !result.outside_exec) result.scoped_complete_word = false;
         if (!result.scoped_complete_word) result.scoped_blanket_roots.clear();
         result.arbitrary = arbitrary && result.placeholder && result.hard;
@@ -761,7 +808,7 @@ bool vector_word_defined_in_exec(const RegState& rs, const ScalarSourceMarks& ma
 }
 
 void begin_mimg_source_proof(RegState& rs, uint32_t pc) {
-    rs.mimg_sources = {pc, rs.exec_narrowed, true, {}, {}};
+    rs.mimg_sources = {pc, rs.exec_narrowed, true, true, {}, {}};
 }
 
 void record_mimg_source_word(RegState& rs, int reg) {
@@ -772,6 +819,13 @@ void record_mimg_source_word(RegState& rs, int reg) {
     if (reg < 0 || reg > 255 || value == rs.vreg.end() || !value->second ||
         !vector_word_defined_in_exec(rs, marks, rs.exec))
         proof.defined = false;
+    // #5193: an arbitrary address word (a value hardware could have held) leaves the read
+    // arbitrary, not hard; any other undefined word is a hard lane.
+    const bool arbitrary_word = marks.placeholder && marks.hard && marks.arbitrary;
+    if (reg < 0 || reg > 255 ||
+        (!arbitrary_word && (value == rs.vreg.end() || !value->second ||
+                             !vector_word_defined_in_exec(rs, marks, rs.exec))))
+        proof.no_hard = false;
     proof.roots.insert(marks.blanket_roots.begin(), marks.blanket_roots.end());
 }
 
@@ -780,7 +834,7 @@ void record_mimg_address_operand(RegState& rs, const Rdna2Inst& in, uint32_t ind
     // Zero padding beyond the encoded instruction cannot invent an additional v0 operand.
     if (rs.mimg_sources.enabled && in.len_dwords > 2u && index > 0u &&
         2u + (index - 1u) / 4u >= in.len_dwords)
-        rs.mimg_sources.defined = false;
+        rs.mimg_sources.defined = rs.mimg_sources.no_hard = false;
 }
 
 uint32_t read_mimg_source_word(SpirvCompute& b, RegState& rs, int reg) {
@@ -799,11 +853,27 @@ int mimg_address_vgpr(RegState& rs, const Rdna2Inst& in, uint32_t index) {
 
 void mark_vector_loop_carried(RegState& rs, const std::vector<Rdna2Inst>& ins, uint32_t lo,
                               uint32_t hi, std::map<int, std::set<uint64_t>>& carried,
-                              std::map<int, uint32_t>& confined) {
+                              std::map<int, uint32_t>& confined, std::set<int>* arbitrary,
+                              const std::set<int>& no_arbitrary) {
     std::set<int> vectors, scalars;
     loop_written_regs(ins, lo, hi, vectors, scalars);
     for (int reg : vectors) {
         auto source = vector_word(rs, reg);
+        const int root_word = kVectorBlanketBase + reg;
+        const bool keeps_arbitrary = arbitrary && !no_arbitrary.contains(reg);
+        if (keeps_arbitrary && source.placeholder && source.hard && source.arbitrary &&
+            source.outside_exec == 0) {
+            // CONFIDENCE: MED -- #5193 companion rule: an unconfined arbitrary preheader word
+            // keeps the property at the header. Each lane holds an arbitrary value or a defined
+            // one; the back edge must bring in no hard lane, which LoopBlanketCheck verifies
+            // (loop_root_verdicts), refusing any read that relied on this root otherwise. Its
+            // defined lanes keep their preheader obligations beside this header's root.
+            carried[root_word] = source.blanket_roots;
+            arbitrary->insert(root_word);
+            source.blanket_roots.insert(blanket_root(lo, root_word));
+            rs.vreg_source_marks[reg] = std::move(source);
+            continue;
+        }
         // A new soft header generation needs its own backedge obligation; its global proof
         // survives, but a prior complete writer's active-domain proof does not bypass that edge.
         if (!source.hard) {
@@ -811,18 +881,27 @@ void mark_vector_loop_carried(RegState& rs, const std::vector<Rdna2Inst>& ins, u
             source.scoped_complete_word = false;
             source.scoped_blanket_roots.clear();
         }
-        const int root_word = kVectorBlanketBase + reg;
+        const bool confined_arbitrary =
+            keeps_arbitrary && source.placeholder && source.hard && source.arbitrary;
         if (rs.vreg.contains(reg) && (!source.hard || source.outside_exec != 0)) {
             carried[root_word] = source.blanket_roots;
             if (source.hard) confined[root_word] = source.outside_exec;
             source.blanket_roots.insert(blanket_root(lo, root_word));
+            if (confined_arbitrary) {
+                // CONFIDENCE: MED -- the lanes outside the owner stay arbitrary at the header
+                // under their own root, which the back edge checks (loop_root_verdicts).
+                carried[root_word + kArbitraryOutsideRootOffset];
+                source.blanket_roots.insert(
+                    blanket_root(lo, root_word + kArbitraryOutsideRootOffset));
+            }
         } else {
             source.hard = true;
             source.blanket_roots.clear();
         }
         // The loop writes this word, so its back edge may carry a value into any lane, and this
-        // header cannot yet know whether the body computes it from a hard input (#5185).
-        source.arbitrary = false;
+        // header cannot yet know whether the body computes it from a hard input (#5185) -- except
+        // under the arbitrary-outside root above, which the back edge checks.
+        source.arbitrary = confined_arbitrary && rs.vreg.contains(reg) && source.outside_exec != 0;
         source.placeholder = true;
         rs.vreg_source_marks[reg] = std::move(source);
     }

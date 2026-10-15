@@ -10,7 +10,8 @@
 //   - a launch VGPR hardware DOES load but the backend does not supply (native barycentrics; in
 //     the unit emitter below, v1 under TIDIG_COMP_CNT = 1 with no bound local Y);
 //   - scalar placeholders, and every word when the launch profile is unknown (no inventory);
-//   - loaded data (#5185 keeps memory results hard, whatever their address).
+//   - loaded data whose address has a hard lane, or that no bounded read produced (#5193 admits a
+//     bounded read at an arbitrary address; test_loaded_arbitrary.cpp holds its twins).
 // Lane-wise forms propagate hardness per lane; a cross-lane form makes every result lane hard
 // when any lane it can read is. Each accepted arm has a refused twin that differs only in one hard
 // input.
@@ -357,7 +358,7 @@ TEST(UnloadedLaunchVgpr, ACrossLaneMovePullsAHardLaneIntoEveryResultLane) {
     EXPECT_TRUE(arbitrary.defined(compare8));
 }
 
-TEST(UnloadedLaunchVgpr, ACrossLaneMoveCannotDropTheLoopObligationOfItsDefinedLanes) {
+TEST(UnloadedLaunchVgpr, ACrossLaneMoveKeepsTheLoopObligationOfItsDefinedLanes) {
     // v6 is loop-carried: defined on the header's assumption, which the back edge checks.
     Emitter e(true);
     ASSERT_TRUE(e.emit({mov6}));
@@ -367,21 +368,31 @@ TEST(UnloadedLaunchVgpr, ACrossLaneMoveCannotDropTheLoopObligationOfItsDefinedLa
     ASSERT_TRUE(e.emit({cmpx_a, mov8_v6, mov10_v6}));
     ASSERT_TRUE(e.rs.vreg_source_marks.at(10).arbitrary);
     ASSERT_FALSE(e.rs.vreg_source_marks.at(10).blanket_roots.empty());
-    // row_shr:1 moves v8 into v10 across lanes. The owner goes, and with it the obligation the
-    // defined lanes owe the loop proof: a read through the result could no longer record it, so
-    // it is hard rather than arbitrary.
+    // row_shr:1 moves v8 into v10 across lanes. The owner goes, but not the obligation the
+    // defined lanes owe the loop proof: the result stays arbitrary and keeps the roots, so a read
+    // through it records them for the back edge to check (#5193; this used to drop them and make
+    // the result hard).
+    const auto roots = e.rs.vreg_source_marks.at(10).blanket_roots;
     ASSERT_TRUE(e.emit(cat({dpp10_v8(), {full_exec}})));
-    EXPECT_FALSE(e.rs.vreg_source_marks.at(10).arbitrary);
-    EXPECT_FALSE(e.defined(compare10));
+    EXPECT_TRUE(e.rs.vreg_source_marks.at(10).arbitrary);
+    EXPECT_EQ(e.rs.vreg_source_marks.at(10).outside_exec, 0u);
+    EXPECT_FALSE(e.rs.vreg_source_marks.at(10).blanket_roots.empty());
+    e.b.loop_blanket_roots_read.clear();
+    EXPECT_TRUE(e.defined(compare10));
+    for (const uint64_t root : roots) EXPECT_TRUE(e.b.loop_blanket_roots_read.contains(root));
 }
 
 TEST(UnloadedLaunchVgpr, ALoopBackEdgeCanCarryAHardValueIntoAnArbitraryWord) {
     // v6 is never written before the loop, so it is arbitrary on entry. The body reads it and
-    // then rewrites it with LDS data read at the never-written address v7 (hard): the second
-    // iteration reads that. The header cannot know what the back edge brings, so it does not keep
-    // the entry's arbitrary property for a word the loop writes. (Conservative: the same refusal
-    // applies when the body writes a defined value; proving the back edge is a follow-up.)
-    refused(compile_compute(loop_over_v6({0xd8d80000u, 0x06000007u})));
+    // then rewrites it with the old LDS word an atomic returns at the never-written address v7:
+    // an atomic at an arbitrary address is hard (#5193), and the second iteration reads it. The
+    // header keeps the arbitrary property only on the condition the back edge checks, so the read
+    // that relied on it is refused there (an arbitrary or defined back edge is admitted:
+    // test_loaded_arbitrary.cpp).
+    const auto result = compile_compute(loop_over_v6({0xd8800000u, 0x06000007u}));
+    EXPECT_TRUE(result.module.empty());
+    EXPECT_NE(result.reason.find("fabricated on the back edge"), std::string::npos)
+        << result.reason;
 }
 
 TEST(UnloadedLaunchVgpr, AnM0RelativeWriteIsHardWhenM0IsAPlaceholder) {
@@ -430,16 +441,18 @@ TEST(UnloadedLaunchVgpr, PublicComputeAdmitsArbitraryWordsAndRefusesAHardPath) {
     // refused it as a word written on some path).
     accepted(
         compile_compute({0xbf068004u, 0xbf840001u, mov6_3, cmpx_a, mov6, full_exec, compare6}));
-    // Writing LDS data read at the arbitrary address v7 leaves a hard lane on that path.
+    // The old LDS word an atomic returns at the arbitrary address v7 leaves a hard lane on that
+    // path (a plain LDS read there would be arbitrary, #5193).
     refused(compile_compute(
-        {0xbf068004u, 0xbf840002u, 0xd8d80000u, 0x06000007u, cmpx_a, mov6, full_exec, compare6}));
+        {0xbf068004u, 0xbf840002u, 0xd8800000u, 0x06000007u, cmpx_a, mov6, full_exec, compare6}));
 }
 
-TEST(UnloadedLaunchVgpr, PublicComputeKeepsLoadedDataHardWhateverItsAddress) {
-    // ds_read_b32 v6 at the defined address v0, then at the arbitrary address v7. The second is
-    // real LDS content at an address hardware never formed: #5185 keeps loaded data hard.
+TEST(UnloadedLaunchVgpr, PublicComputeLoadedDataIsAsHardAsItsAddress) {
+    // ds_read_b32 v6 at the defined address v0, at the arbitrary address v7 (a bounded read there
+    // loads a value hardware could have loaded, #5193), and at v7 = the fabricated s20 (hard).
     accepted(compile_compute({0xd8d80000u, 0x06000000u, compare6}));
-    refused(compile_compute({0xd8d80000u, 0x06000007u, compare6}));
+    accepted(compile_compute({0xd8d80000u, 0x06000007u, compare6}));
+    refused(compile_compute({0x7e0e0214u, 0xd8d80000u, 0x06000007u, compare6}));
 }
 
 TEST(UnloadedLaunchVgpr, PublicFragmentRelayChainsAreAsHardAsTheirLaunchWord) {

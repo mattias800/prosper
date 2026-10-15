@@ -1675,7 +1675,8 @@ bool emit_cfg_state_machine(
                                             const Rdna2Inst& in, bool record_compare) {
             const bool definite_scc = scalar_scc && !halves.relayed_words.contains(kRelayedScc);
             const auto relay_sources =
-                spilled_vector_source_marks(halves, in, masks, scalar_words, definite_scc);
+                spilled_vector_source_marks(halves, in, masks, scalar_words, definite_scc, 64,
+                                            b.indirect_pointer_proof);
             // Storage presence excludes neither a missing spill arm nor its scalar relays.
             const auto definite_word = [&](int word) {
                 return scalar_words.contains(word) && !halves.relayed_words.contains(word);
@@ -6903,7 +6904,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     return false;
                 }
             for (int r : cv) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, vget(r), preheader, p); rs.vreg[r] = ph; phis.push_back({r, 0, ph, p}); }
-            LoopBlanketCheck blanket_check(rs, cs, L.header_pc);
+            LoopBlanketCheck blanket_check(rs, cs, L.header_pc, retry_gate(b, ins, L, exec_proof));
             for (int r : cs) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, sget(r), preheader, p); rs.sreg[r] = ph; phis.push_back({r, 1, ph, p}); }
             LaneSlotLoopCarry lane_slots(rs);   // V_WRITELANE spill slots, as in the counted loop
             mark_loop_carried(rs, cs, ins, L.header_pc, L.backedge_pc, blanket_check);

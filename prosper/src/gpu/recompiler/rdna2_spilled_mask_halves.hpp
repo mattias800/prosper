@@ -14,6 +14,7 @@
 
 namespace prosper::gpu {
 
+struct IndirectPointerRelocationProof;
 struct RegState;
 
 // One 32-bit half of a saved B64 mask pair. `def_pc` names the INSTANCE: the pc of the mask write
@@ -79,7 +80,9 @@ SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& st
                                                      const Rdna2Inst& in,
                                                      const std::set<int>& masks,
                                                      const std::set<int>& scalar_words,
-                                                     bool definite_scc, uint32_t wave_size = 64);
+                                                     bool definite_scc, uint32_t wave_size = 64,
+                                                     const IndirectPointerRelocationProof*
+                                                         relocation = nullptr);
 
 // CFG join: keep only the facts every incoming path agrees on (`relayed_words`, a MAY fact, takes
 // every path's).

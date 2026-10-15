@@ -2170,7 +2170,8 @@ int main(int argc, char** argv) {
     flat_missing_offset_table.resources[0].fetch_pc = 4;
     // #5174: v6 is then never written and compute does not load it, an arbitrary value the
     // guard admits (a refusal before that decision made it an over-refusal). #5185 admits a relay
-    // of another never-loaded word too; LDS data read at that word as an address stays hard.
+    // of another never-loaded word too; the old LDS word an atomic returns at that word as an
+    // address stays hard (#5193: a plain LDS read there would be arbitrary).
     CHECK(!recompile_compute(kFlatCompute + 1, std::size(kFlatCompute) - 1,
                              &flat_missing_offset_table, flat_config)
                .empty(),
@@ -2182,9 +2183,9 @@ int main(int argc, char** argv) {
                              flat_config)
                .empty(),
           "the FLAT cache control admits a v6 byte offset relayed from never-written v31 (#5185)");
-    // ds_read_b32 v6, v31 is two dwords: move the resource PC with the instruction it names.
+    // ds_add_rtn_u32 v6, v31, v0 is two dwords: move the resource PC with the instruction it names.
     auto flat_hard_offset = flat_relayed_offset;
-    flat_hard_offset[0] = 0xd8d80000u;
+    flat_hard_offset[0] = 0xd8800000u;   // ds_add_rtn_u32: an atomic at v31 stays hard (#5193)
     flat_hard_offset.insert(flat_hard_offset.begin() + 1, (6u << 24) | 31u);
     auto flat_hard_offset_table = flat_table;
     flat_hard_offset_table.resources[0].fetch_pc = 6;

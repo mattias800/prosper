@@ -36,11 +36,12 @@ constexpr uint32_t compare8 = 0x7d841108u, compare6 = 0x7d840d06u;
 constexpr uint32_t full_exec = 0xbefe04c1u, end = 0xbf810000u;
 constexpr uint32_t fmac6 = 0x560c0ef2u; // v_fmac_f32 v6, 1.0, v7; old v6 is implicit
 // #5185: a word relayed from, or accumulated over, a never-written VGPR compute does not load is
-// arbitrary, so the public refusals below need a HARD producer: LDS data read at the never-written
-// address v20 (ds_read_b32 vD, v20). #5185 keeps loaded data hard whatever its address. (They used
-// v_mov_b32 v7, v20 or an absent accumulator, which are admitted as arbitrary now.)
+// arbitrary, so the public refusals below need a HARD producer: the old LDS word an atomic returns
+// at the never-written address v20 (ds_add_rtn_u32 vD, v20, v0). An atomic at an arbitrary address
+// stays hard (#5193); a plain LDS read there would be arbitrary. (They used v_mov_b32 v7, v20 or
+// an absent accumulator, which are admitted as arbitrary now.)
 Words lds_hard(uint32_t vgpr) {
-    return {0xd8d80000u, (vgpr << 24) | 20u};
+    return {0xd8800000u, (vgpr << 24) | 20u};
 }
 
 Words cat(std::initializer_list<Words> pieces) {
@@ -404,7 +405,9 @@ TEST(ConfinedSourceUnion, OneArmWriterCannotSupplyTheOtherPredecessor) {
 
 TEST(ConfinedSourceUnion, ALoopBackedgeCannotLaunderAnAbsentCurrentGeneration) {
     accepted(compile(loop({mov6})));
-    const auto poisoned = compile(loop({0x7e0c0314u}));
+    // v6 = s30, which no launch loads: hard. A never-written source (v20) is arbitrary, which an
+    // arbitrary back edge now holds weakly (#5193).
+    const auto poisoned = compile(loop({0x7e0c021eu}));
     EXPECT_TRUE(poisoned.module.empty());
     EXPECT_NE(poisoned.reason.find("fabricated on the back edge"), std::string::npos)
         << poisoned.reason;
@@ -626,18 +629,23 @@ TEST(ConditionalWordPublication, PublicLoopPublishesItsCurrentGenerationBeforeTh
         compile(publication_loop({cmpx_a, mov6, mov8, fmac6_from8, compare6, full_exec})));
 }
 
+// #5193: these twins seed v6 = s30 (no launch loads it), so an unreplaced old v6 is HARD. With
+// the defined seed v6 = 1 it is a loop assumption, which an arbitrary meet now keeps with its
+// obligations: no hard lane reaches the compare.
+constexpr uint32_t hard_seed6 = 0x7e0c021eu;   // v_mov_b32 v6, s30
+
 TEST(ConditionalWordPublication, PublicLoopRejectsAnUnreadButUnreplacedOldAccumulator) {
-    structured_public(
-        compile(publication_loop({cmpx_a, mov6, mov8, fmac6_from8, compare6, full_exec})));
-    refused(
-        compile(publication_loop({cmpx_a, 0xbf800000u, mov8, fmac6_from8, compare6, full_exec})),
-        9);
+    structured_public(compile(publication_loop(
+        {cmpx_a, mov6, mov8, fmac6_from8, compare6, full_exec}, {hard_seed6})));
+    refused(compile(publication_loop(
+                {cmpx_a, 0xbf800000u, mov8, fmac6_from8, compare6, full_exec}, {hard_seed6})),
+            9);
 }
 
 TEST(ConditionalWordPublication, PublicLoopRejectsANewAbsentSourceAtItsFreshCompare) {
     refused(
-        compile(publication_loop({cmpx_a, 0x7e0c0314u, mov8, fmac6_from8, compare6, full_exec})),
-        9);
+        compile(publication_loop({cmpx_a, 0x7e0c021eu, mov8, fmac6_from8, compare6, full_exec})),
+        9);   // v6 = s30, never loaded: hard (a never-written v20 would be arbitrary, #5193)
 }
 
 TEST(ConditionalWordPublication, PublicLoopRequiresBothWriterArms) {
@@ -645,8 +653,8 @@ TEST(ConditionalWordPublication, PublicLoopRequiresBothWriterArms) {
         return Words{cmpx_a, 0xbf068004u, 0xbf840002u, mov6,     0xbf820001u,
                      other,  mov8,        fmac6_from8, compare6, full_exec};
     };
-    structured_public(compile(publication_loop(body(mov6))));
-    refused(compile(publication_loop(body(0xbf800000u))), 13);
+    structured_public(compile(publication_loop(body(mov6), {hard_seed6})));
+    refused(compile(publication_loop(body(0xbf800000u), {hard_seed6})), 13);
 }
 
 TEST(ConditionalWordPublication, PublicLoopChecksTheConsumedSourceOnItsActualBackedge) {
@@ -654,7 +662,8 @@ TEST(ConditionalWordPublication, PublicLoopChecksTheConsumedSourceOnItsActualBac
         return Words{cmpx_a, mov6_from7, mov8, fmac6_from8, compare6, full_exec, rewrite};
     };
     structured_public(compile(publication_loop(body(mov7), {mov6, mov7})));
-    const auto poisoned = compile(publication_loop(body(0x7e0e0314u), {mov6, mov7}));
+    // v7 = s30, never loaded: hard (a never-written v20 would be arbitrary, #5193).
+    const auto poisoned = compile(publication_loop(body(0x7e0e021eu), {mov6, mov7}));
     EXPECT_TRUE(poisoned.module.empty());
     EXPECT_NE(poisoned.reason.find("loop-carried v7 is fabricated on the back edge"),
               std::string::npos)

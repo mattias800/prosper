@@ -246,7 +246,9 @@ TEST(ComputeLoopDataRoute, GenuineFormatLoadRetainsItsCurrentProducer) {
     ASSERT_TRUE(has_op(r.module, 251u));
 }
 TEST(ComputeLoopDataRoute, AFormatBindingCannotSupplyAnUnwrittenAddress) {
-    const auto p = memory_producer(false);
+    // The address v9 must be hard: a never-written one is arbitrary, and a bounded format load
+    // there loads a value hardware could have loaded (#5193).
+    const auto p = hard_old(memory_producer(false), 9);
     missing(compile(p, config(), input_table()), p.header);
 }
 TEST(ComputeLoopDataRoute, AFormatLoadStillNeedsItsActualResource) {

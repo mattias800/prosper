@@ -203,15 +203,16 @@ TEST(Wave32WordProvenance, BothArmsRetainTheCurrentWord) {
     values({0x7e280280u, 0xbf068004u, 0xbf840001u, 0x7e280280u, 0x7e0c0314u, 0x7e580506u}, 0);
 }
 // v6 relays v20, a VGPR compute never loads and nothing writes: an arbitrary value, so the
-// predicate over it is admitted (#5185; this was a refusal before). LDS data read at the
-// never-written address v20 (ds_read_b32 v6, v20) is hard, and keeps the refusal.
+// predicate over it is admitted (#5185; this was a refusal before). The old LDS word an atomic
+// returns at the never-written address v20 (ds_add_rtn_u32 v6, v20) is hard (#5193: a plain read
+// there would be arbitrary), and keeps the refusal.
 TEST(Wave32WordProvenance, MissingFreshPredicateDirect) {
     admitted({0x7e0c0314u, 0x7d840106u, 0xbeac036au});
-    refused({0xd8d80000u, 0x06000014u, 0x7d840106u, 0xbeac036au}, "fabricated-fresh-mask-source");
+    refused({0xd8800000u, 0x06000014u, 0x7d840106u, 0xbeac036au}, "fabricated-fresh-mask-source");
 }
 TEST(Wave32WordProvenance, MissingFreshPredicateAcrossEdge) {
     admitted({0x7e0c0314u, 0xbf880000u, 0x7d840106u, 0xbeac036au});
-    refused({0xd8d80000u, 0x06000014u, 0xbf880000u, 0x7d840106u, 0xbeac036au},
+    refused({0xd8800000u, 0x06000014u, 0xbf880000u, 0x7d840106u, 0xbeac036au},
             "fabricated-fresh-mask-source");
 }
 TEST(Wave32WordProvenance, GenuineFreshPredicateAcrossEdge) {

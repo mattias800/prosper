@@ -104,7 +104,12 @@ void producing(const std::vector<uint32_t>& code, uint32_t threads = 64, uint32_
     EXPECT_EQ(output, expected) << "the selected input follows the actual Bool and lane sources; "
                                    "padded workers never store";
 }
-void missing(const std::vector<uint32_t>& code) {
+// The absent inputs below must be HARD: a never-written v2 or v9 is arbitrary, and a bounded
+// buffer read at an arbitrary address loads a value hardware could have loaded (#5185, #5193).
+// So every refused arm first relays s30 -- which no launch loads -- into v2 and v9.
+void missing(const std::vector<uint32_t>& body) {
+    std::vector<uint32_t> code{0x7e04021eu, 0x7e12021eu};   // v2 = s30; v9 = s30
+    code.insert(code.end(), body.begin(), body.end());
     const auto attempt = compile(code);
     EXPECT_TRUE(attempt.module.empty())
         << "missing current input reached an observable buffer sink";
