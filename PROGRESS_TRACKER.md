@@ -172,6 +172,7 @@ of its manifest.
 | ArcRunner | `PPSA21406` | 1 | `1-----` | - | - | none | [#1226](https://github.com/mattias800/prosper/issues/1226), [#2084](https://github.com/mattias800/prosper/issues/2084) | [#1817](https://github.com/mattias800/prosper/issues/1817) | [`ARCRUNNER_STATUS.md`](prosper/docs/games/ARCRUNNER_STATUS.md) |
 | Assassin's Creed Black Flag Resynced | `PPSA28183` | 1 | `1-----` | - | - | - | [#4139](https://github.com/mattias800/prosper/issues/4139) | [#4131](https://github.com/mattias800/prosper/issues/4131) | [`AC_BLACK_FLAG_STATUS.md`](prosper/docs/games/AC_BLACK_FLAG_STATUS.md) |
 | BlazBlue Entropy Effect X | `PPSA29714` | 1 | `1-----` | - | - | - | - | [#3496](https://github.com/mattias800/prosper/issues/3496) | - |
+| Castlevania: Belmont's Curse | `PPSA35399` | 1 | `1-----` | - | - | - | - | [#5217](https://github.com/mattias800/prosper/issues/5217) | - |
 | Little Nightmares II | `PPSA02154` | 1 | `1-----` | **6.9** fps · 19% active · 4K · boot logo sequence, then a flat white clear · screenshot · 2026-08-22 | - | none | [#2932](https://github.com/mattias800/prosper/issues/2932) | [#2884](https://github.com/mattias800/prosper/issues/2884) | [`NEVER_BOOTED_SURVEY_2026_08.md`](prosper/docs/games/NEVER_BOOTED_SURVEY_2026_08.md) |
 | Luna Abyss | `PPSA36257` | 1 | `1-----` | - | - | - | [#4808](https://github.com/mattias800/prosper/issues/4808) | [#5038](https://github.com/mattias800/prosper/issues/5038) | - |
 | METAL GEAR SOLID 4 (Master Collection) | `PPSA18194` | 1 | `1-----` | - | - | - | - | [#5032](https://github.com/mattias800/prosper/issues/5032) | - |
@@ -208,9 +209,9 @@ of its manifest.
 | 4 -- manual visual verification | 3 |
 | 3 -- gameplay with the scene rendering | 12 |
 | 2 -- title screen | 23 |
-| 1 -- any real graphics | 10 |
+| 1 -- any real graphics | 11 |
 | 0 -- not started | 20 |
 
-**4 of 83** trackers record a PS5 hardware-oracle comparison (57 carry
-`Oracle record: none`, 22 unrecorded). That ratio is the reason this column exists -- before #2730 it took a
+**4 of 84** trackers record a PS5 hardware-oracle comparison (57 carry
+`Oracle record: none`, 23 unrecorded). That ratio is the reason this column exists -- before #2730 it took a
 scan of 6,224 issue comments to establish, and it was wrong by nine titles.
