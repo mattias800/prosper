@@ -179,8 +179,7 @@ TEST(FragmentFrontFace, EnabledInputCompilesInItsAddressedSlot) {
             // #5174 admits a never-written read of it as an arbitrary value. The refusal this arm
             // used to assert is an over-refusal under that decision; the addressed slot above and
             // the unsupplied-encoding arms below still pin where FRONT_FACE is bound.
-            if (slot)
-                EXPECT_FALSE(compile(slot - 1, &inputs).empty());
+            if (slot) EXPECT_FALSE(compile(slot - 1, &inputs).empty());
         }
     }
 }

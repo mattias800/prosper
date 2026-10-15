@@ -1507,6 +1507,7 @@ bool emit_cfg_state_machine(
         b.is_compute && uses_native_saved_mask_words(b)};
     std::vector<SpillSlotDomains> wave64_slot_domain_in(starts.size());
     std::unordered_set<uint32_t> proven_mask_writelane_pcs;
+    std::unordered_map<uint32_t, uint32_t> proven_instance_half_readlane_pcs;
 
     // Wave64 dispatcher Bool variables hold values, not lifetime tags. A scalar overwrite stores
     // false for a dead mask, and an unfiltered load at a later case can therefore make mere map
@@ -2144,7 +2145,8 @@ bool emit_cfg_state_machine(
             if (track_active_vectors) {
                 advance_active_vector_words(halves.active_vectors, in, scalar_writes, vector_writes,
                                             mask_write, relay_sources.active_defined,
-                                            vector_write_completes_active_word(in));
+                                            vector_write_completes_active_word(in) ||
+                                                vector_read_completes_active_word(in));
                 if (record_compare) active_vectors_after[in.pc] = halves.active_vectors.current;
             }
             if (track_spilled_halves)
@@ -2158,11 +2160,29 @@ bool emit_cfg_state_machine(
                 halves.relayed_vectors.erase(in.dst.value);
                 halves.memory_vectors.erase(in.dst.value);
             }
+            // The #5175 retry spills a half of a saved-mask instance as the pair's Bool: the high
+            // half is typed MaskHi, and a reload of either half from such a slot is a proven half
+            // published on emit_alu's EXEC-half alias route (below).
+            const int half = track_spilled_halves && b.spilled_mask_bool_halves
+                                 ? spilled_slot_half(halves, in)
+                                 : -1;
+            const int slot_vgpr = in.opcode == 0x361 ? in.dst.value : in.src[0].value;
+            const auto slot = slot_domains.find({slot_vgpr, in.src[1].value});
+            const bool proven_reload =
+                half >= 0 && in.opcode == 0x360 && slot != slot_domains.end() &&
+                slot->second == (half ? SpillSlotDomain::MaskHi : SpillSlotDomain::MaskLo);
+            if (record_compare && proven_reload) proven_instance_half_readlane_pcs[in.pc] = half;
             if (b.is_compute)
-                advance_spill_slot_domains(slot_domains, in,
-                                           {masks, ambiguous, scalar_words, readlane_words},
-                                           slot_context, vector_writes,
-                                           record_compare ? &proven_mask_writelane_pcs : nullptr);
+                advance_spill_slot_domains(
+                    slot_domains, in, {masks, ambiguous, scalar_words, readlane_words},
+                    slot_context, vector_writes,
+                    record_compare ? &proven_mask_writelane_pcs : nullptr, proven_reload);
+            if (half == 1 && in.opcode == 0x361 &&
+                slot_domains[{in.dst.value, in.src[1].value}] == SpillSlotDomain::Other) {
+                slot_domains[{in.dst.value, in.src[1].value}] = SpillSlotDomain::MaskHi;
+                if (record_compare) proven_mask_writelane_pcs.insert(in.pc);
+                if (record_compare) b.wave64_mask_high_half_writelane_pcs.insert(in.pc);
+            }
             refine_portable_mask_dispatch(b, in, writes_exact_wave_scc, relay_sources, halves,
                                           slot_domains);
             if (record_compare && in.fmt == Rdna2Format::SOPP &&
@@ -2281,6 +2301,8 @@ bool emit_cfg_state_machine(
             }
         }
     }
+    for (const auto& [pc, half] : proven_instance_half_readlane_pcs)
+        b.wave64_mask_readlane_half_for_pc.emplace(pc, half);
 
     auto mask_zero_compare_is_proven = [&](const Rdna2Inst& in) {
         // Wave32 has its own one-word MUST-domain filtering in load_state. Wave64 needs the
@@ -7150,8 +7172,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     std::set<int> pre_entry_m0;
                     for (int r : ifs)
                         if (entry_m0_live(rs, r)) pre_entry_m0.insert(r);
-                    MergeEdgeMarks pre_marks = merge_edge_marks(rs, ifs);   // #4706
-                    if (F.on_exec && F.on_scc0) pre_marks.execz_skip_exec = rs.exec;   // #5174
+                    const auto pre_marks = merge_edge_marks(rs, ifs, F.on_exec && F.on_scc0);
                     uint32_t pre_scc = rs.scc, pre_vcc = rs.vcc, pre_exec = rs.exec;
                     const bool pre_narrowed = rs.exec_narrowed;
                     // The SKIPPED edge keeps the pre-branch bits, so it keeps the pre-branch copy

@@ -1449,6 +1449,55 @@ bool rdna2_mimg_dynamic_mip_shape(const Rdna2Inst& in, uint32_t* mip_vgpr) {
     return true;
 }
 
+uint32_t rdna2_mimg_read_address_count(const Rdna2Inst& in) {
+    if (in.fmt != Rdna2Format::MIMG || in.mimg_a16 || in.mimg_reserved ||
+        in.src[0].kind != OperandKind::VGPR || in.src[0].value < 0)
+        return 0;
+    // Body coordinates per DIM: 1D, 2D, 3D, CUBE (x, y, face), 1D_ARRAY, 2D_ARRAY, 2D_MSAA and
+    // 2D_MSAA_ARRAY (the fragment id is a body coordinate of a load).
+    static constexpr uint32_t kBody[8] = {1u, 2u, 3u, 3u, 2u, 3u, 3u, 4u};
+    const uint32_t body = kBody[in.mimg_dim & 7u];
+    uint32_t count = 0;
+    if (in.opcode == 0x00u) {
+        count = body;   // IMAGE_LOAD
+    } else if (in.opcode == 0x01u) {
+        count = body + 1u;   // IMAGE_LOAD_MIP: the mip level follows the body
+    } else if (in.opcode >= 0x20u && in.opcode <= 0x5fu && in.mimg_dim < 6u) {
+        // Sample (0x20-0x3F) and gather4 (0x40-0x5F): bit 4 = _O, bit 3 = _C, and the low three
+        // bits select none, _CL, _D, _D_CL, _L, _B, _B_CL, _LZ. Derivative forms are not modelled
+        // (gather4 has none: those slots are unassigned).
+        const uint32_t variant = in.opcode & 7u;
+        if (variant == 2u || variant == 3u) return 0;
+        const uint32_t offset = (in.opcode >> 4) & 1u;
+        const uint32_t compare = (in.opcode >> 3) & 1u;
+        const uint32_t bias = variant == 5u || variant == 6u ? 1u : 0u;
+        const uint32_t level = variant == 1u || variant == 4u || variant == 6u ? 1u : 0u;
+        count = offset + bias + compare + body + level;
+    } else {
+        return 0;
+    }
+    if (in.mimg_nsa == 0u) return in.len_dwords == 2u ? count : 0u;
+    // NSA: every address after VADDR is one byte of the extra dwords; the rest must be padding.
+    const uint32_t extra = in.len_dwords > 2u ? in.len_dwords - 2u : 0u;
+    if (extra != in.mimg_nsa || extra != (count - 1u + 3u) / 4u || extra > 3u) return 0;
+    for (uint32_t byte = count - 1u; byte < 4u * extra; ++byte)
+        if ((in.words[2u + byte / 4u] >> (8u * (byte % 4u))) & 0xffu) return 0;
+    return count;
+}
+
+int rdna2_mimg_address_vgpr(const Rdna2Inst& in, uint32_t index) {
+    if (in.fmt != Rdna2Format::MIMG || in.src[0].kind != OperandKind::VGPR || in.src[0].value < 0)
+        return -1;
+    if (index == 0u) return in.src[0].value;
+    if (in.mimg_nsa == 0u) {
+        const uint32_t reg = static_cast<uint32_t>(in.src[0].value) + index;
+        return reg < 256u ? static_cast<int>(reg) : -1;
+    }
+    const uint32_t byte = index - 1u;
+    if (2u + byte / 4u >= in.len_dwords) return -1;
+    return static_cast<int>((in.words[2u + byte / 4u] >> (8u * (byte % 4u))) & 0xffu);
+}
+
 uint32_t rdna2_sload_required_bytes(const uint32_t* code, size_t dwords, uint32_t sgpr_base) {
     std::vector<Rdna2Inst> instructions;
     rdna2_walk(code, dwords, instructions);

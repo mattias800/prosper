@@ -238,6 +238,10 @@ bool vector_write_completes_active_word(const Rdna2Inst& in) {
             in.src[1].kind == OperandKind::Special && in.src[1].value == 125);
 }
 
+bool vector_read_completes_active_word(const Rdna2Inst& in) {
+    return memory_read_completes_active_word(in);
+}
+
 void record_exec_mask_subset(RegState& rs, uint32_t result, uint32_t left, uint32_t right,
                              uint32_t opcode, uint32_t previous_exec) {
     // CONFIDENCE: HIGH -- A&B is a subset of each operand; A&~B is a subset of A.

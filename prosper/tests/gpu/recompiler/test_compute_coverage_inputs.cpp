@@ -76,7 +76,9 @@ Compilation compile_consumer(const uint32_t* code, std::size_t count, uint32_t w
 // arms were refusals before that decision made them over-refusals. Relaying another never-loaded
 // word into the same register is a write, which the decision keeps hard, so each test keeps a
 // twin that reaches the guard at the actual consumer.
-constexpr uint32_t relay_from_v31(uint32_t vgpr) { return 0x7e00031fu | (vgpr << 17); }
+constexpr uint32_t relay_from_v31(uint32_t vgpr) {
+    return 0x7e00031fu | (vgpr << 17);
+}
 
 void missing_predicate(const Compilation& result, uint32_t pc) {
     EXPECT_TRUE(result.module.empty());
@@ -230,8 +232,7 @@ TEST(ComputeCoverageInputs, DescriptorLifetimeNeedsBothRealCompareInputsAndItsBr
     const auto absent = compile_x16(missing_vectors, 1);
     EXPECT_FALSE(absent.module.empty()) << absent.reason;
     const auto relayed_vectors = inputs::with_inputs(
-        inputs::x16_wave_mask_consumer,
-        std::array{relay_from_v31(10), 0x7e240280u, 0xbf068080u});
+        inputs::x16_wave_mask_consumer, std::array{relay_from_v31(10), 0x7e240280u, 0xbf068080u});
     missing_predicate(compile_x16(relayed_vectors, 3), 11);
     const auto missing_scc_prefix =
         inputs::with_inputs(inputs::x16_wave_mask_consumer, std::array{0x7e140300u, 0x7e240280u});

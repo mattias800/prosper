@@ -2175,7 +2175,8 @@ int main(int argc, char** argv) {
                              &flat_missing_offset_table, flat_config)
                .empty(),
           "the FLAT cache control admits an unloaded, never-written v6 byte offset");
-    auto flat_relayed_offset = std::vector<uint32_t>(std::begin(kFlatCompute), std::end(kFlatCompute));
+    auto flat_relayed_offset =
+        std::vector<uint32_t>(std::begin(kFlatCompute), std::end(kFlatCompute));
     flat_relayed_offset[0] = 0x7e0c031fu;   // v_mov_b32 v6, v31
     CHECK(recompile_compute(flat_relayed_offset.data(), flat_relayed_offset.size(), &flat_table,
                             flat_config)

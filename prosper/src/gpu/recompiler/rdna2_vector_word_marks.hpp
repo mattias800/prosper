@@ -68,6 +68,8 @@ struct NativeInterpolationPublication {
 
 // Pure write effect, shared by structured provenance and current-EXEC CFG DATA facts.
 bool vector_write_completes_active_word(const Rdna2Inst& in);
+// The ordinary LDS and typed-buffer FORMAT reads, which complete each EXEC lane's result words.
+bool vector_read_completes_active_word(const Rdna2Inst& in);
 void union_source_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other);
 // Called only after a genuine Bool-domain logical producer has emitted its result.
 void record_exec_mask_subset(RegState& rs, uint32_t result, uint32_t left, uint32_t right,

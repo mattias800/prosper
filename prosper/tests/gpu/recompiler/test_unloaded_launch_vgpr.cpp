@@ -97,7 +97,9 @@ struct Result {
     Words module;
     std::string reason;
 };
-void accepted(const Result& result) { EXPECT_FALSE(result.module.empty()) << result.reason; }
+void accepted(const Result& result) {
+    EXPECT_FALSE(result.module.empty()) << result.reason;
+}
 void refused(const Result& result) {
     EXPECT_TRUE(result.module.empty());
     EXPECT_NE(result.reason.find("fabricated-fresh-mask-source"), std::string::npos)
@@ -132,15 +134,21 @@ Result compile_compute(const Words& body) {
 
 // v_cmp_eq_i32 vcc, 0, v<vgpr>; v8 = vcc ? 0 : 1.0; export (v8, 0, 0, 1.0) to MRT0.
 Words fragment_compare(uint32_t vgpr) {
-    return {0x7d040080u | (vgpr << 9), 0x7e120280u, 0x021012f2u, 0x7e140280u,
-            0x7e1602f2u, 0xf800180fu, 0x0b0a0908u, end};
+    return {0x7d040080u | (vgpr << 9),
+            0x7e120280u,
+            0x021012f2u,
+            0x7e140280u,
+            0x7e1602f2u,
+            0xf800180fu,
+            0x0b0a0908u,
+            end};
 }
 Result compile_fragment(const Words& body, uint32_t vgpr, const PixelSystemInputMapping* inputs) {
     const Words code = cat({body, fragment_compare(vgpr)});
     static uint64_t next_address = 0x5174100000ull;
     const uint64_t address = ++next_address;
-    auto module = recompile_fragment(code.data(), code.size(), nullptr, inputs, UINT32_MAX,
-                                     nullptr, true, {RecompileDiagnosticStage::Fragment, address});
+    auto module = recompile_fragment(code.data(), code.size(), nullptr, inputs, UINT32_MAX, nullptr,
+                                     true, {RecompileDiagnosticStage::Fragment, address});
     return {std::move(module), last_terminal_reject_reason(address)};
 }
 
@@ -351,22 +359,24 @@ TEST(UnloadedLaunchVgpr, AFirstArmNarrowerThanItsMaskDoesNotConfineTheSkippedEdg
 
 TEST(UnloadedLaunchVgpr, PublicFragmentJoinsTheTwoArmsUnderTheLaunchMask) {
     // v6 first holds a WRITTEN value (v7 relayed), so only the proof can admit the read.
-    const Words both_arms{save_exec, mov6_v7, cmpx_x4, mov6, andn2_exec_s30, execz_2,
-                          scalar_side_effect, mov6_3, restore_exec};
+    const Words both_arms{save_exec,          mov6_v7, cmpx_x4,     mov6, andn2_exec_s30, execz_2,
+                          scalar_side_effect, mov6_3,  restore_exec};
     accepted(compile_fragment(both_arms, 6, &kPosX));
     // The second arm writes v8 instead: v6's lanes outside P keep the relayed value.
-    const Words one_arm{save_exec, mov6_v7, cmpx_x4, mov6, andn2_exec_s30, execz_2,
-                        scalar_side_effect, mov8_3, restore_exec};
+    const Words one_arm{save_exec,          mov6_v7, cmpx_x4,     mov6, andn2_exec_s30, execz_2,
+                        scalar_side_effect, mov8_3,  restore_exec};
     refused(compile_fragment(one_arm, 6, &kPosX));
 }
 
 TEST(UnloadedLaunchVgpr, PublicFragmentJoinsTheTwoArmsUnderANarrowedMask) {
     // The parent mask is itself narrowed (x <= 4 first), as in Kena's nested shapes.
-    const Words both_arms{cmpx_x4_ge, save_exec, mov6_v7, 0x7c2200f4u /* v_cmpx_lt_f32 2.0, v0 */,
-                          mov6, andn2_exec_s30, execz_2, scalar_side_effect, mov6_3, restore_exec};
+    const Words both_arms{
+        cmpx_x4_ge, save_exec,      mov6_v7, 0x7c2200f4u /* v_cmpx_lt_f32 2.0, v0 */,
+        mov6,       andn2_exec_s30, execz_2, scalar_side_effect,
+        mov6_3,     restore_exec};
     accepted(compile_fragment(both_arms, 6, &kPosX));
-    const Words one_arm{cmpx_x4_ge, save_exec, mov6_v7, 0x7c2200f4u, mov6, andn2_exec_s30,
-                        execz_2, scalar_side_effect, mov8_3, restore_exec};
+    const Words one_arm{cmpx_x4_ge, save_exec,          mov6_v7, 0x7c2200f4u, mov6, andn2_exec_s30,
+                        execz_2,    scalar_side_effect, mov8_3,  restore_exec};
     refused(compile_fragment(one_arm, 6, &kPosX));
 }
 
@@ -379,8 +389,7 @@ TEST(UnloadedLaunchVgpr, PublicFragmentJoinsTheTwoArmsUnderANarrowedMask) {
 TEST(UnloadedLaunchVgpr, ANarrowedCompleteWriteOverADefinedWordIsDefined) {
     Emitter e(false);
     ASSERT_TRUE(e.emit({mov8_3, cmpx_a, mov6, cmpx_b, mov8_v6, full_exec}));
-    EXPECT_FALSE(e.rs.vreg_source_marks.contains(8) &&
-                 e.rs.vreg_source_marks.at(8).placeholder);
+    EXPECT_FALSE(e.rs.vreg_source_marks.contains(8) && e.rs.vreg_source_marks.at(8).placeholder);
     EXPECT_TRUE(e.defined(compare8));
     Emitter undefined_old(false);   // v8 was never written before the narrowed write
     ASSERT_TRUE(undefined_old.emit({cmpx_a, mov6, cmpx_b, mov8_v6, full_exec}));
@@ -401,7 +410,8 @@ TEST(UnloadedLaunchVgpr, ASourceUndefinedInsideTheWriteExecIsNotMadeDefined) {
     // v6's undefined value even though the old v8 was defined.
     for (const uint32_t write : {mov8_v6, fmac8_v6}) {
         Emitter e(false);
-        ASSERT_TRUE(e.emit({mov8_3, cmpx_a, save_a_s8, cmpx_b, mov6, restore_s8, write, full_exec}));
+        ASSERT_TRUE(
+            e.emit({mov8_3, cmpx_a, save_a_s8, cmpx_b, mov6, restore_s8, write, full_exec}));
         EXPECT_FALSE(e.defined(compare8)) << std::hex << write;
     }
 }

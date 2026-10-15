@@ -61,6 +61,9 @@ struct SpilledVectorSourceMarks {
     bool scalar_relay = false;
     bool memory = false;
     bool active_defined = false;
+    // active_defined, and the write completes every EXEC lane's result words: the result is
+    // genuine in the current EXEC whatever the relay MAY facts say about its sources.
+    bool active_complete = false;
 };
 // Snapshot before ANY scalar/mask destination fact changes, including an aliasing VOP3B SDST.
 SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& state,
@@ -89,6 +92,10 @@ void mark_relayed_words(const SpilledMaskHalves& entry, RegState& rs);
 // True when `in` is `s_mov_b64 dst, s[N:N+1]` and sN / sN+1 hold the low / high half of the same
 // saved-mask instance. Evaluated BEFORE `in`'s own transfer.
 bool reassembles_spilled_mask_pair(const SpilledMaskHalves& state, const Rdna2Inst& in);
+
+// For a constant-lane V_WRITELANE (after its transfer) or V_READLANE: which half (0 low, 1 high) of
+// a saved-mask instance its slot holds; -1 when not known.
+int spilled_slot_half(const SpilledMaskHalves& state, const Rdna2Inst& in);
 
 // The transfer for one instruction. `masks` is the MUST-mask set before `in` (a V_WRITELANE never
 // changes it), `mask_slot_keys` the pairs whose spills the dispatcher persists as mask slots,
