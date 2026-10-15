@@ -725,6 +725,21 @@ inline uint32_t scalar_pair_lane_bit(SpirvCompute& b, RegState& rs, const Operan
                   b.uconst(0));
 }
 
+// The f16 bit pattern an inline float constant supplies in a 16-bit operand position (ISA Table 10
+// lists per-width encodings: "0.5 ... half: 0x3800" etc.). Only 1/(2*pi) (code 248, 0x3118) differs
+// from rounding the f32 value — the f32 table entry 0.15915494 would round to a different last bit
+// than the documented operand, so 16-bit consumers must use these bits, not the f32 constant.
+inline uint32_t inline_float_f16_bits(int code) {
+    switch (code) {
+        case 240: return 0x3800u; case 241: return 0xB800u;   // +/-0.5
+        case 242: return 0x3C00u; case 243: return 0xBC00u;   // +/-1.0
+        case 244: return 0x4000u; case 245: return 0xC000u;   // +/-2.0
+        case 246: return 0x4400u; case 247: return 0xC400u;   // +/-4.0
+        case 248: return 0x3118u;                             // 1/(2*pi)
+        default:  return 0;
+    }
+}
+
 // Predicate a just-computed VGPR write against EXEC: under a narrowed mask, inactive lanes keep their
 // prior value. A no-op when EXEC is full (the straight-line common case), so nothing is perturbed.
 inline void predicate_write(SpirvCompute& b, RegState& rs, int idx, uint32_t old_val) {

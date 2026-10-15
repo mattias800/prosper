@@ -193,6 +193,101 @@ python3 prosper/tools/ci/check_arch_ratchet.py --root . --update   # lowers the 
 - A route moved verbatim may exceed the 80-line function target. Leave it whole in the relocation
   commit, and split it in a separate behaviour-neutral commit gated by the corpus.
 
+## Vector families: what changes
+
+The vector ALU (VOP2 integer/bitwise group) followed the same steps, with four differences.
+
+**1. A VALU case is a pipeline, not a route chain.** VOP2's body was a fixed sequence of stages
+shared by every opcode:
+
+1. DPP routes that own the whole instruction.
+2. SRC0's DPP transform.
+3. SDWA selects or float abs/neg.
+4. The `switch` that computes D.
+5. SDWA destination placement.
+6. OMOD/CLAMP.
+7. The EXEC-predicated VDST write (`predicate_write`).
+
+It was relocated with the same tool and plan format. Name each segment `route_*` if it can own the
+instruction, or `stage_*` if it always falls through. `lower()` calls them in the old order
+(`lower/vop2.cpp`).
+
+The case-scope locals become members, with these exceptions:
+
+- The two emit_alu reference aliases become reference members bound in the constructor:
+  `vreg` (`decltype(RegState::vreg)&`) and `vcc` (`uint32_t&`).
+- `uint32_t& d = vreg[in.dst.value];` stays a local in `lower()`, created where the old code created
+  it, and is passed to the stages that use it (`compute(uint32_t& d)` etc.). Do not bind it in the
+  constructor: `vreg[...]` inserts a map entry, and `vreg_old()` runs before it.
+- A helper emit_alu kept in its anonymous namespace and that both files now need moves to a header
+  (`inline_float_f16_bits` went to `rdna2_alu_support.hpp`, made `inline`).
+
+The shared context is `lower/lowering_context.hpp`. Vector classes live in
+`lower/vector_lowering_internal.hpp`, and emit_alu calls `ir::lower_vop2(...)`.
+
+**2. Only the operation goes through the IR.** A vector definition (`ops/vector_alu.hpp`,
+`VectorOpDef`) is `D = f(S0, S1)` for one lane. The stages around it are the same for every opcode
+of the format, so they stay in `lower/`. The `compute()` stage takes the definition first and falls
+back to the remaining `switch` cases:
+
+```cpp
+if (const VectorOpDef* def = find_vector_op(in.fmt, in.opcode)) {
+    d = emit_vector_op(b, *def, a, c);
+    return std::nullopt;
+}
+```
+
+Then delete the migrated `case` labels. Keep each operand ORDER exactly: the *rev* ops take the
+shift amount or the subtrahend from S0.
+
+**3. The execution test is per lane.** Call `tests/gpu/recompiler/ir/vector_lane_harness.hpp`:
+
+```cpp
+const LaneInputs in = lane_inputs(seed);   // 64 lanes, own S0/S1/old VDST each, ~1/4 inactive
+const LaneRun run = run_vector_op_per_lane({vop2(def.opcode)}, in, wave);   // wave 64 and 32
+// each lane: in.active[l] ? eval_vector_op(def, in.s0[l], in.s1[l]) : in.old_d[l]
+```
+
+The harness loads four per-lane arrays from one buffer, sets EXEC with `v_cmpx_ne_u32 0, v4`, runs
+your instruction words (written as `op v1, v2, v3`), restores EXEC and stores v1 per lane. For
+another encoding, pass its words: a VOP1 is `op v1, v2`, and a VOP3 is its two words naming the same
+registers. Copy `test_ir_vector_alu_execution.cpp`, including its
+`HarnessSeesPerLaneOperandsAndExec` arm. Each of these mutations turned the test red:
+
+- swapping the UMax emitter mapping;
+- dropping AShr's sign in eval;
+- deleting `predicate_write`;
+- deleting the harness's `v_cmpx`.
+
+The lowering test (`test_ir_lower_vop2.cpp`) pins the stage behaviour: a defined op emits exactly
+its instruction under full EXEC, a narrowed EXEC adds the predicated write, and undefined opcodes
+still take the switch.
+
+**4. The positive control is louder.** Swapping `v_add_nc_u32`'s operands changed 754 modules
+(752 by replay, 2 by stage). VALU ops are everywhere, so a vector family's gate is a strong check.
+
+## Family list and order
+
+Remaining in `rdna2_emit_alu.cpp`, in the order to migrate them. Codex takes the open groups; the
+reserved ones stay with the lead. **The reservation rule:** anything that reads or writes a wave mask
+(EXEC, VCC, SGPR masks), anything that moves data between lanes, anything that touches definedness
+marks or proof routes, and control flow. When a group mixes the two, migrate only its open opcodes
+and leave the reserved ones in the `switch`.
+
+| order | group | who |
+| --- | --- | --- |
+| 1 | VOP2 float: `v_add/sub/subrev/mul_f32`, `v_min/max_f32` (NMin/NMax), `v_mac/fmac_f32`, `v_madmk/madak/fmamk/fmaak` | Codex |
+| 2 | VOP2 f16: `v_add/sub/mul/max/min_f16`, `v_pk_fmac_f16`, `v_cvt_pkrtz_f16_f32` | Codex |
+| 3 | VOP1 integer and bit ops (`v_not`, `v_bfrev`, `v_ffbh/ffbl`, ...), then float unary (`rcp/sqrt/exp/log/sin/cos/fract/trunc/...`), then conversions | Codex |
+| 4 | VOP3-only integer ops (`v_bfe`, `v_bfi`, `v_lshl_add`, `v_add3`, `v_mad_u32_u24`, `v_alignbit`, `v_perm`, `v_sad*`, `v_min3/max3/med3`), then VOP3 float (`v_fma`, `v_mad`, `v_ldexp`, `v_div_fixup`, ...) | Codex |
+| 5 | VOP3 (e64) encodings of VOP2/VOP1 ops that emit_alu does not admit today | Codex, but ADMITTING them is a behaviour change: corpus-explained, separate PR |
+| 6 | VOP3P packed 16-bit ops | Codex |
+| 7 | VINTRP | Codex, with the lead reviewing: it reads M0 |
+| - | VOP2 `v_cndmask_b32`, carry ops `v_add/sub/subrev_co_ci_u32` (VCC), every VOPC (writes VCC/EXEC), VOP3B (`v_add_co_u32`, `v_div_scale`, `v_mad_u64_u32`: SGPR carry masks), `v_mbcnt` | lead (wave masks) |
+| - | DPP (the VOP1/VOP2 DPP routes and SRC0 stage), `v_permlane*`, `v_readlane/writelane/readfirstlane`, `ds_bpermute/permute`, quad and swizzle ops | lead (cross-lane) |
+| - | `v_movrel*`, `s_movrel*`, and the memory families SMEM, MUBUF/MTBUF, FLAT, MIMG, DS (descriptor provenance, raw windows, active-word marks) | lead (proof and definedness) |
+| - | SOPP, `rdna2_emit_cfg.cpp`, the SOP `*_routes.cpp` | lead (control flow, mask routes) |
+
 ## Byte-identical, or explained
 
 "Byte-identical" means the gate's verdict for every program and the sha256 of every accepted module

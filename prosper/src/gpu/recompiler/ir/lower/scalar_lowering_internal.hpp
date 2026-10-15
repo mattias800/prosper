@@ -11,6 +11,7 @@
 // The members are emit_alu's locals under the same names, so the moved text compiles unchanged.
 #pragma once
 
+#include "gpu/recompiler/ir/lower/lowering_context.hpp"
 #include "gpu/recompiler/ir/lower/scalar_alu_lowering.hpp"
 #include "gpu/recompiler/ir/ops/scalar_alu.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
@@ -36,14 +37,7 @@
 
 namespace prosper::gpu::ir {
 
-struct ScalarLoweringContext {
-    SpirvCompute& b;
-    RegState& rs;
-    const Rdna2Inst& in;
-    bool& ok;
-    bool allow_wave;
-    uint32_t val(const Operand& o) { return operand_bits(b, rs, in, o, &ok); }
-};
+using ScalarLoweringContext = LoweringContext;
 
 class Sop1Lowering : ScalarLoweringContext {
 public:
