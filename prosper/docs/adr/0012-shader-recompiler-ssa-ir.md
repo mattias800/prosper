@@ -1,6 +1,6 @@
 ---
 kind: adr
-status: proposed
+status: accepted
 date: 2026-10-05
 ---
 
@@ -48,3 +48,6 @@ risk is a long period with two paths; the byte-identical gate is what keeps it f
 ## Approval
 
 Requires the project owner's acceptance and ADR 0006 first.
+
+Accepted by the project owner on 2026-10-15. The first family is the scalar ALU (SOP1/SOP2/SOPC/SOPK), which also
+resolves the duplicated folder and emitter semantics in #2514.
