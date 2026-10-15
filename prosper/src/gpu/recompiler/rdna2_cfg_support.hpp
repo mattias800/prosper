@@ -1786,11 +1786,16 @@ inline SavedB64MaskSnapshot snapshot_saved_b64_masks(SpirvCompute& b, const RegS
     note_memory_address(b, rs, in, snapshot.source_marks);   // #5193, before the roots are cleared
     if (in.fmt == Rdna2Format::FLAT || in.fmt == Rdna2Format::MUBUF ||
         in.fmt == Rdna2Format::MTBUF) {
-        // Address assumptions are read by this memory instruction, before an aliasing write.
-        // The genuine loaded value is separate from those address-generation obligations.
-        const auto& roots = snapshot.source_marks.blanket_roots;
+        // Address assumptions are read before an aliasing write. Keep them on the loaded value:
+        // a weak back edge makes it arbitrary, so a later strong address consumer must charge
+        // these same roots rather than treating the loaded value as unconditional DATA (#5204).
+        auto& roots = snapshot.source_marks.blanket_roots;
         b.loop_blanket_roots_read.insert(roots.begin(), roots.end());
-        snapshot.source_marks.blanket_roots.clear();
+        // Scalar roots cannot hold weakly; retire their address-only dependencies as before.
+        std::erase_if(roots, [](uint64_t root) {
+            return static_cast<int>(root & 0xffffu) < kVectorBlanketBase;
+        });
+        if (!roots.empty()) snapshot.source_marks.placeholder = true;
     }
     if (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x43)
         snapshot.source_marks = vector_relative_source_marks(b, rs, in);

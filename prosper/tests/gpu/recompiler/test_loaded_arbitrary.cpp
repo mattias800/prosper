@@ -282,3 +282,18 @@ TEST(LoadedArbitrary, ALoopThatReadsAVectorIntoAScalarDoesNotHoldWeakly) {
     refused(compile_compute(cat({{mov6_3}, loop_over_v6({readfirstlane_s21_v6, mov6_v7})})),
             "fabricated on the back edge");
 }
+
+TEST(LoadedArbitrary, ALoadedAddressRetainsItsWeakHeaderObligation) {
+    // buffer_load_dword v8, v6, s[12:15], 0 offen; then use that value as an LDS address.
+    // The first bounded read cannot grant the second read an unconditionally defined address.
+    const Words load{0xe0301000u, 0x80030806u};
+    const Words strong_read = ds(ds_read_b32, 9, 8);
+    for (const auto& loads : {load, cat({load, {0xe0301000u, 0x80030808u}})}) {
+        accepted(
+            compile_compute(cat({{mov6_3}, loop_over_v6(cat({loads, strong_read, {mov6_3}}))})));
+        accepted(compile_compute(cat({{mov6_3}, loop_over_v6(cat({loads, {mov6_v7}}))})));
+        refused(
+            compile_compute(cat({{mov6_3}, loop_over_v6(cat({loads, strong_read, {mov6_v7}}))})),
+            "fabricated on the back edge");
+    }
+}
