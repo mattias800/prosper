@@ -376,10 +376,23 @@ TEST(FreshMaskExecConfinement, ALoadReadsItsAddressLoopObligationBeforeWritingTh
         ASSERT_EQ(ins.size(), 1u);
         const auto before = snapshot_saved_b64_masks(h.b, h.rs, ins[0]);
         EXPECT_TRUE(h.b.loop_blanket_roots_read.contains(root));
-        EXPECT_FALSE(before.source_marks.placeholder);
-        EXPECT_TRUE(before.source_marks.blanket_roots.empty());
+        // #5204: a vector root can weaken on the back edge. The loaded value must retain it
+        // so a later address consumer cannot treat that value as unconditional DATA.
+        EXPECT_TRUE(before.source_marks.placeholder);
+        EXPECT_EQ(before.source_marks.blanket_roots.size(), 1u);
+        EXPECT_TRUE(before.source_marks.blanket_roots.contains(root));
         record_vector_word_marks(h.rs, ins[0], before.source_marks);
+        EXPECT_TRUE(h.rs.vreg_source_marks.at(6).blanket_roots.contains(root));
+        h.b.loop_blanket_roots_read.clear();
         EXPECT_TRUE(fresh_mask_sources_defined(h.b, h.rs, decode(kCmpV6V6)[0]));
+        EXPECT_TRUE(h.b.loop_blanket_roots_read.contains(root));
+
+        h.b.loop_blanket_roots_strong.clear();
+        const std::array lds_read = {0xd8d80000u, 0x07000006u};   // ds_read_b32 v7, v6
+        const auto consumer = decode(lds_read);
+        ASSERT_EQ(consumer.size(), 1u);
+        snapshot_saved_b64_masks(h.b, h.rs, consumer[0]);
+        EXPECT_TRUE(h.b.loop_blanket_roots_strong.contains(root));
     }
 }
 
