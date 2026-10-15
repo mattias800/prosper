@@ -406,3 +406,68 @@ TEST(LoopWaveScalarRoute, WithoutANativeEntryALiveWaveScalarIsRefused) {
     EXPECT_TRUE(r.module.empty());
     EXPECT_NE(r.reason.find("wave-scalar-loop-live-out"), std::string::npos) << r.reason;
 }
+
+// #5206: a compute EXEC loop whose body can re-enable a lane that already left it. Hardware runs
+// that lane again in every later wave iteration; the left invocation cannot. The scalars are dead
+// after these loops (v3 = 0), so only the widening routes them.
+namespace {
+Program widening(uint32_t restore) {
+    auto p = defined_data();
+    p.words[8] = restore;        // in the body, after the exit test
+    p.words[14] = 0x7e060280u;   // v3 = 0
+    return p;
+}
+// Exact route; output3 (binding 3) holds `last` in every lane of `lanes`, untouched elsewhere.
+void exact_stores(const Result& r, uint32_t first_lane, uint32_t last) {
+    ASSERT_FALSE(r.module.empty()) << r.reason;
+    ASSERT_TRUE(has_op(r.module, 251u)) << "exact synchronized dispatcher route";
+    bpermute_oracle::Interpreter vm(r.module);
+    vm.native_subgroup_width = 64;
+    vm.push_constants = config().user_sgprs;
+    vm.extra_writable_bindings = {3};
+    vm.run_buffers(
+        64,
+        {{2, std::vector<uint32_t>(64, 0xdeadbeefu)}, {3, std::vector<uint32_t>(64, 0xdeadbeefu)}},
+        2);
+    ASSERT_TRUE(vm.error.empty()) << vm.error;
+    const auto stores = vm.writable_result(3);
+    ASSERT_EQ(stores.size(), 64u);
+    for (uint32_t lane = 0; lane < 64; ++lane)
+        EXPECT_EQ(stores[lane], lane < first_lane ? 0xdeadbeefu : last) << "lane " << lane;
+}
+} // namespace
+
+TEST(LoopExecWidening, AnAllLanesWriteReEnablesLeftLanes) {
+    // The #5206 reproduction: s_mov_b64 exec, -1. Every lane, lane 0 included, stores in every
+    // wave iteration; the last one (iteration 63) stores 62.
+    exact_stores(compile(widening(0xbefe04c1u)), 0, 62);
+}
+TEST(LoopExecWidening, ARestoreOfAMaskSavedBeforeTheLoopWidens) {
+    exact_stores(compile(widening(0xbefe0414u)), 0, 62);   // s_mov_b64 exec, s[20:21]
+}
+TEST(LoopExecWidening, ARestoreOfAMaskSavedBeforeTheExitTestWidens) {
+    // s[24:25] = EXEC at the header, before the CMPX test; restored in the body. Lanes 1..63 keep
+    // iterating with the wave until iteration 63; lane 0 never entered.
+    auto p = widening(0xbefe0418u);                       // s_mov_b64 exec, s[24:25]
+    p.words.insert(p.words.begin() + 6, 0xbe98047eu);     // header: s_mov_b64 s[24:25], exec
+    p.words[13] = 0xbf82fff8u;                            // back edge -> the new header pc6
+    exact_stores(compile(p), 1, 62);
+}
+TEST(LoopExecWidening, ANestedIfRestoreKeepsTheStructuredRoute) {
+    // v_cmp_ne vcc,0,v1; s_and_saveexec s[24:25],vcc; v8=0; s_or exec,exec,s[24:25]: the body
+    // restores only what it narrowed after the exit test.
+    auto p = widening(0x7d8a0280u);
+    p.words.insert(p.words.begin() + 9, {0xbe98246au, 0x7e100280u, 0x88fe187eu});
+    p.words[7] = 0xbf880008u;    // exit -> restore at pc16
+    p.words[15] = 0xbf82fff6u;   // back edge -> header pc6
+    const auto values = structured(compile(p));
+    ASSERT_EQ(values.size(), 64u);
+    for (uint32_t lane = 0; lane < 64; ++lane) EXPECT_EQ(values[lane], 0u) << lane;
+}
+TEST(LoopExecWidening, WithoutANativeEntryAWideningLoopIsRefused) {
+    auto c = config();
+    c.native_subgroup_size = 0;
+    const auto r = compile(widening(0xbefe04c1u), c);
+    EXPECT_TRUE(r.module.empty());
+    EXPECT_NE(r.reason.find("exec-loop-widens"), std::string::npos) << r.reason;
+}
