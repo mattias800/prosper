@@ -21,12 +21,12 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ## 2026-10-15
 
-### Kena's recorded title world with the fresh-mask guard enabled
+### Kena's title world renders on a default build, every other frame
 
-With the fresh-mask guard still on, *Kena*'s title menu draws over its forest-shrine world in this recorded run, alternating with block-noise frames ([#5026](https://github.com/mattias800/prosper/issues/5026)). These captures predate the combined changes now on main.
+With the fresh-mask guard on, *Kena*'s title menu now draws over its forest-shrine world; the odd frames stay noise until the flicker fix ([#5175](https://github.com/mattias800/prosper/issues/5175)) can reach its compute program, which a separate dispatcher refusal still blocks ([#5174](https://github.com/mattias800/prosper/issues/5174)).
 
-<p align="center"><img src="assets/screenshots/issue-5174-kena-title-world.webp" alt="Kena: Bridge of Spirits title menu over the forest shrine world; Linux RADV prosper-app, default guard, PROSPER_NULL_PAGE=1 and -force-gfx-direct, pad flip 251"></p>
-<p align="center"><img src="assets/screenshots/issue-5174-kena-title-flicker-sheet.webp" alt="Contact sheet of 65 frames from flips 220 to 420 of the same run: 32 show the world, 33 show full-screen block noise under the menu"></p>
+<p align="center"><img src="assets/screenshots/issue-5174-kena-title-world.webp" alt="Kena: Bridge of Spirits title menu over the forest shrine world; Linux RADV prosper-app, default guard, PROSPER_NULL_PAGE=1 and -force-gfx-direct, pad flip 240"></p>
+<p align="center"><img src="assets/screenshots/issue-5174-kena-title-flicker-sheet.webp" alt="Contact sheet of 97 frames from flips 220 to 420 of the same run: 48 show the world, 49 show full-screen block noise under the menu"></p>
 
 ### Kena's title world no longer flickers to noise on every other frame
 
