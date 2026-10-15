@@ -7,6 +7,7 @@
 // decode of the same file. A backend that returned the wrong plane order, a cropped or padded
 // stride, full-range chroma, or a dropped/duplicated frame cannot produce it.
 #include "videotoolbox_backend.hpp"
+#include "test_hardware_selection.hpp"
 
 #include <VideoToolbox/VideoToolbox.h>
 #include <gtest/gtest.h>
@@ -232,23 +233,25 @@ protected:
         ASSERT_TRUE(install_videotoolbox_backend());
         vb_ = backend();
         ASSERT_NE(vb_, nullptr);
-        // The hardware gate, exercised in whichever direction this host allows. A host that can
-        // decode on a hardware H.264 session (every Apple Silicon and recent Intel Mac) runs every
-        // case through it. A host that cannot -- a virtualised CI runner -- must REFUSE without
-        // the explicit override, which is asserted here, and only then runs the same checks in
-        // software.
-        hardware_ = hardware_h264_decode_available();
+        // Independent decoding is useful evidence, but its session can fail transiently while
+        // the backend's next hardware-only session succeeds. Inspect that actual session before
+        // choosing the explicit software arm; a successful independent probe still requires the
+        // backend to work, and a successful backend open must report hardware.
+        const bool probe_decoded = hardware_h264_decode_available();
         // This test binary owns PROSPER_AVP_ALLOW_SOFTWARE: every case starts with it unset and
         // TearDown unsets it again, so no case inherits another's software arm.
         unsetenv("PROSPER_AVP_ALLOW_SOFTWARE");
-        if (!hardware_) {
-            const int refused = vb_->open(kAsset);
-            EXPECT_LT(refused, 0)
-                << "without a hardware decoder, open must refuse unless software is "
-                   "explicitly allowed";
-            if (refused >= 0) vb_->close(refused);
-            setenv("PROSPER_AVP_ALLOW_SOFTWARE", "1", 1);
-        }
+        const auto mode = test::select_decode_mode(
+            probe_decoded, [&] { return vb_->open(kAsset); },
+            [&](int id) {
+                return static_cast<VideoToolboxBackend*>(vb_)->decoder_uses_hardware(id);
+            },
+            [&](int id) { vb_->close(id); });
+        ASSERT_NE(mode, test::DecodeMode::Refuse)
+            << "hardware-only open must use hardware, and a successful independent decode "
+               "must also be supported by the backend";
+        hardware_ = mode == test::DecodeMode::Hardware;
+        if (!hardware_) { setenv("PROSPER_AVP_ALLOW_SOFTWARE", "1", 1); }
     }
     void TearDown() override {
         unsetenv("PROSPER_AVP_ALLOW_SOFTWARE");
@@ -263,7 +266,6 @@ TEST_F(VideoToolboxBackendTest, MissingSourceFailsInsteadOfFabricatingASession) 
 }
 
 TEST_F(VideoToolboxBackendTest, DecodesEveryPictureBitExactWithAudio) {
-    RecordProperty("hardware_h264_decoder", hardware_ ? "yes" : "no");
     const int id = vb_->open(kAsset);
     ASSERT_GE(id, 0) << (hardware_ ? "hardware" : "explicitly allowed software") << " decode";
     StreamInfo stream{};
@@ -278,9 +280,13 @@ TEST_F(VideoToolboxBackendTest, DecodesEveryPictureBitExactWithAudio) {
     EXPECT_GE(stream.duration_us, 900000u);
     EXPECT_LE(stream.duration_us, 1100000u);
 
-    // The OBSERVED decoder (the session's own report), not a capability query: hardware wherever
-    // the host has an H.264 decoder, software only under the explicit override.
-    EXPECT_EQ(static_cast<VideoToolboxBackend*>(vb_)->decoder_uses_hardware(id), hardware_ ? 1 : 0);
+    // An explicit software allowance still prefers hardware, which can become available after
+    // an earlier failure. Assert this session's actual policy rather than the prior session's type.
+    const int observed_hardware = static_cast<VideoToolboxBackend*>(vb_)->decoder_uses_hardware(id);
+    EXPECT_TRUE(test::decoder_matches_mode(hardware_ ? test::DecodeMode::Hardware
+                                                     : test::DecodeMode::AllowSoftware,
+                                           observed_hardware));
+    RecordProperty("hardware_h264_decoder", observed_hardware == 1 ? "yes" : "no");
     const Drained d = drain(*vb_, id, stream);
     EXPECT_TRUE(d.reached_eof);
     EXPECT_EQ(d.video, kExpectedFrames) << "every picture is delivered exactly once";
