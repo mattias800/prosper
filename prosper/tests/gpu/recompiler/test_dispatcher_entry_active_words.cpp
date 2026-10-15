@@ -15,6 +15,7 @@
 // and a loop back edge that changes EXEC.
 #include "fixtures/checked_compute_launch.hpp"
 #include "gpu/recompiler/rdna2_active_vector_words.hpp"
+#include "gpu/recompiler/rdna2_cfg_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
@@ -93,12 +94,15 @@ struct Result {
 
 // The CFG dispatcher, forced, so every conditional branch ends a case and every case entry reloads
 // the register file from storage. s0..s23 are user data, so the image's T# words are genuine.
-Result compile(const Words& body) {
+// With `natural`, the dispatcher is not forced: an irreducible loop after the body requires it
+// (test_cfg_spilled_mask_halves' kTail), so the compiler's refused-program retries run as they do
+// for a captured program.
+Result compile(const Words& body, bool natural = false) {
     ComputeShaderConfig config;
     config.local_x = 64;
     config.wave_size = 64;
     config.native_subgroup_size = 64;
-    config.force_exchange_dispatcher = true;
+    config.force_exchange_dispatcher = !natural;
     config.user_sgprs.resize(24);
     prosper::test::complete_compute_launch(config, 2);
     ShaderResourceTable table;
@@ -120,7 +124,10 @@ Result compile(const Words& body) {
     texture.sgpr_base = 16;
     table.resources.push_back(texture);
     // v9 = 13 is stored, so the program has an observable effect after the body.
-    const Words code = cat({body, {0x7e12028du, 0xe0702000u, 0x80020900u, end}});
+    const Words irreducible{0x7e020280u, 0x7e040280u, 0x7c020300u, 0xbf860001u,
+                            0x7e040281u, 0x7d840100u, 0xbf870001u, 0xbf82fffdu};
+    const Words code =
+        cat({body, natural ? irreducible : Words{}, {0x7e12028du, 0xe0702000u, 0x80020900u, end}});
     static uint64_t next_address = 0x5173000000ull;
     const uint64_t address = ++next_address;
     auto module = recompile_compute(code.data(), code.size(), &table, config,
@@ -188,6 +195,24 @@ TEST(DispatcherEntryActiveWords, UnmodelledImageAddressShapesAreUnknown) {
              Words{0xf000010cu, 0x00040800u, 0x00000014u, 0u},   // two NSA dwords for one address
          })
         EXPECT_EQ(rdna2_mimg_read_address_count(decode(words)), 0u) << std::hex << words[0];
+}
+
+// #5182: the register inventory names every image address, not only VADDR. Each destination is
+// below the extra address, so only the address can raise the count.
+TEST(DispatcherEntryActiveWords, TheRegisterInventoryCountsEveryImageAddress) {
+    const auto highest = [](const Words& words) {
+        std::vector<Rdna2Inst> instructions;
+        rdna2_walk(words.data(), words.size(), instructions);
+        return shader_max_vgpr(instructions);
+    };
+    // image_load v1, v[10:11]: the consecutive second address.
+    EXPECT_EQ(highest({0xf0000108u, 0x0004010au, end}), 11);
+    // image_load v1, [v10, v30]: the NSA second address.
+    EXPECT_EQ(highest({0xf000010au, 0x0004010au, 0x0000001eu, end}), 30);
+    // image_sample_lz v1, [v10, v30], s[16:23], s[24:27].
+    EXPECT_EQ(highest({0xf09c010au, 0x00c4010au, 0x0000001eu, end}), 30);
+    // image_store v1, [v10, v30]: an unmodelled shape still names its NSA register.
+    EXPECT_EQ(highest({0xf020010au, 0x0004010au, 0x0000001eu, end}), 30);
 }
 
 // ---- which memory reads complete the current EXEC's words -------------------------------------
@@ -326,6 +351,193 @@ TEST(DispatcherEntryActiveWords, AWriteFromGenuineSourcesKeepsGenuineOldLanes) {
     // v8's address is missing, so v10 is not genuine even inside A.
     refused(compile(accumulate(true, lds_v8_v20())), 8);
     refused(compile(cat({{mov1}, accumulate(true, image_v8_v20())})), 10);
+}
+
+// ---- #5181: an EXEC-or-zero select, spilled with V_WRITELANE and reloaded, restores EXEC ----
+
+// Kena cs 0x5008e80000 pc299-405: SCC; vcc = SCC ? exec : 0; s[20:21] = s[6:7] & vcc; both halves
+// spilled to v18 lanes 7/6 (high first), s[20:21] reused as data, reloaded with V_READLANE, and
+// `s_mov_b64 exec, s[20:21]`. That EXEC is a subset of the one v8 was read under, so v8 stays
+// genuine across the next case edge. Encodings from llvm-mc -mcpu=gfx1030 -mattr=+wavefrontsize64.
+constexpr uint32_t cselect_exec_0 = 0x85ea807eu;   // s_cselect_b64 vcc, exec, 0
+constexpr uint32_t cselect_0_exec = 0x85ea7e80u;   // s_cselect_b64 vcc, 0, exec
+constexpr uint32_t cselect_s6_0 = 0x85ea8006u;   // s_cselect_b64 vcc, s[6:7], 0
+constexpr uint32_t and20 = 0x87946a06u;   // s_and_b64 s[20:21], s[6:7], vcc
+constexpr uint32_t and20_exec = 0x87947e06u;   // s_and_b64 s[20:21], s[6:7], exec
+constexpr uint32_t and20_data = 0x87940606u;   // s_and_b64 s[20:21], s[6:7], s[6:7]
+constexpr uint32_t clear20 = 0xbe940380u;   // s_mov_b32 s20, 0
+constexpr uint32_t clear21 = 0xbe950380u;   // s_mov_b32 s21, 0
+constexpr uint32_t exec20 = 0xbefe0414u;   // s_mov_b64 exec, s[20:21]
+Words spill21() {
+    return {0xd7610012u, 0x00010e15u};
+}   // v_writelane_b32 v18, s21, 7
+Words spill20() {
+    return {0xd7610012u, 0x00010c14u};
+}   // v_writelane_b32 v18, s20, 6
+Words reload21() {
+    return {0xd7600015u, 0x00010f12u};
+}   // v_readlane_b32 s21, v18, 7
+Words reload20() {
+    return {0xd7600014u, 0x00010d12u};
+}   // v_readlane_b32 s20, v18, 6
+
+// SCC; <select>; s[20:21] = s[6:7] & <select>; [spill; reuse; reload]; exec = s[20:21]
+Words narrowed_restore(uint32_t select, bool spill, uint32_t combine = and20) {
+    Words code{scalar_test, select, combine};
+    if (spill) code = cat({code, spill21(), spill20(), {clear20, clear21}, reload21(), reload20()});
+    code.push_back(exec20);
+    return code;
+}
+
+// save; A; execz R; read v8; <narrow>; [edge: execz R']; compare v8; R: restore.
+Words narrowed_edge(const Words& narrow) {
+    const Words body = cat({lds_v8(), narrow});
+    return cat({{save_exec, cmpx_a, execz(static_cast<uint32_t>(body.size()) + 2u)},
+                body,
+                {execz(1u), compare8, restore_exec}});
+}
+uint32_t compare_pc(const Words& narrow) {
+    return 3u + 2u + static_cast<uint32_t>(narrow.size()) + 1u;
+}
+// Kena's spilled pair has no physical words, so its spill needs the #5175 Bool-half retry, which
+// runs only when the dispatcher is not forced.
+void narrowed_accepted(const Words& narrow) {
+    accepted(compile(narrowed_edge(narrow), true));
+}
+// The terminal reason names the FIRST attempt's refusal. When that is the word-less spill the
+// retry repairs, the retry's own refusal (at the compare, checked by hand with its diagnostics
+// committed) is not reported, so only the empty module is asserted; each such twin has an
+// accepted counterpart differing in one instruction.
+void narrowed_refused(const Words& narrow, bool reason_names_compare = true) {
+    const Result result = compile(narrowed_edge(narrow), true);
+    if (reason_names_compare)
+        refused(result, compare_pc(narrow));
+    else
+        EXPECT_TRUE(result.module.empty());
+}
+
+TEST(DispatcherEntryActiveWords, AnExecOrZeroSelectCarriesTheCurrentExecWords) {
+    narrowed_accepted(narrowed_restore(cselect_exec_0, false));
+    narrowed_accepted(narrowed_restore(cselect_0_exec, false));
+    // The non-zero arm is scalar data, not EXEC: its lanes may lie outside A.
+    narrowed_refused(narrowed_restore(cselect_s6_0, false));
+}
+
+TEST(DispatcherEntryActiveWords, ASavedMaskKeepsItsWordsThroughAWritelaneSpill) {
+    // Kena's shape, both mechanisms together.
+    narrowed_accepted(narrowed_restore(cselect_exec_0, true));
+    // The spill alone, over a mask whose words come from an AND with EXEC (already carried).
+    narrowed_accepted(narrowed_restore(0xbf800000u, true, and20_exec));
+    narrowed_refused(narrowed_restore(cselect_s6_0, true));
+    // v8 is overwritten from a never-written v20 while the pair is spilled: the saved mask's
+    // lanes no longer hold a genuine v8.
+    const Words destroyed = cat({{scalar_test, cselect_exec_0, and20},
+                                 spill21(),
+                                 spill20(),
+                                 {clear20, clear21, 0x7e100314u},   // v_mov_b32 v8, v20
+                                 reload21(),
+                                 reload20(),
+                                 {exec20}});
+    narrowed_refused(destroyed, false);
+}
+
+// Two instances of s[20:21] spilled to different slots: B = s[6:7] & s[6:7] (scalar data, any
+// lanes) to lanes 5/4 FIRST, then Kena's A to lanes 7/6. Reloading A's slots restores A's words;
+// reloading B's must not, although A was the pair's later (and last spilled) instance.
+Words two_instances(bool reload_a) {
+    const Words reload = reload_a ? cat({reload21(), reload20()})
+                                  : Words{0xd7600015u, 0x00010a12u,   // v_readlane_b32 s21, v18, 5
+                                          0xd7600014u, 0x00010812u};   // v_readlane_b32 s20, v18, 4
+    return cat(
+        {{and20_data},
+         {0xd7610012u, 0x00010a15u, 0xd7610012u, 0x00010814u},   // v18[5] = s21, v18[4] = s20
+         {scalar_test, cselect_exec_0, and20},
+         spill21(),
+         spill20(),
+         {clear20, clear21},
+         reload,
+         {exec20}});
+}
+
+TEST(DispatcherEntryActiveWords, AReloadRestoresOnlyItsOwnInstancesWords) {
+    narrowed_accepted(two_instances(true));
+    narrowed_refused(two_instances(false), false);
+}
+
+TEST(DispatcherEntryActiveWords, AnExecWriteBetweenTheSaveAndTheSpillKeepsTheSavedLanes) {
+    // The mask is saved under the PARENT EXEC, before v8 exists; EXEC then narrows to A, v8 is
+    // read there, and the pair is spilled and restored: its lanes outside A see a never-written
+    // v8. Words snapshotted from the EXEC current at the spill would wrongly include it.
+    const Words code = cat({{save_exec, scalar_test, cselect_exec_0, and20, cmpx_a, execz(15u)},
+                            lds_v8(),
+                            spill21(),
+                            spill20(),
+                            {clear20, clear21},
+                            reload21(),
+                            reload20(),
+                            {exec20, execz(1u), compare8, restore_exec}});
+    refused(compile(code, true), 20);
+    // Saved AFTER the read, under A, the same spill is Kena's accepted shape (above).
+}
+
+// ---- #5181: a lane-mask select is lane-wise in its mask's Bool --------------------------------
+
+// Kena cs 0x5008e80000 pc520/562: s[28:29] = (s19 < 1.0) (a VOPC with an SGPR destination), then
+// `v_cndmask_b32_e64 v1, v1, v0, s[28:29]`. Each lane selects with its own bit of a live mask, so
+// the result is genuine wherever both selected words are.
+Words mask28() {
+    return {0x7c03e4f9u, 0x86869c13u};
+}   // v_cmp_lt_f32_sdwa s[28:29], s19, 1.0
+Words select_v8_28() {
+    return {0xd501000au, 0x00721080u};
+}   // v_cndmask_b32_e64 v10, 0, v8, s[28:29]
+Words select_v8_30() {
+    return {0xd501000au, 0x007a1080u};
+}   // v_cndmask_b32_e64 v10, 0, v8, s[30:31]
+Words select_v20_28() {
+    return {0xd501000au, 0x00722880u};
+}   // v_cndmask_b32_e64 v10, 0, v20, s[28:29]
+
+// save; A; execz R; read v8; <mask; select into v10>; [edge: execz R']; compare v10; R: restore.
+Words selected_edge(const Words& select) {
+    const Words body = cat({lds_v8(), select});
+    return cat({{save_exec, cmpx_a, execz(static_cast<uint32_t>(body.size()) + 2u)},
+                body,
+                {execz(1u), compare10, restore_exec}});
+}
+uint32_t selected_compare_pc(const Words& select) {
+    return 3u + 2u + static_cast<uint32_t>(select.size()) + 1u;
+}
+
+TEST(DispatcherEntryActiveWords, ALaneMaskSelectKeepsItsSelectedWordsGenuine) {
+    const Words kena = cat({mask28(), select_v8_28()});
+    accepted(compile(selected_edge(kena)));
+    // A selected word that is missing in the current EXEC.
+    const Words missing = cat({mask28(), select_v20_28()});
+    refused(compile(selected_edge(missing)), selected_compare_pc(missing));
+    // An absent mask, and one defined on one path only, are refused at the select itself.
+    refused(compile(selected_edge(cat({mask28(), select_v8_30()}))), 7);
+    refused(compile(selected_edge(cat({{scalar_test, 0xbf850002u}, mask28(), select_v8_28()}))), 9);
+}
+
+// The rule itself: the MASK must be a live MUST mask with no relayed word, and only SRC2 of
+// v_cndmask_b32 is read that way.
+TEST(DispatcherEntryActiveWords, OnlyALiveUnrelayedMaskIsALaneWiseSelector) {
+    Facts facts;
+    facts.state.current = {0, 8};
+    const auto defined = [&](const Words& words, const std::set<int>& relayed_words = {}) {
+        return active_vector_sources_defined(facts.state, decode(words), facts.relayed, facts.masks,
+                                             facts.scalar_words, relayed_words, true);
+    };
+    for (int reg = 0; reg < 32; ++reg) facts.scalar_words.erase(reg);
+    EXPECT_FALSE(defined(select_v8_28())) << "s[28:29] is not a mask";
+    facts.masks.insert(28);
+    EXPECT_TRUE(defined(select_v8_28()));
+    EXPECT_FALSE(defined(select_v8_28(), {29})) << "a relayed high word";
+    EXPECT_FALSE(defined(select_v8_28(), {28})) << "a relayed low word";
+    EXPECT_FALSE(defined(select_v20_28())) << "v20 is relayed and not current";
+    // v_add_f32_e64 v10, v8, s28: an ordinary scalar DATA source is not a mask read.
+    EXPECT_FALSE(defined({0xd503000au, 0x00003908u}));
 }
 
 }   // namespace

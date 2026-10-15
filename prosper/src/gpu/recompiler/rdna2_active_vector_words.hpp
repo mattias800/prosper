@@ -7,6 +7,7 @@
 #include "gpu/recompiler/rdna2_saved_exec_data.hpp"
 #include "gpu/recompiler/rdna2_exec_spill_equality.hpp"
 
+#include <cstdint>
 #include <map>
 #include <set>
 #include <utility>
@@ -27,6 +28,11 @@ struct ActiveVectorWords {
     // A vector word is genuine wherever the CURRENT value of this saved B64 mask enables a lane.
     // Overwriting a vector with a possibly missing source retires it from every guarantee.
     std::map<int, std::set<int>> masks;
+    // The same guarantee for a saved-mask INSTANCE (SpilledMaskHalf::def_pc, the pc that defined
+    // the pair), snapshotted when a half is spilled with V_WRITELANE so it outlives the pair's own
+    // registers. A destroyed word leaves it as it leaves `masks`; a new definition at that pc ends
+    // it. A reload that SpilledMaskHalves proves reassembles the instance re-publishes it (#5181).
+    std::map<uint32_t, std::set<int>> instances;
     ComplementaryExecData complement;
     SavedExecDataEquality saved_exec;
     ExecSpillEquality exec_spill;

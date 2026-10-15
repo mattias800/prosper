@@ -101,7 +101,10 @@ int spilled_slot_half(const SpilledMaskHalves& state, const Rdna2Inst& in);
 // changes it), `mask_slot_keys` the pairs whose spills the dispatcher persists as mask slots,
 // `scalar_writes` the (base, width) SGPR ranges `in` writes, `vector_writes` the VGPRs it may
 // write (V_WRITELANE and V_READLANE are modelled here instead), and `mask_write` the pair `in`
-// defines as a mask, or -1.
+// defines as a mask, or -1. With ActiveVectorWords enabled it also carries a saved mask's word set
+// across the spill and reload (#5181): a spill of a slot holding a half of a live instance
+// snapshots the pair's words under that instance; a reload completing sN/sN+1 (N even) as half
+// 0/1 of ONE instance re-publishes them for s[N:N+1]. The words name the VALUE, not an EXEC.
 void advance_spilled_mask_halves(SpilledMaskHalves& state, const Rdna2Inst& in,
                                  const std::set<int>& masks, const std::set<int>& mask_slot_keys,
                                  const std::vector<std::pair<int, uint32_t>>& scalar_writes,
