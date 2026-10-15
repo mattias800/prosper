@@ -275,16 +275,17 @@ int main() {
     printf("  N=%u mismatches=%u worst=%g (out[50]=%g expect=%g)\n", N, bad, worst, got[50], expect[50]);
     CHECK(bad == 0, "recompiled RDNA2 kernel computes ((a0+a1)*a2)*a3+a1 correctly");
 
-    // Raw scalar data may occupy the physical VCC pair. Its old predicate must be discarded,
-    // while v_cvt_f32_u32 reads the two current buffer words. Two independent byte inputs make
-    // constant/zero substitution fail this actual GPU execution check.
+    // Raw scalar data may occupy the physical VCC pair: v_cvt_f32_u32 must read both current
+    // buffer words. Two independent byte inputs make constant/zero substitution fail this GPU
+    // execution check. The initial gfx10 CMPX updates EXEC only and supplies no old VCC predicate,
+    // so this fixture does not establish that loading scalar data retires an earlier predicate.
     const uint32_t raw_vcc_data[] = {
-        0x7da80084u,                 // old VCC compare (v_cmp_*_u32 vcc, 4, v0)
+        0x7da80084u,   // v_cmpx_gt_u32_e32 4, v0 (EXEC only)
         0xf4041a80u, 0xfa000008u,   // s_load_dwordx2 vcc, s[0:1], 0x08
-        0x7e000c6au,                 // v_cvt_f32_u32 v0, vcc_lo
-        0x7e020c6bu,                 // v_cvt_f32_u32 v1, vcc_hi
-        0x7d040300u,                 // new VCC compare (v_cmp_*_f32 vcc, v0, v1)
-        0x06000300u,                 // v_add_f32 v0, v0, v1
+        0x7e000c6au,   // v_cvt_f32_u32 v0, vcc_lo
+        0x7e020c6bu,   // v_cvt_f32_u32 v1, vcc_hi
+        0x7d040300u,   // v_cmp_eq_i32_e32 vcc_lo, v0, v1
+        0x06000300u,   // v_add_f32 v0, v0, v1
         0xbf810000u,
     };
     ShaderResourceTable raw_vcc_table;
@@ -2345,13 +2346,13 @@ int main() {
     // and run it. Returns whether it compiled, and the stored words.
     const auto run_restored_exec_pair = [&](const std::vector<uint32_t>& fixture) {
         std::vector<uint32_t> code(fixture.begin(), fixture.end() - std::size(code17d));
-        code.push_back(0x7e020281u);                            // v_mov_b32 v1, 1
-        code.push_back(0xe0702000u); code.push_back(0x80020100u); // buffer_store_dword v1, v0
-        code.push_back(0xbefe04c1u);                            // s_mov_b64 exec, -1
+        code.push_back(0x7e020281u);   // v_mov_b32 v1, 1
+        code.push_back(0xe0702000u);
+        code.push_back(0x80020100u);   // buffer_store_dword v1, v0
+        code.push_back(0xbefe04c1u);   // s_mov_b64 exec, -1
         code.insert(code.end(), std::begin(code17d), std::end(code17d));
         std::vector<uint32_t> got;
-        const auto spv = recompile_compute(code.data(), code.size(), &rt17d1,
-                                           native_linear_cfg17d);
+        const auto spv = recompile_compute(code.data(), code.size(), &rt17d1, native_linear_cfg17d);
         if (!spv.empty())
             prosper::test::run_compute(spv, std::vector<float>(64, 0.0f), 64, 64, {},
                                        std::vector<uint32_t>(64, 0u), &got);
@@ -2383,8 +2384,8 @@ int main() {
     code17d1_mask_half_b64_consumer.insert(
         code17d1_mask_half_b64_consumer.end(), std::begin(code17d), std::end(code17d));
     CHECK(!recompile_compute(code17d1_mask_half_b64_consumer.data(),
-                             code17d1_mask_half_b64_consumer.size(), nullptr,
-                             native_linear_cfg17d).empty(),
+                             code17d1_mask_half_b64_consumer.size(), nullptr, native_linear_cfg17d)
+               .empty(),
           "Wave64 mask-half alias consumed as a pair compiles through the dispatcher");
     if (can_execute_mask_half_spill) {
         const auto [compiled, got] = run_restored_exec_pair(code17d1_mask_half_b64_consumer);
@@ -2412,7 +2413,8 @@ int main() {
         code17d1_mask_half_between_overwrite.end(), std::begin(code17d), std::end(code17d));
     CHECK(!recompile_compute(code17d1_mask_half_between_overwrite.data(),
                              code17d1_mask_half_between_overwrite.size(), nullptr,
-                             native_linear_cfg17d).empty(),
+                             native_linear_cfg17d)
+               .empty(),
           "a scalar overwrite between Wave64 half reloads compiles through the dispatcher");
     if (can_execute_mask_half_spill) {
         const auto [compiled, got] = run_restored_exec_pair(code17d1_mask_half_between_overwrite);

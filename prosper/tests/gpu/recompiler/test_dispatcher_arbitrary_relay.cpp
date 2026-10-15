@@ -38,12 +38,12 @@ constexpr uint32_t kIrreducibleTail[] = {
     0x7e040d02u,   // v_cvt_f32_u32 v2, v2
     0xbf810000u,   // s_endpgm
 };
-constexpr uint32_t kEdge = 0xbf880000u;          // s_cbranch_execz +0: a dispatcher case edge
-constexpr uint32_t kAddV3OneV1 = 0x4a060281u;    // v_add_nc_u32 v3, 1, v1
-constexpr uint32_t kAddV3S0V1 = 0x4a060200u;     // v_add_nc_u32 v3, s0, v1
-constexpr uint32_t kAddV4S0V1 = 0x4a080200u;     // v_add_nc_u32 v4, s0, v1
-constexpr uint32_t kAddV3OneV4 = 0x4a060881u;    // v_add_nc_u32 v3, 1, v4
-constexpr uint32_t kCompareV3 = 0x7d840700u;     // v_cmp_eq_u32 vcc, v0, v3
+constexpr uint32_t kEdge = 0xbf880000u;   // s_cbranch_execz +0: a dispatcher case edge
+constexpr uint32_t kAddV3OneV1 = 0x4a060281u;   // v_add_nc_u32 v3, 1, v1
+constexpr uint32_t kAddV3S0V1 = 0x4a060200u;   // v_add_nc_u32 v3, s0, v1
+constexpr uint32_t kAddV4S0V1 = 0x4a080200u;   // v_add_nc_u32 v4, s0, v1
+constexpr uint32_t kAddV3OneV4 = 0x4a060881u;   // v_add_nc_u32 v3, 1, v4
+constexpr uint32_t kCompareV3 = 0x7d840700u;   // v_cmp_eq_u32 vcc, v0, v3
 
 Words program(std::initializer_list<uint32_t> prefix) {
     Words code(prefix);
@@ -90,8 +90,6 @@ TEST(DispatcherArbitraryRelay, ScalarRelayAcrossAnEdgeIsHard) {
 
 TEST(DispatcherArbitraryRelay, HardnessPropagatesThroughASecondVectorRelay) {
     // v4 is hard (unloaded s0); v3 = 1 + v4 crosses a second edge and must stay hard.
-    EXPECT_FALSE(
-        compiles(program({kAddV4S0V1, kEdge, kAddV3OneV4, kEdge, kCompareV3}), launch()));
-    EXPECT_TRUE(
-        compiles(program({kAddV4S0V1, kEdge, kAddV3OneV4, kEdge, kCompareV3}), launch(1)));
+    EXPECT_FALSE(compiles(program({kAddV4S0V1, kEdge, kAddV3OneV4, kEdge, kCompareV3}), launch()));
+    EXPECT_TRUE(compiles(program({kAddV4S0V1, kEdge, kAddV3OneV4, kEdge, kCompareV3}), launch(1)));
 }
