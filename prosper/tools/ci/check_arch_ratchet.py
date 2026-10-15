@@ -27,6 +27,10 @@ The rules (every count is per file, over tracked files only, with comments strip
                  per file per token, same roots as getenv.
   file-size      a C/C++ file under prosper/src, prosper/frontends or prosper/tests/fixtures longer
                  than FILE_SIZE_THRESHOLD lines may not exceed its baselined line cap.
+  dir-file-cap   a C/C++ file under a directory in DIR_FILE_CAPS longer than that directory's hard
+                 cap. Unlike file-size there is no baseline of existing large files: every file
+                 there starts small and a file past the cap is a new finding (ADR 0012 decision 5:
+                 gpu/recompiler/ir/ caps every file at 1,000 lines).
   test-dep       `prosper::test::` in code under prosper/frontends -- the shipping app depending on
                  the test namespace.
   platform-ifdef preprocessor conditionals (`#if`/`#ifdef`/`#ifndef`/`#elif`...) that test a host
@@ -214,6 +218,10 @@ FORBIDDEN_LAYERS = ("frontends", "tests")  # never includable from prosper/src
 # ordinary files and makes each a conflict surface; a higher one lets the next render_runner.h grow
 # unwatched for a year.
 FILE_SIZE_THRESHOLD = 5000
+# Directory-scoped hard line caps, (directory prefix, cap). A file under the prefix longer than the
+# cap fails as a new finding; split it rather than baselining it. ADR 0012 decision 5 (owner,
+# 2026-10-15): the recompiler IR keeps files small enough to test in pieces.
+DIR_FILE_CAPS = ((f"{SRC}gpu/recompiler/ir/", 1000),)
 # A line cap reports `decrease` only when the file is more than 2% below it (~330 lines on a
 # 16,500-line file). See the module docstring for the concurrency reasoning.
 SHRINK_MARGIN = 0.02
@@ -258,6 +266,7 @@ RULES = (
     "getenv",
     "blocking-sync",
     "file-size",
+    "dir-file-cap",
     "test-dep",
     "platform-ifdef",
     "platform-stub",
@@ -302,6 +311,10 @@ FIX_HINT = {
     "file-size": (
         "A file past its line cap. Split it (prosper/tools/refactor/split_file.py) or move code "
         "out; a cap rises only by a baseline edit a reviewer accepts."
+    ),
+    "dir-file-cap": (
+        "A file past its directory's hard line cap (DIR_FILE_CAPS). Split it by role -- one file "
+        "per instruction family or sub-family -- rather than raising a baseline row."
     ),
     "test-dep": (
         "The shipping frontend referencing prosper::test::. Move what it needs into src/ or "
@@ -604,6 +617,9 @@ def scan(files: dict[str, str], slugs: set[str]) -> dict[str, Finding]:
             lines = line_count(text)
             if lines > FILE_SIZE_THRESHOLD:
                 found[f"file-size|{path}"] = Finding(f"file-size|{path}", lines)
+        for prefix, cap in DIR_FILE_CAPS:
+            if path.startswith(prefix) and line_count(text) > cap:
+                found[f"dir-file-cap|{path}"] = Finding(f"dir-file-cap|{path}", line_count(text))
         if path.startswith(SRC):
             parts = path.split("/")
             # parts[0:2] is prosper/src; every directory component below it, never the filename.
@@ -1025,6 +1041,7 @@ POSITIVE_TREE = {
     "prosper/src/gpu/v.cpp": "vkCreateFence(d, &i, nullptr, &f);\n",
     "prosper/src/gpu/w.cpp": 'if (bad) throw std::runtime_error("x");\ncatch (...) { throw; }\n',
     "prosper/frontends/k.cpp": '#include "fixtures/render_runner.h"\n',
+    "prosper/src/gpu/recompiler/ir/big.cpp": "int x;\n" * 1001,
 }
 POSITIVE_KEYS = {
     "title-id|prosper/src/a.cpp": 1,
@@ -1042,6 +1059,7 @@ POSITIVE_KEYS = {
     "vk-object|prosper/src/gpu/v.cpp|vkCreateFence": 1,
     "host-throw|prosper/src/gpu/w.cpp": 2,
     "fixture-include|prosper/frontends/k.cpp": 1,
+    "dir-file-cap|prosper/src/gpu/recompiler/ir/big.cpp": 1001,
 }
 # Every rule's pattern written where it must NOT count: comments, string and raw-string literals,
 # lookalike identifiers, non-scanned roots, a non-title directory.
@@ -1071,6 +1089,9 @@ NEGATIVE_TREE = {
         '// #include "gpu/execute/x.hpp"\n#include "gpu/recompiler/a.hpp"\n#include "../pm4/p.hpp"\n'
     ),
     "prosper/src/gpu/execute/call.cpp": '#include "gpu/recompiler/rdna2_to_spirv.hpp"\n',
+    # dir-file-cap: exactly at the cap, and over it outside the capped directory.
+    "prosper/src/gpu/recompiler/ir/at_cap.cpp": "int x;\n" * 1000,
+    "prosper/src/gpu/recompiler/not_ir.cpp": "int x;\n" * 1001,
 }
 
 

@@ -3591,6 +3591,14 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_rdna2_instruction_effects.cpp
     LIBRARIES prosper_core)
 
+  # The recompiler IR (ADR 0012): one focused test per piece under tests/gpu/recompiler/ir/.
+  foreach(ir_test ir_core)
+    prosper_add_gtest(test_${ir_test}
+      SOURCES tests/gpu/recompiler/ir/test_${ir_test}.cpp
+      INCLUDES tests
+      LIBRARIES prosper_core)
+  endforeach()
+
   # Link only the helper and its table dependency: another core object must not accidentally
   # supply a weak inline copy of the declaration-only ALU helper (#5153).
   prosper_add_gtest(test_scalar_alu_width_linkage

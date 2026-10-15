@@ -77,6 +77,11 @@ class OnePositivePerRule(unittest.TestCase):
             "file-size|prosper/frontends/shared/big.cpp",
             car.FILE_SIZE_THRESHOLD + 1,
         ),
+        "dir-file-cap": (
+            {"prosper/src/gpu/recompiler/ir/lower/a.cpp": "int x;\n" * 1001},
+            "dir-file-cap|prosper/src/gpu/recompiler/ir/lower/a.cpp",
+            1001,
+        ),
         "test-dep": (
             {"prosper/frontends/shared/a.cpp": "using X = prosper :: test :: Thing;\n"},
             "test-dep|prosper/frontends/shared/a.cpp",
