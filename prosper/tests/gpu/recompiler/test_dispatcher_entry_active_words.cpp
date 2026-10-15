@@ -141,7 +141,9 @@ Result compile(const Words& body, bool natural = false) {
     // v9 = 13 is stored, so the program has an observable effect after the body.
     const Words irreducible{0x7e020280u, 0x7e040280u, 0x7c020300u, 0xbf860001u,
                             0x7e040281u, 0x7d840100u, 0xbf870001u, 0xbf82fffdu};
-    const Words code = cat({hard_prefix(), body, natural ? irreducible : Words{},
+    const Words code = cat({hard_prefix(),
+                            body,
+                            natural ? irreducible : Words{},
                             {0x7e12028du, 0xe0702000u, 0x80020900u, end}});
     static uint64_t next_address = 0x5173000000ull;
     const uint64_t address = ++next_address;
