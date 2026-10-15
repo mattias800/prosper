@@ -7,6 +7,7 @@
 #include "gpu/recompiler/rdna2_saved_exec_data.hpp"
 #include "gpu/recompiler/rdna2_exec_spill_equality.hpp"
 
+#include <cstdint>
 #include <map>
 #include <set>
 #include <utility>

@@ -306,7 +306,7 @@ void advance_active_vector_words(ActiveVectorWords& state, const Rdna2Inst& in,
             // the result's. A zero operand enables no lane and constrains nothing: Kena's
             // `s_cselect_b64 vcc, exec, 0` (cs 0x5008e80000 pc299) is a subset of EXEC carrying
             // EXEC's words (#5181). Any other operand contributes only its own proven words.
-            result = zero_mask(in.src[0]) ? right
+            result = zero_mask(in.src[0])   ? right
                      : zero_mask(in.src[1]) ? left
                                             : intersect(left, right);
             has_result = true;

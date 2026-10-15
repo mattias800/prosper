@@ -381,7 +381,7 @@ void carry_spilled_mask_words(SpilledMaskHalves& state, const Rdna2Inst& in) {
     if (words != active.instances.end()) active.masks[pair] = words->second;
 }
 
-}  // namespace
+}   // namespace
 
 void advance_spilled_mask_halves(SpilledMaskHalves& state, const Rdna2Inst& in,
                                  const std::set<int>& masks, const std::set<int>& mask_slot_keys,
