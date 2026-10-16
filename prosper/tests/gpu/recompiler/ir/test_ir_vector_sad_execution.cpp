@@ -8,6 +8,7 @@
 #include <fstream>
 #include <ios>
 #include <string>
+#include <system_error>
 #include "gpu/recompiler/ir/ops/vector_ternary_integer.hpp"
 #include "gpu/recompiler/ir/builder.hpp"
 #include "gpu/recompiler/ir/eval.hpp"
@@ -186,6 +187,11 @@ TEST(IrVectorSadExecution, ExportsBothWaveFormsForTheCorpusGate) {
     const char* configured = std::getenv("PROSPER_IR_WITNESS_DIR");
     const fs::path root =
         configured ? fs::path(configured) : prosper_test::test_scratch_dir() / "sad-witness";
+    if (!configured) {
+        std::error_code error;
+        fs::remove_all(root, error);
+        ASSERT_FALSE(error) << error.message();
+    }
     ASSERT_FALSE(fs::exists(root)) << "witness export requires a new directory";
     ASSERT_TRUE(fs::create_directories(root));
     const fs::path dump = root / "refused_shaders_20000101-000000Z_synthetic";
