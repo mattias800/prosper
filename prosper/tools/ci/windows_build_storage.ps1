@@ -1,5 +1,6 @@
 #requires -Version 7.0
-# Read-only Windows CI storage measurements; no paths or file contents enter the report.
+# Windows CI storage measurements; only explicit synthetic probes are flushed.
+# No paths or file contents enter the report.
 param(
     [ValidateSet('before', 'after')][string]$Phase = 'after',
     [string]$CompilerTempDirectory,
@@ -84,7 +85,13 @@ function Get-TreeStorage {
 function Test-StorageProbe {
     param([string]$Path, [string]$Expected)
     $logical = (Get-Item -LiteralPath $Path).Length
+    $beforeFlush = [ProsperCiStorage]::Read($Path)
+    # Closing a cached writer does not establish persisted allocation. Flush only this
+    # workflow-owned synthetic control, never the build/cache/temporary roots we observe.
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+    try { $stream.Flush($true) } finally { $stream.Dispose() }
     $storage = [ProsperCiStorage]::Read($Path)
+    Write-Host "Storage control $Expected observed: logical=$logical before_flush=$beforeFlush storage=$storage"
     if ($logical -le 0) { throw 'Storage control must contain bytes' }
     if ($Expected -eq 'uncompressed' -and $storage -ne $logical) {
         throw 'Uncompressed storage control disagrees with logical size'
