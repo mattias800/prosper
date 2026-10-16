@@ -54,13 +54,18 @@ LaneInputs inputs(uint32_t seed) {
     }
     return in;
 }
-Known expected(const VectorOpDef& def, uint32_t source, Form f) {
+Known expected(const VectorOpDef& def, uint32_t source, Form f, uint32_t rsrc1) {
     if (f.abs) source &= 0x7fffffffu;
     if (f.neg) source ^= 0x80000000u;
     auto result = eval_vector_op(def, source, std::nullopt);
     if (!result) return {};
     float x = std::bit_cast<float>(*result);
-    if (f.scale) x *= f.scale == 1 ? 2.0f : f.scale == 2 ? 4.0f : 0.5f;
+    // AMD70648 section 6.2: either output-denorm enable or IEEE suppresses OMOD.
+    // The ordinary finite test values scale exactly; enabled OMOD canonicalizes -0.
+    if (f.scale && !(rsrc1 & ((0x20u << 12) | (1u << 23)))) {
+        x *= f.scale == 1 ? 2.0f : f.scale == 2 ? 4.0f : 0.5f;
+        if (x == 0.0f) x = 0.0f;
+    }
     if (f.clamp) {
         // With finite nonzero intermediate results, NMax(x,0) then NMin(x,1)
         // is unambiguous. Zero-sign ambiguity is a separate negative below.
@@ -69,8 +74,8 @@ Known expected(const VectorOpDef& def, uint32_t source, Form f) {
     }
     return std::bit_cast<uint32_t>(x);
 }
-void compare(const VectorOpDef& def, const LaneInputs& in, uint32_t wave, Form f = {}) {
-    const auto run = run_vector_op_per_lane(words(def.opcode, f), in, wave);
+void compare_run(const VectorOpDef& def, const LaneInputs& in, uint32_t wave, Form f,
+                 uint32_t rsrc1, const LaneRun& run) {
     ASSERT_TRUE(run.error.empty()) << run.error << " opcode " << def.opcode;
     ASSERT_EQ(run.d.size(), in.lanes());
     for (size_t lane = 0; lane < in.lanes(); ++lane) {
@@ -78,7 +83,7 @@ void compare(const VectorOpDef& def, const LaneInputs& in, uint32_t wave, Form f
                           : f.source == 242 ? 0x3f800000u
                           : f.source == 255 ? f.literal
                                             : in.s0[lane];
-        const auto want = in.active[lane] ? expected(def, source, f) : Known(in.old_d[lane]);
+        const auto want = in.active[lane] ? expected(def, source, f, rsrc1) : Known(in.old_d[lane]);
         if (!want) {
             ADD_FAILURE() << "opcode " << def.opcode << " lane " << lane;
             return;
@@ -86,6 +91,11 @@ void compare(const VectorOpDef& def, const LaneInputs& in, uint32_t wave, Form f
         EXPECT_EQ(run.d[lane], *want)
             << "opcode " << def.opcode << " wave " << wave << " lane " << lane;
     }
+}
+void compare(const VectorOpDef& def, const LaneInputs& in, uint32_t wave, Form f = {},
+             uint32_t rsrc1 = kDefaultComputePgmRsrc1) {
+    compare_run(def, in, wave, f, rsrc1,
+                run_vector_op_per_lane(words(def.opcode, f), in, wave, false, rsrc1));
 }
 }   // namespace
 TEST(IrVectorRoundFloatExecution, EveryNewFormMatchesDistinctActiveAndInactiveLanes) {
@@ -102,7 +112,8 @@ TEST(IrVectorRoundFloatExecution, SourceAndOutputModifiersMatchTheirNumericOrder
                 // Varying magnitudes keep this independent of the constant examples below.
                 for (size_t lane = 0; lane < in.lanes(); ++lane)
                     in.s0[lane] = std::bit_cast<uint32_t>(float(2 + lane % 16) + 0.25f);
-                compare(def, in, wave, form(n));
+                for (uint32_t rsrc1 : {0u, 0x30u << 12, 1u << 23})
+                    compare(def, in, wave, form(n), rsrc1);
             }
 }
 TEST(IrVectorRoundFloatExecution, DestinationAliasAndInlineOrLiteralInputsExecute) {
@@ -134,6 +145,51 @@ TEST(IrVectorRoundFloatExecution, HandWorkedIsaExamplesCoverEachNewOperationAndT
                 EXPECT_EQ(run.d[lane], in.active[lane] ? x.want : in.old_d[lane]);
         }
     }
+}
+TEST(IrVectorRoundFloatExecution, HandWorkedOutputModesDistinguishScalingSuppressionAndZero) {
+    struct Example {
+        uint32_t op, source, scale, plain, scaled;
+    };
+    // Worked independently from AMD70648 sections 6.2 and 12.8. FRACT(-1.25)=.75;
+    // TRUNC/CEIL(-1.75)=-1; FLOOR(-1.25)=-2; RNDNE(-.25)=-0.
+    // Half the minimum normal flushes; twice the maximum finite overflows to +Inf.
+    for (const auto x : {Example{0x1a0, 0xbfa00000, 1, 0x3f400000, 0x3fc00000},
+                         Example{0x1a0, 0x00800000, 3, 0x00800000, 0},
+                         Example{0x1a1, 0x7f7fffff, 1, 0x7f7fffff, 0x7f800000},
+                         Example{0x1a1, 0xbfe00000, 1, 0xbf800000, 0xc0000000},
+                         Example{0x1a2, 0xbfe00000, 1, 0xbf800000, 0xc0000000},
+                         Example{0x1a3, 0xbe800000, 1, 0x80000000, 0},
+                         Example{0x1a4, 0xbfa00000, 2, 0xc0000000, 0xc1000000},
+                         Example{0x1a4, 0x3fa00000, 3, 0x3f800000, 0x3f000000}})
+        for (uint32_t wave : {64u, 32u})
+            for (uint32_t rsrc1 : {0u, 0x30u << 12, 1u << 23}) {
+                auto in = inputs(5311);
+                std::fill(in.s0.begin(), in.s0.end(), x.source);
+                Form f;
+                f.scale = x.scale;
+                const auto run = run_vector_op_per_lane(words(x.op, f), in, wave, false, rsrc1);
+                ASSERT_TRUE(run.error.empty()) << run.error;
+                ASSERT_EQ(run.d.size(), in.lanes());
+                for (size_t lane = 0; lane < in.lanes(); ++lane)
+                    EXPECT_EQ(run.d[lane],
+                              in.active[lane] ? (rsrc1 ? x.plain : x.scaled) : in.old_d[lane])
+                        << "opcode " << x.op << " wave " << wave << " lane " << lane
+                        << " PGM_RSRC1 " << rsrc1;
+            }
+}
+TEST(IrVectorRoundFloatExecution, MissingLaunchModeRefusesOnlyAnActiveOutputScale) {
+    for (const auto& def : vector_round_float_defs())
+        for (uint32_t wave : {64u, 32u}) {
+            Form f;
+            f.scale = 1;
+            const auto scaled =
+                run_vector_op_per_lane(words(def.opcode, f), inputs(7), wave, false, UINT32_MAX);
+            EXPECT_NE(scaled.error.find("float-omod-launch-mode-unavailable"), std::string::npos)
+                << scaled.error;
+            const auto plain =
+                run_vector_op_per_lane(words(def.opcode), inputs(7), wave, false, UINT32_MAX);
+            EXPECT_TRUE(plain.error.empty()) << plain.error;
+        }
 }
 TEST(IrVectorRoundFloatExecution, HarnessAndEffectsRetainOneOwnedWordPerLane) {
     const auto in = inputs(97);
@@ -237,10 +293,11 @@ TEST(IrVectorRoundFloatExecution, NoncanonicalUnusedFieldsIncludingLiteralSelect
             EXPECT_TRUE(run_vector_op_per_lane(words(def.opcode), inputs(7)).error.empty());
         }
 }
-TEST(IrVectorRoundFloatExecution, ExistingUnadmittedUnaryFormsStayUnadmitted) {
+TEST(IrVectorRoundFloatExecution, NeighboringUnaryFamiliesKeepTheirCurrentAdmission) {
     for (uint32_t op : {0x1a5u, 0x1abu, 0x1afu, 0x1b7u}) {
         EXPECT_EQ(find_vector_round_float_op(Rdna2Format::VOP3, op), nullptr);
-        EXPECT_FALSE(run_vector_op_per_lane(words(op), inputs(7)).error.empty());
+        // Main already admits integer NOT through its own family (#5316).
+        EXPECT_EQ(run_vector_op_per_lane(words(op), inputs(7)).error.empty(), op == 0x1b7u);
     }
 }
 TEST(IrVectorRoundFloatExecution, AmbiguousClampedZeroRemainsAnOracleNegative) {
@@ -292,6 +349,22 @@ TEST(IrVectorRoundFloatExecution, ExportsEveryNewFormAndItsOldEncodingControls) 
                 const auto replay = replay_refused_shader_inputs(program.code, read);
                 ASSERT_TRUE(replay.produced) << replay.reject;
                 EXPECT_TRUE(replay.incomplete.empty()) << replay.incomplete;
+                // Execute this exact sidecar-replayed module before counting its admission.
+                auto in = inputs(37 + n);
+                for (size_t lane = 0; lane < in.lanes(); ++lane)
+                    in.s0[lane] = std::bit_cast<uint32_t>(float(2 + lane % 16) + 0.25f);
+                std::vector<uint32_t> buffer;
+                for (const auto* array : {&in.s0, &in.s1, &in.old_d})
+                    buffer.insert(buffer.end(), array->begin(), array->end());
+                for (bool active : in.active) buffer.push_back(active ? 1u : 0u);
+                bpermute_oracle::Interpreter vm(replay.spirv);
+                auto values = vm.run_buffers(64, {{3, buffer}}, 3);
+                ASSERT_TRUE(vm.error.empty())
+                    << vm.error << " opcode " << def.opcode << " wave " << wave << " form " << n;
+                ASSERT_GE(values.size(), in.lanes());
+                values.resize(in.lanes());
+                compare_run(def, in, wave, n == 36 ? Form{} : form(n),
+                            program.config.compute_pgm_rsrc1, {values, {}});
                 ++count;
             }
     EXPECT_EQ(count, 370u);
