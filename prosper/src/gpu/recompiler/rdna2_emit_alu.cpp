@@ -50,6 +50,7 @@
 #include "gpu/recompiler/ir/lower/vector_alu_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop1_integer_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_bitfield_lowering.hpp"
+#include "gpu/recompiler/ir/lower/vop3_align_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_ternary_integer_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_multiply_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_mad24_lowering.hpp"
@@ -1766,53 +1767,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             } else if (in.opcode == 0x15F) {   // v_div_fixup_f32
                 vreg[in.dst.value] = fresult(emit_v_div_fixup_f32(b, fv(0), fv(1), fv(2)));
             } else if (ir::lower_vop3_bitfield(b, rs, in, ok, allow_wave)) {
-            } else if (in.opcode == kVop3OpcodeAlignbitB32 ||
-                       in.opcode == kVop3OpcodeAlignbyteB32) {
-                // RDNA2 defines ALIGNBIT as
-                //   D = ({S0,S1} >> S2.u[4:0]) & 0xffffffff
-                // and ALIGNBYTE as the same 64-bit join shifted by 8*S2.u[4:0]. S0 is the high
-                // dword and S1 the low dword. Keep every emitted SPIR-V shift below 32:
-                // OpSelect is not short-circuiting, so even an apparently unused shift by 32 would
-                // be undefined. ALIGNBIT's masked bit count always remains in the joined low-dword
-                // domain; ALIGNBYTE additionally has the high-dword and zero-fill domains.
-                const bool modified = in.src_abs[0] || in.src_abs[1] || in.src_abs[2] ||
-                                      in.src_neg[0] || in.src_neg[1] || in.src_neg[2] ||
-                                      in.clamp || in.omod;
-                if (modified) {
-                    ok = false;
-                } else {
-                    const uint32_t s0 = val(in.src[0]);
-                    const uint32_t s1 = val(in.src[1]);
-                    const uint32_t count = b.ibin(
-                        Op_BitwiseAnd, val(in.src[2]), b.uconst(31));
-                    const uint32_t shift = in.opcode == kVop3OpcodeAlignbitB32
-                        ? count
-                        : b.ibin(Op_BitwiseAnd,
-                                 b.ibin(Op_ShiftLeftLogical, count, b.uconst(3)),
-                                 b.uconst(31));
-                    const uint32_t inv_shift = b.ibin(
-                        Op_BitwiseAnd, b.ibin(Op_ISub, b.uconst(32), shift),
-                        b.uconst(31));
-                    const uint32_t joined = b.ibin(
-                        Op_BitwiseOr, b.ibin(Op_ShiftRightLogical, s1, shift),
-                        b.ibin(Op_ShiftLeftLogical, s0, inv_shift));
-                    const uint32_t low = b.sel(
-                        b.ucmp(Op_IEqual, count, b.uconst(0)), s1, joined);
-                    if (in.opcode == kVop3OpcodeAlignbitB32) {
-                        vreg[in.dst.value] = low;
-                    } else {
-                        const uint32_t upper_byte = b.ibin(Op_ISub, count, b.uconst(4));
-                        const uint32_t upper_shift = b.ibin(
-                            Op_BitwiseAnd,
-                            b.ibin(Op_ShiftLeftLogical, upper_byte, b.uconst(3)),
-                            b.uconst(31));
-                        const uint32_t upper = b.ibin(Op_ShiftRightLogical, s0, upper_shift);
-                        vreg[in.dst.value] = b.sel(
-                            b.ucmp(Op_ULessThan, count, b.uconst(4)), low,
-                            b.sel(b.ucmp(Op_ULessThan, count, b.uconst(8)), upper,
-                                  b.uconst(0)));
-                    }
-                }
+            } else if (ir::lower_vop3_align(b, rs, in, ok, allow_wave)) {
             } else if (ir::lower_vop3_permute(b, rs, in, ok, allow_wave)) {
             } else if (in.opcode == kVop3OpcodeLshlrevB64) {   // v_lshlrev_b64
                 // GTA V constructs a per-lane bit as `1ull << lane` immediately after MBCNT. This
