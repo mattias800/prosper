@@ -39,6 +39,11 @@ Known evaluate_op(Opcode op, uint32_t imm, uint32_t a, uint32_t b, uint32_t c) {
         case Opcode::ConstTrue: return 1u;
         case Opcode::ConstFalse: return 0u;
         case Opcode::BoolAnd: return uint32_t(bool(a) && bool(b));
+        case Opcode::BoolOr: return uint32_t(bool(a) || bool(b));
+        case Opcode::F32UnordNe: {
+            const float x = std::bit_cast<float>(a), y = std::bit_cast<float>(b);
+            return uint32_t(std::isnan(x) || std::isnan(y) || x != y);
+        }
         case Opcode::F32Clamp01:
             return std::bit_cast<uint32_t>(
                 std::fmin(std::fmax(std::bit_cast<float>(a), 0.0f), 1.0f));

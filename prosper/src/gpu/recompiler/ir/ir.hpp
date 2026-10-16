@@ -73,6 +73,7 @@ enum class Opcode : uint8_t {
     F32NMin,
     F32NMax,   // raw binary32 bits -> raw bits
     BoolAnd,
+    BoolOr,
     F32Clamp01,
     PackHalfLo,
     FfbhU32, // leading zero count; all ones for a zero word
@@ -97,6 +98,7 @@ enum class Opcode : uint8_t {
     BfeS,
     UnpackHalf, // imm = component 0 or 1, raw binary16 -> binary32
     F32Ge,
+    F32UnordNe, // unordered-not-equal over raw binary32 words
 };
 
 struct OpcodeInfo {
