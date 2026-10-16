@@ -124,9 +124,9 @@ TEST(IrLowerVop3DivFixup, CallerKeepsExecVccSccAndTheFinalPredicate) {
     EXPECT_EQ(t.rs.scc, scc);
     EXPECT_GT(t.count(Op_Select), selects);
 }
-TEST(IrLowerVop3DivFixup, FusedFmaCarryAndForeignFormatsRemainUnmatched) {
-    for (auto in :
-         {instruction(0x14b), instruction(0x34b), instruction(0x176), instruction(0x02)}) {
+TEST(IrLowerVop3DivFixup, DivisionScaleFmasHalfAndForeignFormatsRemainUnmatched) {
+    for (auto in : {instruction(0x16d), instruction(0x16f), instruction(0x35f), instruction(0x176),
+                    instruction(0x02)}) {
         FloatFixup t;
         const auto before = t.code_words();
         EXPECT_FALSE(t.lower(in));
