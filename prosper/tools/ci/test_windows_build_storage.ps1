@@ -22,6 +22,15 @@ Assert-Equal ([ProsperCiStorage]::Decode([uint32]::MaxValue, 1, 0)) ([uint64]858
 Assert-Equal ([ProsperCiStorage]::Decode(0, 0, 0)) 0
 Assert-Throws { [ProsperCiStorage]::Decode([uint32]::MaxValue, 0, 5) } 'GetCompressedFileSizeW failed'
 
+# Exercise Windows path spelling on every host, independently of its filesystem/opt-in.
+$longDrivePath = 'C:\build\' + ('nested\' * 40) + 'output.obj'
+$longUncPath = '\\server\share\' + ('nested\' * 40) + 'output.obj'
+Assert-Equal ([ProsperCiStorage]::ExtendedPath($longDrivePath)) ('\\?\' + $longDrivePath)
+Assert-Equal ([ProsperCiStorage]::ExtendedPath($longUncPath)) ('\\?\UNC\' + $longUncPath.Substring(2))
+Assert-Equal ([ProsperCiStorage]::ExtendedPath('\\?\C:\build\output.obj')) '\\?\C:\build\output.obj'
+Assert-Equal ([ProsperCiStorage]::ExtendedPath('\\?\UNC\server\share\output.obj')) '\\?\UNC\server\share\output.obj'
+Assert-Equal ([ProsperCiStorage]::ExtendedPath('C:/build/output.obj')) '\\?\C:\build\output.obj'
+
 $scratch = Join-Path ([IO.Path]::GetTempPath()) ('prosper-storage-' + [guid]::NewGuid())
 try {
     New-Item -ItemType Directory -Path $scratch | Out-Null

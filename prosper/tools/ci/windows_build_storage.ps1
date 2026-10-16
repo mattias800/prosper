@@ -27,7 +27,16 @@ public static class ProsperCiStorage {
             throw new Win32Exception(error, "GetCompressedFileSizeW failed");
         return ((ulong)high << 32) | low;
     }
+    public static string ExtendedPath(string fullPath) {
+        // Read supplies an absolute path. Avoid depending on the host's long-path opt-in.
+        if (fullPath.StartsWith(@"\\?\", StringComparison.Ordinal)) return fullPath;
+        fullPath = fullPath.Replace('/', '\\');
+        if (fullPath.StartsWith(@"\\", StringComparison.Ordinal))
+            return @"\\?\UNC\" + fullPath.Substring(2);
+        return @"\\?\" + fullPath;
+    }
     public static ulong Read(string path) {
+        path = ExtendedPath(System.IO.Path.GetFullPath(path));
         SetLastError(0);
         uint high;
         uint low = GetCompressedFileSizeW(path, out high);
