@@ -7,7 +7,7 @@
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include "gpu/recompiler/storage_dst_sel.hpp"
-#include "gpu/recompiler/rdna2_dot.hpp"
+#include "gpu/recompiler/ir/lower/vop3p_integer_dot_lowering.hpp"
 #include "gpu/recompiler/rdna2_dpp_row_shr.hpp"
 #include "gpu/recompiler/ir/lower/vop3_sad_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_permute_lowering.hpp"
@@ -231,12 +231,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 predicate_write(b, rs, in.dst.value, old_d);
                 return true;
             }
-            if (in.opcode >= 0x14u && in.opcode <= 0x19u) {
-                const uint32_t old_d = vreg_old(b, rs, in.dst.value);
-                rs.vreg[in.dst.value] = emit_v_dot(b, rs, in, ok);
-                if (ok) predicate_write(b, rs, in.dst.value, old_d);
-                return true;
-            }
+            if (ir::lower_vop3p_integer_dot(b, rs, in, ok, allow_wave)) return true;
             // Mixed-precision FMA family, trivial form only (all sources full f32 — the decoder set
             // has_modifier for any opsel/neg/clamp bits, rejected above). v_fma_mix_f32 (0x20):
             // d = s0*s1+s2. v_fma_mixlo/hi_f16 (0x21/0x22): the f32 result converts to f16 into the
