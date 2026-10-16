@@ -1055,6 +1055,19 @@ int main(int argc, char** argv) {
     }
     { const uint32_t c[] = {0x06000300u, 0x10000500u, 0xBF810000u};
       dump(dir, "compute_alu", recompile_valu(c, 3, 3, 0), "recompile_valu"); }
+    // This VOP3 LSHL_ADD route calls the ordered IR input resolver; validate its containing module.
+    {
+        const uint32_t c[] = {
+            0x7e020281u,   // v_mov_b32 v1,1
+            0x7e040282u,   // v_mov_b32 v2,2
+            0x7e060283u,   // v_mov_b32 v3,3
+            0xd7460001u, 0x04060702u,   // v_lshl_add_u32 v1,v2,v3,v1
+            0xbf810000u,
+        };
+        dump(dir, "ir_ternary_input_resolver",
+             recompile_compute(c, std::size(c), nullptr, ComputeShaderConfig{}),
+             "emit_spirv_resolving_inputs");
+    }
     dump_numeric_mbcnt(dir);
     dump_numeric_wqm(dir);
     dump_numeric_wqm_sources(dir);

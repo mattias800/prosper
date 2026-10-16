@@ -6,6 +6,10 @@
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
 #include <gtest/gtest.h>
+#include "support/death_test.hpp"
+#include <cstddef>
+#include <cstdint>
+#include <vector>
 
 using namespace prosper::gpu;
 using namespace prosper::gpu::ir;
@@ -75,4 +79,44 @@ TEST(IrCore, EmissionFollowsBlockOrder) {
     EXPECT_LT(ids[first.index], ids[second.index]);
     EXPECT_LT(ids[second.index], ids[flag.index]);
     EXPECT_EQ(b.code.size() - before, 3u * 5u) << "three 5-word instructions";
+}
+
+TEST(IrCore, InputResolverPreservesConstantsAndInterveningOperations) {
+    SpirvCompute b;
+    b.begin(16, nullptr, 64, 1, 1, 64, 0);
+    Block block;
+    Builder ir(block);
+    const Value mask = ir.c32(0x13579bdf);
+    const Value first = ir.input(Type::U32);
+    const Value masked = ir.and_(first, mask);
+    const Value second = ir.input(Type::U32);
+    const Value d = ir.iadd(masked, second);
+    std::vector<size_t> code_sizes;
+    const auto ids = emit_spirv_resolving_inputs(b, block, [&](uint32_t slot) {
+        EXPECT_TRUE(b.uconst_cache.contains(0x13579bdf));
+        code_sizes.push_back(b.code.size());
+        return b.uconst(slot == 0 ? 59 : 62);
+    });
+    ASSERT_EQ(code_sizes.size(), 2u);
+    EXPECT_GT(code_sizes[1], code_sizes[0]);
+    EXPECT_NE(ids[d.index], 0u);
+}
+TEST(IrCore, MissingInputResolverIsLoudOnlyWhenThereAreInputs) {
+    EXPECT_DEATH(
+        {
+            prosper::test::suppress_coredump();
+            SpirvCompute b;
+            Block block;
+            Builder ir(block);
+            ir.input(Type::U32);
+            emit_spirv_resolving_inputs(b, block, {});
+        },
+        "input resolver missing");
+    SpirvCompute b;
+    b.begin(16, nullptr, 64, 1, 1, 64, 0);
+    Block block;
+    Builder ir(block);
+    const Value d = ir.c32(19);
+    const auto ids = emit_spirv_resolving_inputs(b, block, {});
+    EXPECT_EQ(ids[d.index], b.uconst_cache.at(19));
 }

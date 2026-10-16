@@ -1,8 +1,11 @@
 // spirv_emitter.cpp — the SPIR-V half of each IR opcode's definition (see ir.hpp).
 #include "gpu/recompiler/ir/emit/spirv_emitter.hpp"
+#include "gpu/recompiler/ir/ir.hpp"
 
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
+#include <span>
+#include <vector>
 #include <cstdio>
 #include <cstdlib>
 
@@ -81,13 +84,15 @@ uint32_t emit_one(SpirvCompute& b, const Inst& inst, const uint32_t* x) {
 
 } // namespace
 
-std::vector<uint32_t> emit_spirv(SpirvCompute& b, const Block& block,
-                                 std::span<const uint32_t> inputs) {
+namespace {
+template <class InputReader>
+std::vector<uint32_t> emit_block(SpirvCompute& b, const Block& block,
+                                 const InputReader& read_input) {
     std::vector<uint32_t> ids(block.size(), 0);
     for (size_t i = 0; i < block.size(); ++i) {
         const Inst& inst = block.insts()[i];
         if (inst.op == Opcode::Input) {
-            ids[i] = inst.imm < inputs.size() ? inputs[inst.imm] : 0;
+            ids[i] = read_input(inst.imm);
             continue;
         }
         uint32_t args[3] = {0, 0, 0};
@@ -96,6 +101,20 @@ std::vector<uint32_t> emit_spirv(SpirvCompute& b, const Block& block,
         ids[i] = emit_one(b, inst, args);
     }
     return ids;
+}
+}   // namespace
+std::vector<uint32_t> emit_spirv(SpirvCompute& b, const Block& block,
+                                 std::span<const uint32_t> inputs) {
+    return emit_block(b, block,
+                      [inputs](uint32_t slot) { return slot < inputs.size() ? inputs[slot] : 0; });
+}
+std::vector<uint32_t> emit_spirv_resolving_inputs(SpirvCompute& b, const Block& block,
+                                                  const SpirvInputResolver& read_input) {
+    if (block.input_count() && !read_input) {
+        std::fprintf(stderr, "[ir] input resolver missing\n");
+        std::abort();
+    }
+    return emit_block(b, block, read_input);
 }
 
 } // namespace prosper::gpu::ir

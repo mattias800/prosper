@@ -7,6 +7,7 @@
 #include "gpu/recompiler/ir/ir.hpp"
 
 #include <span>
+#include <functional>
 #include <vector>
 
 namespace prosper::gpu {
@@ -17,5 +18,11 @@ namespace prosper::gpu::ir {
 
 // Returns the SPIR-V id of every Value of `block`. `inputs[i]` is the id bound to input slot i.
 std::vector<uint32_t> emit_spirv(SpirvCompute& b, const Block& block, std::span<const uint32_t> inputs);
+
+// Resolve each input at its position in Block order. Unlike already-bound ids, this preserves
+// old operand_bits calls interleaved with constants/operations. The resolver must exist for inputs.
+using SpirvInputResolver = std::function<uint32_t(uint32_t)>;
+std::vector<uint32_t> emit_spirv_resolving_inputs(SpirvCompute& b, const Block& block,
+                                                  const SpirvInputResolver& read_input);
 
 } // namespace prosper::gpu::ir
