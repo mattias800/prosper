@@ -75,6 +75,7 @@
 #include <functional>
 #include "gpu/recompiler/ir/lower/vop1_conversion_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop1_float_source.hpp"
+#include "gpu/recompiler/ir/lower/vop3_half_integer_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop1_unary_float_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop1_unary_f16_lowering.hpp"
 
@@ -347,14 +348,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
             }
             ir::lower_vop1_float_source(b, in, a);
-            if ((in.opcode == 0x05 || in.opcode == 0x06) && in.sdwa_src0_sel <= 5) {
-                const uint32_t bits = in.sdwa_src0_sel <= 3 ? 8u : 16u;
-                const uint32_t offset = in.sdwa_src0_sel <= 3
-                    ? 8u * in.sdwa_src0_sel : 16u * (in.sdwa_src0_sel - 4u);
-                a = ((in.words[1] >> 19) & 1u)
-                    ? b.bfe_s(a, b.uconst(offset), b.uconst(bits))
-                    : b.bfe_u(a, b.uconst(offset), b.uconst(bits));
-            }
+            ir::select_vop1_conversion_source(b, in, a);
             ir::select_vop1_integer_source(b, in, a);
             if (in.opcode == 0x02) {   // v_readfirstlane_b32: SGPR dst = value of the lowest active lane
                 // Cross-lane broadcast. Our per-lane scalar model has no cross-lane reduction, so we use
@@ -1448,6 +1442,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             } else if (ir::lower_vop3_bit_utilities(b, rs, in, ok, allow_wave)) {
             } else if (ir::lower_vop3_binary_integer(b, rs, in, ok, allow_wave)) {
             } else if (ir::lower_vop3_unary_integer(b, rs, in, ok, allow_wave)) {
+            } else if (ir::lower_vop3_half_integer(b, rs, in, ok, allow_wave, old_d)) {
             } else if (ir::lower_vop3_ternary_integer(b, rs, in, ok, allow_wave)) {
                 // The common modifier and predicated destination stages still follow.
             } else if (in.opcode == 0x128 || in.opcode == 0x129 || in.opcode == 0x12A) {

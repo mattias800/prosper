@@ -90,3 +90,40 @@ TEST(IrLowerVop1Conversion, OtherOpcodesRemainWithTheCaller) {
         EXPECT_EQ(t.code_words(), before);
     }
 }
+
+TEST(IrLowerVop1Conversion, SelectsIntegerConversionSourcesBeforeAnyValueOrWrite) {
+    for (uint32_t op : {5u, 6u})
+        for (uint32_t selector = 0; selector < 6; ++selector)
+            for (bool sext : {false, true}) {
+                LoweringFixture t;
+                auto in = instruction(op);
+                in.sdwa_src0_sel = selector;
+                in.words[1] = sext ? 1u << 19 : 0;
+                const auto before = t.code_words();
+                const auto old = t.b.uconst(0x81234567);
+                auto a = old;
+                ir::select_vop1_conversion_source(t.b, in, a);
+                EXPECT_NE(a, old);
+                EXPECT_GT(t.code_words(), before);
+                EXPECT_TRUE(t.constant_cached(selector < 4 ? 8u : 16u));
+                EXPECT_TRUE(t.constant_cached(selector < 4 ? selector * 8 : (selector - 4) * 16));
+                EXPECT_TRUE(t.ok);
+                EXPECT_TRUE(t.rs.vreg.empty());
+            }
+}
+TEST(IrLowerVop1Conversion, SourceSelectionLeavesOtherOperationsAndDwordFormsUnchanged) {
+    for (uint32_t op : {0u, 1u, 5u, 6u, 7u, 8u, 0xbu, 0x38u, 0x50u, 0x52u, 0x53u})
+        for (uint32_t selector : {0u, 5u, 6u}) {
+            if ((op == 5 || op == 6) && selector != 6) continue;
+            LoweringFixture t;
+            auto in = instruction(op);
+            in.sdwa_src0_sel = selector;
+            const auto old = t.b.uconst(0x81234567);
+            const auto before = t.code_words();
+            auto a = old;
+            ir::select_vop1_conversion_source(t.b, in, a);
+            EXPECT_EQ(a, old);
+            EXPECT_EQ(t.code_words(), before);
+            EXPECT_TRUE(t.ok);
+        }
+}
