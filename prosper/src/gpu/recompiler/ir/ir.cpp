@@ -75,6 +75,7 @@ constexpr OpcodeInfo kInfo[] = {
     {"unpack.half", 1, Type::U32},
     {"f32.ge", 2, Type::Bool},
     {"f32.unord.ne", 2, Type::Bool},
+    {"f32.eq", 2, Type::Bool},
     {"f32.ldexp", 2, Type::U32},
     {"pack.norm16", 1, Type::U32},
 };
