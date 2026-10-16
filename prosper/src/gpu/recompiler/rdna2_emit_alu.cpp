@@ -65,6 +65,7 @@
 #include "gpu/recompiler/ir/lower/vop3_minmax_half_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_mad_float_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_binary_float_lowering.hpp"
+#include "gpu/recompiler/ir/lower/vop3_float_modifiers.hpp"
 #include "gpu/recompiler/ir/lower/vop3_legacy_mul_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_minmax_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_minmax_float_lowering.hpp"
@@ -1223,31 +1224,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 return true;
             }
             uint32_t old_d = vreg_old(b, rs, in.dst.value);
-            // Float source with its VOP3 modifiers applied: abs then a sign-bit-exact negate
-            // (hardware order neg(abs(x))). Returns raw bits (fbin/fext re-bitcast), so it's a
-            // drop-in for val() in the FLOAT ops only — integer VOP3 ops keep val() (modifiers are
-            // float-domain; assemblers don't set them on int ops).
-            auto fv = [&](int k) -> uint32_t {
-                uint32_t bits = val(in.src[k]);
-                if (in.src_abs[k]) bits = b.fext1(Glsl_FAbs, bits);
-                if (in.src_neg[k]) bits = b.fneg(bits);
-                return bits;
-            };
-            // Output modifiers on a FLOAT result: OMOD scale (×2/×4/×0.5) then CLAMP saturate to [0,1]
-            // (hardware order: clamp(omod(x))). Wrap each float op's result through this. Opcodes
-            // that route through it mark the CLAMP bit consumed; a set CLAMP on any opcode that
-            // does NOT (integer ops, cndmask, the pack family) means unmodeled INTEGER saturation
-            // (ISA 6.5) or an unhandled combination — the dispatch tail rejects it fail-visibly
-            // instead of silently dropping the saturation.
             bool clamp_routed = false;
-            auto fresult = [&](uint32_t bits) -> uint32_t {
-                clamp_routed = true;
-                if (in.omod == 1)      bits = b.fbin(Op_FMul, bits, b.uconst(fbits(2.0f)));
-                else if (in.omod == 2) bits = b.fbin(Op_FMul, bits, b.uconst(fbits(4.0f)));
-                else if (in.omod == 3) bits = b.fbin(Op_FMul, bits, b.uconst(fbits(0.5f)));
-                if (in.clamp) bits = b.clamp01(bits);
-                return bits;
-            };
+            ir::Vop3FloatModifiers modifiers{b, in, val, clamp_routed};
+            auto fv = [&](int k) { return modifiers.fv(k); };
+            auto fresult = [&](uint32_t bits) { return modifiers.fresult(bits); };
             if (ir::lower_vop3_pack16(b, rs, in, ok, allow_wave)) {
             } else if (ir::lower_vop3_minmax_half(b, rs, in, ok, allow_wave, old_d, fresult)) {
             } else if (in.opcode == 0x34B) {
