@@ -1,4 +1,5 @@
 // SPIR-V ordered equality must distinguish NaN from itself while matching both zero signs.
+// Incorrect zero detection can publish a NaN instead of the DX9 zero result.
 #include "gpu/recompiler/ir/builder.hpp"
 #include "gpu/recompiler/ir/eval.hpp"
 #include "gpu/recompiler/ir/ir.hpp"

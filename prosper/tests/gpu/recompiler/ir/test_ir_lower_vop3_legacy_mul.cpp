@@ -1,4 +1,5 @@
 // Preserve legacy multiply source order, DX9 zero selection and root-owned modifiers.
+// A lost zero selector or misplaced modifier can corrupt the published lane value.
 #include "gpu/recompiler/ir/lower/vop3_legacy_mul_lowering.hpp"
 #include "gpu/recompiler/ir/lowering_fixture.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -104,7 +105,9 @@ TEST(IrLowerVop3LegacyMul, SourceErrorsStillRunTheOriginalValueAndModifierStages
         EXPECT_EQ(t.count(Op_Select), 1u);
     }
 }
-TEST(IrLowerVop3LegacyMul, CallerKeepsExecVccSccAndTheFinalPredicate) {
+// This helper owns only the DX9 value select. The execution suite checks inactive-lane
+// publication through the root predicate; this direct call checks mask-state preservation.
+TEST(IrLowerVop3LegacyMul, HelperPreservesMaskStateAndOwnsOnlyTheDx9Select) {
     FloatLegacy t;
     t.rs.exec = t.b.bfalse();
     t.rs.exec_narrowed = true;

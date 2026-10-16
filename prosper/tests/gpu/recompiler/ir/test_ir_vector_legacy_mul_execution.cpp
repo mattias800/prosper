@@ -1,4 +1,5 @@
 // AMD70648 legacy multiply: real lane execution pins the DX9 zero rule and preserved modifiers.
+// A wrong product corrupts active outputs; a lost predicate overwrites inactive destinations.
 #include "gpu/recompiler/ir/ops/vector_legacy_mul.hpp"
 #include "gpu/recompiler/ir/ops/vector_ternary_integer.hpp"
 #include "gpu/recompiler/ir/eval.hpp"
