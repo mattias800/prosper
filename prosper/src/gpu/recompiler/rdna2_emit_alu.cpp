@@ -9,7 +9,7 @@
 #include "gpu/recompiler/storage_dst_sel.hpp"
 #include "gpu/recompiler/rdna2_dot.hpp"
 #include "gpu/recompiler/rdna2_dpp_row_shr.hpp"
-#include "gpu/recompiler/rdna2_sad.hpp"
+#include "gpu/recompiler/ir/lower/vop3_sad_lowering.hpp"
 #include "gpu/recompiler/rdna2_perm_b32.hpp"
 #include "gpu/recompiler/rdna2_div_fixup.hpp"
 #include "gpu/recompiler/rdna2_mad_64.hpp"
@@ -1765,21 +1765,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t p = b.ibin(Op_IMul, b.ibin(Op_BitwiseAnd, val(in.src[0]), m24),
                                               b.ibin(Op_BitwiseAnd, val(in.src[1]), m24));
                 vreg[in.dst.value] = b.ibin(Op_IAdd, p, val(in.src[2]));
-            } else if (in.opcode == 0x15A || in.opcode == 0x15B || in.opcode == 0x15C ||
-                       in.opcode == 0x171) {   // v_sad_u8 / v_sad_hi_u8 / v_sad_u16 / v_msad_u8
-                vreg[in.dst.value] = emit_v_sad_subword(b, rs, in, ok);
-            } else if (in.opcode == 0x15D) {   // v_sad_u32 = |s0-s1| (unsigned) + s2
-                // RDNA2 ISA (document 70648), V_SAD_U32: D.u32 = abs(S0.u32 - S1.u32) + S2.u32.
-                // The absolute difference is the UNSIGNED magnitude, so max-min is exact and cannot
-                // wrap (a signed abs would be wrong for operands straddling 0x80000000). Worms
-                // Armageddon's PSSL compiler emits the src1=0 accumulate form `v_sad_u32 vN, sM, 0,
-                // vN` as its vertex-shader index prologue; its shipped .ags shader assets carry the
-                // identical word. VERIFIED(llvm-mc gfx1030: VOP3 0x15d = v_sad_u32).
-                // CONFIDENCE: HIGH.
-                const uint32_t s0 = val(in.src[0]), s1 = val(in.src[1]);
-                const uint32_t diff = b.ibin(Op_ISub, b.uext2(Glsl_UMax, s0, s1),
-                                                       b.uext2(Glsl_UMin, s0, s1));
-                vreg[in.dst.value] = b.ibin(Op_IAdd, diff, val(in.src[2]));
+            } else if (ir::lower_vop3_sad(b, rs, in, ok, allow_wave)) {
             } else if (in.opcode == 0x15F) {   // v_div_fixup_f32
                 vreg[in.dst.value] = fresult(emit_v_div_fixup_f32(b, fv(0), fv(1), fv(2)));
             } else if (ir::lower_vop3_bitfield(b, rs, in, ok, allow_wave)) {
