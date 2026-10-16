@@ -58,6 +58,7 @@
 #include "gpu/recompiler/ir/lower/vop3_multiply_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_mad24_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_integer16_lowering.hpp"
+#include "gpu/recompiler/ir/lower/vop3_mad_float_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_minmax_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_minmax_float_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_ldexp_lowering.hpp"
@@ -1418,13 +1419,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                              b.ibin(Op_ShiftLeftLogical, r16, b.uconst(16)))
                     : b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)), r16);
             } else if (ir::lower_vop3_integer16(b, rs, in, ok, allow_wave, old_d)) {
-            } else if (in.opcode == 0x14B ||
-                       in.opcode == 0x141) {   // v_fma_f32 / v_mad_f32 = src0*src1 + src2
-                // v_mad_f32 (op 0x141) is a gfx10.1 (Navi) instruction REMOVED in gfx10.3, so llvm-mc
-                // -mcpu=gfx1030 rejects it as invalid — but the PS5 shader compiler targets gfx10.1 and
-                // emits it (real game shaders 5,26-29: manual attribute interpolation p0+i*p1). Its result
-                // (unfused mul-then-add) maps exactly to OpFMul+OpFAdd; v_fma's fused rounding is
-                // immaterial here. VERIFIED(round-trip llvm-mc gfx1010, both directions): VOP3 op 0x141.
+            } else if (ir::lower_vop3_mad_float(b, rs, in, ok, allow_wave, std::cref(fv),
+                                                std::cref(fresult))) {
+            } else if (in.opcode == 0x14B) {
+                // Legacy fused-FMA separate rounding remains unchanged pending #5225.
                 uint32_t m = b.fbin(Op_FMul, fv(0), fv(1));
                 vreg[in.dst.value] = fresult(b.fbin(Op_FAdd, m, fv(2)));
             } else if (in.opcode == 0x176 ||
