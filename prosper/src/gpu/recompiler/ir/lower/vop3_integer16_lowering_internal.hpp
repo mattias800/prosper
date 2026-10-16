@@ -11,6 +11,7 @@ public:
     bool lower();
 
 private:
+    uint32_t u16src(int k);
     decltype(RegState::vreg)& vreg;
     const uint32_t old_d;
 };
