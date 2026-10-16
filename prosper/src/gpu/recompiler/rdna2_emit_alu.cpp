@@ -55,6 +55,7 @@
 #include "gpu/recompiler/ir/lower/vector_alu_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop1_integer_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_unary_integer_lowering.hpp"
+#include "gpu/recompiler/ir/lower/vop3_float_integer_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_bitfield_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_align_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_ternary_integer_lowering.hpp"
@@ -73,6 +74,7 @@
 #include "gpu/recompiler/ir/lower/vop3_pack_norm_lowering.hpp"
 #include <functional>
 #include "gpu/recompiler/ir/lower/vop1_conversion_lowering.hpp"
+#include "gpu/recompiler/ir/lower/vop1_float_source.hpp"
 #include "gpu/recompiler/ir/lower/vop1_unary_float_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop1_unary_f16_lowering.hpp"
 
@@ -344,13 +346,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 }
             }
-            // SDWA float source modifiers on src0 (abs then neg). v_cvt_f32_f16 applies them after
-            // selecting and unpacking the requested half below; applying them to the packed u32 as
-            // though it were an f32 changes both the value and the selected sign bit.
-            if (in.opcode != 0x0B) {
-                if (in.src_abs[0]) a = b.fext1(Glsl_FAbs, a);
-                if (in.src_neg[0]) a = b.fbin(Op_FSub, b.uconst(0), a);
-            }
+            ir::lower_vop1_float_source(b, in, a);
             if ((in.opcode == 0x05 || in.opcode == 0x06) && in.sdwa_src0_sel <= 5) {
                 const uint32_t bits = in.sdwa_src0_sel <= 3 ? 8u : 16u;
                 const uint32_t offset = in.sdwa_src0_sel <= 3
@@ -1630,6 +1626,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 b.stage_reject_reason = reason;
                 ok = false;
             } else if (ir::lower_vop3_rtz_pack(b, rs, in, ok, allow_wave, fv)) {
+            } else if (ir::lower_vop3_float_integer(b, rs, in, ok)) {
             } else if (ir::lower_vop3_binary_float(b, rs, in, ok, allow_wave, fv, fresult)) {
             } else if (ir::lower_vop3_legacy_mul(b, rs, in, ok, allow_wave, fv, fresult)) {
             } else if (in.opcode == 0x101) {   // v_cndmask_b32_e64: src2_mask ? src1 : src0

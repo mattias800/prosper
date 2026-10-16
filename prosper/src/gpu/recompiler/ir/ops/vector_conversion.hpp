@@ -19,6 +19,8 @@ struct ConversionDef {
     uint32_t opcode;
     Value (*build)(Builder&, const ConversionIn&);
 };
+Value build_f32_to_u32_sat(Builder& ir, const ConversionIn& in);
+Value build_f32_to_i32_sat(Builder& ir, const ConversionIn& in);
 std::span<const ConversionDef> vector_conversion_defs();
 std::span<const ConversionDef> vector_half_integer_conversion_defs();
 const ConversionDef* find_vector_conversion_op(Rdna2Format fmt, uint32_t opcode);
