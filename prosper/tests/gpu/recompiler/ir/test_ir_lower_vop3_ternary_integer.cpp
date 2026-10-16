@@ -5,6 +5,8 @@
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <gtest/gtest.h>
 #include <cstddef>
+#include <array>
+#include <map>
 #include <cstdint>
 using namespace prosper::gpu;
 using namespace prosper::test::ir;
@@ -32,17 +34,38 @@ TEST(IrLowerVop3TernaryInteger, ShiftIsEmittedBeforeTheLaterSourceWordsAreRead) 
     ASSERT_TRUE(t.ok);
     ASSERT_TRUE(t.rs.vreg.contains(1));
     uint32_t and_result = 0;
+    std::map<uint32_t, std::array<uint32_t, 3>> result_ops;
     for (size_t pc = before; pc < t.b.code.size();) {
         const size_t count = t.b.code[pc] >> 16;
         ASSERT_NE(count, 0u);
         ASSERT_LE(count, t.b.code.size() - pc);
-        if ((t.b.code[pc] & 0xffffu) == Op_BitwiseAnd) and_result = t.b.code[pc + 2];
+        const uint32_t op = t.b.code[pc] & 0xffffu;
+        if (op == Op_BitwiseAnd || op == Op_ShiftLeftLogical || op == Op_ShiftRightLogical ||
+            op == Op_IAdd) {
+            ASSERT_EQ(count, 5u);
+            result_ops[t.b.code[pc + 2]] = {op, t.b.code[pc + 3], t.b.code[pc + 4]};
+        }
+        if (op == Op_BitwiseAnd) and_result = t.b.code[pc + 2];
         pc += count;
     }
     ASSERT_NE(and_result, 0u);
     EXPECT_LT(t.b.uconst_cache.at(61), and_result);
     EXPECT_LT(and_result, t.b.uconst_cache.at(62));
     EXPECT_LT(and_result, t.b.uconst_cache.at(59));
+    // Trace the actual destination, so merely emitting the right constants/operations cannot pass.
+    const uint32_t d = t.rs.vreg.at(1);
+    ASSERT_TRUE(result_ops.contains(d));
+    const auto add = result_ops.at(d);
+    EXPECT_EQ(add[0], Op_IAdd);
+    EXPECT_EQ(add[2], t.b.uconst_cache.at(62));
+    ASSERT_TRUE(result_ops.contains(add[1]));
+    const auto shift = result_ops.at(add[1]);
+    EXPECT_EQ(shift[0], Op_ShiftLeftLogical);
+    EXPECT_EQ(shift[1], t.b.uconst_cache.at(59));
+    EXPECT_EQ(shift[2], and_result);
+    const auto mask = result_ops.at(and_result);
+    EXPECT_EQ(mask[1], t.b.uconst_cache.at(61));
+    EXPECT_EQ(mask[2], t.b.uconst_cache.at(31));
 }
 TEST(IrLowerVop3TernaryInteger, ValueStageLeavesExecVccAndPredicationWithTheCaller) {
     LoweringFixture t;
