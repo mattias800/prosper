@@ -464,7 +464,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             return ir::lower_vop2(b, rs, in, ok, allow_wave);
         }
         case Rdna2Format::VOPC: {                                     // v_cmp_* -> VCC; v_cmpx_* also -> EXEC
-            return ir::lower_vopc(b, rs, in, ok, allow_exec_update);
+            return ir::lower_vopc(b, rs, in, ok, allow_wave, allow_exec_update);
         }
         case Rdna2Format::VOP3: {
             // SCALAR-SPILL lane slots (#273): v_writelane_b32 (0x361) / v_readlane_b32 (0x360) with a
