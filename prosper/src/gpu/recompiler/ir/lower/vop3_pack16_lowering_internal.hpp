@@ -2,6 +2,7 @@
 #pragma once
 #include "gpu/recompiler/ir/lower/lowering_context.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include <cstdint>
 namespace prosper::gpu::ir {
 class Vop3Pack16Lowering : LoweringContext {
 public:
@@ -10,6 +11,7 @@ public:
     bool lower();
 
 private:
+    uint32_t packed_half(int k);
     decltype(RegState::vreg)& vreg;
 };
 }   // namespace prosper::gpu::ir
