@@ -1,7 +1,6 @@
 // The packed integer helper owns both destination halves and its original predicate call.
 #include "gpu/recompiler/ir/lower/vop3p_packed_integer_lowering.hpp"
 #include "gpu/recompiler/ir/lowering_fixture.hpp"
-#include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
