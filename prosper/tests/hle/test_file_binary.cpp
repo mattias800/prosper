@@ -226,7 +226,14 @@ TEST(FileBinary, Contract) {
           "sceKernelCheckReachability finds a translated guest directory");
 #ifdef _WIN32
     CHECK(SetFileAttributesA(path, FILE_ATTRIBUTE_NORMAL),
-          "prepare a normal-attribute Windows chmod fixture");
+          "clear mutable attributes on the Windows chmod fixture");
+    // SetFileAttributes cannot clear NTFS compression inherited from the scratch directory.
+    // NORMAL is valid only alone; chmod must preserve the exact prepared writable state.
+    const DWORD writable_attributes = GetFileAttributesA(path);
+    ASSERT_TRUE(writable_attributes == FILE_ATTRIBUTE_NORMAL ||
+                writable_attributes == FILE_ATTRIBUTE_COMPRESSED);
+    const DWORD expected_readonly_attributes =
+        (writable_attributes & ~FILE_ATTRIBUTE_NORMAL) | FILE_ATTRIBUTE_READONLY;
     auto read_chmod_times = [&](FILETIME* access, FILETIME* modify) {
         HANDLE file = CreateFileA(path, FILE_READ_ATTRIBUTES,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -248,9 +255,8 @@ TEST(FileBinary, Contract) {
           "sceKernelChmod applies a mode to a translated guest directory");
 #ifdef _WIN32
     DWORD readonly_attributes = GetFileAttributesA(path);
-    CHECK((readonly_attributes & FILE_ATTRIBUTE_READONLY) != 0 &&
-              (readonly_attributes & FILE_ATTRIBUTE_NORMAL) == 0,
-          "Windows sceKernelChmod normalizes the read-only attribute set");
+    CHECK(readonly_attributes == expected_readonly_attributes,
+          "Windows sceKernelChmod sets only read-only and preserves compression");
 #endif
     CHECK(kernel_chmod_fn &&
               kernel_chmod_fn((uint64_t)(uintptr_t)reachable_file.c_str(), 0644, 0, 0, 0, 0) == 0 &&
@@ -258,11 +264,11 @@ TEST(FileBinary, Contract) {
           "sceKernelChmod restores writable fixture modes");
 #ifdef _WIN32
     FILETIME chmod_access_after{}, chmod_modify_after{};
-    CHECK(GetFileAttributesA(path) == FILE_ATTRIBUTE_NORMAL &&
+    CHECK(GetFileAttributesA(path) == writable_attributes &&
               read_chmod_times(&chmod_access_after, &chmod_modify_after) &&
               CompareFileTime(&chmod_access_before, &chmod_access_after) == 0 &&
               CompareFileTime(&chmod_modify_before, &chmod_modify_after) == 0,
-          "Windows sceKernelChmod restores normal attributes without changing timestamps");
+          "Windows sceKernelChmod restores writable attributes without changing timestamps");
 #endif
     int64_t chmod_fd = open_fn
         ? (int64_t)open_fn((uint64_t)(uintptr_t)reachable_file.c_str(), 0, 0, 0, 0, 0)
@@ -273,20 +279,19 @@ TEST(FileBinary, Contract) {
           "sceKernelFchmod makes an open file read-only");
 #ifdef _WIN32
     readonly_attributes = GetFileAttributesA(path);
-    CHECK((readonly_attributes & FILE_ATTRIBUTE_READONLY) != 0 &&
-              (readonly_attributes & FILE_ATTRIBUTE_NORMAL) == 0,
-          "Windows sceKernelFchmod normalizes the descriptor's read-only attribute");
+    CHECK(readonly_attributes == expected_readonly_attributes,
+          "Windows sceKernelFchmod sets only read-only and preserves compression");
 #endif
     CHECK(chmod_fd >= 0 && kernel_fchmod_fn &&
               kernel_fchmod_fn((uint64_t)chmod_fd, 0600, 0, 0, 0, 0) == 0,
           "sceKernelFchmod restores a writable descriptor mode");
 #ifdef _WIN32
     FILETIME fchmod_access_after{}, fchmod_modify_after{};
-    CHECK(GetFileAttributesA(path) == FILE_ATTRIBUTE_NORMAL &&
+    CHECK(GetFileAttributesA(path) == writable_attributes &&
               read_chmod_times(&fchmod_access_after, &fchmod_modify_after) &&
               CompareFileTime(&chmod_access_before, &fchmod_access_after) == 0 &&
               CompareFileTime(&chmod_modify_before, &fchmod_modify_after) == 0,
-          "Windows sceKernelFchmod restores normal attributes without changing timestamps");
+          "Windows sceKernelFchmod restores writable attributes without changing timestamps");
 #endif
     if (chmod_fd >= 0 && close_fn) close_fn((uint64_t)chmod_fd, 0, 0, 0, 0, 0);
 #ifndef _WIN32
