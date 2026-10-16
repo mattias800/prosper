@@ -59,6 +59,8 @@
 #include "gpu/recompiler/ir/lower/vop3_mad24_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_integer16_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_minmax_lowering.hpp"
+#include "gpu/recompiler/ir/lower/vop3_minmax_float_lowering.hpp"
+#include <functional>
 #include "gpu/recompiler/ir/lower/vop1_conversion_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop1_unary_float_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop1_unary_f16_lowering.hpp"
@@ -1498,26 +1500,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const uint32_t carry_masked = rs.exec_narrowed ? b.land(rs.exec, carry) : carry;
                 write_vop3b_carry_output(carry_masked);
             } else if (ir::lower_vop3_multiply(b, rs, in, ok, allow_wave)) {
-            } else if (in.opcode == 0x157) {   // v_med3_f32 = median(s0,s1,s2)
-                // ISA op 343: "if (isNan(S0) || isNan(S1) || isNan(S2)) D = V_MIN3_F32(S0,S1,S2)".
-                // The min/max legs use the NaN-aware NMin/NMax (return-the-other-operand), and the
-                // any-NaN case selects min3 explicitly — the plain max(min(...)) formula does not
-                // reproduce the documented NaN fallback on its own.
-                uint32_t s0 = fv(0), s1 = fv(1), s2 = fv(2);
-                uint32_t mn = b.fext2(Glsl_NMin, s0, s1), mx = b.fext2(Glsl_NMax, s0, s1);
-                uint32_t med = b.fext2(Glsl_NMax, mn, b.fext2(Glsl_NMin, mx, s2));
-                uint32_t min3 = b.fext2(Glsl_NMin, mn, s2);
-                uint32_t nan_any = b.lor(b.fcmp(Op_FUnordNotEqual, s0, s0),
-                                         b.lor(b.fcmp(Op_FUnordNotEqual, s1, s1),
-                                               b.fcmp(Op_FUnordNotEqual, s2, s2)));
-                vreg[in.dst.value] = fresult(b.sel(nan_any, min3, med));
+            } else if (in.opcode == 0x157 &&
+                       ir::lower_vop3_minmax_float(b, rs, in, ok, allow_wave, std::cref(fv),
+                                                   std::cref(fresult))) {
             } else if (ir::lower_vop3_minmax(b, rs, in, ok, allow_wave)) {
-            } else if (in.opcode == 0x151 || in.opcode == 0x154) {   // v_min3_f32 / v_max3_f32
-                // min/max of three floats (DOLL's AA-clamp PS). VERIFIED(round-trip llvm-mc gfx1010:
-                // VOP3 0x151 = v_min3_f32, 0x154 = v_max3_f32 — 0xd551…/0xd554…). NaN-aware NMin/
-                // NMax per the ISA one-NaN rule. CONFIDENCE: HIGH.
-                uint32_t op = in.opcode == 0x151 ? (uint32_t)Glsl_NMin : (uint32_t)Glsl_NMax;
-                vreg[in.dst.value] = fresult(b.fext2(op, b.fext2(op, fv(0), fv(1)), fv(2)));
+            } else if (ir::lower_vop3_minmax_float(b, rs, in, ok, allow_wave, std::cref(fv),
+                                                   std::cref(fresult))) {
             } else if (in.opcode == 0x368 || in.opcode == 0x369) {   // v_cvt_pknorm_{i16,u16}_f32
                 // Clamp and normalize two f32 values, then pack src0 in bits[15:0] and src1 in
                 // bits[31:16]. Astro's title ship VS uses the unsigned form (exact first word
