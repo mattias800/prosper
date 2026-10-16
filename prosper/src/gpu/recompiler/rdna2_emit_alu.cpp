@@ -11,6 +11,7 @@
 #include "gpu/recompiler/rdna2_dpp_row_shr.hpp"
 #include "gpu/recompiler/ir/lower/vop3_sad_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_permute_lowering.hpp"
+#include "gpu/recompiler/ir/lower/vop3_pack_saturate_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_pack16_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_bit_utilities_lowering.hpp"
 #include "gpu/recompiler/rdna2_div_fixup.hpp"
@@ -1527,13 +1528,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const uint32_t hi = b.pack_norm(fv(1), 16, is_signed, scale);
                 vreg[in.dst.value] = b.ibin(
                     Op_BitwiseOr, lo, b.ibin(Op_ShiftLeftLogical, hi, b.uconst(16)));
-            } else if (in.opcode == 0x36A) {   // v_cvt_pk_u16_u32
-                // Pack two u32 into u16 halves with UNSIGNED SATURATION: lo = min(s0,0xFFFF),
-                // hi = min(s1,0xFFFF); dst = lo | hi<<16. VERIFIED(round-trip llvm-mc gfx1010:
-                // VOP3 0x36a — 0xd76a…). CONFIDENCE: HIGH.
-                uint32_t lo = b.uext2(Glsl_UMin, val(in.src[0]), b.uconst(0xFFFFu));
-                uint32_t hi = b.uext2(Glsl_UMin, val(in.src[1]), b.uconst(0xFFFFu));
-                vreg[in.dst.value] = b.ibin(Op_BitwiseOr, lo, b.ibin(Op_ShiftLeftLogical, hi, b.uconst(16)));
+            } else if (ir::lower_vop3_pack_saturate(b, rs, in, ok, allow_wave)) {
             } else if (in.opcode == 0x362) {   // v_ldexp_f32
                 // AMD opcode 866: D.f = S0.f * 2**S1.i. The exact GTA V production packet is
                 // d7620000,0002030d (`v_ldexp_f32 v0,v13,v1`) with no modifiers. Admit that proven
