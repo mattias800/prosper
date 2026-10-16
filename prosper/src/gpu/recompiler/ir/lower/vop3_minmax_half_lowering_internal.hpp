@@ -1,5 +1,6 @@
 // Construction captures the previous destination without inserting a new register.
 #pragma once
+#include <cstdint>
 #include "gpu/recompiler/ir/lower/lowering_context.hpp"
 #include "gpu/recompiler/ir/lower/vop3_minmax_half_lowering.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"

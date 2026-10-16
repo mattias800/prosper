@@ -1,7 +1,9 @@
 // Native half extrema mechanically relocated; source selection and destination merging stay here.
+#include "gpu/recompiler/ir/ops/vector_ternary_integer.hpp"
 #include "gpu/recompiler/ir/lower/vop3_minmax_half_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_minmax_half_lowering_internal.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
+#include "gpu/recompiler/ir/ops/vector_minmax_half.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <cstdint>
@@ -9,7 +11,8 @@
 #include <cstdlib>
 namespace prosper::gpu::ir {
 bool Vop3MinmaxHalfLowering::lower() {
-    if (in.opcode != 0x351 && in.opcode != 0x354 && in.opcode != 0x357) return false;
+    const auto* def = find_vector_minmax_half_op(in.fmt, in.opcode);
+    if (!def) return false;
     if (!fresult) {
         std::fprintf(stderr, "[ir] half extrema callback missing\n");
         std::abort();
@@ -37,36 +40,8 @@ bool Vop3MinmaxHalfLowering::lower() {
         if (in.src_neg[k]) value = b.fneg(value);
         return value;
     };
-    uint32_t result = 0;
-    if (in.opcode == 0x351) {                     // v_min3_f16
-        // ISA op 849 is a plain nested min — `V_MIN_F16(V_MIN_F16(S0,S1),S2)` — with
-        // NO any-NaN clause of the kind op 855 v_med3_f16 carries. NMin already
-        // matches V_MIN_F16's own one-NaN rule (return the other operand), so the
-        // bare chain is the whole contract. CONFIDENCE: HIGH.
-        result = b.fext2(Glsl_NMin, b.fext2(Glsl_NMin, f16src(0), f16src(1)), f16src(2));
-    } else if (in.opcode == 0x354) {                     // v_max3_f16
-        // ISA op 852, likewise: `V_MAX_F16(V_MAX_F16(S0,S1),S2)`, no NaN clause.
-        result = b.fext2(Glsl_NMax, b.fext2(Glsl_NMax, f16src(0), f16src(1)), f16src(2));
-    } else {                                             // v_med3_f16
-        // ISA op 855 opens with a SEPARATE any-NaN clause, exactly as op 343
-        // v_med3_f32 does (see 0x157 below — same structure, only the width differs):
-        //   if (isNan(S0) || isNan(S1) || isNan(S2)) D.f16 = V_MIN3_F16(S0,S1,S2)
-        // The plain max(min(...)) median formula does NOT reproduce that fallback on
-        // its own, so the clause is emitted explicitly. It is not academic: Sonic
-        // Racing: CrossWorlds' NaN-safe saturate idiom `v_med3_f16 v3, 1.0, v5, 0`
-        // (#2013) with S1 = NaN must yield MIN3(1.0,NaN,0) = 0.0h, where the bare
-        // formula yields 1.0h — black rendered as white. Kernel 32r10n pins it.
-        // The min/max legs use NaN-aware NMin/NMax because V_MIN_F16/V_MAX_F16 return
-        // the OTHER operand when exactly one input is NaN. CONFIDENCE: HIGH.
-        const uint32_t x = f16src(0), y = f16src(1), z = f16src(2);
-        const uint32_t mn = b.fext2(Glsl_NMin, x, y), mx = b.fext2(Glsl_NMax, x, y);
-        const uint32_t med = b.fext2(Glsl_NMax, mn, b.fext2(Glsl_NMin, mx, z));
-        const uint32_t min3 = b.fext2(Glsl_NMin, mn, z);
-        const uint32_t nan_any =
-            b.lor(b.fcmp(Op_FUnordNotEqual, x, x),
-                  b.lor(b.fcmp(Op_FUnordNotEqual, y, y), b.fcmp(Op_FUnordNotEqual, z, z)));
-        result = b.sel(nan_any, min3, med);
-    }
+    uint32_t result =
+        emit_ternary_integer_op(b, *def, [&](uint32_t k) { return f16src(static_cast<int>(k)); });
     result = fresult(result);
     uint32_t r16 = b.pack_half_lo(result);
     vreg[in.dst.value] =

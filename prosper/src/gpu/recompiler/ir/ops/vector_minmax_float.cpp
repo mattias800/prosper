@@ -9,15 +9,14 @@
 #include <cstdint>
 #include <span>
 namespace prosper::gpu::ir {
-namespace {
 using In = TernaryInputs;
-Value min3(Builder& ir, const In& x) {
+Value build_float_min3(Builder& ir, const In& x) {
     return ir.f32nmin(ir.f32nmin(x.s0(), x.s1()), x.s2());
 }
-Value max3(Builder& ir, const In& x) {
+Value build_float_max3(Builder& ir, const In& x) {
     return ir.f32nmax(ir.f32nmax(x.s0(), x.s1()), x.s2());
 }
-Value med3(Builder& ir, const In& x) {
+Value build_float_med3(Builder& ir, const In& x) {
     const Value s0 = x.s0(), s1 = x.s1(), s2 = x.s2();
     const Value mn = ir.f32nmin(s0, s1), mx = ir.f32nmax(s0, s1);
     const Value med = ir.f32nmax(mn, ir.f32nmin(mx, s2));
@@ -26,9 +25,10 @@ Value med3(Builder& ir, const In& x) {
         ir.boolor_(ir.f32unordne(s0, s0), ir.boolor_(ir.f32unordne(s1, s1), ir.f32unordne(s2, s2)));
     return ir.select(nan_any, min3, med);
 }
-constexpr MinmaxFloatDef kDefs[] = {{Rdna2Format::VOP3, 0x151, min3},
-                                    {Rdna2Format::VOP3, 0x154, max3},
-                                    {Rdna2Format::VOP3, 0x157, med3}};
+namespace {
+constexpr MinmaxFloatDef kDefs[] = {{Rdna2Format::VOP3, 0x151, build_float_min3},
+                                    {Rdna2Format::VOP3, 0x154, build_float_max3},
+                                    {Rdna2Format::VOP3, 0x157, build_float_med3}};
 }   // namespace
 std::span<const MinmaxFloatDef> vector_minmax_float_defs() {
     return kDefs;
