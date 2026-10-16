@@ -1,5 +1,5 @@
 // AMD70648 12.12 u32_to_u16 packing: saturation boundaries, independent per-lane
-// operands and partial EXEC. AMD's earlier ISA explicitly clamps overflowing inputs toffff.
+// operands and partial EXEC. AMD's earlier ISA explicitly clamps overflowing inputs to 0xffff.
 #include "gpu/diagnostics/refused_shader_inputs.hpp"
 #include "fixtures/test_scratch.h"
 #include "gpu/recompiler/ir/ops/vector_pack_saturate.hpp"
