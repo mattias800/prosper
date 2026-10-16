@@ -24,6 +24,8 @@ uint32_t emit_one(SpirvCompute& b, const Inst& inst, const uint32_t* x) {
         case Opcode::F32UnordNe: return b.fcmp(Op_FUnordNotEqual, x[0], x[1]);
         case Opcode::F32Clamp01: return b.clamp01(x[0]);
         case Opcode::F32Ldexp: return b.ldexp_f32_bits(x[0], x[1]);
+        case Opcode::PackNorm16:
+            return b.pack_norm(x[0], 16, inst.imm == 1, inst.imm == 1 ? 32767.0f : 65535.0f);
         case Opcode::PackHalfLo: return b.pack_half_lo(x[0]);
         case Opcode::F32Add: return b.fbin(Op_FAdd, x[0], x[1]);
         case Opcode::F32Sub: return b.fbin(Op_FSub, x[0], x[1]);

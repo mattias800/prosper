@@ -1085,6 +1085,45 @@ jobs:
           key: ccache-windows-mingw-${{ runner.os }}-${{ github.sha }}
           restore-keys: ccache-windows-mingw-${{ runner.os }}-
 
+      # The full static Debug build exhausted the hosted disk before tests (#5276).
+      # NTFS directory compression preserves debug information and all build/test inputs.
+      - name: Prepare compressed build storage
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $buildDir = Join-Path $env:GITHUB_WORKSPACE 'prosper/build-ci'
+          if (Test-Path -LiteralPath $buildDir) {
+            throw 'Expected a fresh build directory before configuring'
+          }
+          New-Item -ItemType Directory -Path $buildDir | Out-Null
+          $driveName = (Get-Item -LiteralPath $buildDir).PSDrive.Name
+          Get-PSDrive -Name $driveName | Select-Object Name, Used, Free | Format-Table
+
+          # Qualify the attribute check against an explicitly uncompressed fresh file.
+          & compact.exe /U $buildDir
+          if ($LASTEXITCODE -ne 0) { throw "compact /U failed: $LASTEXITCODE" }
+          $probeDir = Join-Path $buildDir 'compression-inheritance-control'
+          New-Item -ItemType Directory -Path $probeDir | Out-Null
+          $probeFile = Join-Path $probeDir 'probe.txt'
+          [IO.File]::WriteAllText($probeFile, ('compression-control' * 4096))
+          if ((Get-Item -LiteralPath $probeFile).Attributes -band [IO.FileAttributes]::Compressed) {
+            throw 'Uncompressed control unexpectedly reports compression'
+          }
+          Remove-Item -LiteralPath $probeDir -Recurse
+
+          # /C marks the directory for inheritance; /EXE does not. Never ignore errors (/I).
+          & compact.exe /C $buildDir
+          if ($LASTEXITCODE -ne 0) { throw "compact /C failed: $LASTEXITCODE" }
+          New-Item -ItemType Directory -Path $probeDir | Out-Null
+          [IO.File]::WriteAllText($probeFile, ('compression-control' * 4096))
+          foreach ($item in @($buildDir, $probeDir, $probeFile)) {
+            if (-not ((Get-Item -LiteralPath $item).Attributes -band [IO.FileAttributes]::Compressed)) {
+              throw 'Build-directory compression did not propagate to a new child'
+            }
+          }
+          Remove-Item -LiteralPath $probeDir -Recurse
+          Write-Host 'Compression controls passed: uncompressed file refused, new child inherited'
+
       - name: Configure
         shell: msys2 {0}
         run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE -DPROSPER_DIAGNOSTICS=ON -DPython3_EXECUTABLE="$(cygpath -m "$PWD/.venv/Scripts/python.exe")"
@@ -1093,6 +1132,18 @@ jobs:
         id: build
         shell: msys2 {0}
         run: cmake --build prosper/build-ci
+
+      - name: Report build storage
+        if: ${{ always() && (steps.build.outcome == 'success' || steps.build.outcome == 'failure') }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $buildDir = Join-Path $env:GITHUB_WORKSPACE 'prosper/build-ci'
+          $driveName = (Get-Item -LiteralPath $buildDir).PSDrive.Name
+          Get-PSDrive -Name $driveName | Select-Object Name, Used, Free | Format-Table
+          $files = Get-ChildItem -LiteralPath $buildDir -Recurse -File -Force
+          $size = ($files | Measure-Object -Property Length -Sum).Sum
+          Write-Host "Build files: $($files.Count); logical bytes: $size"
 
       - name: Test
         shell: msys2 {0}
