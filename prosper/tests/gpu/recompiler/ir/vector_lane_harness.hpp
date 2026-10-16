@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <utility>
 
 namespace prosper::test::ir {
 
@@ -68,10 +69,15 @@ inline uint64_t lane_harness_address() {
     return next.fetch_add(0x100, std::memory_order_relaxed);
 }
 
-inline LaneRun run_vector_op_per_lane(const std::vector<uint32_t>& op_words, const LaneInputs& in,
-                                      uint32_t wave = 64, bool half_rte_preserve_denorm = false) {
+// Shared by execution and the opt-in synthetic witness exporter: identical code and inputs.
+struct LaneProgram {
+    std::vector<uint32_t> code;
+    prosper::gpu::ShaderResourceTable table;
+    prosper::gpu::ComputeShaderConfig config;
+};
+inline LaneProgram lane_program(const std::vector<uint32_t>& op_words, uint32_t lanes,
+                                uint32_t wave) {
     using namespace prosper::gpu;
-    const uint32_t lanes = static_cast<uint32_t>(in.lanes());
     const auto load = [&](uint32_t vdata, uint32_t array) -> std::vector<uint32_t> {
         // buffer_load_dword vN, v0 (idxen), s[8:11], offset = array * lanes * 4 bytes
         return {0xe0302000u | (array * lanes * 4u), 0x80020000u | (vdata << 8)};
@@ -104,8 +110,17 @@ inline LaneRun run_vector_op_per_lane(const std::vector<uint32_t>& op_words, con
     config.dispatch_launch.num_thread = {lanes, 1, 1};
     config.dispatch_launch.dimensions = {1, 1, 1};
 
+    return {std::move(code), std::move(table), std::move(config)};
+}
+
+inline LaneRun run_vector_op_per_lane(const std::vector<uint32_t>& op_words, const LaneInputs& in,
+                                      uint32_t wave = 64, bool half_rte_preserve_denorm = false) {
+    using namespace prosper::gpu;
+    const uint32_t lanes = static_cast<uint32_t>(in.lanes());
+    const auto program = lane_program(op_words, lanes, wave);
+    const auto& code = program.code;
     const uint64_t address = lane_harness_address();
-    const auto module = recompile_compute(code.data(), code.size(), &table, config,
+    const auto module = recompile_compute(code.data(), code.size(), &program.table, program.config,
                                           {RecompileDiagnosticStage::Compute, address});
     if (module.empty()) return {{}, "refused: " + last_terminal_reject_reason(address)};
     std::vector<uint32_t> buffer;
