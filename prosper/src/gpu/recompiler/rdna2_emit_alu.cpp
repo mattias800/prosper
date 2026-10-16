@@ -49,6 +49,7 @@
 #include "gpu/recompiler/ir/lower/scalar_alu_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vector_alu_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop1_integer_lowering.hpp"
+#include "gpu/recompiler/ir/lower/vop3_bitfield_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_ternary_integer_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_multiply_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_minmax_lowering.hpp"
@@ -1781,16 +1782,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 vreg[in.dst.value] = b.ibin(Op_IAdd, diff, val(in.src[2]));
             } else if (in.opcode == 0x15F) {   // v_div_fixup_f32
                 vreg[in.dst.value] = fresult(emit_v_div_fixup_f32(b, fv(0), fv(1), fv(2)));
-            } else if (in.opcode == 0x148 || in.opcode == 0x149) {   // v_bfe_u32 / v_bfe_i32
-                uint32_t off = b.ibin(Op_BitwiseAnd, val(in.src[1]), b.uconst(31));
-                uint32_t cnt = b.ibin(Op_BitwiseAnd, val(in.src[2]), b.uconst(31));
-                vreg[in.dst.value] = (in.opcode == 0x148) ? b.bfe_u(val(in.src[0]), off, cnt)
-                                                          : b.bfe_s(val(in.src[0]), off, cnt);
-            } else if (in.opcode == 0x14A) {   // v_bfi_b32 = (s0&s1)|(~s0&s2)
-                uint32_t s0 = val(in.src[0]);
-                uint32_t t1 = b.ibin(Op_BitwiseAnd, s0, val(in.src[1]));
-                uint32_t t2 = b.ibin(Op_BitwiseAnd, b.iun(Op_Not, s0), val(in.src[2]));
-                vreg[in.dst.value] = b.ibin(Op_BitwiseOr, t1, t2);
+            } else if (ir::lower_vop3_bitfield(b, rs, in, ok, allow_wave)) {
             } else if (in.opcode == kVop3OpcodeAlignbitB32 ||
                        in.opcode == kVop3OpcodeAlignbyteB32) {
                 // RDNA2 defines ALIGNBIT as
