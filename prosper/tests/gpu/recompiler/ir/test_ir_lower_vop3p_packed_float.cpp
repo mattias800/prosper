@@ -5,7 +5,6 @@
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "support/death_test.hpp"
 #include <gtest/gtest.h>
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <set>
