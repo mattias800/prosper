@@ -769,34 +769,13 @@ void decode_operands(Rdna2Inst& i) {
                     break;
                 default: break;
             }
-            // The 0x30F/0x310/0x319 _co_ forms produce carry/borrow in SDST but do not consume a
-            // carry-in. Their reserved SRC2 field commonly decodes as s0; exposing that phantom
-            // operand makes CFG provenance reject a valid instruction when s0 differs across a
-            // join, before the instruction can replace it with its fresh carry result.
-            // The no-carry-in VOP3B family above and several VOP3A operations have two explicit
-            // sources. Their reserved SRC2 bits commonly decode as s0 unless cleared here.
-            // Exposing that phantom scalar read can make CFG/provenance analysis reject an otherwise
-            // valid instruction when s0 differs across a merge, before the opcode emitter is reached.
-            if (emitted_vop3_opcode_has_two_data_sources(i.opcode)) {
-                i.src[2] = {};
-                i.n_src = 2;
-            }
-            // Ordinary binary data forms consume no SRC2. Use the shared effects rather than
-            // another opcode inventory. Existing carry/mask cases already have n_src=2 above;
-            // exclude partial, wide, accumulating, relative and cross-lane effects here.
-            const auto& binary_effects = rdna2_instruction_effects(i.fmt, i.opcode);
-            if (i.fmt == Rdna2Format::VOP3 && i.n_src == 3 && ((d1 >> 18) & 0x1ffu) == 0 &&
-                binary_effects.describes_vector_result() &&
-                binary_effects.lane_flow == Rdna2LaneFlow::LaneWise &&
-                binary_effects.vdst_dwords == 1 && !binary_effects.vdst_half &&
-                !binary_effects.accumulates && !binary_effects.implicit_reads &&
-                !binary_effects.implicit_writes &&
-                binary_effects.m0_relative == Rdna2M0Relative::None &&
-                rdna2_valu_source_count(i.fmt, i.opcode) == 2 &&
-                binary_effects.ssrc_dwords[0] == 1 && binary_effects.ssrc_dwords[1] == 1 &&
-                binary_effects.ssrc_dwords[2] == 0) {
-                i.src[2] = {};
-                i.n_src = 2;
+            // Encoded SRC0-SRC2 slots are not all architectural operands. Use the ISA effects
+            // table for their arity, independently of which operations the emitter supports.
+            // Unknown/reserved and interpolation shapes conservatively retain
+            // all three fields through rdna2_valu_source_count.
+            if (i.fmt == Rdna2Format::VOP3) {
+                i.n_src = rdna2_valu_source_count(i.fmt, i.opcode);
+                for (uint32_t source = i.n_src; source < 3; ++source) i.src[source] = {};
             }
             // Scalar 16-bit VOP3 operations: OPSEL[2:0] selects each packed source half and OPSEL[3]
             // selects the destination half. Reuse the packed-op selector field for this family.

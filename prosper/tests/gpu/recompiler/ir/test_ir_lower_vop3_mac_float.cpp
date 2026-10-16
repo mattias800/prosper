@@ -66,7 +66,7 @@ TEST(IrLowerVop3MacFloat, TwoExplicitSourcesAndAnImplicitAccumulatorKeepTheOldSt
     EXPECT_EQ(e.lane_flow, Rdna2LaneFlow::LaneWise);
     EXPECT_EQ(e.vdst_dwords, 1u);
     EXPECT_FALSE(e.vdst_half);
-    EXPECT_EQ(rdna2_valu_source_count(Rdna2Format::VOP3, 0x11f), 3u);
+    EXPECT_EQ(rdna2_valu_source_count(Rdna2Format::VOP3, 0x11f), 2u);
     ASSERT_TRUE(t.lower(instruction()));
     ASSERT_TRUE(t.ok);
     EXPECT_EQ(t.reads.size(), 2u);

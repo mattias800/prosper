@@ -216,28 +216,6 @@ inline constexpr uint32_t kVop3OpcodeAndOrB32 = 0x371;
 inline constexpr uint32_t kVop3OpcodeLdexpF32 = 0x362;
 inline constexpr uint32_t kVop3OpcodeBfmB32 = 0x363;
 
-// VOP3 reserves three encoded source fields even for operations with only two explicit data
-// sources. Keep the complete inventory for every currently emitted two-source operation here so
-// the decoder never exposes reserved bits as a phantom scalar dependency to control-flow or
-// resource analysis. Unsupported opcodes retain all three fields and remain fail-closed.
-inline constexpr bool emitted_vop3_opcode_has_two_data_sources(uint32_t opcode) {
-    return (opcode >= 0x103u && opcode <= 0x105u) ||
-           opcode == 0x107u || opcode == 0x108u || opcode == 0x10fu || opcode == 0x110u ||
-           opcode == kVop3OpcodeMacF32 || opcode == 0x12fu ||
-           opcode == kVop3OpcodeMulLoU32 ||
-           opcode == kVop3OpcodeMulHiU32 || opcode == kVop3OpcodeMulHiI32 ||
-           opcode == kVop3OpcodeLshlrevB64 || opcode == kVop3OpcodeLshrrevB64 ||
-           opcode == kVop3OpcodeAddCoU32 || opcode == kVop3OpcodeSubCoU32 ||
-           opcode == kVop3OpcodeSubrevCoU32 ||
-           (opcode >= 0x303u && opcode <= 0x305u) ||
-           (opcode >= 0x307u && opcode <= 0x30eu) ||
-           opcode == 0x311u || opcode == 0x314u ||
-           opcode == 0x360u || opcode == 0x361u ||
-           opcode == kVop3OpcodeLdexpF32 || opcode == kVop3OpcodeBfmB32 ||
-           opcode == 0x364u || opcode == 0x365u || opcode == 0x366u ||
-           opcode == 0x368u || opcode == 0x369u || opcode == 0x36au;
-}
-
 // GFX10.3 DS cross-lane/float-atomic opcodes shared by decode-side write accounting, control-flow
 // admission, and emission. These inline constants compile to the same immediate comparisons as raw
 // literals.

@@ -224,3 +224,23 @@ TEST(NativeMaskParticipation, SaveexecFormsPreserveExactOriginalExeczContract) {
         EXPECT_TRUE(e.proof(genuine).contains(genuine.producer_pc)) << std::hex << opcode;
     }
 }
+
+// The helper counts only encoded sources. Missing/hard old VDST still poisons a later mask
+// through the existing accumulates transfer, while a genuine full overwrite replaces that word.
+TEST(NativeMaskParticipation, AccumulatorsKeepTheirSeparateOldDestinationDependency) {
+    for (uint32_t op : {0x11fu, 0x12bu})
+        for (int mode = 0; mode < 4; ++mode) {
+            Entry e;
+            if (mode != 0) e.rs.vreg[1] = e.b.uconst(0x3f800000);
+            if (mode == 1 || mode == 3) e.rs.vreg_source_marks[1].hard = true;
+            fixture::Program p;
+            if (mode == 3)
+                p.words.push_back(0x7e020280u); // Complete genuine overwrite of old v1.
+            p.words.insert(p.words.end(), {0xd4000001u | (op << 16), 0x00020100u});
+            p.producer_pc = static_cast<uint32_t>(p.words.size());
+            // The native proof returns named scalar-pair mask sites, not the e32 Special VCC.
+            p.words.insert(p.words.end(), {0xd4c50014u, 0x00020280u, 0xbf810000u});   // s[20:21].
+            EXPECT_EQ(e.proof(p).contains(p.producer_pc), mode >= 2)
+                << "op=" << op << " mode=" << mode;
+        }
+}

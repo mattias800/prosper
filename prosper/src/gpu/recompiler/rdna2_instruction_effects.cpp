@@ -1482,10 +1482,10 @@ uint32_t rdna2_valu_complete_result_dwords(const Rdna2Inst& in) {
 
 uint32_t rdna2_valu_source_count(Rdna2Format fmt, uint32_t opcode) {
     const Rdna2InstructionEffects& e = rdna2_instruction_effects(fmt, opcode);
-    // Unknown, accumulators (a VOP3 MAC/FMAC encodes its old VDST in the SRC2 field) and the
-    // interpolation forms (an attribute field, not a register) keep every field.
-    if (!e.describes_vector_result() || e.accumulates || e.lane_flow == Rdna2LaneFlow::Interpolate)
-        return 3;
+    // Unknown and interpolation forms (an attribute field, not a register) keep every field.
+    // Accumulators read old VDST through e.accumulates, independently of encoded source fields.
+    // Their widths already describe the explicit sources (ISA 70648 12.7: D = S0*S1 + D).
+    if (!e.describes_vector_result() || e.lane_flow == Rdna2LaneFlow::Interpolate) return 3;
     uint32_t count = 0;
     for (uint32_t source = 0; source < 3; ++source)
         if (e.ssrc_dwords[source]) count = source + 1;

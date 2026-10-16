@@ -143,10 +143,21 @@ TEST(IrLowerVop3BinaryInteger, DecoderUsesActualBinaryDataSourcesAndPreservesOth
         EXPECT_EQ(in.n_src, 2u);
         EXPECT_EQ(in.src[2].kind, OperandKind::None);
     }
-    // Carry-in, DIV_SCALE, wide MAD, partial FMA, cross-lane and relative shapes keep their fields.
-    for (uint32_t op : {0x128u, 0x16du, 0x176u, 0x34bu, 0x377u, 0x1c2u, 0x270u}) {
+    // Carry-in, DIV_SCALE, wide MAD, accumulating FMA and cross-lane forms have three sources.
+    for (uint32_t op : {0x128u, 0x16du, 0x176u, 0x34bu, 0x377u, 0x270u}) {
         const auto in = LoweringFixture::decode({0xd4000001u | (op << 16), 0x00020702u});
         EXPECT_EQ(in.n_src, 3u) << "opcode " << op;
+    }
+    // Relative MOV is architecturally unary. Correct decoding grants no lowering/proof authority.
+    for (uint32_t op : {0x181u, 0x1c2u}) {
+        const auto unary = LoweringFixture::decode({0xd4000001u | (op << 16), 0x00020702u});
+        EXPECT_EQ(unary.n_src, 1u);
+        EXPECT_EQ(unary.src[1].kind, OperandKind::None);
+        EXPECT_EQ(unary.src[2].kind, OperandKind::None);
+        LoweringFixture t;
+        EXPECT_FALSE(lower(t, unary));
+        EXPECT_TRUE(t.ok);
+        EXPECT_TRUE(t.rs.vreg.empty());
     }
     const auto carry = LoweringFixture::decode({0xd70f0001u, 0x00020702u});
     EXPECT_EQ(carry.n_src, 2u);   // The existing carry-out inventory remains unchanged.
