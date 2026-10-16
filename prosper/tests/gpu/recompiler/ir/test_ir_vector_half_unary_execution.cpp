@@ -1,5 +1,7 @@
 // VOP1 f16 unary math: actual per-lane emitted SPIR-V against the shared definitions,
 // with an explicit RTE/denormal-preserving half oracle. Driver/native-unit bits are not claimed.
+#include "gpu/diagnostics/refused_shader_inputs.hpp"
+#include "fixtures/test_scratch.h"
 #include "gpu/recompiler/ir/builder.hpp"
 #include "gpu/recompiler/ir/eval.hpp"
 #include "gpu/recompiler/ir/ir.hpp"
@@ -11,9 +13,15 @@
 #include "gpu/resources/shader_resources.hpp"
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <ios>
+#include <string>
 #include <optional>
 #include <set>
 #include <vector>
@@ -36,12 +44,18 @@ uint32_t source_half(uint32_t word, bool high) {
 }
 struct Mode {
     bool sdwa, src_high, dst_high;
+    bool src_dword = false;
 };
+constexpr std::array kModes{Mode{false, false, false},    Mode{true, false, false},
+                            Mode{true, false, true},      Mode{true, true, false},
+                            Mode{true, true, true},       Mode{true, false, false, true},
+                            Mode{true, false, true, true}};
 std::vector<uint32_t> words(uint32_t opcode, Mode m) {
     if (!m.sdwa) return {vop1(opcode)};
-    // VOP1 SDWA: WORD source, WORD destination + UNUSED_PRESERVE, v2 as SRC0.
+    // VOP1 SDWA: WORD/DWORD source, WORD destination + UNUSED_PRESERVE, v2 as SRC0.
+    const uint32_t src_select = m.src_dword ? 6u : m.src_high ? 5u : 4u;
     return {vop1(opcode, kVdst, 249),
-            ((m.src_high ? 5u : 4u) << 16) | ((0x10u | (m.dst_high ? 5u : 4u)) << 8) | kVsrc0};
+            (src_select << 16) | ((0x10u | (m.dst_high ? 5u : 4u)) << 8) | kVsrc0};
 }
 }   // namespace
 TEST(IrVectorHalfUnaryExecution, AllDefinitionsMatchEachLaneInPlainAndWordSdwaForms) {
@@ -50,8 +64,7 @@ TEST(IrVectorHalfUnaryExecution, AllDefinitionsMatchEachLaneInPlainAndWordSdwaFo
         for (uint32_t wave : {64u, 32u})
             for (uint32_t seed = 1; seed <= 3; ++seed) {
                 const auto in = unary_half_inputs(seed * 5232);
-                for (Mode mode : {Mode{false, false, false}, Mode{true, true, false},
-                                  Mode{true, false, true}}) {
+                for (Mode mode : kModes) {
                     const auto run =
                         run_vector_op_per_lane(words(def.opcode, mode), in, wave, true);
                     ASSERT_TRUE(run.error.empty()) << run.error;
@@ -146,4 +159,46 @@ TEST(IrVectorHalfUnaryExecution, UnknownOrUnspecifiedValuesAreNotGuessed) {
         EXPECT_TRUE(eval_vector_op(def, 0x3fa00000, std::nullopt));
         EXPECT_FALSE(eval_vector_op(def, 0x7fc00001, std::nullopt));
     }
+}
+
+// Optional exporter, using exactly the execution harness's programs and resource/launch inputs:
+// PROSPER_IR_WITNESS_DIR=~/... test_ir_vector_half_unary_execution
+//   --gtest_filter=IrVectorHalfUnaryExecution.ExportsAllEncodingFormsForTheCorpusGate
+// Harvest its refused_shaders_* child with recompile_corpus.py, then compare both builds.
+// A new directory is mandatory; this never overwrites an existing corpus or artifact.
+TEST(IrVectorHalfUnaryExecution, ExportsAllEncodingFormsForTheCorpusGate) {
+    namespace fs = std::filesystem;
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): this test process never mutates its launch environment.
+    const char* configured = std::getenv("PROSPER_IR_WITNESS_DIR");
+    const fs::path root =
+        configured ? fs::path(configured) : prosper_test::test_scratch_dir() / "half-unary-witness";
+    ASSERT_FALSE(fs::exists(root)) << "witness export requires a new directory";
+    ASSERT_TRUE(fs::create_directories(root));
+    const fs::path dump = root / "refused_shaders_20000101-000000Z_synthetic";
+    ASSERT_TRUE(fs::create_directory(dump));
+    size_t count = 0;
+    for (const auto& def : vector_half_unary_defs())
+        for (uint32_t wave : {64u, 32u})
+            for (Mode mode : kModes) {
+                const auto program = lane_program(words(def.opcode, mode), 64, wave);
+                const uint64_t address = 0x4938000000ull + count * 0x100;
+                const fs::path stem =
+                    dump / ("cs_" + std::to_string(address) + "_" + std::to_string(count));
+                std::ofstream bin(stem.string() + ".bin", std::ios::binary);
+                bin.write(reinterpret_cast<const char*>(program.code.data()),
+                          static_cast<std::streamsize>(program.code.size() * sizeof(uint32_t)));
+                bin.close();
+                ASSERT_TRUE(bin.good());
+                const fs::path inputs = stem.string() + ".inputs";
+                ASSERT_TRUE(write_refused_compute_inputs(inputs, address, &program.table,
+                                                         program.config,
+                                                         "synthetic-witness (no live refusal)"));
+                const auto read = read_refused_shader_inputs(inputs);
+                ASSERT_TRUE(read.incomplete.empty()) << read.incomplete;
+                const auto replay = replay_refused_shader_inputs(program.code, read);
+                ASSERT_TRUE(replay.produced) << replay.reject << " op " << def.opcode;
+                EXPECT_TRUE(replay.incomplete.empty()) << replay.incomplete;
+                ++count;
+            }
+    EXPECT_EQ(count, 12u * 7u * 2u);
 }
