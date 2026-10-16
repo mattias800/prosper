@@ -1,5 +1,6 @@
 // eval.cpp — the evaluation half of each IR opcode's definition (see ir.hpp).
 #include "gpu/recompiler/ir/eval.hpp"
+#include "gpu/recompiler/ir/eval_conversion.hpp"
 #include "gpu/recompiler/ir/eval_half.hpp"
 #include "gpu/recompiler/ir/eval_float_unary.hpp"
 
@@ -74,6 +75,13 @@ Known evaluate_op(Opcode op, uint32_t imm, uint32_t a, uint32_t b, uint32_t c) {
         case Opcode::F32Sqrt:
         case Opcode::F32Sin:
         case Opcode::F32Cos: return evaluate_float_unary(op, a);
+        case Opcode::I32ToF32:
+        case Opcode::U32ToF32:
+        case Opcode::F32ToU32Sat:
+        case Opcode::F32ToI32Sat:
+        case Opcode::BfeS:
+        case Opcode::UnpackHalf:
+        case Opcode::F32Ge: return evaluate_conversion(op, imm, a, b, c);
         case Opcode::IAdd: return a + b;
         case Opcode::ISub: return a - b;
         case Opcode::IMul: return a * b;

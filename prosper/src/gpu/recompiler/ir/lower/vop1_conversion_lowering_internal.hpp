@@ -1,5 +1,7 @@
 // Original emit_alu locals under their original names, without constructor side effects.
 #pragma once
+#include <cstdint>
+#include <optional>
 #include "gpu/recompiler/ir/lower/vop1_conversion_lowering.hpp"
 namespace prosper::gpu::ir {
 struct Vop1ConversionContext {

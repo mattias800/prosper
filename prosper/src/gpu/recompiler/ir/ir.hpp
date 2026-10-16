@@ -88,6 +88,14 @@ enum class Opcode : uint8_t {
     F32Sqrt,
     F32Sin,
     F32Cos,
+    // Numeric conversions (raw binary32 words); saturating float-to-int matches SpirvCompute.
+    I32ToF32,
+    U32ToF32,
+    F32ToU32Sat,
+    F32ToI32Sat,
+    BfeS,
+    UnpackHalf, // imm = component 0 or 1, raw binary16 -> binary32
+    F32Ge,
 };
 
 struct OpcodeInfo {

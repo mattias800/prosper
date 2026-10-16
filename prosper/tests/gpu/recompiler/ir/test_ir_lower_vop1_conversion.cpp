@@ -2,6 +2,8 @@
 #include "gpu/recompiler/ir/lower/vop1_conversion_lowering.hpp"
 #include "gpu/recompiler/ir/lowering_fixture.hpp"
 #include <gtest/gtest.h>
+#include <cstdint>
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include <optional>
 using namespace prosper::gpu;
 using namespace prosper::test::ir;

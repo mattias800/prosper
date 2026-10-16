@@ -37,6 +37,13 @@ uint32_t emit_one(SpirvCompute& b, const Inst& inst, const uint32_t* x) {
         case Opcode::F32Sqrt: return b.fext1(Glsl_Sqrt, x[0]);
         case Opcode::F32Sin: return b.fext1(Glsl_Sin, x[0]);
         case Opcode::F32Cos: return b.fext1(Glsl_Cos, x[0]);
+        case Opcode::I32ToF32: return b.cvt_i2f(x[0]);
+        case Opcode::U32ToF32: return b.cvt_u2f(x[0]);
+        case Opcode::F32ToU32Sat: return b.cvt_f2u(x[0]);
+        case Opcode::F32ToI32Sat: return b.cvt_f2i(x[0]);
+        case Opcode::BfeS: return b.bfe_s(x[0], x[1], x[2]);
+        case Opcode::UnpackHalf: return b.unpack_half(x[0], inst.imm);
+        case Opcode::F32Ge: return b.fcmp(Op_FOrdGreaterThanEqual, x[0], x[1]);
         case Opcode::IAdd: return b.ibin(Op_IAdd, x[0], x[1]);
         case Opcode::ISub: return b.ibin(Op_ISub, x[0], x[1]);
         case Opcode::IMul: return b.ibin(Op_IMul, x[0], x[1]);
