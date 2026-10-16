@@ -8,6 +8,15 @@
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 namespace prosper::gpu::ir {
+void select_vop1_conversion_source(SpirvCompute& b, const Rdna2Inst& in, uint32_t& a) {
+    if ((in.opcode == 0x05 || in.opcode == 0x06) && in.sdwa_src0_sel <= 5) {
+        const uint32_t bits = in.sdwa_src0_sel <= 3 ? 8u : 16u;
+        const uint32_t offset =
+            in.sdwa_src0_sel <= 3 ? 8u * in.sdwa_src0_sel : 16u * (in.sdwa_src0_sel - 4u);
+        a = ((in.words[1] >> 19) & 1u) ? b.bfe_s(a, b.uconst(offset), b.uconst(bits))
+                                       : b.bfe_u(a, b.uconst(offset), b.uconst(bits));
+    }
+}
 std::optional<bool> Vop1ConversionLowering::route_half_integer() {
     // 16-bit integer <-> f16 converts (plain e32 form). CrossWorlds' post chain hits
     // v_cvt_u16_f16 at ten sites per boot (#2013); the other three are the same family and

@@ -260,3 +260,28 @@ TEST(IrVectorConversionExecution, UnknownHalfNaNsAndInvalidComponentsAreNotGuess
         },
         "half component out of range");
 }
+
+TEST(IrVectorConversionExecution, IntegerSourceSelectionsKeepUnsignedAndSignedWidths) {
+    // AMD70648 SDWA selects and extends before CVT. These exact IEEE words represent
+    // 103,69,35,129,17767,33059 and 103,69,35,-127,17767,-32477 respectively.
+    const uint32_t unsigned_bits[] = {0x42ce0000, 0x428a0000, 0x420c0000,
+                                      0x43010000, 0x468ace00, 0x47012300};
+    const uint32_t signed_bits[] = {0x42ce0000, 0x428a0000, 0x420c0000,
+                                    0xc2fe0000, 0x468ace00, 0xc6fdba00};
+    auto in = lane_inputs(5317);
+    std::fill(in.s0.begin(), in.s0.end(), 0x81234567);
+    for (bool sext : {false, true})
+        for (uint32_t selector = 0; selector < 6; ++selector)
+            for (uint32_t wave : {32u, 64u}) {
+                const uint32_t opcode = sext ? 5u : 6u;
+                auto op = sdwa(opcode, selector, 6, false);
+                if (sext) op[1] |= 1u << 19;
+                const auto run = run_vector_op_per_lane(op, in, wave, true);
+                ASSERT_TRUE(run.error.empty()) << run.error;
+                ASSERT_EQ(run.d.size(), in.lanes());
+                for (size_t lane = 0; lane < in.lanes(); ++lane)
+                    ASSERT_EQ(run.d[lane], in.active[lane] ? (sext ? signed_bits[selector]
+                                                                   : unsigned_bits[selector])
+                                                           : in.old_d[lane]);
+            }
+}
