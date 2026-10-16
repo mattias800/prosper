@@ -16,6 +16,21 @@ Value build_f32_to_u32_sat(Builder& ir, const ConversionIn& x) {
 Value build_f32_to_i32_sat(Builder& ir, const ConversionIn& x) {
     return ir.f32_to_i32_sat(x.s0);
 }
+Value build_conversion_off_f32_i4(Builder& ir, const ConversionIn& x) {
+    return ir.f32mul(ir.i32_to_f32(ir.bfe_s(x.s0, ir.c32(0), ir.c32(4))), ir.c32(0x3d800000));
+}
+Value build_conversion_ubyte0_f32(Builder& ir, const ConversionIn& x) {
+    return ir.u32_to_f32(ir.bfe_u(x.s0, ir.c32(0), ir.c32(8)));
+}
+Value build_conversion_ubyte1_f32(Builder& ir, const ConversionIn& x) {
+    return ir.u32_to_f32(ir.bfe_u(x.s0, ir.c32(8), ir.c32(8)));
+}
+Value build_conversion_ubyte2_f32(Builder& ir, const ConversionIn& x) {
+    return ir.u32_to_f32(ir.bfe_u(x.s0, ir.c32(16), ir.c32(8)));
+}
+Value build_conversion_ubyte3_f32(Builder& ir, const ConversionIn& x) {
+    return ir.u32_to_f32(ir.bfe_u(x.s0, ir.c32(24), ir.c32(8)));
+}
 Value build_half_to_u16_sat(Builder& ir, const ConversionIn& x) {
     const Value f = ir.unpack_half(x.s0, 0);
     const Value result = ir.umin(ir.f32_to_u32_sat(f), ir.c32(0xffff));
@@ -45,18 +60,11 @@ constexpr ConversionDef kDefs[] = {
          return ir.f32_to_i32_sat(rounded);
      }},
     {F::VOP1, 0x0d, [](Builder& ir, const In& x) { return ir.f32_to_i32_sat(ir.f32floor(x.s0)); }},
-    {F::VOP1, 0x0e,
-     [](Builder& ir, const In& x) {
-         return ir.f32mul(ir.i32_to_f32(ir.bfe_s(x.s0, ir.c32(0), ir.c32(4))), ir.c32(0x3d800000));
-     }},
-    {F::VOP1, 0x11,
-     [](Builder& ir, const In& x) { return ir.u32_to_f32(ir.bfe_u(x.s0, ir.c32(0), ir.c32(8))); }},
-    {F::VOP1, 0x12,
-     [](Builder& ir, const In& x) { return ir.u32_to_f32(ir.bfe_u(x.s0, ir.c32(8), ir.c32(8))); }},
-    {F::VOP1, 0x13,
-     [](Builder& ir, const In& x) { return ir.u32_to_f32(ir.bfe_u(x.s0, ir.c32(16), ir.c32(8))); }},
-    {F::VOP1, 0x14,
-     [](Builder& ir, const In& x) { return ir.u32_to_f32(ir.bfe_u(x.s0, ir.c32(24), ir.c32(8))); }},
+    {F::VOP1, 0x0e, build_conversion_off_f32_i4},
+    {F::VOP1, 0x11, build_conversion_ubyte0_f32},
+    {F::VOP1, 0x12, build_conversion_ubyte1_f32},
+    {F::VOP1, 0x13, build_conversion_ubyte2_f32},
+    {F::VOP1, 0x14, build_conversion_ubyte3_f32},
 };
 constexpr ConversionDef kHalfIntegerDefs[] = {
     {F::VOP1, 0x50,
