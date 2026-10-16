@@ -32,6 +32,19 @@ if(MINGW OR (WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU"))
   add_link_options(-static -static-libgcc -static-libstdc++)
 endif()
 
+# Host-storage profile for Windows CI (#5276). A depth-one link pool alone still exhausts
+# storage. Flush each completed executable without changing its bytes or Debug information;
+# the native compressed probe qualifies the same operation before the build begins.
+option(PROSPER_WINDOWS_FLUSH_LINK_OUTPUT "Flush completed Windows CI executable links" OFF)
+if(PROSPER_WINDOWS_FLUSH_LINK_OUTPUT)
+  if(NOT WIN32 OR NOT MINGW)
+    message(FATAL_ERROR "PROSPER_WINDOWS_FLUSH_LINK_OUTPUT requires Windows MinGW")
+  endif()
+  find_program(PWSH_EXECUTABLE NAMES pwsh HINTS "$ENV{ProgramFiles}/PowerShell/7" REQUIRED)
+  include(cmake/FlushLinkedOutput.cmake)
+  prosper_flush_link_outputs("${PWSH_EXECUTABLE}")
+endif()
+
 # Windows: an executable that HOSTS A GUEST opts out of high-entropy bottom-up ASLR (#4426).
 #
 # With IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA set (the default for current binutils and for

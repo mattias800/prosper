@@ -88,8 +88,7 @@ function Test-StorageProbe {
     $beforeFlush = [ProsperCiStorage]::Read($Path)
     # Closing a cached writer does not establish persisted allocation. Flush only this
     # workflow-owned synthetic control, never the build/cache/temporary roots we observe.
-    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
-    try { $stream.Flush($true) } finally { $stream.Dispose() }
+    & "$PSScriptRoot/flush_link_output.ps1" -OutputFile $Path
     $storage = [ProsperCiStorage]::Read($Path)
     Write-Host "Storage control $Expected observed: logical=$logical before_flush=$beforeFlush storage=$storage"
     if ($logical -le 0) { throw 'Storage control must contain bytes' }

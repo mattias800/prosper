@@ -1138,7 +1138,8 @@ jobs:
 
       - name: Configure
         shell: msys2 {0}
-        run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE -DPROSPER_DIAGNOSTICS=ON -DPython3_EXECUTABLE="$(cygpath -m "$PWD/.venv/Scripts/python.exe")"
+        # Bound concurrent large Debug links while retaining all targets and debug information.
+        run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_JOB_POOLS=windows_ci_link=1 -DCMAKE_JOB_POOL_LINK=windows_ci_link -DPROSPER_WINDOWS_FLUSH_LINK_OUTPUT=ON -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE -DPROSPER_DIAGNOSTICS=ON -DPython3_EXECUTABLE="$(cygpath -m "$PWD/.venv/Scripts/python.exe")"
 
       - name: Build
         id: build
