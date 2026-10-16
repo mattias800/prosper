@@ -1,5 +1,6 @@
 // Pin the relocated VOP3 value stage: source-read order, register insertion and caller-owned stages.
 #include "gpu/recompiler/ir/lower/vop3_ternary_integer_lowering.hpp"
+#include "gpu/recompiler/ir/ops/vector_ternary_integer.hpp"
 #include "gpu/recompiler/ir/lowering_fixture.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
@@ -106,4 +107,45 @@ TEST(IrLowerVop3TernaryInteger, OtherFormatsAndReservedOpcodesStayWithTheCaller)
         EXPECT_TRUE(t.rs.vreg.empty());
         EXPECT_EQ(t.code_words(), before);
     }
+}
+TEST(IrLowerVop3TernaryInteger, UnsupportedModifiersRefuseBeforeOperandMaterialization) {
+    for (const auto& def : ir::vector_ternary_integer_defs()) {
+        for (unsigned flag = 0; flag < 13; ++flag) {
+            LoweringFixture t;
+            auto in = instruction(def.opcode);
+            if (flag < 3)
+                in.src_abs[flag] = true;
+            else if (flag < 6)
+                in.src_neg[flag - 3] = true;
+            else if (flag < 9)
+                in.omod = static_cast<uint8_t>(flag - 5);
+            else
+                in.words[0] |= 1u << (flag + 2);
+            const auto before = t.code_words();
+            ASSERT_TRUE(ir::lower_vop3_ternary_integer(t.b, t.rs, in, t.ok, false));
+            EXPECT_FALSE(t.ok) << "opcode " << def.opcode << " modifier " << flag;
+            EXPECT_TRUE(t.rs.vreg.empty());
+            EXPECT_EQ(t.code_words(), before);
+            for (uint32_t value : {59u, 61u, 62u}) EXPECT_FALSE(t.constant_cached(value));
+        }
+        LoweringFixture plain;
+        ASSERT_TRUE(ir::lower_vop3_ternary_integer(plain.b, plain.rs, instruction(def.opcode),
+                                                   plain.ok, false));
+        EXPECT_TRUE(plain.ok);
+        EXPECT_TRUE(plain.rs.vreg.contains(1));
+    }
+}
+TEST(IrLowerVop3TernaryInteger, TheRelocatedGuardDoesNotClaimCarryOrClampStages) {
+    LoweringFixture foreign;
+    auto carry = instruction(0x128);
+    carry.src_neg[0] = true;
+    EXPECT_FALSE(ir::lower_vop3_ternary_integer(foreign.b, foreign.rs, carry, foreign.ok, false));
+    EXPECT_TRUE(foreign.ok);
+    EXPECT_TRUE(foreign.rs.vreg.empty());
+    LoweringFixture plain;
+    auto clamp = instruction(kVop3OpcodeAdd3U32);
+    clamp.clamp = true;   // The unchanged root rejects unhandled integer saturation later.
+    EXPECT_TRUE(ir::lower_vop3_ternary_integer(plain.b, plain.rs, clamp, plain.ok, false));
+    EXPECT_TRUE(plain.ok);
+    EXPECT_TRUE(plain.rs.vreg.contains(1));
 }
