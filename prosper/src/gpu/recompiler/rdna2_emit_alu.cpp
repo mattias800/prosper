@@ -62,6 +62,7 @@
 #include "gpu/recompiler/ir/lower/vop3_minmax_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_minmax_float_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_ldexp_lowering.hpp"
+#include "gpu/recompiler/ir/lower/vop3_pack_norm_lowering.hpp"
 #include <functional>
 #include "gpu/recompiler/ir/lower/vop1_conversion_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop1_unary_float_lowering.hpp"
@@ -1505,16 +1506,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             } else if (ir::lower_vop3_minmax(b, rs, in, ok, allow_wave)) {
             } else if (ir::lower_vop3_minmax_float(b, rs, in, ok, allow_wave, std::cref(fv),
                                                    std::cref(fresult))) {
-            } else if (in.opcode == 0x368 || in.opcode == 0x369) {   // v_cvt_pknorm_{i16,u16}_f32
-                // Clamp and normalize two f32 values, then pack src0 in bits[15:0] and src1 in
-                // bits[31:16]. Astro's title ship VS uses the unsigned form (exact first word
-                // d7690002). AMD specifies round-to-nearest-even for the normalized conversion.
-                const bool is_signed = in.opcode == 0x368;
-                const float scale = is_signed ? 32767.0f : 65535.0f;
-                const uint32_t lo = b.pack_norm(fv(0), 16, is_signed, scale);
-                const uint32_t hi = b.pack_norm(fv(1), 16, is_signed, scale);
-                vreg[in.dst.value] = b.ibin(
-                    Op_BitwiseOr, lo, b.ibin(Op_ShiftLeftLogical, hi, b.uconst(16)));
+            } else if (ir::lower_vop3_pack_norm(b, rs, in, ok, allow_wave, std::cref(fv))) {
             } else if (ir::lower_vop3_pack_saturate(b, rs, in, ok, allow_wave)) {
             } else if (ir::lower_vop3_ldexp(b, rs, in, ok, allow_wave, std::cref(fv),
                                             std::cref(fresult))) {
