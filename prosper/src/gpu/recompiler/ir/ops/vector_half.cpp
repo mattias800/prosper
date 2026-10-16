@@ -51,33 +51,29 @@ using In = HalfOpIn;
 Value pack_rtz(Builder& ir, const In& x) {
     return build_half_rtz(ir, x.s0, x.s1);
 }
-Value finish(Builder& ir, Value value, bool clamp) {
-    if (clamp) value = ir.f32clamp01(value);
+Value finish(Builder& ir, Value value, const In& x) {
+    value = build_float_output_modifier(ir, value, x.modifier);
+    if (x.clamp) value = ir.f32clamp01(value);
     return ir.pack_half_lo(value);
 }
 constexpr HalfOpDef kRtz{F::VOP2, 0x2f, pack_rtz};
 constexpr HalfOpDef kDefs[] = {
     kRtz,
-    {F::VOP2, 0x32,
-     [](Builder& ir, const In& x) { return finish(ir, ir.f32add(x.s0, x.s1), x.clamp); }},
-    {F::VOP2, 0x33,
-     [](Builder& ir, const In& x) { return finish(ir, ir.f32sub(x.s0, x.s1), x.clamp); }},
-    {F::VOP2, 0x35,
-     [](Builder& ir, const In& x) { return finish(ir, ir.f32mul(x.s0, x.s1), x.clamp); }},
-    {F::VOP2, 0x39,
-     [](Builder& ir, const In& x) { return finish(ir, ir.f32nmax(x.s0, x.s1), x.clamp); }},
-    {F::VOP2, 0x3a,
-     [](Builder& ir, const In& x) { return finish(ir, ir.f32nmin(x.s0, x.s1), x.clamp); }},
+    {F::VOP2, 0x32, [](Builder& ir, const In& x) { return finish(ir, ir.f32add(x.s0, x.s1), x); }},
+    {F::VOP2, 0x33, [](Builder& ir, const In& x) { return finish(ir, ir.f32sub(x.s0, x.s1), x); }},
+    {F::VOP2, 0x35, [](Builder& ir, const In& x) { return finish(ir, ir.f32mul(x.s0, x.s1), x); }},
+    {F::VOP2, 0x39, [](Builder& ir, const In& x) { return finish(ir, ir.f32nmax(x.s0, x.s1), x); }},
+    {F::VOP2, 0x3a, [](Builder& ir, const In& x) { return finish(ir, ir.f32nmin(x.s0, x.s1), x); }},
 };
 struct Built {
     Block block;
     Value d;
 };
-Built build(const HalfOpDef& def, bool clamp) {
+Built build(const HalfOpDef& def, bool clamp, FloatOutputModifier modifier) {
     Built out;
     Builder ir(out.block);
     const Value a = ir.input(Type::U32), b = ir.input(Type::U32);
-    out.d = def.build(ir, {a, b, clamp});
+    out.d = def.build(ir, {a, b, clamp, modifier});
     return out;
 }
 }   // namespace
@@ -89,13 +85,15 @@ const HalfOpDef* find_vector_half_op(Rdna2Format fmt, uint32_t opcode) {
         if (def.fmt == fmt && def.opcode == opcode) return &def;
     return nullptr;
 }
-Known eval_half_op(const HalfOpDef& def, Known s0, Known s1, bool clamp) {
-    const auto built = build(def, clamp);
+Known eval_half_op(const HalfOpDef& def, Known s0, Known s1, bool clamp,
+                   FloatOutputModifier modifier) {
+    const auto built = build(def, clamp, modifier);
     const Known inputs[] = {s0, s1};
     return evaluate(built.block, inputs)[built.d.index];
 }
-uint32_t emit_half_op(SpirvCompute& b, const HalfOpDef& def, uint32_t s0, uint32_t s1, bool clamp) {
-    const auto built = build(def, clamp);
+uint32_t emit_half_op(SpirvCompute& b, const HalfOpDef& def, uint32_t s0, uint32_t s1, bool clamp,
+                      FloatOutputModifier modifier) {
+    const auto built = build(def, clamp, modifier);
     const uint32_t inputs[] = {s0, s1};
     return emit_spirv(b, built.block, inputs)[built.d.index];
 }

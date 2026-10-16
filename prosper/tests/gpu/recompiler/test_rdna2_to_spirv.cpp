@@ -9312,7 +9312,9 @@ int main() {
 
     // Kernel 55: VOP3 OMOD (mul:2). v_fma_f32 v3, v0, v1, v2 mul:2 = 2*(a0*a1+a2).
     const uint32_t code55[] = { 0xD54B0003u, 0x0C0A0300u, 0xBF810000u };
-    std::vector<uint32_t> spv55 = recompile_valu(code55, sizeof(code55)/sizeof(code55[0]), 3, /*out_vgpr*/3);
+    // MODE=0, IEEE=0 explicitly enables OMOD; the default MODE preserves output denormals.
+    std::vector<uint32_t> spv55 = recompile_valu(code55, sizeof(code55) / sizeof(code55[0]), 3,
+                                                 /*out_vgpr*/ 3, nullptr, 0, 0);
     CHECK(!spv55.empty(), "recompiled kernel 55 (v_fma_f32 mul:2) -> SPIR-V");
     std::vector<float> in55(N * 3), exp55(N);
     for (uint32_t i = 0; i < N; i++) { float a0=(float)i*0.1f-6.0f, a1=0.5f, a2=1.0f;
@@ -9321,6 +9323,16 @@ int main() {
     uint32_t bad55 = 0; for (uint32_t i=0;i<N&&got55.size()==N;i++) if (std::fabs(got55[i]-exp55[i])>1e-3f) bad55++;
     printf("  kernel55 mismatches=%u (out[80]=%g expect=%g)\n", bad55, got55.size()==N?got55[80]:-1, exp55[80]);
     CHECK(got55.size()==N && bad55==0, "recompiled kernel 55 (VOP3 omod mul:2: 2*(a0*a1+a2)) correct");
+    for (uint32_t rsrc1 : {0x30u << 12, 1u << 23}) {
+        const auto suppressed = recompile_valu(code55, std::size(code55), 3, 3, nullptr, 0, rsrc1);
+        CHECK(!suppressed.empty(), "kernel 55 compiles with explicit OMOD-suppressing launch mode");
+        const auto actual = prosper::test::run_compute(suppressed, in55, N, N);
+        uint32_t bad = 0;
+        for (uint32_t i = 0; i < N && actual.size() == N; ++i)
+            if (std::fabs(actual[i] - exp55[i] * 0.5f) > 1e-3f) ++bad;
+        CHECK(actual.size() == N && bad == 0,
+              "kernel 55 preserves the unscaled FMA when output denormals or IEEE are enabled");
+    }
 
     // Kernels 56-58: VOP3-encoded VOP2 float ops (were rejected) with modifiers.
     // 56: v_add_f32_e64 v3, -v0, v1  = -a0 + a1  (VOP3 v_add_f32 0x103 + neg src0).
@@ -10438,11 +10450,12 @@ int main() {
 
     // Kernel O: VOP2 v_mul_f32 in SDWA form with OMOD ×2 output modifier. This was a #121 blocker —
     // PPSA02664's pixel shaders emit `v_mul_f32 v,v,v mul:2` (full-DWORD selects, omod=×2), which the
-    // decoder rejected as an unhandled modifier, failing the whole PS. Now the ×2 is applied.
+    // decoder rejected as an unhandled modifier, failing the whole PS. MODE=0/IEEE=0 applies ×2.
     //   w0=0x100002f9 (op 0x08, dst v0, vsrc1 v1, src0=0xF9=SDWA), w1=0x06064600 (dst/s0/s1 sel=DWORD, omod=1)
     //   => out = (a0 * a1) * 2
     const uint32_t codeO[] = { 0x100002f9u, 0x06064600u, 0xBF810000u };
-    std::vector<uint32_t> spvO = recompile_valu(codeO, sizeof(codeO)/sizeof(codeO[0]), 2, 0);
+    std::vector<uint32_t> spvO =
+        recompile_valu(codeO, sizeof(codeO) / sizeof(codeO[0]), 2, 0, nullptr, 0, 0);
     CHECK(!spvO.empty(), "recompiled v_mul_f32 SDWA omod:2 -> SPIR-V (no longer rejected)");
     std::vector<float> inO(N * 2), expO(N);
     for (uint32_t i = 0; i < N; i++) {
@@ -10453,6 +10466,16 @@ int main() {
     uint32_t badO = 0; for (uint32_t i=0;i<N&&gotO.size()==N;i++) if (std::fabs(gotO[i]-expO[i])>1e-3f) badO++;
     printf("  kernelO(omod:2) mismatches=%u (out[20]=%g expect=%g)\n", badO, gotO.size()==N?gotO[20]:-1, expO[20]);
     CHECK(gotO.size()==N && badO==0, "v_mul_f32 SDWA omod:2 doubles the product: out = (a0*a1)*2");
+    for (uint32_t rsrc1 : {0x30u << 12, 1u << 23}) {
+        const auto suppressed = recompile_valu(codeO, std::size(codeO), 2, 0, nullptr, 0, rsrc1);
+        CHECK(!suppressed.empty(), "SDWA OMOD compiles with explicit suppressing launch mode");
+        const auto actual = prosper::test::run_compute(suppressed, inO, N, N);
+        uint32_t bad = 0;
+        for (uint32_t i = 0; i < N && actual.size() == N; ++i)
+            if (std::fabs(actual[i] - expO[i] * 0.5f) > 1e-3f) ++bad;
+        CHECK(actual.size() == N && bad == 0,
+              "SDWA leaves the product unscaled when output denormals or IEEE are enabled");
+    }
 
     // ---- #273 kernels: ops surfaced by DOLL's failing shaders (all llvm-mc gfx1010 verified) ----
 

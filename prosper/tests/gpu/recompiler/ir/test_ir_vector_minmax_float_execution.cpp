@@ -152,39 +152,42 @@ TEST(IrVectorMinmaxFloatExecution, InlineFloatAndLiteralEachSourceKeepTheirBits)
             for (uint32_t wave : {64u, 32u}) compare(def, inputs(31 + mode), wave, mode);
 }
 TEST(IrVectorMinmaxFloatExecution, CallerSourceAndResultModifiersStayInOrder) {
-    auto in =
-        inputs(43);   // finite nonzero inputs avoid unspecified signed-zero pairs and NaN payloads.
-    for (size_t lane = 0; lane < in.lanes(); ++lane) {
-        in.s0[lane] = 0xbf000000;
-        in.s1[lane] = 0x3f800000;
-        in.s2[lane] = 0x40000000;
-    }
-    for (const auto& def : vector_minmax_float_defs())
-        for (uint32_t abs = 0; abs < 8; ++abs)
-            for (uint32_t neg = 0; neg < 8; ++neg)
-                for (uint32_t omod = 0; omod < 4; ++omod)
-                    for (bool clamp : {false, true}) {
-                        auto run =
-                            run_vector_op_per_lane(words(def.opcode, 0, abs, neg, omod, clamp), in);
-                        ASSERT_TRUE(run.error.empty()) << run.error;
-                        auto args = sources(in, 0);
-                        for (size_t k = 0; k < 3; ++k) {
-                            if (abs & (1u << k)) *args[k] &= 0x7fffffffu;
-                            if (neg & (1u << k)) *args[k] ^= 0x80000000u;
+    // Explicit ISA arms: scaling enabled, output denorms preserved, or IEEE enabled.
+    for (uint32_t rsrc1 : {0u, 0x30u << 12, 1u << 23}) {
+        auto in = inputs(
+            43);   // finite nonzero inputs avoid unspecified signed-zero pairs and NaN payloads.
+        for (size_t lane = 0; lane < in.lanes(); ++lane) {
+            in.s0[lane] = 0xbf000000;
+            in.s1[lane] = 0x3f800000;
+            in.s2[lane] = 0x40000000;
+        }
+        for (const auto& def : vector_minmax_float_defs())
+            for (uint32_t abs = 0; abs < 8; ++abs)
+                for (uint32_t neg = 0; neg < 8; ++neg)
+                    for (uint32_t omod = 0; omod < 4; ++omod)
+                        for (bool clamp : {false, true}) {
+                            auto run = run_vector_op_per_lane(
+                                words(def.opcode, 0, abs, neg, omod, clamp), in, 64, false, rsrc1);
+                            ASSERT_TRUE(run.error.empty()) << run.error;
+                            auto args = sources(in, 0);
+                            for (size_t k = 0; k < 3; ++k) {
+                                if (abs & (1u << k)) *args[k] &= 0x7fffffffu;
+                                if (neg & (1u << k)) *args[k] ^= 0x80000000u;
+                            }
+                            auto want = eval_minmax_float_op(def, args);
+                            ASSERT_TRUE(want);
+                            if (omod && rsrc1 == 0)
+                                want = evaluate_op(Opcode::F32Mul, 0, *want,
+                                                   omod == 1   ? 0x40000000u
+                                                   : omod == 2 ? 0x40800000u
+                                                               : 0x3f000000u,
+                                                   0);
+                            if (clamp) want = evaluate_op(Opcode::F32Clamp01, 0, *want, 0, 0);
+                            ASSERT_TRUE(want);
+                            for (size_t lane = 0; lane < in.lanes(); ++lane)
+                                EXPECT_EQ(run.d[lane], in.active[lane] ? *want : in.old_d[lane]);
                         }
-                        auto want = eval_minmax_float_op(def, args);
-                        ASSERT_TRUE(want);
-                        if (omod)
-                            want = evaluate_op(Opcode::F32Mul, 0, *want,
-                                               omod == 1   ? 0x40000000u
-                                               : omod == 2 ? 0x40800000u
-                                                           : 0x3f000000u,
-                                               0);
-                        if (clamp) want = evaluate_op(Opcode::F32Clamp01, 0, *want, 0, 0);
-                        ASSERT_TRUE(want);
-                        for (size_t lane = 0; lane < in.lanes(); ++lane)
-                            EXPECT_EQ(run.d[lane], in.active[lane] ? *want : in.old_d[lane]);
-                    }
+    }
 }
 TEST(IrVectorMinmaxFloatExecution, EffectsUnknownDomainAndEveryValueOpcodeAreCovered) {
     std::set<Opcode> used;

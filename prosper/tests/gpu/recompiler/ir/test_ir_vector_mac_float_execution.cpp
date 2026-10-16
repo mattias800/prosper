@@ -152,64 +152,74 @@ TEST(IrVectorMacFloatExecution, InlineFloatIntegerAndLiteralExplicitSourcesKeepT
             for (uint32_t wave : {64u, 32u}) compare(def, inputs(31 + mode), wave, mode);
 }
 TEST(IrVectorMacFloatExecution, ExplicitSourceAndResultModifiersDoNotModifyTheAccumulator) {
-    const auto* def = find_vector_mac_float_op(Rdna2Format::VOP3, 0x11f);
-    ASSERT_NE(def, nullptr);
-    auto in = inputs(71);
-    std::fill(in.s0.begin(), in.s0.end(), 0xbfc00000);
-    std::fill(in.s1.begin(), in.s1.end(), 0xc0000000);
-    std::fill(in.old_d.begin(), in.old_d.end(), 0xbf000000);
-    for (uint32_t abs = 0; abs < 8; ++abs)
-        for (uint32_t neg = 0; neg < 8; ++neg) {
-            std::array<Known, 3> args;
-            const uint32_t raw[] = {0xbfc00000, 0xc0000000, 0xbf000000};
-            for (uint32_t k = 0; k < 2; ++k) {
-                uint32_t v = raw[k];
-                if (abs & (1u << k)) v &= 0x7fffffffu;
-                if (neg & (1u << k)) v ^= 0x80000000u;
-                args[k] = v;
-            }
-            args[2] = 0xbf000000;
-            const auto result = eval_ternary_integer_op(*def, args);
-            ASSERT_TRUE(result.has_value());
-            if (!result) continue;
-            for (uint32_t omod = 0; omod < 4; ++omod)
-                for (bool clamp : {false, true}) {
-                    float value = std::bit_cast<float>(*result);
-                    if (omod) value *= omod == 1 ? 2.0f : omod == 2 ? 4.0f : 0.5f;
-                    if (clamp) value = std::clamp(value, 0.0f, 1.0f);
-                    const uint32_t want = std::bit_cast<uint32_t>(value);
-                    for (uint32_t wave : {64u, 32u}) {
-                        const auto run =
-                            run_vector_op_per_lane(words(0, abs, neg, omod, clamp), in, wave);
-                        ASSERT_TRUE(run.error.empty()) << run.error;
-                        for (size_t lane = 0; lane < in.lanes(); ++lane)
-                            ASSERT_EQ(run.d[lane], in.active[lane] ? want : in.old_d[lane]);
-                    }
+    // Explicit ISA arms: scaling enabled, output denorms preserved, or IEEE enabled.
+    for (uint32_t rsrc1 : {0u, 0x30u << 12, 1u << 23}) {
+        const auto* def = find_vector_mac_float_op(Rdna2Format::VOP3, 0x11f);
+        ASSERT_NE(def, nullptr);
+        auto in = inputs(71);
+        std::fill(in.s0.begin(), in.s0.end(), 0xbfc00000);
+        std::fill(in.s1.begin(), in.s1.end(), 0xc0000000);
+        std::fill(in.old_d.begin(), in.old_d.end(), 0xbf000000);
+        for (uint32_t abs = 0; abs < 8; ++abs)
+            for (uint32_t neg = 0; neg < 8; ++neg) {
+                std::array<Known, 3> args;
+                const uint32_t raw[] = {0xbfc00000, 0xc0000000, 0xbf000000};
+                for (uint32_t k = 0; k < 2; ++k) {
+                    uint32_t v = raw[k];
+                    if (abs & (1u << k)) v &= 0x7fffffffu;
+                    if (neg & (1u << k)) v ^= 0x80000000u;
+                    args[k] = v;
                 }
-        }
+                args[2] = 0xbf000000;
+                const auto result = eval_ternary_integer_op(*def, args);
+                ASSERT_TRUE(result.has_value());
+                if (!result) continue;
+                for (uint32_t omod = 0; omod < 4; ++omod)
+                    for (bool clamp : {false, true}) {
+                        float value = std::bit_cast<float>(*result);
+                        if (omod && rsrc1 == 0) value *= omod == 1 ? 2.0f : omod == 2 ? 4.0f : 0.5f;
+                        if (clamp) value = std::clamp(value, 0.0f, 1.0f);
+                        const uint32_t want = std::bit_cast<uint32_t>(value);
+                        for (uint32_t wave : {64u, 32u}) {
+                            const auto run = run_vector_op_per_lane(words(0, abs, neg, omod, clamp),
+                                                                    in, wave, false, rsrc1);
+                            ASSERT_TRUE(run.error.empty()) << run.error;
+                            for (size_t lane = 0; lane < in.lanes(); ++lane)
+                                ASSERT_EQ(run.d[lane], in.active[lane] ? want : in.old_d[lane]);
+                        }
+                    }
+            }
+    }
 }
 TEST(IrVectorMacFloatExecution, HandWorkedAbsThenNegAndOmodThenClampOrder) {
-    struct Example {
-        uint32_t abs, neg, omod;
-        bool clamp;
-        uint32_t want;
-    };
-    auto in = inputs(83);
-    std::fill(in.s0.begin(), in.s0.end(), 0xbfc00000);
-    std::fill(in.s1.begin(), in.s1.end(), 0xc0000000);
-    std::fill(in.old_d.begin(), in.old_d.end(), 0xbf000000);
-    for (auto x : {Example{1, 0, 0, false, 0xc0600000}, Example{1, 1, 0, false, 0x40200000},
-                   Example{0, 4, 0, false, 0x40200000}, Example{7, 0, 0, false, 0x40200000},
-                   Example{7, 7, 0, false, 0x40200000}, Example{0, 0, 1, false, 0x40a00000},
-                   Example{0, 0, 2, false, 0x41200000}, Example{0, 0, 3, false, 0x3fa00000},
-                   Example{0, 0, 3, true, 0x3f800000}, Example{1, 0, 0, true, 0},
-                   Example{0, 1, 0, false, 0xc0600000}, Example{0, 0, 0, true, 0x3f800000}}) {
-        for (uint32_t wave : {64u, 32u}) {
-            const auto run =
-                run_vector_op_per_lane(words(0, x.abs, x.neg, x.omod, x.clamp), in, wave);
-            ASSERT_TRUE(run.error.empty()) << run.error;
-            for (size_t lane = 0; lane < in.lanes(); ++lane)
-                ASSERT_EQ(run.d[lane], in.active[lane] ? x.want : in.old_d[lane]);
+    // Explicit ISA arms: scaling enabled, output denorms preserved, or IEEE enabled.
+    for (uint32_t rsrc1 : {0u, 0x30u << 12, 1u << 23}) {
+        struct Example {
+            uint32_t abs, neg, omod;
+            bool clamp;
+            uint32_t want;
+        };
+        auto in = inputs(83);
+        std::fill(in.s0.begin(), in.s0.end(), 0xbfc00000);
+        std::fill(in.s1.begin(), in.s1.end(), 0xc0000000);
+        std::fill(in.old_d.begin(), in.old_d.end(), 0xbf000000);
+        for (auto x : {Example{1, 0, 0, false, 0xc0600000}, Example{1, 1, 0, false, 0x40200000},
+                       Example{0, 4, 0, false, 0x40200000}, Example{7, 0, 0, false, 0x40200000},
+                       Example{7, 7, 0, false, 0x40200000}, Example{0, 0, 1, false, 0x40a00000},
+                       Example{0, 0, 2, false, 0x41200000}, Example{0, 0, 3, false, 0x3fa00000},
+                       Example{0, 0, 3, true, 0x3f800000}, Example{1, 0, 0, true, 0},
+                       Example{0, 1, 0, false, 0xc0600000}, Example{0, 0, 0, true, 0x3f800000}}) {
+            for (uint32_t wave : {64u, 32u}) {
+                const auto run = run_vector_op_per_lane(words(0, x.abs, x.neg, x.omod, x.clamp), in,
+                                                        wave, false, rsrc1);
+                ASSERT_TRUE(run.error.empty()) << run.error;
+                for (size_t lane = 0; lane < in.lanes(); ++lane)
+                    ASSERT_EQ(
+                        run.d[lane],
+                        in.active[lane]
+                            ? (rsrc1 && x.omod ? (x.clamp ? 0x3f800000u : 0x40200000u) : x.want)
+                            : in.old_d[lane]);
+            }
         }
     }
 }

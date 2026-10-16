@@ -177,52 +177,57 @@ TEST(IrVectorDivFixupExecution, InlineAndLiteralEachSourceKeepTheirRole) {
             for (uint32_t wave : {64u, 32u}) compare(def, inputs(31 + mode), wave, mode);
 }
 TEST(IrVectorDivFixupExecution, AllSourceAndResultModifierCombinationsKeepTheCallerOrder) {
-    auto in = inputs(43);
-    for (size_t lane = 0; lane < in.lanes(); ++lane) {
-        in.s0[lane] = lane & 1 ? 0xbfc00000 : 0x3fc00000;
-        in.s1[lane] = lane & 2 ? 0xc0000000 : 0x40000000;
-        in.s2[lane] = lane & 4 ? 0xc0400000 : 0x40400000;
-    }
-    for (const auto& def : vector_div_fixup_defs())
-        for (uint32_t abs = 0; abs < 8; ++abs)
-            for (uint32_t neg = 0; neg < 8; ++neg)
-                for (uint32_t omod = 0; omod < 4; ++omod)
-                    for (bool clamp : {false, true})
-                        for (uint32_t wave : {64u, 32u}) {
-                            const auto run =
-                                run_vector_op_per_lane(words(0, abs, neg, omod, clamp), in, wave);
-                            ASSERT_TRUE(run.error.empty()) << run.error;
-                            for (size_t lane = 0; lane < in.lanes(); ++lane) {
-                                std::array<uint32_t, 3> args = {in.s0[lane], in.s1[lane],
-                                                                in.s2[lane]};
-                                for (size_t k = 0; k < 3; ++k) {
-                                    if (abs & (1u << k)) args[k] &= 0x7fffffffu;
-                                    if (neg & (1u << k)) args[k] ^= 0x80000000u;
+    // Explicit ISA arms: scaling enabled, output denorms preserved, or IEEE enabled.
+    for (uint32_t rsrc1 : {0u, 0x30u << 12, 1u << 23}) {
+        auto in = inputs(43);
+        for (size_t lane = 0; lane < in.lanes(); ++lane) {
+            in.s0[lane] = lane & 1 ? 0xbfc00000 : 0x3fc00000;
+            in.s1[lane] = lane & 2 ? 0xc0000000 : 0x40000000;
+            in.s2[lane] = lane & 4 ? 0xc0400000 : 0x40400000;
+        }
+        for (const auto& def : vector_div_fixup_defs())
+            for (uint32_t abs = 0; abs < 8; ++abs)
+                for (uint32_t neg = 0; neg < 8; ++neg)
+                    for (uint32_t omod = 0; omod < 4; ++omod)
+                        for (bool clamp : {false, true})
+                            for (uint32_t wave : {64u, 32u}) {
+                                const auto run = run_vector_op_per_lane(
+                                    words(0, abs, neg, omod, clamp), in, wave, false, rsrc1);
+                                ASSERT_TRUE(run.error.empty()) << run.error;
+                                for (size_t lane = 0; lane < in.lanes(); ++lane) {
+                                    std::array<uint32_t, 3> args = {in.s0[lane], in.s1[lane],
+                                                                    in.s2[lane]};
+                                    for (size_t k = 0; k < 3; ++k) {
+                                        if (abs & (1u << k)) args[k] &= 0x7fffffffu;
+                                        if (neg & (1u << k)) args[k] ^= 0x80000000u;
+                                    }
+                                    auto want =
+                                        eval_ternary_integer_op(def, {args[0], args[1], args[2]});
+                                    if (!want) {
+                                        ADD_FAILURE();
+                                        return;
+                                    }
+                                    if (omod && rsrc1 == 0)
+                                        want = evaluate_op(Opcode::F32Mul, 0, *want,
+                                                           omod == 1   ? 0x40000000
+                                                           : omod == 2 ? 0x40800000
+                                                                       : 0x3f000000,
+                                                           0);
+                                    if (!want) {
+                                        ADD_FAILURE();
+                                        return;
+                                    }
+                                    if (clamp)
+                                        want = evaluate_op(Opcode::F32Clamp01, 0, *want, 0, 0);
+                                    if (!want) {
+                                        ADD_FAILURE();
+                                        return;
+                                    }
+                                    EXPECT_EQ(run.d[lane],
+                                              in.active[lane] ? *want : in.old_d[lane]);
                                 }
-                                auto want =
-                                    eval_ternary_integer_op(def, {args[0], args[1], args[2]});
-                                if (!want) {
-                                    ADD_FAILURE();
-                                    return;
-                                }
-                                if (omod)
-                                    want = evaluate_op(Opcode::F32Mul, 0, *want,
-                                                       omod == 1   ? 0x40000000
-                                                       : omod == 2 ? 0x40800000
-                                                                   : 0x3f000000,
-                                                       0);
-                                if (!want) {
-                                    ADD_FAILURE();
-                                    return;
-                                }
-                                if (clamp) want = evaluate_op(Opcode::F32Clamp01, 0, *want, 0, 0);
-                                if (!want) {
-                                    ADD_FAILURE();
-                                    return;
-                                }
-                                EXPECT_EQ(run.d[lane], in.active[lane] ? *want : in.old_d[lane]);
                             }
-                        }
+    }
 }
 TEST(IrVectorDivFixupExecution, EffectsAllValueOpcodesAndUnknownSourcesAreCovered) {
     std::set<Opcode> used;

@@ -120,12 +120,15 @@ inline LaneProgram lane_program(const std::vector<uint32_t>& op_words, uint32_t 
     return {std::move(code), std::move(table), std::move(config)};
 }
 
-inline LaneRun run_vector_op_per_lane(const std::vector<uint32_t>& op_words, const LaneInputs& in,
-                                      uint32_t wave = 64, bool half_rte_preserve_denorm = false) {
+inline LaneRun
+run_vector_op_per_lane(const std::vector<uint32_t>& op_words, const LaneInputs& in,
+                       uint32_t wave = 64, bool half_rte_preserve_denorm = false,
+                       uint32_t compute_pgm_rsrc1 = prosper::gpu::kDefaultComputePgmRsrc1) {
     using namespace prosper::gpu;
     const uint32_t lanes = static_cast<uint32_t>(in.lanes());
     if (!in.s2.empty() && in.s2.size() != lanes) return {{}, "S2 lane count mismatch"};
-    const auto program = lane_program(op_words, lanes, wave, !in.s2.empty());
+    auto program = lane_program(op_words, lanes, wave, !in.s2.empty());
+    program.config.compute_pgm_rsrc1 = compute_pgm_rsrc1;
     const auto& code = program.code;
     const uint64_t address = lane_harness_address();
     const auto module = recompile_compute(code.data(), code.size(), &program.table, program.config,

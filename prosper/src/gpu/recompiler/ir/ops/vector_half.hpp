@@ -5,6 +5,7 @@
 #include "gpu/recompiler/ir/builder.hpp"
 #include "gpu/recompiler/ir/eval.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/ir/ops/float_output_modifier.hpp"
 #include <cstdint>
 #include <span>
 namespace prosper::gpu {
@@ -14,6 +15,7 @@ namespace prosper::gpu::ir {
 struct HalfOpIn {
     Value s0, s1;
     bool clamp;
+    FloatOutputModifier modifier{};
 };
 struct HalfOpDef {
     Rdna2Format fmt;
@@ -24,8 +26,9 @@ struct HalfOpDef {
 Value build_half_rtz(Builder& ir, Value a, Value b);
 std::span<const HalfOpDef> vector_half_defs();
 const HalfOpDef* find_vector_half_op(Rdna2Format fmt, uint32_t opcode);
-Known eval_half_op(const HalfOpDef& def, Known s0, Known s1, bool clamp = false);
+Known eval_half_op(const HalfOpDef& def, Known s0, Known s1, bool clamp = false,
+                   FloatOutputModifier modifier = {});
 uint32_t emit_half_op(SpirvCompute& b, const HalfOpDef& def, uint32_t s0, uint32_t s1,
-                      bool clamp = false);
+                      bool clamp = false, FloatOutputModifier modifier = {});
 uint32_t emit_half_rtz(SpirvCompute& b, uint32_t s0, uint32_t s1);
 } // namespace prosper::gpu::ir
