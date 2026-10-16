@@ -47,6 +47,13 @@ Known evaluate_op(Opcode op, uint32_t imm, uint32_t a, uint32_t b, uint32_t c) {
         case Opcode::F32Clamp01:
             return std::bit_cast<uint32_t>(
                 std::fmin(std::fmax(std::bit_cast<float>(a), 0.0f), 1.0f));
+        case Opcode::F32Ldexp:
+            // The integer-backed emitter preserves specials verbatim. +/-512 already takes every
+            // finite binary32 value beyond its representable scaling range; bounding prevents
+            // host integer-exponent arithmetic overflow without changing the rounded result.
+            if ((a & 0x7f800000u) == 0x7f800000u) return a;
+            return std::bit_cast<uint32_t>(
+                std::scalbn(std::bit_cast<float>(a), std::clamp(s(b), -512, 512)));
         case Opcode::PackHalfLo: return pack_half_rte(a);
         case Opcode::F32Add:
         case Opcode::F32Sub:

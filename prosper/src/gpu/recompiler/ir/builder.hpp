@@ -82,6 +82,7 @@ public:
     Value unpack_half(Value a, uint32_t component) {
         return block_.append({Opcode::UnpackHalf, Type::U32, component, {a}});
     }
+    Value f32ldexp(Value a, Value exponent) { return u32(Opcode::F32Ldexp, a, exponent); }
     Value f32ge(Value a, Value b) { return cmp(Opcode::F32Ge, a, b); }
     Value bfe_u(Value base, Value offset, Value count) {
         return block_.append({Opcode::BfeU, Type::U32, 0, {base, offset, count}});

@@ -1,14 +1,17 @@
-// Existing LDEXP guard and body mechanically moved with extract_case_routes.py.
+// Existing LDEXP guard, raw integer exponent and root-owned float modifier callbacks.
 #include "gpu/recompiler/ir/lower/vop3_ldexp_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_ldexp_lowering_internal.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/ir/ops/vector_ldexp.hpp"
+#include "gpu/recompiler/ir/ops/vector_ternary_integer.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 namespace prosper::gpu::ir {
 bool Vop3LdexpLowering::lower() {
-    if (in.opcode != 0x362) return false;
+    const auto* def = find_vector_ldexp_op(in.fmt, in.opcode);
+    if (!def) return false;
     if (!fv || !fresult) {
         std::fprintf(stderr, "[ir] float callbacks missing\n");
         std::abort();
@@ -36,7 +39,8 @@ bool Vop3LdexpLowering::lower() {
     if (in.src_abs[1] || in.src_abs[2] || in.src_neg[1] || in.src_neg[2] || in.omod) {
         ok = false;
     } else {
-        vreg[in.dst.value] = fresult(b.ldexp_f32_bits(fv(0), val(in.src[1])));
+        vreg[in.dst.value] = fresult(emit_ternary_integer_op(
+            b, *def, [this](uint32_t source) { return source == 0 ? fv(0) : val(in.src[1]); }));
     }
     return true;
 }
