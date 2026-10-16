@@ -12,6 +12,7 @@
 #include "gpu/recompiler/ir/lower/vop3_sad_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_permute_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_pack16_lowering.hpp"
+#include "gpu/recompiler/ir/lower/vop3_bit_utilities_lowering.hpp"
 #include "gpu/recompiler/rdna2_div_fixup.hpp"
 #include "gpu/recompiler/rdna2_mad_64.hpp"
 #include "gpu/recompiler/rdna2_mimg_store.hpp"
@@ -1659,33 +1660,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     vreg[hi_dst] = b.u64_hi(result);
                     predicate_write(b, rs, hi_dst, old_hi);
                 }
-            } else if (in.opcode == 0x363) {   // v_bfm_b32
-                // RDNA2: D.u32 = ((1 << S0[4:0]) - 1) << S1[4:0]. Mask both shift
-                // amounts before emitting SPIR-V so neither can reach the undefined >=32 range;
-                // in particular, an input width of 32 wraps to zero rather than producing all ones.
-                // The instruction has no defined modifier forms. OP_SEL is not retained by the
-                // generic decoder for this opcode, so reject its raw field explicitly as well.
-                const uint32_t opsel = (in.words[0] >> 11) & 0xFu;
-                if (in.src_abs[0] || in.src_abs[1] || in.src_abs[2] ||
-                    in.src_neg[0] || in.src_neg[1] || in.src_neg[2] ||
-                    in.clamp || in.omod || opsel) {
-                    ok = false;
-                } else {
-                    const uint32_t width = b.ibin(
-                        Op_BitwiseAnd, val(in.src[0]), b.uconst(31));
-                    const uint32_t offset = b.ibin(
-                        Op_BitwiseAnd, val(in.src[1]), b.uconst(31));
-                    const uint32_t mask = b.ibin(
-                        Op_ISub,
-                        b.ibin(Op_ShiftLeftLogical, b.uconst(1), width),
-                        b.uconst(1));
-                    vreg[in.dst.value] = b.ibin(Op_ShiftLeftLogical, mask, offset);
-                }
-            } else if (in.opcode == 0x364) {   // v_bcnt_u32_b32
-                // AMD RDNA2: D = popcount(S0) + S1. The third VOP3 source field is unused.
-                vreg[in.dst.value] = b.ibin(Op_IAdd,
-                                             b.iun(Op_BitCount, val(in.src[0])),
-                                             val(in.src[1]));
+            } else if (ir::lower_vop3_bit_utilities(b, rs, in, ok, allow_wave)) {
             } else if ((in.opcode == kVop3OpcodeAdd3U32 || in.opcode == 0x346 ||
                         in.opcode == kVop3OpcodeAndOrB32 || in.opcode == 0x372 ||
                         in.opcode == 0x178 || in.opcode == 0x36F || in.opcode == 0x345 ||
