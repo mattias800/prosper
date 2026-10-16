@@ -52,6 +52,7 @@
 #include "gpu/recompiler/ir/lower/vop3_bitfield_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_ternary_integer_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_multiply_lowering.hpp"
+#include "gpu/recompiler/ir/lower/vop3_mad24_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_minmax_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop1_conversion_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop1_unary_float_lowering.hpp"
@@ -1760,11 +1761,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     }
                 }
                 vreg[in.dst.value] = fresult(r2);
-            } else if (in.opcode == 0x143) {   // v_mad_u32_u24 = (s0&0xFFFFFF)*(s1&0xFFFFFF)+s2
-                uint32_t m24 = b.uconst(0xFFFFFF);
-                uint32_t p = b.ibin(Op_IMul, b.ibin(Op_BitwiseAnd, val(in.src[0]), m24),
-                                              b.ibin(Op_BitwiseAnd, val(in.src[1]), m24));
-                vreg[in.dst.value] = b.ibin(Op_IAdd, p, val(in.src[2]));
+            } else if (ir::lower_vop3_mad24(b, rs, in, ok, allow_wave)) {
             } else if (ir::lower_vop3_sad(b, rs, in, ok, allow_wave)) {
             } else if (in.opcode == 0x15F) {   // v_div_fixup_f32
                 vreg[in.dst.value] = fresult(emit_v_div_fixup_f32(b, fv(0), fv(1), fv(2)));
