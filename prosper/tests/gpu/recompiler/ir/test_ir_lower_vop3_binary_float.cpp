@@ -1,4 +1,4 @@
-// Pin the existing MAD source/result callback boundaries without admitting fused FMA.
+// Pin existing binary float source/result boundaries and ADD/MUL observation order.
 #include "gpu/recompiler/ir/lower/vop3_binary_float_lowering.hpp"
 #include "gpu/recompiler/ir/lowering_fixture.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -10,7 +10,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <set>
 #include <vector>
 using namespace prosper::gpu;
@@ -181,4 +180,22 @@ TEST(IrLowerVop3BinaryFloat, AddAndMulObservationsPrecedeSourceAndResultReads) {
                       op == 0x103 ? FragmentArithmeticFamily::Add : FragmentArithmeticFamily::Mul);
         }
     }
+}
+
+TEST(IrLowerVop3BinaryFloat, MissingCallbacksStopOnlyForMatchedForms) {
+    FloatBinary t;
+    EXPECT_FALSE(
+        ir::lower_vop3_binary_float_erased(t.b, t.rs, instruction(0x107), t.ok, false, {}, {}));
+    EXPECT_DEATH(
+        {
+            prosper::test::suppress_coredump();
+            ir::lower_vop3_binary_float_erased(t.b, t.rs, instruction(), t.ok, false, {}, t.result);
+        },
+        "binary float callbacks missing");
+    EXPECT_DEATH(
+        {
+            prosper::test::suppress_coredump();
+            ir::lower_vop3_binary_float_erased(t.b, t.rs, instruction(), t.ok, false, t.source, {});
+        },
+        "binary float callbacks missing");
 }
