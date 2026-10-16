@@ -3,6 +3,7 @@
 #include "gpu/recompiler/ir/builder.hpp"
 #include "gpu/recompiler/ir/emit/spirv_emitter.hpp"
 #include "gpu/recompiler/ir/eval.hpp"
+#include "gpu/recompiler/ir/ir.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
 #include <gtest/gtest.h>
@@ -119,4 +120,31 @@ TEST(IrCore, MissingInputResolverIsLoudOnlyWhenThereAreInputs) {
     const Value d = ir.c32(19);
     const auto ids = emit_spirv_resolving_inputs(b, block, {});
     EXPECT_EQ(ids[d.index], b.uconst_cache.at(19));
+}
+
+// SPIR-V OpBitCount counts all 32 bits of a numeric word, independently of its signed appearance.
+TEST(IrCore, NumericBitCountFactsEdgesAndUnknownInputs) {
+    EXPECT_EQ(opcode_info(Opcode::BitCount).arity, 1u);
+    EXPECT_EQ(opcode_info(Opcode::BitCount).result, Type::U32);
+    Block block;
+    Builder ir(block);
+    const Value input = ir.input(Type::U32);
+    const Value count = ir.bit_count(input);
+    struct Example {
+        uint32_t bits, want;
+    };
+    for (auto x : {Example{0, 0}, Example{1, 1}, Example{0x80000000, 1}, Example{0xaaaaaaaa, 16},
+                   Example{0x7fffffff, 31}, Example{0xffffffff, 32}}) {
+        const Known values[] = {Known(x.bits)};
+        EXPECT_EQ(evaluate(block, values)[count.index], Known(x.want));
+    }
+    EXPECT_FALSE(evaluate(block, {})[count.index]);
+    EXPECT_DEATH(
+        {
+            prosper::test::suppress_coredump();
+            Block b;
+            Builder value(b);
+            value.bit_count(value.ctrue());
+        },
+        "argument type mismatch");
 }

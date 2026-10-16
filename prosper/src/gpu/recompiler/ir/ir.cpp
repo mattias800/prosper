@@ -53,6 +53,7 @@ constexpr OpcodeInfo kInfo[] = {
     {"f32.clamp01", 1, Type::U32},
     {"pack.half.lo", 1, Type::U32},
     {"ffbh.u32", 1, Type::U32},
+    {"bitcount", 1, Type::U32},
     {"f32.fract", 1, Type::U32},
     {"f32.trunc", 1, Type::U32},
     {"f32.ceil", 1, Type::U32},

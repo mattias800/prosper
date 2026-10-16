@@ -76,6 +76,7 @@ enum class Opcode : uint8_t {
     F32Clamp01,
     PackHalfLo,
     FfbhU32, // leading zero count; all ones for a zero word
+    BitCount, // population count of one numeric word, without wave-mask state
     F32Fract,
     F32Trunc,
     F32Ceil,

@@ -31,6 +31,7 @@ public:
     Value xor_(Value a, Value b) { return u32(Opcode::Xor, a, b); }
     Value not_(Value a) { return block_.append({Opcode::Not, Type::U32, 0, {a}}); }
     Value ffbh_u32(Value a) { return block_.append({Opcode::FfbhU32, Type::U32, 0, {a}}); }
+    Value bit_count(Value a) { return block_.append({Opcode::BitCount, Type::U32, 0, {a}}); }
     Value bitreverse(Value a) { return block_.append({Opcode::BitReverse, Type::U32, 0, {a}}); }
     Value shl(Value a, Value count) { return u32(Opcode::Shl, a, count); }
     Value lshr(Value a, Value count) { return u32(Opcode::LShr, a, count); }
