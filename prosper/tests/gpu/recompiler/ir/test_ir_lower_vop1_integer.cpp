@@ -67,3 +67,37 @@ TEST(IrLowerVop1Integer, ReservedLaneAndOtherFormatsFallBackUntouched) {
         EXPECT_EQ(t.code_words(), words);
     }
 }
+
+TEST(IrLowerVop1Integer, BfrevSelectsItsSourceAtTheRelocatedNumericStage) {
+    for (uint8_t selector = 0; selector <= 5; ++selector) {
+        LoweringFixture t;
+        auto in = instruction(0x38);
+        in.has_sdwa = true;
+        in.sdwa_src0_sel = selector;
+        const auto original = t.b.uconst(0x81234567);
+        auto a = original;
+        const auto before = t.code_words();
+        ir::select_vop1_integer_source(t.b, in, a);
+        EXPECT_NE(a, original);
+        EXPECT_GT(t.code_words(), before);
+        EXPECT_TRUE(t.ok);
+    }
+}
+TEST(IrLowerVop1Integer, SourceSelectionLeavesOtherOperationsAndDwordFormsUntouched) {
+    for (uint32_t op : {0x01u, 0x02u, 0x37u, 0x38u, 0x39u, 0x3au})
+        for (bool sdwa : {false, true})
+            for (uint8_t selector : {0, 6}) {
+                if (op == 0x38 && sdwa && selector == 0) continue;
+                LoweringFixture t;
+                auto in = instruction(op);
+                in.has_sdwa = sdwa;
+                in.sdwa_src0_sel = selector;
+                const auto original = t.b.uconst(0x81234567);
+                auto a = original;
+                const auto before = t.code_words();
+                ir::select_vop1_integer_source(t.b, in, a);
+                EXPECT_EQ(a, original);
+                EXPECT_EQ(t.code_words(), before);
+                EXPECT_TRUE(t.ok);
+            }
+}

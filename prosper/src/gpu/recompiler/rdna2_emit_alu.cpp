@@ -54,6 +54,7 @@
 #include "gpu/recompiler/ir/lower/scalar_alu_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vector_alu_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop1_integer_lowering.hpp"
+#include "gpu/recompiler/ir/lower/vop3_unary_integer_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_bitfield_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_align_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_ternary_integer_lowering.hpp"
@@ -357,15 +358,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     ? b.bfe_s(a, b.uconst(offset), b.uconst(bits))
                     : b.bfe_u(a, b.uconst(offset), b.uconst(bits));
             }
-            // SDWA BREV selects and zero-extends its byte/word before reversing the resulting
-            // dword. The decoder admits only this unmodified full-destination subset, so neither
-            // sign extension nor destination preservation can reach this path.
-            if (in.opcode == 0x38 && in.has_sdwa && in.sdwa_src0_sel <= 5) {
-                const uint32_t bits = in.sdwa_src0_sel <= 3 ? 8u : 16u;
-                const uint32_t offset = in.sdwa_src0_sel <= 3
-                    ? 8u * in.sdwa_src0_sel : 16u * (in.sdwa_src0_sel - 4u);
-                a = b.bfe_u(a, b.uconst(offset), b.uconst(bits));
-            }
+            ir::select_vop1_integer_source(b, in, a);
             if (in.opcode == 0x02) {   // v_readfirstlane_b32: SGPR dst = value of the lowest active lane
                 // Cross-lane broadcast. Our per-lane scalar model has no cross-lane reduction, so we use
                 // THIS lane's value. SPECULATIVE(confidence: med): exact only when src0 is wave-uniform —
@@ -1476,6 +1469,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
             } else if (ir::lower_vop3_bit_utilities(b, rs, in, ok, allow_wave)) {
             } else if (ir::lower_vop3_binary_integer(b, rs, in, ok, allow_wave)) {
+            } else if (ir::lower_vop3_unary_integer(b, rs, in, ok, allow_wave)) {
             } else if (ir::lower_vop3_ternary_integer(b, rs, in, ok, allow_wave)) {
                 // The common modifier and predicated destination stages still follow.
             } else if (in.opcode == 0x128 || in.opcode == 0x129 || in.opcode == 0x12A) {

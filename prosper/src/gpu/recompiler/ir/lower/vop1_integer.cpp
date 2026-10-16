@@ -7,6 +7,17 @@
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <cstdint>
 namespace prosper::gpu::ir {
+void select_vop1_integer_source(SpirvCompute& b, const Rdna2Inst& in, uint32_t& a) {
+    // SDWA BREV selects and zero-extends its byte/word before reversing the resulting
+    // dword. The decoder admits only this unmodified full-destination subset, so neither
+    // sign extension nor destination preservation can reach this path.
+    if (in.opcode == 0x38 && in.has_sdwa && in.sdwa_src0_sel <= 5) {
+        const uint32_t bits = in.sdwa_src0_sel <= 3 ? 8u : 16u;
+        const uint32_t offset =
+            in.sdwa_src0_sel <= 3 ? 8u * in.sdwa_src0_sel : 16u * (in.sdwa_src0_sel - 4u);
+        a = b.bfe_u(a, b.uconst(offset), b.uconst(bits));
+    }
+}
 bool lower_vop1_integer(SpirvCompute& b, const Rdna2Inst& in, uint32_t a, uint32_t& d, bool& ok) {
     const VectorOpDef* def = find_vector_integer_unary_op(in.fmt, in.opcode);
     if (!def) return false;
