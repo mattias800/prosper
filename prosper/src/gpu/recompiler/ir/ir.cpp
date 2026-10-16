@@ -75,8 +75,9 @@ constexpr OpcodeInfo kInfo[] = {
     {"unpack.half", 1, Type::U32},
     {"f32.ge", 2, Type::Bool},
     {"f32.unord.ne", 2, Type::Bool},
+    {"f32.ldexp", 2, Type::U32},
 };
-static_assert(std::size(kInfo) == static_cast<size_t>(Opcode::F32UnordNe) + 1);
+static_assert(std::size(kInfo) == static_cast<size_t>(Opcode::F32Ldexp) + 1);
 
 // The type argument `slot` of `op` must have.
 Type argument_type(Opcode op, size_t slot) {

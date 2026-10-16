@@ -99,6 +99,7 @@ enum class Opcode : uint8_t {
     UnpackHalf, // imm = component 0 or 1, raw binary16 -> binary32
     F32Ge,
     F32UnordNe, // unordered-not-equal over raw binary32 words
+    F32Ldexp, // binary32 word scaled by a signed integer exponent
 };
 
 struct OpcodeInfo {
