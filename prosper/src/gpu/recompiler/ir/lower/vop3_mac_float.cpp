@@ -2,21 +2,22 @@
 #include "gpu/recompiler/ir/lower/vop3_mad_float_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_mac_float_lowering_internal.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/ir/ops/vector_mac_float.hpp"
+#include "gpu/recompiler/ir/ops/vector_ternary_integer.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 namespace prosper::gpu::ir {
 bool Vop3MacFloatLowering::lower() {
-    if (in.opcode != 0x11f) return false;
+    const auto* def = find_vector_mac_float_op(in.fmt, in.opcode);
+    if (!def) return false;
     if (!fv || !fresult) {
         std::fprintf(stderr, "[ir] MAC float callbacks missing\n");
         std::abort();
     }
-    // dst = src0*src1 + dst, with the VOP3 float source modifiers (neg/abs via fv) and output
-    // modifiers (omod/clamp via fresult). The scene VS emits this e64 form with a `-|v10|`
-    // modifier (round-trip: `llvm-mc -mcpu=gfx1010` of 0xd51f020a → v_mac_f32_e64 v10,v28,-|v10|).
-    vreg[in.dst.value] = fresult(b.fbin(Op_FAdd, b.fbin(Op_FMul, fv(0), fv(1)), old_d));
+    vreg[in.dst.value] = fresult(emit_ternary_integer_op(
+        b, *def, [&](uint32_t slot) { return slot == 2 ? old_d : fv(static_cast<int>(slot)); }));
     return true;
 }
 bool lower_vop3_mac_float(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok,

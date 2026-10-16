@@ -8,6 +8,7 @@
 #include <span>
 namespace prosper::gpu::ir {
 using MadFloatDef = TernaryIntegerDef;
+Value build_nonfused_mad_float(Builder& ir, const TernaryInputs& x);
 std::span<const MadFloatDef> vector_mad_float_defs();
 const MadFloatDef* find_vector_mad_float_op(Rdna2Format fmt, uint32_t opcode);
 Known eval_mad_float_op(const MadFloatDef& def, const std::array<Known, 3>& sources);
