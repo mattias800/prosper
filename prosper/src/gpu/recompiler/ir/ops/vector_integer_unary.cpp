@@ -8,16 +8,27 @@
 #include <cstdint>
 #include <span>
 namespace prosper::gpu::ir {
+Value build_integer_unary_not_b32(Builder& ir, const VectorOpIn& x) {
+    return ir.not_(x.s0);
+}
+Value build_integer_unary_bfrev_b32(Builder& ir, const VectorOpIn& x) {
+    return ir.bitreverse(x.s0);
+}
+Value build_integer_unary_ffbh_u32(Builder& ir, const VectorOpIn& x) {
+    return ir.ffbh_u32(x.s0);
+}
+Value build_integer_unary_ffbl_b32(Builder& ir, const VectorOpIn& x) {
+    return ir.ffbh_u32(ir.bitreverse(x.s0));
+}
 namespace {
 using F = Rdna2Format;
 using In = VectorOpIn;
 constexpr VectorOpDef kDefs[] = {
     {F::VOP1, 0x01, [](Builder&, const In& x) { return x.s0; }},
-    {F::VOP1, 0x37, [](Builder& ir, const In& x) { return ir.not_(x.s0); }},
-    {F::VOP1, 0x38, [](Builder& ir, const In& x) { return ir.bitreverse(x.s0); }},
-    {F::VOP1, kVop1OpcodeFfbhU32, [](Builder& ir, const In& x) { return ir.ffbh_u32(x.s0); }},
-    {F::VOP1, kVop1OpcodeFfblB32,
-     [](Builder& ir, const In& x) { return ir.ffbh_u32(ir.bitreverse(x.s0)); }},
+    {F::VOP1, 0x37, build_integer_unary_not_b32},
+    {F::VOP1, 0x38, build_integer_unary_bfrev_b32},
+    {F::VOP1, kVop1OpcodeFfbhU32, build_integer_unary_ffbh_u32},
+    {F::VOP1, kVop1OpcodeFfblB32, build_integer_unary_ffbl_b32},
 };
 }   // namespace
 std::span<const VectorOpDef> vector_integer_unary_defs() {
