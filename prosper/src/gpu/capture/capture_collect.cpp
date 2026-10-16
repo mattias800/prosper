@@ -560,6 +560,7 @@ bool capture_failure_diagnostics(
         diagnostic.has_system_inputs = failure.has_system_inputs;
         diagnostic.ps_wave32 = failure.ps_wave32;
         diagnostic.ps_float_mode = failure.ps_float_mode;
+        diagnostic.vertex_float_mode = failure.vertex_float_mode;
         diagnostic.ps_float_flags = failure.ps_float_flags;
         diagnostic.ps_launch_rsrc1 = failure.ps_launch_rsrc1;
         diagnostic.float_transport = failure.float_transport;
@@ -747,6 +748,10 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
             error = "invalid realized-draw fragment float flags";
             return false;
         }
+        if (!d.vertex_float_mode.canonical()) {
+            error = "invalid realized-draw graphics float mode";
+            return false;
+        }
         if (!d.ps_float_mode.canonical() || !d.float_transport.canonical()) {
             error = "invalid realized-draw fragment float mode";
             return false;
@@ -823,6 +828,7 @@ bool capture_submit_items(const std::vector<DrawItem>& draws,
         c.fragment_wave_config_available = d.fragment_wave_config_available;
         c.ps_wave32 = d.ps_wave32;
         c.ps_float_mode = d.ps_float_mode;
+        c.vertex_float_mode = d.vertex_float_mode;
         c.ps_float_flags = d.ps_float_flags;
         c.ps_launch_rsrc1 = d.ps_launch_rsrc1;
         c.ps_entry = d.ps_entry;

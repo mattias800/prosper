@@ -171,6 +171,7 @@ std::vector<uint32_t> observe_graphics_shader_attempt(const ShaderCompileKey& ke
         c.pcrel_target = key.has_pcrel_dispatch ? key.pcrel_dispatch_target : UINT32_MAX;
         g.capture_position = key.capture_position;
         g.vertex_lds_dwords = key.vertex_lds_dwords;
+        g.vertex_float_mode = key.vertex_float_mode;
     } catch (const std::exception&) { return compile(); }
     return observe_refused_graphics_compile(key.stage == ShaderProgramStage::Fragment ? "ps" : "vs",
                                             {key.code, key.refused_memo}, std::move(g), table,

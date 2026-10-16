@@ -124,7 +124,12 @@ void read_arguments(In& in, RefusedGraphicsInputs& g) {
 std::vector<uint8_t> encode(const std::string& stage, const RefusedGraphicsInputs& g) {
     Out o;
     o.bytes.insert(o.bytes.end(), std::begin(kMagic), std::end(kMagic));
-    o.num<uint32_t>(kRefusedGraphicsInputsSchema);
+    const uint32_t schema = g.vertex_float_mode != GraphicsFloatMode{} ||
+                                    g.shell.float_mode != GraphicsFloatMode{} ||
+                                    g.launch.rsrc1_available != 0
+                                ? kRefusedGraphicsInputsSchema
+                                : 3u;
+    o.num<uint32_t>(schema);
     o.text(stage);
     o.num(g.invocation.program_address);
     o.text(g.live_reject.empty() ? g.invocation.expected_reject : g.live_reject);
@@ -140,6 +145,16 @@ std::vector<uint8_t> encode(const std::string& stage, const RefusedGraphicsInput
     const auto carrier = encode_fragment_compile_case(c);
     o.num<uint32_t>(uint32_t(carrier.size()));
     o.bytes.insert(o.bytes.end(), carrier.begin(), carrier.end());
+    if (schema >= 5) {
+        const auto write_mode = [&](GraphicsFloatMode mode) {
+            require(mode.canonical(), "graphics-input float mode");
+            o.num<uint8_t>(mode.available);
+            o.num(mode.value);
+            o.num<uint8_t>(mode.ieee_mode);
+        };
+        write_mode(g.vertex_float_mode);
+        write_mode(g.shell.float_mode);
+    }
     require(o.bytes.size() <= kMaxFile - 8, "graphics-input file budget");
     o.num(hash(o.bytes));
     return std::move(o.bytes);
@@ -199,7 +214,8 @@ RefusedShaderInputs decode_refused_graphics_inputs(const std::vector<uint8_t>& b
             "graphics-input checksum");
     In in{std::span(bytes).first(bytes.size() - 8), sizeof kMagic};
     const auto schema = in.num<uint32_t>();
-    require(schema == 2 || schema == kRefusedGraphicsInputsSchema, "graphics-input schema");
+    require(schema == 2 || schema == 3 || schema == kRefusedGraphicsInputsSchema,
+            "graphics-input schema");
     RefusedShaderInputs result;
     result.stage = in.text();
     result.program_address = in.num<uint64_t>();
@@ -213,6 +229,23 @@ RefusedShaderInputs decode_refused_graphics_inputs(const std::vector<uint8_t>& b
             "graphics-input carrier budget");
     g->invocation = decode_fragment_compile_case(in.bytes.subspan(in.at, n));
     in.at += n;
+    if (schema >= 5) {
+        const auto read_mode = [&] {
+            GraphicsFloatMode mode;
+            mode.available = in.flag();
+            mode.value = in.num<uint8_t>();
+            mode.ieee_mode = in.flag();
+            require(mode.canonical(), "graphics-input float mode");
+            return mode;
+        };
+        g->vertex_float_mode = read_mode();
+        g->shell.float_mode = read_mode();
+    } else if (g->selector == RefusedGraphicsCompiler::NggSubgroup && g->launch.observed &&
+               (g->launch.rsrc1_available & 1u)) {
+        // Old graphics sidecars already own the actual GS register. The NGG selector proves
+        // its physical bank; native-vertex sidecars lack that association and stay unknown.
+        g->shell.float_mode = graphics_float_mode_from_rsrc1(g->launch.rsrc1[0]);
+    }
     require(in.at == in.bytes.size() && !g->invocation.complete,
             "graphics-input trailing data or complete carrier");
     require(g->invocation.program_address == result.program_address &&
@@ -229,6 +262,11 @@ RefusedShaderInputs decode_refused_graphics_inputs(const std::vector<uint8_t>& b
 uint64_t refused_graphics_inputs_identity(const RefusedGraphicsInputs& g) {
     Out o;
     write_arguments(o, g);
+    for (const auto mode : {g.vertex_float_mode, g.shell.float_mode}) {
+        o.num<uint8_t>(mode.available);
+        o.num(mode.value);
+        o.num<uint8_t>(mode.ieee_mode);
+    }
     // Code/chain and semantic choices participate. Buffer bytes and host pointer values do not.
     const auto& actual = g.invocation;
     FragmentCompileCase c;
@@ -340,12 +378,14 @@ RefusedShaderReplay replay_refused_graphics_inputs(const std::vector<uint32_t>& 
             case RefusedGraphicsCompiler::Vertex:
                 module =
                     recompile_vertex(c.code.data(), c.code.size(), table, pixel, g.capture_position,
-                                     g.vertex_lds_dwords, diagnostic, c.float_transport);
+                                     g.vertex_lds_dwords, diagnostic, c.float_transport,
+                                     use_inputs ? g.vertex_float_mode : GraphicsFloatMode{});
                 break;
             case RefusedGraphicsCompiler::VertexChain:
-                module = recompile_vertex_chain(c.code.data(), c.code.size(), g.chain.data(),
-                                                g.chain.size(), table, pixel, g.capture_position,
-                                                g.vertex_lds_dwords, diagnostic, c.float_transport);
+                module = recompile_vertex_chain(
+                    c.code.data(), c.code.size(), g.chain.data(), g.chain.size(), table, pixel,
+                    g.capture_position, g.vertex_lds_dwords, diagnostic, c.float_transport,
+                    use_inputs ? g.vertex_float_mode : GraphicsFloatMode{});
                 break;
             case RefusedGraphicsCompiler::Fragment:
                 module = recompile_fragment(

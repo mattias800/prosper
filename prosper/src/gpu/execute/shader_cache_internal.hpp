@@ -200,6 +200,7 @@ struct ShaderCompileKey {
     PixelSystemInputMapping system_inputs{};
     bool fragment_wave32 = false;
     FragmentFloatMode fragment_float_mode{};
+    GraphicsFloatMode vertex_float_mode{};
     FloatTransportConfig float_transport{};
     FragmentFloatFlags fragment_float_flags{};
     FragmentLaunchRsrc1 fragment_launch_rsrc1{};
@@ -274,6 +275,7 @@ struct ShaderCompileKey {
                has_system_inputs == other.has_system_inputs &&
                system_inputs == other.system_inputs && fragment_wave32 == other.fragment_wave32 &&
                fragment_float_mode == other.fragment_float_mode &&
+               vertex_float_mode == other.vertex_float_mode &&
                float_transport == other.float_transport &&
                fragment_float_flags == other.fragment_float_flags &&
                fragment_launch_rsrc1 == other.fragment_launch_rsrc1 &&
@@ -369,6 +371,9 @@ struct ShaderCompileKeyHash {
         hash = hash_mix(hash, key.fragment_wave32);
         hash = hash_mix(hash, key.fragment_float_mode.available);
         hash = hash_mix(hash, key.fragment_float_mode.value);
+        hash = hash_mix(hash, key.vertex_float_mode.available);
+        hash = hash_mix(hash, key.vertex_float_mode.value);
+        hash = hash_mix(hash, key.vertex_float_mode.ieee_mode);
         hash = hash_mix(hash, static_cast<uint8_t>(key.float_transport.profile));
         hash = hash_mix(hash, key.fragment_float_flags.available);
         hash = hash_mix(hash, key.fragment_float_flags.ieee_mode);

@@ -227,6 +227,7 @@ struct GpuCapturedDraw {
     bool ps_wave32 = false;
     // v64: actual producing RSRC1_PS.FLOAT_MODE; missing legacy metadata is unknown, not mode0.
     FragmentFloatMode ps_float_mode{};
+    GraphicsFloatMode vertex_float_mode{};   // v77: producing physical VS or merged GS launch
     FloatTransportConfig float_transport{};
     FragmentFloatFlags ps_float_flags{}; // v67: independent producing launch flags
     FragmentLaunchRsrc1 ps_launch_rsrc1{}; // v67: exact observed word, not inferred policy
@@ -336,6 +337,7 @@ struct GpuCapturedOperationFailure {
     bool has_system_inputs = false;
     bool ps_wave32 = false;
     FragmentFloatMode ps_float_mode{};
+    GraphicsFloatMode vertex_float_mode{};   // v77: producing physical VS or merged GS launch
     FloatTransportConfig float_transport{};
     FragmentFloatFlags ps_float_flags{};
     FragmentLaunchRsrc1 ps_launch_rsrc1{};

@@ -12,7 +12,8 @@ class NativeGraphicsStageCompilation {
         const PixelInputMapping*, const PixelSystemInputMapping*, uint64_t*, bool, uint32_t, bool,
         const SharedShaderAnalysis&, FragmentFloatMode, FloatTransportConfig, FragmentFloatFlags,
         FragmentLaunchRsrc1, RefusedShaderSource*, const CheckedGraphicsSource*,
-        std::shared_ptr<const NativeGraphicsStageCompilation>*, FragmentExportFormats);
+        std::shared_ptr<const NativeGraphicsStageCompilation>*, FragmentExportFormats,
+        GraphicsFloatMode);
     const GraphicsReadSource source_;
     const SharedShaderWords module_;
     const ShaderProgramStage stage_;

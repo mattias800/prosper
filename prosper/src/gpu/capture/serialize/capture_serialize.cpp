@@ -1414,6 +1414,28 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
                 return false;
             }
     }
+
+    if (gpu_capture_version_for(c) >= kVersionWithGraphicsFloatMode) {
+        const auto write_mode = [&](GraphicsFloatMode mode) {
+            if (!mode.canonical()) return false;
+            w.u8(mode.available);
+            w.u8(mode.value);
+            w.u8(mode.ieee_mode);
+            return true;
+        };
+        w.u32(static_cast<uint32_t>(c.draws.size()));
+        for (const auto& draw : c.draws)
+            if (!write_mode(draw.vertex_float_mode)) {
+                error = "invalid draw graphics float mode";
+                return false;
+            }
+        w.u32(static_cast<uint32_t>(c.failure_diagnostics.size()));
+        for (const auto& diagnostic : c.failure_diagnostics)
+            if (!write_mode(diagnostic.vertex_float_mode)) {
+                error = "invalid failed draw graphics float mode";
+                return false;
+            }
+    }
     // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail
     // existed, so a capture sitting just under the maximum could serialize successfully into a file
     // that read_gpu_capture then rejects as oversized -- a write that reports success and produces

@@ -28,12 +28,12 @@ compile_graphics_shader_actual(ShaderProgramStage stage, const ShaderCompileKey&
                          code, code_size, key.chain_code->data(), key.chain_code->size(), resources,
                          key.has_pixel_inputs ? &key.pixel_inputs : nullptr, key.capture_position,
                          key.vertex_lds_dwords, {RecompileDiagnosticStage::Vertex, program_address},
-                         key.float_transport)
+                         key.float_transport, key.vertex_float_mode)
                    : recompile_vertex(code, code_size, resources,
                                       key.has_pixel_inputs ? &key.pixel_inputs : nullptr,
                                       key.capture_position, key.vertex_lds_dwords,
                                       {RecompileDiagnosticStage::Vertex, program_address},
-                                      key.float_transport);
+                                      key.float_transport, key.vertex_float_mode);
     if (stage == ShaderProgramStage::Fragment) {
         const FragmentInterpolationLayout interpolation = fragment_interpolation_layout(
             code, code_size, key.has_system_inputs ? &key.system_inputs : nullptr,

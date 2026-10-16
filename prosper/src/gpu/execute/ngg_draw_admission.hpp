@@ -104,6 +104,7 @@ struct NggDrawRegisters {
     uint32_t spi_ps_input_ena = 0;
     uint32_t primitive_type = 0;   // VGT_PRIMITIVE_TYPE.PRIM_TYPE (4 list, 6 strip)
     const char* missing = nullptr;
+    GraphicsFloatMode float_mode{};   // observed RSRC1_GS; not an admission default
 };
 
 // The draw packet and its bound state, already decoded by the caller.

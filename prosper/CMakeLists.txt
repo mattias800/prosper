@@ -4580,6 +4580,17 @@ endif()
   add_executable(test_fragment_float_mode_capture tests/gpu/execute/test_fragment_float_mode_capture.cpp)
   target_link_libraries(test_fragment_float_mode_capture PRIVATE prosper_core)
   add_test(NAME fragment_float_mode_capture COMMAND test_fragment_float_mode_capture)
+  prosper_add_gtest(test_graphics_float_mode
+    SOURCES tests/gpu/state/test_graphics_float_mode.cpp
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_graphics_float_launch
+    SOURCES tests/gpu/execute/test_graphics_float_launch.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_graphics_float_inputs
+    SOURCES tests/gpu/diagnostics/test_graphics_float_inputs.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_fragment_float_flags
     SOURCES tests/gpu/state/test_fragment_float_flags.cpp
     LIBRARIES prosper_core)

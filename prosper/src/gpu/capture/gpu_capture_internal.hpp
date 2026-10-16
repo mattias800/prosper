@@ -224,7 +224,10 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // carries these words; v71-v74 captures keep their exact bytes and load an unknown launch record.
 // v76 retains the actual front-face compiler input in draw then failure order. Legacy frames
 // leave it unavailable; an observed raw raster register is not retrospectively a compiler argument.
-constexpr uint32_t kVersion = 76;
+// v77 adds the vertex/NGG producing FLOAT_MODE and IEEE_MODE, with explicit unavailable state.
+// It is appended only when needed; captures without these compiler inputs retain their old bytes.
+constexpr uint32_t kVersion = 77;
+constexpr uint32_t kVersionWithGraphicsFloatMode = 77;
 constexpr uint32_t kVersionWithFrontFaceEncoding = 76;
 constexpr uint32_t kVersionWithComputeDispatchLaunch = 75;
 constexpr uint32_t kVersionWithUnavailableSource = 74;
@@ -243,6 +246,11 @@ inline bool gpu_capture_has_unavailable_source(const GpuCaptureFile& c) {
 }
 // The lowest version whose tails can hold everything this capture carries.
 inline uint32_t gpu_capture_version_for(const GpuCaptureFile& c) {
+    for (const auto& draw : c.draws)
+        if (draw.vertex_float_mode != GraphicsFloatMode{}) return kVersionWithGraphicsFloatMode;
+    for (const auto& diagnostic : c.failure_diagnostics)
+        if (diagnostic.vertex_float_mode != GraphicsFloatMode{})
+            return kVersionWithGraphicsFloatMode;
     for (const auto& draw : c.draws)
         if (draw.system_inputs.front_face_encoding != FragmentFrontFaceEncoding::Unavailable)
             return kVersionWithFrontFaceEncoding;
@@ -1408,6 +1416,12 @@ inline bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::str
         if (!diagnostic.ps_float_flags.canonical() ||
             (diagnostic.kind != SubmitOperationKind::Draw && diagnostic.ps_float_flags.available)) {
             error = "invalid failed-draw fragment float flags";
+            return false;
+        }
+        if (!diagnostic.vertex_float_mode.canonical() ||
+            (diagnostic.kind != SubmitOperationKind::Draw &&
+             diagnostic.vertex_float_mode.available)) {
+            error = "invalid failed-draw graphics float mode";
             return false;
         }
         if (!diagnostic.ps_float_mode.canonical() ||
