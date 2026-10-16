@@ -119,3 +119,20 @@ TEST(IrVectorIntegerUnaryExecution, AnUnknownSourceIsNeverAnEmptyScan) {
         EXPECT_TRUE(eval_vector_op(def, 0x12345678, std::nullopt));
     }
 }
+
+TEST(IrVectorIntegerUnaryExecution, SdwaBfrevReversesTheSelectedUnsignedSource) {
+    // AMD70648 byte/word selection then D[31:0]=S[0:31]; answers are hand reversed.
+    const uint32_t expected[] = {0xe6000000, 0xa2000000, 0xc4000000,
+                                 0x81000000, 0xe6a20000, 0xc4810000};
+    auto in = lane_inputs(5310);
+    for (auto& source : in.s0) source = 0x81234567;
+    for (uint32_t selector = 0; selector < 6; ++selector)
+        for (uint32_t wave : {32u, 64u}) {
+            const auto run = run_vector_op_per_lane(
+                {vop1(0x38, kVdst, 249), kVsrc0 | (6u << 8) | (selector << 16)}, in, wave);
+            ASSERT_TRUE(run.error.empty()) << run.error;
+            ASSERT_EQ(run.d.size(), in.lanes());
+            for (size_t lane = 0; lane < in.lanes(); ++lane)
+                ASSERT_EQ(run.d[lane], in.active[lane] ? expected[selector] : in.old_d[lane]);
+        }
+}

@@ -7,5 +7,7 @@ struct SpirvCompute;
 struct Rdna2Inst;
 }   // namespace prosper::gpu
 namespace prosper::gpu::ir {
+// Numeric SDWA BFREV source selection; called at its original pre-route stage.
+void select_vop1_integer_source(SpirvCompute& b, const Rdna2Inst& in, uint32_t& a);
 bool lower_vop1_integer(SpirvCompute& b, const Rdna2Inst& in, uint32_t a, uint32_t& d, bool& ok);
 }
