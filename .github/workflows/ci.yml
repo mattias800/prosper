@@ -187,9 +187,14 @@ jobs:
       - name: Configure
         # Keep full Debug information while avoiding repeated uncompressed DWARF in every test
         # executable (#5176). Linker compression is lossless; no target or assertion is removed.
+        # PROSPER_CORE_SHARED links every test against ONE shared prosper_core instead of a static
+        # copy of most of the core per test executable, which is what grows the build tree with
+        # each new test file (#5176). Default OFF elsewhere; see the option in prosper/CMakeLists.txt.
         run: >-
           cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug
           -DCMAKE_EXE_LINKER_FLAGS="-Wl,--compress-debug-sections=zlib"
+          -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--compress-debug-sections=zlib"
+          -DPROSPER_CORE_SHARED=ON
           -DPROSPER_DIAGNOSTICS=ON -DPython3_EXECUTABLE="$PWD/.venv/bin/python"
 
       # A configuration that quietly loses Vulkan would silently drop those tests again and still

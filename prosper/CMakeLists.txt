@@ -70,6 +70,33 @@ function(prosper_hosts_a_guest target)
   endif()
 endfunction()
 
+# --- Shared prosper_core (test-suite disk footprint, #5176) ----------------
+# Every test executable links prosper_core. As a STATIC archive each one carries its own copy of
+# most of the core, with full Debug information, so the build tree grows by roughly one core per
+# test file -- the hosted Linux CI runner ran out of disk linking them (#5176). ON builds
+# prosper_core as ONE shared library that every test loads from the build tree (CMake's default
+# build RPATH), so the core is paid for once. OFF (the default) is unchanged: release builds,
+# prosper-app packaging, Windows and macOS all keep the static archive. Linux-only for now -- the
+# Windows build links its runtimes statically and the macOS build has not been tried.
+# A test that depends on static-archive link semantics links prosper_core_static instead; the three
+# kinds are listed in tests/AGENTS.md (--wrap of core's calls, a core .cpp compiled into the test,
+# and static-destruction ordering relative to the core).
+option(PROSPER_CORE_SHARED "Build prosper_core as a shared library (Linux test builds, #5176)" OFF)
+if(PROSPER_CORE_SHARED)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "PROSPER_CORE_SHARED is supported on Linux only")
+  endif()
+  # Everything that ends up inside the shared object (libatrac9, the build-revision stamp, the
+  # core's own objects) must be position-independent; set before any target is created.
+  set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+  # ...and link executables as PIE to match. Without check_pie_supported() the property only adds
+  # -fPIE at compile time, so a toolchain that does not default to PIE (Fedora's GCC) still links
+  # them at a fixed address below 4 GiB. That matters here: code that treats a value under 4 GiB as
+  # an offset rather than a host pointer misreads a test's static data there (gpu_execute).
+  include(CheckPIESupported)
+  check_pie_supported()
+endif()
+
 # --- Diagnostics (optional observer-only instrumentation) -----------------
 # Boot timeline capture, event bus, JSON export. OFF by default: zero cost when
 # disabled (stubs compile to no-ops). ON adds ~300 lines of optional code.
@@ -165,30 +192,52 @@ if(NOT PROSPER_DIAGNOSTICS)
   list(FILTER PROSPER_SRC EXCLUDE REGEX "src/diagnostics/(core|storage)/")
 endif()
 if(PROSPER_SRC)
-  add_library(prosper_core STATIC ${PROSPER_SRC})
-  target_include_directories(prosper_core PUBLIC src)
+  # PROSPER_CORE_SHARED (see the option above): the sources compile once into an OBJECT library,
+  # which becomes the shared prosper_core every ordinary consumer links, plus a static archive of
+  # the same objects for the few tests that need link-time control over core's own references.
+  # Every usage requirement below is set on whichever target owns the sources.
+  if(PROSPER_CORE_SHARED)
+    add_library(prosper_core_objects OBJECT ${PROSPER_SRC})
+    set(_prosper_core_impl prosper_core_objects)
+  else()
+    add_library(prosper_core STATIC ${PROSPER_SRC})
+    set(_prosper_core_impl prosper_core)
+  endif()
+  target_include_directories(${_prosper_core_impl} PUBLIC src)
   # stb_truetype.h backs the libSceFont Ft (FreeType-edition) rasterizer in
   # src/hle/util/hle_font.cpp, and stb_image.h (v2.30, PNG only) backs libScePngDec in
   # src/hle/util/hle_pngdec.cpp -- the latter by owner decision 2026-10-05; prosper-app links its
   # own copy for cover art. PRIVATE: implementation details of those translation units, not part
   # of prosper_core's interface. BOTH headers are on the guest path and parse bytes a title
   # supplies, so treat them as parsers of untrusted input; see third_party/stb/README.md.
-  target_include_directories(prosper_core PRIVATE third_party/stb)
-  target_link_libraries(prosper_core PUBLIC libatrac9 PRIVATE prosper_build_revision)
-  target_compile_definitions(prosper_core PRIVATE PROSPER_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+  target_include_directories(${_prosper_core_impl} PRIVATE third_party/stb)
+  target_link_libraries(${_prosper_core_impl} PUBLIC libatrac9 PRIVATE prosper_build_revision)
+  target_compile_definitions(${_prosper_core_impl} PRIVATE PROSPER_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   if(PROSPER_NATIVE_CLANG_TLS)
-    prosper_add_gnu_variadic_producer(prosper_core
+    prosper_add_gnu_variadic_producer(${_prosper_core_impl}
       "${CMAKE_CURRENT_SOURCE_DIR}/src/hle/libc/libc_variadic_capture.cpp" libc_capture)
   endif()
   if(PROSPER_DIAGNOSTICS)
-    target_compile_definitions(prosper_core PRIVATE PROSPER_DIAGNOSTICS)
+    target_compile_definitions(${_prosper_core_impl} PRIVATE PROSPER_DIAGNOSTICS)
   endif()
   find_package(Threads REQUIRED)
-  target_link_libraries(prosper_core PUBLIC Threads::Threads)
+  target_link_libraries(${_prosper_core_impl} PUBLIC Threads::Threads)
   # Windows: the guest futex HLE (sceKernelWaitOnAddress/WakeByAddress) is backed by the native Win32
   # WaitOnAddress/WakeByAddressSingle/All, which live in the Synchronization import lib (not kernel32).
   if(WIN32)
-    target_link_libraries(prosper_core PUBLIC synchronization bcrypt)
+    target_link_libraries(${_prosper_core_impl} PUBLIC synchronization bcrypt)
+  endif()
+  # prosper_core_static is what a test links when it rewrites core's OWN references at link time
+  # (-Wl,--wrap=mmap and friends). --wrap only rewrites references in the objects of the link it
+  # is passed to, so against a shared prosper_core the wrapper would silently stop observing core.
+  # In the default static build it is simply another name for prosper_core.
+  if(PROSPER_CORE_SHARED)
+    add_library(prosper_core SHARED)
+    target_link_libraries(prosper_core PUBLIC prosper_core_objects)
+    add_library(prosper_core_static STATIC)
+    target_link_libraries(prosper_core_static PUBLIC prosper_core_objects)
+  else()
+    add_library(prosper_core_static ALIAS prosper_core)
   endif()
 endif()
 
@@ -2959,7 +3008,7 @@ if(TARGET prosper_core)
     # Fail sizing/seek operations on a valid fixture without blocking I/O or huge allocations.
     add_executable(test_module_file_io tests/misc/test_module_file_io.cpp)
     target_include_directories(test_module_file_io PRIVATE tests)
-    target_link_libraries(test_module_file_io PRIVATE prosper_core)
+    target_link_libraries(test_module_file_io PRIVATE prosper_core_static)  # --wrap: see prosper_core_static
     target_link_options(test_module_file_io PRIVATE
       "-Wl,--wrap=fseek" "-Wl,--wrap=ftell" "-Wl,--wrap=fread" "-Wl,--wrap=fclose")
     add_test(NAME module_file_io COMMAND test_module_file_io)
@@ -3263,9 +3312,11 @@ if(TARGET prosper_core)
   # #4003: force the stale-drainer handoff in the actual completion-queue implementation.
   # This executable supplies its own CP object; the ordinary archive CP object stays unselected.
   # Rendezvous calls are compiled out of prosper_core and every shipping frontend.
+  # prosper_core_static, not prosper_core: "unselected" is an archive property. A shared core
+  # always carries its own CP object, whose file-scope state would then exist twice in the process.
   add_executable(test_pending_drain_gate tests/gpu/pm4/test_pending_drain_gate.cpp
     src/gpu/pm4/command_processor.cpp)
-  target_link_libraries(test_pending_drain_gate PRIVATE prosper_core)
+  target_link_libraries(test_pending_drain_gate PRIVATE prosper_core_static)
   target_compile_definitions(test_pending_drain_gate PRIVATE PROSPER_PENDING_DRAIN_TEST_CHECKPOINTS)
   if(PROSPER_DIAGNOSTICS)
     target_compile_definitions(test_pending_drain_gate PRIVATE PROSPER_DIAGNOSTICS)
@@ -4233,7 +4284,7 @@ endif()
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(test_guest_writable_query_adapter
       tests/host/memory/test_guest_writable_query_adapter.cpp)
-    target_link_libraries(test_guest_writable_query_adapter PRIVATE prosper_core)
+    target_link_libraries(test_guest_writable_query_adapter PRIVATE prosper_core_static)  # --wrap
     target_link_options(test_guest_writable_query_adapter PRIVATE "-Wl,--wrap=ioctl" "-Wl,--wrap=open")
     add_test(NAME guest_writable_query_adapter COMMAND ${CMAKE_COMMAND} -E env
       --unset=PROSPER_NO_GUEST_WRITE_CACHE --unset=PROSPER_NO_GUEST_WRITABLE_QUERY
@@ -5229,13 +5280,13 @@ endif()
       add_executable(test_runtime_prx_load tests/host/image/test_runtime_prx_load.cpp)
       # Includes a shared fixture, which resolves from the `tests` root.
       target_include_directories(test_runtime_prx_load PRIVATE tests)
-      target_link_libraries(test_runtime_prx_load PRIVATE prosper_core)
+      target_link_libraries(test_runtime_prx_load PRIVATE prosper_core_static)  # --wrap=mmap
       add_test(NAME runtime_prx_load COMMAND test_runtime_prx_load)
       if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         # Initial installation must reject an oversized last-slot hook before touching live pages.
         prosper_add_gtest(test_initial_stub_install
           SOURCES tests/host/image/test_initial_stub_install.cpp
-          LIBRARIES prosper_core
+          LIBRARIES prosper_core_static  # --wrap=mmap
           PROPERTIES TIMEOUT 20)
         target_link_options(test_initial_stub_install PRIVATE "-Wl,--wrap=mmap")
         target_link_options(test_runtime_prx_load PRIVATE "-Wl,--wrap=mmap")
@@ -5324,8 +5375,11 @@ endif()
     # destructor. The test parks a guest worker and drives the whole tail from an exit-time probe, so
     # the post-destruction access happens on EVERY run instead of 1-in-300 — and the probe checks the
     # two library canaries first, so a broken ordering assumption fails instead of passing vacuously.
+    # prosper_core_static: the probe's ordering is "this TU initializes before the core's statics",
+    # which holds for an archive later on the link line and is reversed for a shared library (its
+    # initializers run before the executable's). The test's canaries detect the reversal and fail.
     add_executable(test_exit_registry_lifetime tests/host/image/test_exit_registry_lifetime.cpp)
-    target_link_libraries(test_exit_registry_lifetime PRIVATE prosper_core)
+    target_link_libraries(test_exit_registry_lifetime PRIVATE prosper_core_static)
     add_test(NAME exit_registry_lifetime COMMAND test_exit_registry_lifetime)
     set_tests_properties(exit_registry_lifetime PROPERTIES TIMEOUT 120)
 

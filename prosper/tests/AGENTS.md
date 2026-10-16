@@ -15,6 +15,14 @@ Older tests are standalone executables registered with `add_test` and a local `C
 - The few tests that must compile standalone (e.g. `tools/perf/mutate_*.sh` build them with plain g++)
   stay on the allowlist. Since the list only shrinks, a new standalone test needs the owner's say-so.
 - Dump- or Vulkan-gated tests keep their gating in CMake, not inside gtest.
+- Linux CI builds with `-DPROSPER_CORE_SHARED=ON`, so tests link ONE shared `prosper_core` rather
+  than each carrying a static copy (#5176: the runner ran out of disk). A test that depends on
+  static-archive linking must link `prosper_core_static` instead: one that rewrites core's own calls
+  with `-Wl,--wrap=...`, or one that compiles a core `.cpp` itself and relies on the archive's copy
+  staying unselected (`test_pending_drain_gate`), or one whose exit-time probe must run after the
+  core's static destructors (`test_exit_registry_lifetime`). Against the shared library the first
+  stops observing core without failing, the second runs two copies of that file's state, and the
+  third has its ordering reversed, because a shared library initializes before the executable.
 
 ## Python test policy
 
