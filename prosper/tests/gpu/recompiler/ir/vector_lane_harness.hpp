@@ -23,7 +23,8 @@
 
 namespace prosper::test::ir {
 
-inline constexpr uint32_t kVdst = 1, kVsrc0 = 2, kVsrc1 = 3;   // the registers the op must name
+inline constexpr uint32_t kVdst = 1, kVsrc0 = 2, kVsrc1 = 3,
+                          kVsrc2 = 5;   // the registers the op must name
 
 // VOP2 `op v1, v2, v3` (SRC0 = VGPR v2 is operand 256 + 2).
 inline uint32_t vop2(uint32_t op, uint32_t vdst = kVdst, uint32_t src0 = 256 + kVsrc0,
@@ -39,6 +40,8 @@ inline uint32_t vop1(uint32_t op, uint32_t vdst = kVdst, uint32_t src0 = 256 + k
 struct LaneInputs {
     std::vector<uint32_t> s0, s1, old_d;
     std::vector<bool> active;
+    std::vector<uint32_t>
+        s2; // optional independent fifth array; old four-array programs stay identical
     size_t lanes() const { return s0.size(); }
 };
 
@@ -76,7 +79,7 @@ struct LaneProgram {
     prosper::gpu::ComputeShaderConfig config;
 };
 inline LaneProgram lane_program(const std::vector<uint32_t>& op_words, uint32_t lanes,
-                                uint32_t wave) {
+                                uint32_t wave, bool third_source = false) {
     using namespace prosper::gpu;
     const auto load = [&](uint32_t vdata, uint32_t array) -> std::vector<uint32_t> {
         // buffer_load_dword vN, v0 (idxen), s[8:11], offset = array * lanes * 4 bytes
@@ -85,6 +88,10 @@ inline LaneProgram lane_program(const std::vector<uint32_t>& op_words, uint32_t 
     std::vector<uint32_t> code;
     for (const auto& words : {load(kVsrc0, 0), load(kVsrc1, 1), load(kVdst, 2), load(4, 3)})
         code.insert(code.end(), words.begin(), words.end());
+    if (third_source) {
+        const auto words = load(kVsrc2, 4);
+        code.insert(code.end(), words.begin(), words.end());
+    }
     code.push_back(0xbf8c3f70u);   // s_waitcnt vmcnt(0)
     code.push_back(0x7daa0880u);   // v_cmpx_ne_u32 0, v4
     code.insert(code.end(), op_words.begin(), op_words.end());
@@ -98,7 +105,7 @@ inline LaneProgram lane_program(const std::vector<uint32_t>& op_words, uint32_t 
     r.binding = 3;
     r.sgpr_base = 8;
     r.stride = 4;
-    r.size = 4 * lanes * 4;
+    r.size = (third_source ? 5u : 4u) * lanes * 4u;
     ShaderResourceTable table;
     table.resources.push_back(r);
     ComputeShaderConfig config;
@@ -117,7 +124,8 @@ inline LaneRun run_vector_op_per_lane(const std::vector<uint32_t>& op_words, con
                                       uint32_t wave = 64, bool half_rte_preserve_denorm = false) {
     using namespace prosper::gpu;
     const uint32_t lanes = static_cast<uint32_t>(in.lanes());
-    const auto program = lane_program(op_words, lanes, wave);
+    if (!in.s2.empty() && in.s2.size() != lanes) return {{}, "S2 lane count mismatch"};
+    const auto program = lane_program(op_words, lanes, wave, !in.s2.empty());
     const auto& code = program.code;
     const uint64_t address = lane_harness_address();
     const auto module = recompile_compute(code.data(), code.size(), &program.table, program.config,
@@ -126,6 +134,7 @@ inline LaneRun run_vector_op_per_lane(const std::vector<uint32_t>& op_words, con
     std::vector<uint32_t> buffer;
     for (const auto* array : {&in.s0, &in.s1, &in.old_d}) buffer.insert(buffer.end(), array->begin(), array->end());
     for (bool active : in.active) buffer.push_back(active ? 1u : 0u);
+    buffer.insert(buffer.end(), in.s2.begin(), in.s2.end());
     bpermute_oracle::Interpreter vm(module);
     vm.half_rte_preserve_denorm = half_rte_preserve_denorm;
     auto out = vm.run_buffers(lanes, {{3, buffer}}, 3);

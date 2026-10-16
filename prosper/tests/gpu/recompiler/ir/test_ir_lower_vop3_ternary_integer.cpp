@@ -2,6 +2,7 @@
 #include "gpu/recompiler/ir/lower/vop3_ternary_integer_lowering.hpp"
 #include "gpu/recompiler/ir/lowering_fixture.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <gtest/gtest.h>
 #include <cstddef>
 #include <cstdint>
