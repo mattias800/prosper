@@ -76,8 +76,9 @@ constexpr OpcodeInfo kInfo[] = {
     {"f32.ge", 2, Type::Bool},
     {"f32.unord.ne", 2, Type::Bool},
     {"f32.ldexp", 2, Type::U32},
+    {"pack.norm16", 1, Type::U32},
 };
-static_assert(std::size(kInfo) == static_cast<size_t>(Opcode::F32Ldexp) + 1);
+static_assert(std::size(kInfo) == static_cast<size_t>(Opcode::PackNorm16) + 1);
 
 // The type argument `slot` of `op` must have.
 Type argument_type(Opcode op, size_t slot) {
@@ -122,6 +123,8 @@ Value Block::append(const Inst& inst) {
     }
     if (inst.op == Opcode::UnpackHalf && inst.imm > 1)
         malformed("half component out of range", info);
+    if (inst.op == Opcode::PackNorm16 && inst.imm > 1)
+        malformed("normalized-pack mode out of range", info);
     insts_.push_back(inst);
     return Value{static_cast<uint32_t>(insts_.size() - 1)};
 }
