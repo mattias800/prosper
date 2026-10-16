@@ -221,7 +221,7 @@ TEST(IrVectorMacFloatExecution, DefinitionFactsRequiredSourcesAndNonfusedScopeAr
         EXPECT_EQ(e.vdst_dwords, 1u);
         EXPECT_FALSE(e.vdst_half);
         EXPECT_TRUE(e.accumulates);
-        EXPECT_EQ(rdna2_valu_source_count(def.fmt, def.opcode), 3u);
+        EXPECT_EQ(rdna2_valu_source_count(def.fmt, def.opcode), 2u);
         Block block;
         Builder ir(block);
         std::vector<uint32_t> slots;

@@ -26,6 +26,7 @@
 // listed set stays within the LLVM-clean set and that unknown opcodes stay conservative, so a
 // future extension is a deliberate, reviewed diff rather than drift.
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_instruction_effects.hpp"
 
 #include <gtest/gtest.h>
 
@@ -241,24 +242,29 @@ TEST(Rdna2PredicateTables, OpselCaptureSetIsExactlyTheSixteenBitFamily) {
     EXPECT_EQ(decode_vop3(0x306u, 258u, 0xFu << 11).vop3p_opsel, 0u) << "0x306 hole";
 }
 
-TEST(Rdna2PredicateTables, TwoSourcePredicateMatchesDecodedArity) {
-    // The predicate and the decoder's SRC2 clearing must agree on every VOP3 opcode: a listed op
-    // decodes two sources (reserved SRC2 reads as s0 and must not escape), an unlisted op keeps
-    // all three (fail-closed for unsupported encodings).
-    for (uint32_t op = 0x100u; op <= 0x3FFu; ++op) {
-        const Rdna2Inst in = decode_vop3(op, 0u);
-        const bool listed = emitted_vop3_opcode_has_two_data_sources(op);
-        EXPECT_EQ(in.n_src == 2 && in.src[2].kind == OperandKind::None, listed)
-            << "VOP3 op=" << op;
-    }
-    // Negative controls: genuine three-source ops the list must never absorb. 0x128 keeps its
-    // carry-in (the live GTA V _co_ci_ consumer), 0x143/0x14B/0x36D/0x371 are ordinary ternaries.
+TEST(Rdna2PredicateTables, DecodedArityMatchesEffectsTable) {
+    // Architectural arity is independent of emitter admission. Test canonical zero and nonzero
+    // raw SRC2 fields: an unused encoded slot must never escape as a phantom dependency.
+    for (uint32_t op = 0x100u; op <= 0x3FFu; ++op)
+        for (uint32_t raw_src2 : {0u, 258u}) {
+            const Rdna2Inst in = decode_vop3(op, raw_src2);
+            const auto& effects = rdna2_instruction_effects(Rdna2Format::VOP3, op);
+            const uint32_t count = rdna2_valu_source_count(Rdna2Format::VOP3, op);
+            ASSERT_EQ(in.n_src, count) << "VOP3 op=" << op;
+            if (!effects.describes_sources()) EXPECT_EQ(count, 3u) << "unknown op=" << op;
+            for (uint32_t source = 0; source < 3; ++source)
+                EXPECT_EQ(in.src[source].kind == OperandKind::None, source >= count)
+                    << "VOP3 op=" << op << " source=" << source;
+        }
+    // Genuine three-source forms retain the carry-in or third arithmetic source because their
+    // shared ISA effects describe it, including when the raw slot would otherwise resemble s0.
     for (uint32_t op : {0x128u, 0x143u, 0x14Bu, 0x36Du, 0x371u}) {
-        EXPECT_FALSE(emitted_vop3_opcode_has_two_data_sources(op))
-            << "three-source VOP3 op=" << op;
+        EXPECT_EQ(rdna2_valu_source_count(Rdna2Format::VOP3, op), 3u);
         EXPECT_EQ(decode_vop3(op, 0u).n_src, 3) << "op=" << op;
+        EXPECT_NE(decode_vop3(op, 258u).src[2].kind, OperandKind::None);
     }
-    // The 0x306 hole is not an instruction but still decodes fail-closed with three fields.
-    EXPECT_FALSE(emitted_vop3_opcode_has_two_data_sources(0x306u));
+    // The 0x306 hole has no instruction contract and must keep all three fields fail-closed.
+    EXPECT_FALSE(rdna2_instruction_effects(Rdna2Format::VOP3, 0x306u).describes_sources());
     EXPECT_EQ(decode_vop3(0x306u, 0u).n_src, 3);
+    EXPECT_NE(decode_vop3(0x306u, 258u).src[2].kind, OperandKind::None);
 }

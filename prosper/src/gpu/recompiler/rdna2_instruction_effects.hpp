@@ -226,8 +226,8 @@ uint32_t rdna2_valu_complete_result_dwords(Rdna2Format fmt, uint32_t opcode);
 uint32_t rdna2_valu_complete_result_dwords(const Rdna2Inst& in);
 // How many of a VALU encoding's three source fields the instruction reads: the highest source
 // with a register width, so a VOP3 encoding's unused SRC1/SRC2 fields (which decode as s0) are not
-// reads. 3 for an encoding the table does not describe, an accumulator (VOP3 MAC/FMAC encode the
-// old VDST in SRC2) and the v_interp_* forms.
+// reads. 3 for an encoding the table does not describe and the v_interp_* forms. An accumulator's
+// old VDST is a separate implicit dependency, described by accumulates, never an encoded SRC2.
 uint32_t rdna2_valu_source_count(Rdna2Format fmt, uint32_t opcode);
 // Consecutive registers VALU source `source` names (a pair for an F64/B64 operand, a quad for
 // v_mqsad_u32_u8's SRC2), whichever register file the operand is in; 0 when the instruction has no

@@ -6,9 +6,8 @@
 // transforms, OMOD/CLAMP and the EXEC-predicated VDST write stay in ir/lower/, because they are the
 // same for every opcode of a format.
 //
-// Today: the VOP2-encoded integer and bitwise group. The VOP3 (e64) encodings of the same operations
-// are not admitted by emit_alu; admitting them through these definitions is a behaviour change for a
-// later, corpus-gated PR.
+// VOP2 data operations and their canonical e64 aliases share these builders. Encoding
+// admission, unsupported modifiers and EXEC predication remain in the lowerings.
 #pragma once
 
 #include "gpu/recompiler/ir/builder.hpp"
@@ -32,6 +31,23 @@ struct VectorOpDef {
     uint32_t opcode;
     Value (*build)(Builder& ir, const VectorOpIn& in);
 };
+
+// One arithmetic definition shared by the e32 and e64 data encodings.
+Value build_vector_mul_u32_u24(Builder& ir, const VectorOpIn& in);
+Value build_vector_min_i32(Builder& ir, const VectorOpIn& in);
+Value build_vector_max_i32(Builder& ir, const VectorOpIn& in);
+Value build_vector_min_u32(Builder& ir, const VectorOpIn& in);
+Value build_vector_max_u32(Builder& ir, const VectorOpIn& in);
+Value build_vector_lshrrev_b32(Builder& ir, const VectorOpIn& in);
+Value build_vector_ashrrev_i32(Builder& ir, const VectorOpIn& in);
+Value build_vector_lshlrev_b32(Builder& ir, const VectorOpIn& in);
+Value build_vector_and_b32(Builder& ir, const VectorOpIn& in);
+Value build_vector_or_b32(Builder& ir, const VectorOpIn& in);
+Value build_vector_xor_b32(Builder& ir, const VectorOpIn& in);
+Value build_vector_xnor_b32(Builder& ir, const VectorOpIn& in);
+Value build_vector_add_nc_u32(Builder& ir, const VectorOpIn& in);
+Value build_vector_sub_nc_u32(Builder& ir, const VectorOpIn& in);
+Value build_vector_subrev_nc_u32(Builder& ir, const VectorOpIn& in);
 
 // nullptr when (fmt, opcode) has no vector definition.
 const VectorOpDef* find_vector_op(Rdna2Format fmt, uint32_t opcode);

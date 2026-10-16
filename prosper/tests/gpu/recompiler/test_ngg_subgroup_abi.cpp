@@ -492,8 +492,10 @@ TEST(NggSubgroupAbi, UnusedVop3SourceFieldsAreNotReads) {
     // The two-source VOP3-only forms the old opcode-band rule left at three (#5146 step 4).
     EXPECT_EQ(rdna2_valu_source_count(Rdna2Format::VOP3, 0x376), 2u) << "v_sub_nc_i32";
     EXPECT_EQ(rdna2_valu_source_count(Rdna2Format::VOP3, 0x164), 2u) << "v_add_f64";
-    EXPECT_EQ(rdna2_valu_source_count(Rdna2Format::VOP3, 0x11f), 3u)
-        << "v_mac_f32_e64 encodes its accumulator in SRC2";
+    EXPECT_EQ(rdna2_valu_source_count(Rdna2Format::VOP3, 0x11f), 2u)
+        << "v_mac_f32_e64 has two encoded sources and a separate implicit old VDST";
+    EXPECT_TRUE(rdna2_instruction_effects(Rdna2Format::VOP3, 0x11f).accumulates);
+    EXPECT_EQ(rdna2_valu_result_keeps_old_vdst(Rdna2Format::VOP3, 0x11f), Rdna2Answer::Yes);
     // v_mov_b32_e64 v10, v0: SRC1 and SRC2 are zero fields, i.e. s0.
     EXPECT_TRUE(analyze(program({0xd581000au, 0x00000100u})).ok());
     // v_add_nc_u32_e64 v10, v0, v1: SRC2 is a zero field.
@@ -521,4 +523,14 @@ TEST(NggSubgroupAbi, ALocalVccWriteNeedsItsSourcesWrittenInItsOwnBlock) {
     // s_cbranch_scc0 +2 and s_cbranch_cdbgsys +2 both land on pc 3, past the s[8:9] writes.
     EXPECT_FALSE(proven(0xBF840002u)) << "a conditional branch joins at pc 3";
     EXPECT_FALSE(proven(0xBF970002u)) << "a debugger-conditional branch joins at pc 3";
+}
+
+TEST(NggSubgroupAbi, AccumulatorsStillReadUndefinedOldVdstWithoutPhantomSrc2) {
+    for (uint32_t op : {0x11fu, 0x12bu}) {
+        const uint32_t encoded = 0xd4000006u | (op << 16);   // D=v6, S0=v0, S1=v1.
+        const auto missing = analyze(program({encoded, 0x00020300u}));
+        EXPECT_EQ(missing.reason, "ngg-abi-read-v6-v7") << missing.refusal;
+        const auto genuine = analyze(program({0x7e0c0280u, encoded, 0x00020300u}));
+        EXPECT_TRUE(genuine.ok()) << genuine.refusal;
+    }
 }

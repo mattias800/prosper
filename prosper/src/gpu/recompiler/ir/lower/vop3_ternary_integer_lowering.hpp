@@ -1,5 +1,5 @@
 // Value helper only: true means this subgroup owns D, even when an operand cleared ok.
-// The caller retains the existing modifier refusal and common destination/predication stages.
+// This helper owns ordinary source-modifier refusal; the caller retains CLAMP and predication.
 #pragma once
 namespace prosper::gpu {
 struct SpirvCompute;
