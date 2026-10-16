@@ -654,6 +654,12 @@ if(Python3_Interpreter_FOUND)
   # guards a state this repository produces routinely, since every lane pushes after CI starts.
   add_test(NAME pr_merge_gate
            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/ci/test_pr_merge_gate.py")
+  find_program(PWSH_EXECUTABLE NAMES pwsh HINTS "$ENV{ProgramFiles}/PowerShell/7")
+  if(PWSH_EXECUTABLE)
+    add_test(NAME windows_build_storage
+             COMMAND "${PWSH_EXECUTABLE}" -NoLogo -NoProfile -File
+                     "${CMAKE_SOURCE_DIR}/tools/ci/test_windows_build_storage.ps1")
+  endif()
   # check_python_quality.py ratchets ruff on CHANGED Python files only (#4126). Its tests skip,
   # loudly, when ruff is absent; the python-quality CI job installs it, so there they always run.
   add_test(NAME python_quality_gate

@@ -1092,6 +1092,10 @@ jobs:
 
       # The full static Debug build exhausted the hosted disk before tests (#5276).
       # NTFS directory compression preserves debug information and all build/test inputs.
+      - name: Locate compiler temporary storage
+        shell: msys2 {0}
+        run: printf 'CI_COMPILER_TEMP=%s\n' "$(cygpath -m "${TMPDIR:-/tmp}")" >> "$GITHUB_ENV"
+
       - name: Prepare compressed build storage
         shell: pwsh
         run: |
@@ -1114,6 +1118,7 @@ jobs:
           if ((Get-Item -LiteralPath $probeFile).Attributes -band [IO.FileAttributes]::Compressed) {
             throw 'Uncompressed control unexpectedly reports compression'
           }
+          & ./prosper/tools/ci/windows_build_storage.ps1 -ProbeFile $probeFile -ExpectedProbe uncompressed
           Remove-Item -LiteralPath $probeDir -Recurse
 
           # /C marks the directory for inheritance; /EXE does not. Never ignore errors (/I).
@@ -1126,8 +1131,10 @@ jobs:
               throw 'Build-directory compression did not propagate to a new child'
             }
           }
+          & ./prosper/tools/ci/windows_build_storage.ps1 -ProbeFile $probeFile -ExpectedProbe compressed
           Remove-Item -LiteralPath $probeDir -Recurse
           Write-Host 'Compression controls passed: uncompressed file refused, new child inherited'
+          & ./prosper/tools/ci/windows_build_storage.ps1 -Phase before -CompilerTempDirectory $env:CI_COMPILER_TEMP
 
       - name: Configure
         shell: msys2 {0}
@@ -1141,14 +1148,7 @@ jobs:
       - name: Report build storage
         if: ${{ always() && (steps.build.outcome == 'success' || steps.build.outcome == 'failure') }}
         shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $buildDir = Join-Path $env:GITHUB_WORKSPACE 'prosper/build-ci'
-          $driveName = (Get-Item -LiteralPath $buildDir).PSDrive.Name
-          Get-PSDrive -Name $driveName | Select-Object Name, Used, Free | Format-Table
-          $files = Get-ChildItem -LiteralPath $buildDir -Recurse -File -Force
-          $size = ($files | Measure-Object -Property Length -Sum).Sum
-          Write-Host "Build files: $($files.Count); logical bytes: $size"
+        run: ./prosper/tools/ci/windows_build_storage.ps1 -Phase after -CompilerTempDirectory $env:CI_COMPILER_TEMP
 
       - name: Test
         shell: msys2 {0}
