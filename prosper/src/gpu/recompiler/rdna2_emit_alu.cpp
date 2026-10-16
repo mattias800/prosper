@@ -58,6 +58,7 @@
 #include "gpu/recompiler/ir/lower/vop3_multiply_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_mad24_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_integer16_lowering.hpp"
+#include "gpu/recompiler/ir/lower/vop3_minmax_half_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_mad_float_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_minmax_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_minmax_float_lowering.hpp"
@@ -1354,8 +1355,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 return bits;
             };
             if (ir::lower_vop3_pack16(b, rs, in, ok, allow_wave)) {
-            } else if (in.opcode == 0x34B || in.opcode == 0x351 || in.opcode == 0x354 ||
-                       in.opcode == 0x357) {
+            } else if (ir::lower_vop3_minmax_half(b, rs, in, ok, allow_wave, old_d, fresult)) {
+            } else if (in.opcode == 0x34B) {
                 // Scalar f16 VOP3: one selected half from each packed source and one independently
                 // selected destination half. The opposite destination half is preserved. The
                 // `v_max3_f16` occurs eight times in Syberia's nonzero 960x544 gameplay composite
@@ -1380,38 +1381,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     return value;
                 };
                 uint32_t result = 0;
-                if (in.opcode == 0x34B) {                            // v_fma_f16
+                {   // Deferred fused-FMA behavior stays in the legacy path (#5225).
                     result = b.fbin(Op_FAdd, b.fbin(Op_FMul, f16src(0), f16src(1)), f16src(2));
-                } else if (in.opcode == 0x351) {                     // v_min3_f16
-                    // ISA op 849 is a plain nested min — `V_MIN_F16(V_MIN_F16(S0,S1),S2)` — with
-                    // NO any-NaN clause of the kind op 855 v_med3_f16 carries. NMin already
-                    // matches V_MIN_F16's own one-NaN rule (return the other operand), so the
-                    // bare chain is the whole contract. CONFIDENCE: HIGH.
-                    result = b.fext2(Glsl_NMin,
-                                     b.fext2(Glsl_NMin, f16src(0), f16src(1)), f16src(2));
-                } else if (in.opcode == 0x354) {                     // v_max3_f16
-                    // ISA op 852, likewise: `V_MAX_F16(V_MAX_F16(S0,S1),S2)`, no NaN clause.
-                    result = b.fext2(Glsl_NMax,
-                                     b.fext2(Glsl_NMax, f16src(0), f16src(1)), f16src(2));
-                } else {                                             // v_med3_f16
-                    // ISA op 855 opens with a SEPARATE any-NaN clause, exactly as op 343
-                    // v_med3_f32 does (see 0x157 below — same structure, only the width differs):
-                    //   if (isNan(S0) || isNan(S1) || isNan(S2)) D.f16 = V_MIN3_F16(S0,S1,S2)
-                    // The plain max(min(...)) median formula does NOT reproduce that fallback on
-                    // its own, so the clause is emitted explicitly. It is not academic: Sonic
-                    // Racing: CrossWorlds' NaN-safe saturate idiom `v_med3_f16 v3, 1.0, v5, 0`
-                    // (#2013) with S1 = NaN must yield MIN3(1.0,NaN,0) = 0.0h, where the bare
-                    // formula yields 1.0h — black rendered as white. Kernel 32r10n pins it.
-                    // The min/max legs use NaN-aware NMin/NMax because V_MIN_F16/V_MAX_F16 return
-                    // the OTHER operand when exactly one input is NaN. CONFIDENCE: HIGH.
-                    const uint32_t x = f16src(0), y = f16src(1), z = f16src(2);
-                    const uint32_t mn = b.fext2(Glsl_NMin, x, y), mx = b.fext2(Glsl_NMax, x, y);
-                    const uint32_t med = b.fext2(Glsl_NMax, mn, b.fext2(Glsl_NMin, mx, z));
-                    const uint32_t min3 = b.fext2(Glsl_NMin, mn, z);
-                    const uint32_t nan_any = b.lor(b.fcmp(Op_FUnordNotEqual, x, x),
-                                                   b.lor(b.fcmp(Op_FUnordNotEqual, y, y),
-                                                         b.fcmp(Op_FUnordNotEqual, z, z)));
-                    result = b.sel(nan_any, min3, med);
                 }
                 result = fresult(result);
                 uint32_t r16 = b.pack_half_lo(result);
