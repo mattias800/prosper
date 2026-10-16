@@ -50,6 +50,7 @@ constexpr OpcodeInfo kInfo[] = {
     {"f32.nmin", 2, Type::U32},
     {"f32.nmax", 2, Type::U32},
     {"bool.and", 2, Type::Bool},
+    {"bool.or", 2, Type::Bool},
     {"f32.clamp01", 1, Type::U32},
     {"pack.half.lo", 1, Type::U32},
     {"ffbh.u32", 1, Type::U32},
@@ -73,12 +74,13 @@ constexpr OpcodeInfo kInfo[] = {
     {"bfe.s", 3, Type::U32},
     {"unpack.half", 1, Type::U32},
     {"f32.ge", 2, Type::Bool},
+    {"f32.unord.ne", 2, Type::Bool},
 };
-static_assert(std::size(kInfo) == static_cast<size_t>(Opcode::F32Ge) + 1);
+static_assert(std::size(kInfo) == static_cast<size_t>(Opcode::F32UnordNe) + 1);
 
 // The type argument `slot` of `op` must have.
 Type argument_type(Opcode op, size_t slot) {
-    if (op == Opcode::BoolAnd) return Type::Bool;
+    if (op == Opcode::BoolAnd || op == Opcode::BoolOr) return Type::Bool;
     if ((op == Opcode::Select || op == Opcode::BoolSelect) && slot == 0) return Type::Bool;
     if (op == Opcode::BoolSelect) return Type::Bool;
     return Type::U32;
