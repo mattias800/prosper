@@ -60,6 +60,7 @@
 #include "gpu/recompiler/ir/lower/vop3_integer16_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_minmax_half_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_mad_float_lowering.hpp"
+#include "gpu/recompiler/ir/lower/vop3_binary_float_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_minmax_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_minmax_float_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_ldexp_lowering.hpp"
@@ -1773,20 +1774,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 ok = false;
             } else if (in.opcode == 0x12F) {   // v_cvt_pkrtz_f16_f32 = pack(s0->lo, s1->hi)
                 vreg[in.dst.value] = b.pack_half2x16_rtz(fv(0), fv(1)); // v_cvt_pkrtz VOP3: RTZ clamp (#452)
-            } else if (in.opcode == 0x103) {   // v_add_f32 (VOP3 form)
-                b.observe_fragment_arithmetic_site(in.pc, FragmentArithmeticFamily::Add);
-                vreg[in.dst.value] = fresult(b.fbin(Op_FAdd, fv(0), fv(1)));
-            } else if (in.opcode == 0x104) {   // v_sub_f32 (VOP3 form) = s0 - s1
-                vreg[in.dst.value] = fresult(b.fbin(Op_FSub, fv(0), fv(1)));
-            } else if (in.opcode == 0x105) {   // v_subrev_f32 (VOP3 form) = s1 - s0
-                vreg[in.dst.value] = fresult(b.fbin(Op_FSub, fv(1), fv(0)));
-            } else if (in.opcode == 0x108) {   // v_mul_f32 (VOP3 form)
-                b.observe_fragment_arithmetic_site(in.pc, FragmentArithmeticFamily::Mul);
-                vreg[in.dst.value] = fresult(b.fbin(Op_FMul, fv(0), fv(1)));
-            } else if (in.opcode == 0x10F) {   // v_min_f32 (VOP3 form; NaN -> other operand)
-                vreg[in.dst.value] = fresult(b.fext2(Glsl_NMin, fv(0), fv(1)));
-            } else if (in.opcode == 0x110) {   // v_max_f32 (VOP3 form; NaN -> other operand)
-                vreg[in.dst.value] = fresult(b.fext2(Glsl_NMax, fv(0), fv(1)));
+            } else if (ir::lower_vop3_binary_float(b, rs, in, ok, allow_wave, fv, fresult)) {
             } else if (in.opcode == 0x107) {   // v_mul_legacy_f32: DX9 multiply —
                 // 0 * x == 0 for ALL x including ±Inf/NaN (that guarantee is WHY compilers emit it,
                 // e.g. attenuation=0 times 1/dist). Plain IEEE FMul gives NaN for 0*Inf, so emit
