@@ -11,6 +11,7 @@
 // rdna2_alu_support.hpp — helpers shared by rdna2_emit_alu.cpp and rdna2_to_spirv.cpp.
 // INTERNAL to src/gpu/recompiler/.
 #include <atomic>
+#include <cstdint>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
@@ -738,6 +739,39 @@ inline uint32_t inline_float_f16_bits(int code) {
         case 248: return 0x3118u;                             // 1/(2*pi)
         default:  return 0;
     }
+}
+
+// The 32-bit dword an inline constant places on the source bus when the consuming operand is
+// 16 bits wide. Hardware materializes the constant at the OPERAND's width and leaves the rest of
+// the dword ZERO, so the packed operand is simply that dword: an inline FLOAT contributes its
+// documented f16 encoding in [15:0] and 0 in [31:16] — it is NOT duplicated into the high half —
+// while an inline INT is its sign-extended two's-complement dword, which is why `-1` legitimately
+// reads 0xffff in BOTH halves but `1` reads 0 in the high one. A half select (VOP3P OPSEL /
+// OPSEL_HI, VOP3 OPSEL) therefore applies to an inline constant exactly as it does to a register:
+// it is NEVER a no-op. Returns false when `o` is not an inline constant.
+//
+// VERIFIED (llvm-mc gfx1030 literal folding, both directions — #2119):
+//   `v_pk_add_f16 v0, 0x00003c00, v1` canonicalizes to `v_pk_add_f16 v0, 1.0, v1`, while
+//   `0x3c003c00` stays a 32-bit literal. The fold is value-preserving, so inline `1.0` IS
+//   0x00003c00 in a packed f16 operand. The integer side rules out "the assembler simply never
+//   folds packed literals": 0x00000001 folds to `1` and 0xffffffff to `-1`, but 0x00010001 does
+//   not fold. Identical on gfx1010/1030/1100/1200 — there is NO gfx10-vs-gfx11 split here, and
+//   #2119 was filed supposing one. The ISA is consistent with this and states no replication
+//   rule: VOP3P pseudocode simply reads S0[31:16] for the high result, and the inline-constant
+//   table gives a half-precision constant as a 16-bit pattern ("half: 0x3118"). CONFIDENCE: HIGH.
+//
+// Three f16 paths used to hardcode the LOW half here and call the select a no-op; kernels
+// 32r14a/b/c in test_rdna2_to_spirv pin the high-half value each one now reads.
+inline bool inline_16bit_operand_dword(const Operand& o, uint32_t& out) {
+    if (o.kind == OperandKind::InlineFloat) {
+        out = inline_float_f16_bits(o.value);
+        return true;
+    }
+    if (o.kind == OperandKind::InlineInt) {
+        out = static_cast<uint32_t>(o.value);
+        return true;
+    }
+    return false;
 }
 
 // Predicate a just-computed VGPR write against EXEC: under a narrowed mask, inactive lanes keep their
