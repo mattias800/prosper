@@ -49,6 +49,7 @@
 #include "gpu/recompiler/ir/lower/scalar_alu_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vector_alu_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop1_integer_lowering.hpp"
+#include "gpu/recompiler/ir/lower/vop3_ternary_integer_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop1_conversion_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop1_unary_float_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop1_unary_f16_lowering.hpp"
@@ -1969,29 +1970,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // unmodified result, as v_bfm_b32 and v_lshrrev_b64 above already do. CLAMP is
                 // gated after the chain. No program in the local corpus sets one (#5143).
                 ok = false;
-            } else if (in.opcode == kVop3OpcodeAdd3U32) {   // v_add3_u32 = s0+s1+s2
-                vreg[in.dst.value] = b.ibin(Op_IAdd, b.ibin(Op_IAdd, val(in.src[0]), val(in.src[1])), val(in.src[2]));
-            } else if (in.opcode == 0x346) {   // v_lshl_add_u32 = (s0<<(s1&31))+s2
-                uint32_t sh = b.ibin(Op_BitwiseAnd, val(in.src[1]), b.uconst(31));
-                vreg[in.dst.value] = b.ibin(Op_IAdd, b.ibin(Op_ShiftLeftLogical, val(in.src[0]), sh), val(in.src[2]));
-            } else if (in.opcode == kVop3OpcodeAndOrB32) {   // v_and_or_b32 = (s0&s1)|s2
-                uint32_t t = b.ibin(Op_BitwiseAnd, val(in.src[0]), val(in.src[1]));
-                vreg[in.dst.value] = b.ibin(Op_BitwiseOr, t, val(in.src[2]));
-            } else if (in.opcode == 0x372) {   // v_or3_b32 = s0|s1|s2
-                uint32_t t = b.ibin(Op_BitwiseOr, val(in.src[0]), val(in.src[1]));
-                vreg[in.dst.value] = b.ibin(Op_BitwiseOr, t, val(in.src[2]));
-            } else if (in.opcode == 0x178) {   // v_xor3_b32 = s0^s1^s2
-                uint32_t t = b.ibin(Op_BitwiseXor, val(in.src[0]), val(in.src[1]));
-                vreg[in.dst.value] = b.ibin(Op_BitwiseXor, t, val(in.src[2]));
-            } else if (in.opcode == 0x36F) {   // v_lshl_or_b32 = (s0<<(s1&31))|s2
-                uint32_t sh = b.ibin(Op_BitwiseAnd, val(in.src[1]), b.uconst(31));
-                vreg[in.dst.value] = b.ibin(Op_BitwiseOr, b.ibin(Op_ShiftLeftLogical, val(in.src[0]), sh), val(in.src[2]));
-            } else if (in.opcode == 0x345) {   // v_xad_u32 = (s0^s1)+s2
-                uint32_t t = b.ibin(Op_BitwiseXor, val(in.src[0]), val(in.src[1]));
-                vreg[in.dst.value] = b.ibin(Op_IAdd, t, val(in.src[2]));
-            } else if (in.opcode == 0x347) {   // v_add_lshl_u32 = (s0+s1)<<(s2&31)
-                uint32_t sh = b.ibin(Op_BitwiseAnd, val(in.src[2]), b.uconst(31));
-                vreg[in.dst.value] = b.ibin(Op_ShiftLeftLogical, b.ibin(Op_IAdd, val(in.src[0]), val(in.src[1])), sh);
+            } else if (ir::lower_vop3_ternary_integer(b, rs, in, ok, allow_wave)) {
+                // The common modifier and predicated destination stages still follow.
             } else if (in.opcode == 0x128 || in.opcode == 0x129 || in.opcode == 0x12A) {
                 // Add/sub with carry-in + carry-out (VOP3B): v_add_co_ci_u32 (0x128), v_sub_co_ci (0x129),
                 // v_subrev_co_ci (0x12A). carry-in = src2 mask (VCC or an SGPR bool); carry-out -> sdst mask.
