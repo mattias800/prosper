@@ -20,6 +20,8 @@ struct HalfOpDef {
     uint32_t opcode;
     Value (*build)(Builder&, const HalfOpIn&);
 };
+// Shared integer-backed value graph; source reads remain with each encoding.
+Value build_half_rtz(Builder& ir, Value a, Value b);
 std::span<const HalfOpDef> vector_half_defs();
 const HalfOpDef* find_vector_half_op(Rdna2Format fmt, uint32_t opcode);
 Known eval_half_op(const HalfOpDef& def, Known s0, Known s1, bool clamp = false);
