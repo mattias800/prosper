@@ -1805,11 +1805,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // recompiled "successfully" and computed the un-negated value. fv == val when no
                 // modifier bits are set.
                 if (!m) ok = false; else vreg[in.dst.value] = b.sel(m, fv(1), fv(0));
-            } else if (in.opcode == 0x11F) {   // v_mac_f32_e64 (VOP3 form of VOP2 0x1f)
-                // dst = src0*src1 + dst, with the VOP3 float source modifiers (neg/abs via fv) and output
-                // modifiers (omod/clamp via fresult). The scene VS emits this e64 form with a `-|v10|`
-                // modifier (round-trip: `llvm-mc -mcpu=gfx1010` of 0xd51f020a → v_mac_f32_e64 v10,v28,-|v10|).
-                vreg[in.dst.value] = fresult(b.fbin(Op_FAdd, b.fbin(Op_FMul, fv(0), fv(1)), old_d));
+            } else if (ir::lower_vop3_mac_float(b, rs, in, ok, allow_wave, std::cref(fv),
+                                                std::cref(fresult), old_d)) {
             } else
                 ok = false;
             // A set CLAMP bit on an opcode that does not route through fresult means unmodeled

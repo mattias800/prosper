@@ -13,4 +13,7 @@ using Vop3FloatResult = std::function<uint32_t(uint32_t)>;
 bool lower_vop3_mad_float(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok,
                           bool allow_wave, const Vop3FloatSource& fv,
                           const Vop3FloatResult& fresult);
+bool lower_vop3_mac_float(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok,
+                          bool allow_wave, const Vop3FloatSource& fv,
+                          const Vop3FloatResult& fresult, uint32_t old_d);
 }   // namespace prosper::gpu::ir
