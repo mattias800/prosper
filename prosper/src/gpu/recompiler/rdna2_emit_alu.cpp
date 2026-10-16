@@ -50,6 +50,7 @@
 #include "gpu/recompiler/ir/lower/vector_alu_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop1_integer_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_ternary_integer_lowering.hpp"
+#include "gpu/recompiler/ir/lower/vop3_multiply_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop1_conversion_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop1_unary_float_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop1_unary_f16_lowering.hpp"
@@ -1651,13 +1652,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // ISA 3.9 carry-mask rule: an EXEC-inactive lane's bit is written 0, not its raw carry.
                 const uint32_t carry_masked = rs.exec_narrowed ? b.land(rs.exec, carry) : carry;
                 write_vop3b_carry_output(carry_masked);
-            } else if (in.opcode == 0x169) {                          // v_mul_lo_u32
-                vreg[in.dst.value] = b.ibin(Op_IMul, val(in.src[0]), val(in.src[1]));
-            } else if (in.opcode == 0x16a) {                          // v_mul_hi_u32 (high 32 bits)
-                vreg[in.dst.value] = b.umul_hi(val(in.src[0]), val(in.src[1]));
-            } else if (in.opcode == 0x16c) {                          // v_mul_hi_i32 (high 32 bits, signed)
-                vreg[in.dst.value] = b.smul_hi(val(in.src[0]), val(in.src[1]));
-            } else if (in.opcode == 0x157) {                          // v_med3_f32 = median(s0,s1,s2)
+            } else if (ir::lower_vop3_multiply(b, rs, in, ok, allow_wave)) {
+            } else if (in.opcode == 0x157) {   // v_med3_f32 = median(s0,s1,s2)
                 // ISA op 343: "if (isNan(S0) || isNan(S1) || isNan(S2)) D = V_MIN3_F32(S0,S1,S2)".
                 // The min/max legs use the NaN-aware NMin/NMax (return-the-other-operand), and the
                 // any-NaN case selects min3 explicitly — the plain max(min(...)) formula does not
