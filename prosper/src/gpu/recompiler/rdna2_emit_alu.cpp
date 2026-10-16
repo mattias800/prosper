@@ -10,7 +10,7 @@
 #include "gpu/recompiler/rdna2_dot.hpp"
 #include "gpu/recompiler/rdna2_dpp_row_shr.hpp"
 #include "gpu/recompiler/ir/lower/vop3_sad_lowering.hpp"
-#include "gpu/recompiler/rdna2_perm_b32.hpp"
+#include "gpu/recompiler/ir/lower/vop3_permute_lowering.hpp"
 #include "gpu/recompiler/rdna2_div_fixup.hpp"
 #include "gpu/recompiler/rdna2_mad_64.hpp"
 #include "gpu/recompiler/rdna2_mimg_store.hpp"
@@ -1813,16 +1813,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                   b.uconst(0)));
                     }
                 }
-            } else if (in.opcode == 0x344) {   // v_perm_b32
-                const bool modified = in.src_abs[0] || in.src_abs[1] || in.src_abs[2] ||
-                                      in.src_neg[0] || in.src_neg[1] || in.src_neg[2] || in.clamp ||
-                                      in.omod;
-                if (modified) {
-                    ok = false;
-                } else {
-                    vreg[in.dst.value] =
-                        emit_v_perm_b32(b, val(in.src[0]), val(in.src[1]), val(in.src[2]));
-                }
+            } else if (ir::lower_vop3_permute(b, rs, in, ok, allow_wave)) {
             } else if (in.opcode == kVop3OpcodeLshlrevB64) {   // v_lshlrev_b64
                 // GTA V constructs a per-lane bit as `1ull << lane` immediately after MBCNT. This
                 // bounded admission keeps SRC1 at the exact inline integer 1; general register-pair

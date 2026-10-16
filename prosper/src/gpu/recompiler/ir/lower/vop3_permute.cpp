@@ -1,8 +1,11 @@
-#include "gpu/recompiler/rdna2_perm_b32.hpp"
+// Original byte permutation value case and helper, extracted with their modifier guard.
+#include "gpu/recompiler/ir/lower/vop3_permute_lowering_internal.hpp"
+#include "gpu/recompiler/ir/lower/vop3_permute_lowering.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
-
-namespace prosper::gpu {
-
+#include <cstdint>
+namespace prosper::gpu::ir {
+namespace {
 uint32_t emit_v_perm_b32(SpirvCompute& b, uint32_t high, uint32_t low, uint32_t sel_dword) {
     // RDNA2 V_PERM_B32 (AMD doc 70648): byte permute across {src0 (high), src1 (low)}
     // controlled by 4 selector bytes in src2.
@@ -36,5 +39,26 @@ uint32_t emit_v_perm_b32(SpirvCompute& b, uint32_t high, uint32_t low, uint32_t 
     }
     return result;
 }
-
-}  // namespace prosper::gpu
+}   // namespace
+bool Vop3PermuteLowering::lower() {
+    // Temporary sentinel preserves the extracted else-if chain verbatim.
+    if (false) {
+    } else if (in.opcode == 0x344) {   // v_perm_b32
+        const bool modified = in.src_abs[0] || in.src_abs[1] || in.src_abs[2] || in.src_neg[0] ||
+                              in.src_neg[1] || in.src_neg[2] || in.clamp || in.omod;
+        if (modified) {
+            ok = false;
+        } else {
+            vreg[in.dst.value] = emit_v_perm_b32(b, val(in.src[0]), val(in.src[1]), val(in.src[2]));
+        }
+    } else {
+        return false;
+    }
+    return true;
+}
+bool lower_vop3_permute(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok,
+                        bool allow_wave) {
+    if (in.fmt != Rdna2Format::VOP3) return false;
+    return Vop3PermuteLowering({b, rs, in, ok, allow_wave}).lower();
+}
+}   // namespace prosper::gpu::ir
