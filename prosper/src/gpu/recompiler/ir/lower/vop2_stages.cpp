@@ -1,6 +1,7 @@
 // vop2_stages.cpp — VOP2 source and destination modifier stages: SDWA source selects / float abs-neg, SDWA destination, OMOD/CLAMP.
 // Relocated verbatim from emit_alu's VOP2 case by tools/refactor/extract_case_routes.py (ADR 0012).
 #include "gpu/recompiler/ir/lower/vector_lowering_internal.hpp"
+#include "gpu/recompiler/ir/lower/float_output_modifiers.hpp"
 
 namespace prosper::gpu::ir {
 
@@ -57,12 +58,12 @@ std::optional<bool> Vop2Lowering::stage_output_modifiers(uint32_t& d) {
     // only (int ops never carry omod). Mirrors the VOP3 fresult path; a no-op when omod/clamp unset.
     if (ok && (in.omod || in.clamp) && !packed_f16) switch (in.opcode) {
         case 0x03: case 0x04: case 0x05: case 0x08: case 0x0F: case 0x10:
-        case 0x1F: case 0x2B: case 0x20: case 0x2C: case 0x21: case 0x2D:
-            if      (in.omod == 1) d = b.fbin(Op_FMul, d, b.uconst(fbits(2.0f)));
-            else if (in.omod == 2) d = b.fbin(Op_FMul, d, b.uconst(fbits(4.0f)));
-            else if (in.omod == 3) d = b.fbin(Op_FMul, d, b.uconst(fbits(0.5f)));
-            if (in.clamp) d = b.clamp01(d);
-            break;
+        case 0x1F:
+        case 0x2B:
+        case 0x20:
+        case 0x2C:
+        case 0x21:
+        case 0x2D: d = modify_float_result(b, in, d, ok); break;
         // A non-float-result opcode carrying a modifier (e.g. an INTEGER SDWA op with CLAMP =
         // integer saturation) is not modeled by the float-domain omod/clamp above, so applying
         // nothing would SILENTLY drop the saturation and emit a valid-but-wrong shader. Reject

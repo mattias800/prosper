@@ -2,6 +2,7 @@
 #pragma once
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include "gpu/recompiler/ir/lower/float_output_modifiers.hpp"
 #include <cstdint>
 namespace prosper::gpu::ir {
 template <class Read>
@@ -10,6 +11,7 @@ struct Vop3FloatModifiers {
     const Rdna2Inst& in;
     Read& val;
     bool& clamp_routed;
+    bool& ok;
     // Float source with its VOP3 modifiers applied: abs then a sign-bit-exact negate
     // (hardware order neg(abs(x))). Returns raw bits (fbin/fext re-bitcast), so it's a
     // drop-in for val() in the FLOAT ops only — integer VOP3 ops keep val() (modifiers are
@@ -28,14 +30,7 @@ struct Vop3FloatModifiers {
     // instead of silently dropping the saturation.
     uint32_t fresult(uint32_t bits) const {
         clamp_routed = true;
-        if (in.omod == 1)
-            bits = b.fbin(Op_FMul, bits, b.uconst(fbits(2.0f)));
-        else if (in.omod == 2)
-            bits = b.fbin(Op_FMul, bits, b.uconst(fbits(4.0f)));
-        else if (in.omod == 3)
-            bits = b.fbin(Op_FMul, bits, b.uconst(fbits(0.5f)));
-        if (in.clamp) bits = b.clamp01(bits);
-        return bits;
+        return modify_float_result(b, in, bits, ok);
     }
 };
 } // namespace prosper::gpu::ir

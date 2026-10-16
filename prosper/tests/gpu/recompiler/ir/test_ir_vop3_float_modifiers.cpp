@@ -37,7 +37,7 @@ TEST(IrVop3FloatModifiers, SourceReadsTheSelectedSlotOnceBeforeItsNumericModifie
                 return t.b.uconst(0xbfa00000);
             };
             bool routed = false;
-            ir::Vop3FloatModifiers stage{t.b, in, read, routed};
+            ir::Vop3FloatModifiers stage{t.b, in, read, routed, t.ok};
             EXPECT_NE(stage.fv(slot), 0u);
             EXPECT_EQ(reads, (std::vector<int>{7 + slot}));
             EXPECT_EQ(count(t.b, Op_ExtInst, Glsl_FAbs), uint32_t(bool(flags & 1)));
@@ -61,32 +61,30 @@ TEST(IrVop3FloatModifiers, ResultRoutesEvenWithoutModifiersAndScalesBeforeClampi
             LoweringFixture t;
             Rdna2Inst in{};
             in.omod = scale;
+            t.b.compute_pgm_rsrc1 = 0; // observed output-flush, non-IEEE launch
             in.clamp = clamp;
             auto read = [&](const Operand&) -> uint32_t {
                 ADD_FAILURE() << "result stage must never read a source";
                 return 0;
             };
             bool routed = false;
-            ir::Vop3FloatModifiers stage{t.b, in, read, routed};
+            ir::Vop3FloatModifiers stage{t.b, in, read, routed, t.ok};
             const auto input = t.b.uconst(0x3e800000);
             const auto result = stage.fresult(input);
             EXPECT_TRUE(routed);
-            EXPECT_EQ(count(t.b, Op_FMul), uint32_t(scale != 0));
+            EXPECT_TRUE(t.ok);
+            EXPECT_EQ(count(t.b, Op_FMul), 0u); // OMOD uses integer IR, independent of host FP
             EXPECT_EQ(count(t.b, Op_ExtInst, Glsl_NMax), uint32_t(clamp));
             EXPECT_EQ(count(t.b, Op_ExtInst, Glsl_NMin), uint32_t(clamp));
             if (!scale && !clamp) EXPECT_EQ(result, input);
-            if (scale)
-                EXPECT_TRUE(t.constant_cached(scale == 1   ? 0x40000000
-                                              : scale == 2 ? 0x40800000
-                                                           : 0x3f000000));
             if (scale && clamp) {
-                size_t mul_at = 0, clamp_at = 0;
+                size_t scaled_at = 0, clamp_at = 0;
                 for (size_t at = 0; at < t.b.code.size(); at += t.b.code[at] >> 16) {
-                    if ((t.b.code[at] & 0xffffu) == Op_FMul) mul_at = at;
+                    if ((t.b.code[at] & 0xffffu) == Op_Select) scaled_at = at;
                     if ((t.b.code[at] & 0xffffu) == Op_ExtInst && t.b.code[at + 4] == Glsl_NMax)
                         clamp_at = at;
                 }
-                EXPECT_LT(mul_at, clamp_at);
+                EXPECT_LT(scaled_at, clamp_at);
             }
             EXPECT_TRUE(t.rs.vreg.empty());
         }

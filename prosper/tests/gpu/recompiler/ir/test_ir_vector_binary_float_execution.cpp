@@ -161,26 +161,32 @@ TEST(IrVectorBinaryFloatExecution, InlineFloatIntegerAndLiteralBindingsKeepSourc
             for (uint32_t wave : {64u, 32u}) compare(def, inputs(31 + mode), wave, mode);
 }
 TEST(IrVectorBinaryFloatExecution, SourceAndResultModifierOrderIsUnchanged) {
-    auto in = inputs(43);
-    std::fill(in.s0.begin(), in.s0.end(), 0xbf000000);
-    std::fill(in.s1.begin(), in.s1.end(), 0x40000000);
-    for (const auto& def : vector_binary_float_defs())
-        for (uint32_t abs = 0; abs < 4; ++abs)
-            for (uint32_t neg = 0; neg < 4; ++neg)
-                for (uint32_t omod = 0; omod < 4; ++omod)
-                    for (bool clamp : {false, true})
-                        for (uint32_t wave : {64u, 32u}) {
-                            auto run = run_vector_op_per_lane(
-                                words(def.opcode, 0, abs, neg, omod, clamp), in, wave);
-                            ASSERT_TRUE(run.error.empty()) << run.error;
-                            auto want = result(def, sources(in, 0, 0, abs, neg), omod, clamp);
-                            if (!want) {
-                                ADD_FAILURE() << "unknown modifier result";
-                                return;
+    // Explicit ISA arms: scaling enabled, output denorms preserved, or IEEE enabled.
+    for (uint32_t rsrc1 : {0u, 0x30u << 12, 1u << 23}) {
+        auto in = inputs(43);
+        std::fill(in.s0.begin(), in.s0.end(), 0xbf000000);
+        std::fill(in.s1.begin(), in.s1.end(), 0x40000000);
+        for (const auto& def : vector_binary_float_defs())
+            for (uint32_t abs = 0; abs < 4; ++abs)
+                for (uint32_t neg = 0; neg < 4; ++neg)
+                    for (uint32_t omod = 0; omod < 4; ++omod)
+                        for (bool clamp : {false, true})
+                            for (uint32_t wave : {64u, 32u}) {
+                                auto run = run_vector_op_per_lane(
+                                    words(def.opcode, 0, abs, neg, omod, clamp), in, wave, false,
+                                    rsrc1);
+                                ASSERT_TRUE(run.error.empty()) << run.error;
+                                auto want = result(def, sources(in, 0, 0, abs, neg),
+                                                   rsrc1 ? 0 : omod, clamp);
+                                if (!want) {
+                                    ADD_FAILURE() << "unknown modifier result";
+                                    return;
+                                }
+                                for (size_t lane = 0; lane < in.lanes(); ++lane)
+                                    EXPECT_EQ(run.d[lane],
+                                              in.active[lane] ? *want : in.old_d[lane]);
                             }
-                            for (size_t lane = 0; lane < in.lanes(); ++lane)
-                                EXPECT_EQ(run.d[lane], in.active[lane] ? *want : in.old_d[lane]);
-                        }
+    }
 }
 TEST(IrVectorBinaryFloatExecution, EffectsAndUnknownInputsRetainTheirDomains) {
     for (const auto& def : vector_binary_float_defs()) {

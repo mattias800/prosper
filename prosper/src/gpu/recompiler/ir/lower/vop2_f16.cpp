@@ -3,6 +3,7 @@
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/ir/lower/vector_lowering_internal.hpp"
 #include "gpu/recompiler/ir/ops/vector_half.hpp"
+#include "gpu/recompiler/ir/lower/float_output_modifiers.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <cstdint>
@@ -30,7 +31,8 @@ bool Vop2Lowering::compute_f16(uint32_t& d) {
         }
         const uint32_t x = half_source(a, in.src[0], in.sdwa_src0_sel, 0);
         const uint32_t y = half_source(c, in.src[1], in.sdwa_src1_sel, 1);
-        const uint32_t r16 = emit_half_op(b, *def, x, y, in.clamp);
+        const auto modifier = float_output_modifier(b, in, FloatResultWidth::F16, ok);
+        const uint32_t r16 = emit_half_op(b, *def, x, y, in.clamp, modifier);
             // dst_sel==6 covers TWO encodings the decoder now distinguishes: the SDWA
             // DWORD+UNUSED_PAD form (zero-fill, has_sdwa) and the plain e32 form, whose
             // gfx10 contract writes [15:0] and PRESERVES [31:16] (the comment above always

@@ -467,12 +467,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if (ok && (in.omod || in.clamp)) switch (in.opcode) {
                 case 0x05: case 0x06: case 0x0B: case 0x0E: case 0x11: case 0x12: case 0x13: case 0x14:
                 case 0x20: case 0x21: case 0x22: case 0x23: case 0x24:
-                case 0x25: case 0x27: case 0x2A: case 0x2B: case 0x2E: case 0x33: case 0x35: case 0x36:
-                    if      (in.omod == 1) d = b.fbin(Op_FMul, d, b.uconst(fbits(2.0f)));
-                    else if (in.omod == 2) d = b.fbin(Op_FMul, d, b.uconst(fbits(4.0f)));
-                    else if (in.omod == 3) d = b.fbin(Op_FMul, d, b.uconst(fbits(0.5f)));
-                    if (in.clamp) d = b.clamp01(d);
-                    break;
+                case 0x25:
+                case 0x27:
+                case 0x2A:
+                case 0x2B:
+                case 0x2E:
+                case 0x33:
+                case 0x35:
+                case 0x36: d = ir::modify_float_result(b, in, d, ok); break;
                 default: ok = false; break;
             }
             if (ok) {
@@ -1225,7 +1227,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             uint32_t old_d = vreg_old(b, rs, in.dst.value);
             bool clamp_routed = false;
-            ir::Vop3FloatModifiers modifiers{b, in, val, clamp_routed};
+            ir::Vop3FloatModifiers modifiers{b, in, val, clamp_routed, ok};
             auto fv = [&](int k) { return modifiers.fv(k); };
             auto fresult = [&](uint32_t bits) { return modifiers.fresult(bits); };
             if (ir::lower_vop3_pack16(b, rs, in, ok, allow_wave)) {
