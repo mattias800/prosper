@@ -781,6 +781,23 @@ void decode_operands(Rdna2Inst& i) {
                 i.src[2] = {};
                 i.n_src = 2;
             }
+            // Ordinary binary data forms consume no SRC2. Use the shared effects rather than
+            // another opcode inventory. Existing carry/mask cases already have n_src=2 above;
+            // exclude partial, wide, accumulating, relative and cross-lane effects here.
+            const auto& binary_effects = rdna2_instruction_effects(i.fmt, i.opcode);
+            if (i.fmt == Rdna2Format::VOP3 && i.n_src == 3 && ((d1 >> 18) & 0x1ffu) == 0 &&
+                binary_effects.describes_vector_result() &&
+                binary_effects.lane_flow == Rdna2LaneFlow::LaneWise &&
+                binary_effects.vdst_dwords == 1 && !binary_effects.vdst_half &&
+                !binary_effects.accumulates && !binary_effects.implicit_reads &&
+                !binary_effects.implicit_writes &&
+                binary_effects.m0_relative == Rdna2M0Relative::None &&
+                rdna2_valu_source_count(i.fmt, i.opcode) == 2 &&
+                binary_effects.ssrc_dwords[0] == 1 && binary_effects.ssrc_dwords[1] == 1 &&
+                binary_effects.ssrc_dwords[2] == 0) {
+                i.src[2] = {};
+                i.n_src = 2;
+            }
             // Scalar 16-bit VOP3 operations: OPSEL[2:0] selects each packed source half and OPSEL[3]
             // selects the destination half. Reuse the packed-op selector field for this family.
             // VERIFIED(llvm-mc gfx1030): 0x351/0x354/0x357 are v_min3_f16/v_max3_f16/v_med3_f16

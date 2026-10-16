@@ -57,6 +57,7 @@
 #include "gpu/recompiler/ir/lower/vop3_bitfield_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_align_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_ternary_integer_lowering.hpp"
+#include "gpu/recompiler/ir/lower/vop3_binary_integer_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_multiply_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_mad24_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_integer16_lowering.hpp"
@@ -1474,6 +1475,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     predicate_write(b, rs, hi_dst, old_hi);
                 }
             } else if (ir::lower_vop3_bit_utilities(b, rs, in, ok, allow_wave)) {
+            } else if (ir::lower_vop3_binary_integer(b, rs, in, ok, allow_wave)) {
             } else if (ir::lower_vop3_ternary_integer(b, rs, in, ok, allow_wave)) {
                 // The common modifier and predicated destination stages still follow.
             } else if (in.opcode == 0x128 || in.opcode == 0x129 || in.opcode == 0x12A) {
