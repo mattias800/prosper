@@ -1090,6 +1090,8 @@ if(TARGET prosper_core)
   add_executable(test_il2cpp_symbols tests/host/symbols/test_il2cpp_symbols.cpp)
   target_include_directories(test_il2cpp_symbols PRIVATE tests)
   target_link_libraries(test_il2cpp_symbols PRIVATE prosper_core)
+  # The synthetic boot controls map real guest images and the fixed stub aperture (#5260).
+  prosper_hosts_a_guest(test_il2cpp_symbols)
   add_test(NAME il2cpp_symbol_resolution
            COMMAND test_il2cpp_symbols
                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/il2cpp_symtab_fixture.symtab")
@@ -7935,7 +7937,7 @@ endforeach()
 # target that DROPS its call must still be inspected, or losing the flag would also lose the check.
 if(WIN32 AND TARGET test_windows_guest_window)
   set(_prosper_guest_host_files "")
-  foreach(_host IN ITEMS boot_trace screenshot prosper-app)
+  foreach(_host IN ITEMS boot_trace screenshot prosper-app test_il2cpp_symbols)
     if(TARGET ${_host})
       add_dependencies(test_windows_guest_window ${_host})
       string(APPEND _prosper_guest_host_files "$<TARGET_FILE:${_host}>|")
