@@ -93,6 +93,7 @@ Known evaluate_op(Opcode op, uint32_t imm, uint32_t a, uint32_t b, uint32_t c) {
         case Opcode::Xor: return a ^ b;
         case Opcode::Not: return ~a;
         case Opcode::BitReverse: return bit_reverse(a);
+        case Opcode::BitCount: return static_cast<uint32_t>(std::popcount(a));
         case Opcode::Shl: return b < 32 ? Known(a << b) : std::nullopt;
         case Opcode::LShr: return b < 32 ? Known(a >> b) : std::nullopt;
         case Opcode::AShr: return b < 32 ? Known(static_cast<uint32_t>(s(a) >> b)) : std::nullopt;

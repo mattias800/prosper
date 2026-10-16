@@ -57,6 +57,7 @@ uint32_t emit_one(SpirvCompute& b, const Inst& inst, const uint32_t* x) {
         case Opcode::Xor: return b.ibin(Op_BitwiseXor, x[0], x[1]);
         case Opcode::Not: return b.iun(Op_Not, x[0]);
         case Opcode::BitReverse: return b.iun(Op_BitReverse, x[0]);
+        case Opcode::BitCount: return b.iun(Op_BitCount, x[0]);
         case Opcode::Shl: return b.ibin(Op_ShiftLeftLogical, x[0], x[1]);
         case Opcode::LShr: return b.ibin(Op_ShiftRightLogical, x[0], x[1]);
         case Opcode::AShr: return b.sbin(Op_ShiftRightArithmetic, x[0], x[1]);
