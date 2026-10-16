@@ -184,7 +184,12 @@ jobs:
           restore-keys: ccache-linux-${{ runner.os }}-
 
       - name: Configure
-        run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DPROSPER_DIAGNOSTICS=ON -DPython3_EXECUTABLE="$PWD/.venv/bin/python"
+        # Keep full Debug information while avoiding repeated uncompressed DWARF in every test
+        # executable (#5176). Linker compression is lossless; no target or assertion is removed.
+        run: >-
+          cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_EXE_LINKER_FLAGS="-Wl,--compress-debug-sections=zlib"
+          -DPROSPER_DIAGNOSTICS=ON -DPython3_EXECUTABLE="$PWD/.venv/bin/python"
 
       # A configuration that quietly loses Vulkan would silently drop those tests again and still
       # report 100% green. Fail the job instead of shrinking the suite.
@@ -235,6 +240,12 @@ jobs:
       - name: Build
         id: build
         run: cmake --build prosper/build-ci
+
+      - name: Report build storage
+        if: ${{ always() && (steps.build.outcome == 'success' || steps.build.outcome == 'failure') }}
+        run: |
+          df -h prosper/build-ci
+          du -sh prosper/build-ci
 
       # The runner has no GPU, so this is Mesa's lavapipe software rasteriser. Four tests were once
       # excluded here as "driver-divergent" (#1681). NONE of them were: every divergence was
