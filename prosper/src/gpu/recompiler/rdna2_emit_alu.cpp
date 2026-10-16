@@ -14,7 +14,7 @@
 #include "gpu/recompiler/ir/lower/vop3_pack_saturate_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_pack16_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_bit_utilities_lowering.hpp"
-#include "gpu/recompiler/rdna2_div_fixup.hpp"
+#include "gpu/recompiler/ir/lower/vop3_div_fixup_lowering.hpp"
 #include "gpu/recompiler/rdna2_mad_64.hpp"
 #include "gpu/recompiler/rdna2_mimg_store.hpp"
 #include "gpu/recompiler/rdna2_movrels.hpp"
@@ -1554,8 +1554,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 vreg[in.dst.value] = fresult(r2);
             } else if (ir::lower_vop3_mad24(b, rs, in, ok, allow_wave)) {
             } else if (ir::lower_vop3_sad(b, rs, in, ok, allow_wave)) {
-            } else if (in.opcode == 0x15F) {   // v_div_fixup_f32
-                vreg[in.dst.value] = fresult(emit_v_div_fixup_f32(b, fv(0), fv(1), fv(2)));
+            } else if (ir::lower_vop3_div_fixup(b, rs, in, ok, allow_wave, fv, fresult)) {
             } else if (ir::lower_vop3_bitfield(b, rs, in, ok, allow_wave)) {
             } else if (ir::lower_vop3_align(b, rs, in, ok, allow_wave)) {
             } else if (ir::lower_vop3_permute(b, rs, in, ok, allow_wave)) {
