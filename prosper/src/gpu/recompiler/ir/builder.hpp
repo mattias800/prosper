@@ -87,6 +87,8 @@ public:
     Value pack_norm16(Value a, bool is_signed) {
         return block_.append({Opcode::PackNorm16, Type::U32, uint32_t(is_signed), {a}});
     }
+    Value f32abs(Value a) { return block_.append({Opcode::F32Abs, Type::U32, 0, {a}}); }
+    Value f32lt(Value a, Value b) { return cmp(Opcode::F32Lt, a, b); }
     Value f32ge(Value a, Value b) { return cmp(Opcode::F32Ge, a, b); }
     Value bfe_u(Value base, Value offset, Value count) {
         return block_.append({Opcode::BfeU, Type::U32, 0, {base, offset, count}});

@@ -15,6 +15,7 @@
 #include "gpu/recompiler/ir/lower/vop3_pack16_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_bit_utilities_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_div_fixup_lowering.hpp"
+#include "gpu/recompiler/ir/lower/vop3_cube_axis_lowering.hpp"
 #include "gpu/recompiler/rdna2_mad_64.hpp"
 #include "gpu/recompiler/rdna2_mimg_store.hpp"
 #include "gpu/recompiler/rdna2_movrels.hpp"
@@ -1483,7 +1484,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             } else if (ir::lower_vop3_pack_saturate(b, rs, in, ok, allow_wave)) {
             } else if (ir::lower_vop3_ldexp(b, rs, in, ok, allow_wave, std::cref(fv),
                                             std::cref(fresult))) {
-            } else if (in.opcode >= 0x144 && in.opcode <= 0x147) {
+            } else if (ir::lower_vop3_cube_axis(b, rs, in, ok, allow_wave, std::cref(fv),
+                                                std::cref(fresult))) {
+            } else if (in.opcode == 0x145 || in.opcode == 0x146) {
                 // Cubemap coordinate ops (#273 — DOLL's title post PSes' reflection-probe math):
                 // v_cubeid_f32 (0x144) face id, v_cubesc_f32 (0x145) S numerator, v_cubetc_f32
                 // (0x146) T numerator, v_cubema_f32 (0x147) 2*major-axis. Src order (x, y, z);
@@ -1504,12 +1507,6 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 auto fneg = [&](uint32_t v) { return b.fbin(Op_FSub, b.uconst(0), v); };
                 uint32_t r2;
                 switch (in.opcode) {
-                    case 0x144: {   // face id: z-major 4/5, y-major 2/3, x-major 0/1 (negative = +1)
-                        uint32_t idz = b.sel(zneg, b.uconst(fbits(5.0f)), b.uconst(fbits(4.0f)));
-                        uint32_t idy = b.sel(yneg, b.uconst(fbits(3.0f)), b.uconst(fbits(2.0f)));
-                        uint32_t idx2 = b.sel(xneg, b.uconst(fbits(1.0f)), b.uconst(fbits(0.0f)));
-                        r2 = b.sel(zmaj, idz, b.sel(ymaj, idy, idx2)); break;
-                    }
                     case 0x145: {   // sc: z-major: z<0 ? -x : x; y-major: x; x-major: x<0 ? z : -z
                         uint32_t scz = b.sel(zneg, fneg(x), x);
                         uint32_t scx = b.sel(xneg, z, fneg(z));
@@ -1519,10 +1516,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         uint32_t tcy = b.sel(yneg, fneg(z), z);
                         r2 = b.sel(zmaj, fneg(y), b.sel(ymaj, tcy, fneg(y))); break;
                     }
-                    default: {      // 0x147 ma: 2 * major axis (signed)
-                        uint32_t maj = b.sel(zmaj, z, b.sel(ymaj, y, x));
-                        r2 = b.fbin(Op_FMul, b.uconst(fbits(2.0f)), maj); break;
-                    }
+                    default: std::abort();   // Guard above owns only SC and TC.
                 }
                 vreg[in.dst.value] = fresult(r2);
             } else if (ir::lower_vop3_mad24(b, rs, in, ok, allow_wave)) {
