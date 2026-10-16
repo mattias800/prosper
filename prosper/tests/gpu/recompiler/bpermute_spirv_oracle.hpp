@@ -212,7 +212,7 @@ struct Interpreter {
       return true;
   }
   bool float_comparison_op(Lane& l, uint32_t op, const std::vector<uint32_t>& a) {
-      if (op != 183 && op != 184 && op != 190) return false;
+      if (op != 180 && op != 183 && op != 184 && op != 190) return false;
       if (a.size() != 4 || ty(a[0]).op != 20) fail("malformed float comparison");
       const auto x = value(l, a[2]), y = value(l, a[3]);
       if (!x.defined || !y.defined || x.words.size() != 1 || y.words.size() != 1 ||
@@ -220,7 +220,10 @@ struct Interpreter {
           fail("undefined or mistyped float comparison");
       const float f = std::bit_cast<float>(x.words[0]), g = std::bit_cast<float>(y.words[0]);
       // FUnordNotEqual includes either NaN; ordered comparisons are false on NaN.
-      const bool result = op == 183   ? std::isnan(f) || std::isnan(g) || f != g
+      // SPIR-V OpFOrdEqual (180), ordered scalar equality; NaNs compare false.
+      // https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html#OpFOrdEqual
+      const bool result = op == 180   ? f == g
+                          : op == 183 ? std::isnan(f) || std::isnan(g) || f != g
                           : op == 184 ? f < g
                                       : f >= g;
       set(l, a[1], a[0], {uint32_t(result)});
