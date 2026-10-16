@@ -11,6 +11,7 @@
 #include "gpu/recompiler/rdna2_dpp_row_shr.hpp"
 #include "gpu/recompiler/ir/lower/vop3_sad_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_permute_lowering.hpp"
+#include "gpu/recompiler/ir/lower/vop3_pack16_lowering.hpp"
 #include "gpu/recompiler/rdna2_div_fixup.hpp"
 #include "gpu/recompiler/rdna2_mad_64.hpp"
 #include "gpu/recompiler/rdna2_mimg_store.hpp"
@@ -1345,38 +1346,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (in.clamp) bits = b.clamp01(bits);
                 return bits;
             };
-            if (in.opcode == 0x311) {
-                // v_pack_b32_f16: D.u32 = {S1.f16, S0.f16} — S0's selected half becomes bits
-                // [15:0] and S1's becomes [31:16]. OPSEL[k] picks which half of each source is
-                // read; the destination is a whole dword, so OPSEL[3] has nothing to select.
-                // This is the instruction that re-assembles the two halves the 16-bit convert
-                // family produces, so it appears immediately behind them (Sonic Racing:
-                // CrossWorlds, `d7110020,00020500` = `v_pack_b32_f16 v32, v0, v2`, #2013).
-                // VERIFIED(round-trip llvm-mc gfx1030). It is a bit move, so ABS/NEG (which would
-                // be f16 sign operations on the selected halves) and CLAMP/OMOD are not modeled
-                // and reject rather than being silently dropped.
-                if (in.src_abs[0] || in.src_abs[1] || in.src_neg[0] || in.src_neg[1] ||
-                    in.clamp || in.omod) {
-                    ok = false;
-                } else {
-                    auto packed_half = [&](int k) {
-                        const Operand& operand = in.src[k];
-                        // OPSEL[k] selects a half of an inline constant exactly as it does of a
-                        // register — see inline_16bit_operand_dword. Both inline branches used to
-                        // ignore it, so `1.0` read 0x3c00 and inline `1` read 1 from the HIGH half
-                        // where hardware reads 0 (#2119, kernel 32r14d).
-                        const uint32_t sel = (in.vop3p_opsel >> k) & 1u;
-                        uint32_t inline_dword;
-                        if (inline_16bit_operand_dword(operand, inline_dword))
-                            return b.uconst((inline_dword >> (16u * sel)) & 0xFFFFu);
-                        return b.bfe_u(val(operand), b.uconst(16u * sel), b.uconst(16));
-                    };
-                    vreg[in.dst.value] = b.ibin(
-                        Op_BitwiseOr, packed_half(0),
-                        b.ibin(Op_ShiftLeftLogical, packed_half(1), b.uconst(16)));
-                }
-            } else if (in.opcode == 0x34B || in.opcode == 0x351 ||
-                in.opcode == 0x354 || in.opcode == 0x357) {
+            if (ir::lower_vop3_pack16(b, rs, in, ok, allow_wave)) {
+            } else if (in.opcode == 0x34B || in.opcode == 0x351 || in.opcode == 0x354 ||
+                       in.opcode == 0x357) {
                 // Scalar f16 VOP3: one selected half from each packed source and one independently
                 // selected destination half. The opposite destination half is preserved. The
                 // `v_max3_f16` occurs eight times in Syberia's nonzero 960x544 gameplay composite
