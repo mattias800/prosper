@@ -10,12 +10,12 @@
 #include <cstdint>
 #include <span>
 namespace prosper::gpu::ir {
+Value build_nonfused_mad_float(Builder& ir, const TernaryInputs& x) {
+    const Value product = ir.f32mul(x.s0(), x.s1());
+    return ir.f32add(product, x.s2());
+}
 namespace {
-constexpr MadFloatDef kDefs[] = {
-    {Rdna2Format::VOP3, 0x141, [](Builder& ir, const TernaryInputs& x) {
-         const Value product = ir.f32mul(x.s0(), x.s1());
-         return ir.f32add(product, x.s2());
-     }}};
+constexpr MadFloatDef kDefs[] = {{Rdna2Format::VOP3, 0x141, build_nonfused_mad_float}};
 }   // namespace
 std::span<const MadFloatDef> vector_mad_float_defs() {
     return kDefs;
