@@ -1048,7 +1048,9 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code_changed != 'false' }}
     runs-on: windows-latest
-    timeout-minutes: 90
+    # Serialized static links exhausted the former 90-minute job budget (#5276).
+    # Allow bounded time for the complete build and both test cohorts.
+    timeout-minutes: 180
     env:
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
