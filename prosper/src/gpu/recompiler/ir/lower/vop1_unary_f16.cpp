@@ -1,47 +1,21 @@
 // Existing VOP1 f16 unary value and placement paths, moved without changing their order.
 #include "gpu/recompiler/ir/lower/vop1_unary_f16_lowering.hpp"
+#include "gpu/recompiler/ir/ops/vector_alu.hpp"
+#include "gpu/recompiler/ir/ops/vector_half_unary.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <cstdint>
 #include <optional>
 namespace prosper::gpu::ir {
-namespace {
-// The VOP1 f16 unary family's operation, given its already-unpacked f16 operand as an f32 value.
-// Both the plain e32 form and the SDWA word-select form lower through this one function, so the two
-// encodings of one opcode cannot drift apart — the SDWA path previously carried its own three-op
-// ternary, which is exactly how a family gains a member in one form and not the other.
-// The domain is `vop1_is_f16_unary` (rdna2_decode.hpp), shared with the decoder's SDWA admission and
-// asserted below rather than assumed: a caller that widens its gate without widening this switch
-// would otherwise get `v_cos_f16` silently. Opcodes verified there by llvm-mc round-trip; trig input
-// is in REVOLUTIONS, exactly as for the f32 forms. Returns 0 (never a valid SPIR-V id) for anything
-// outside the family, which the callers treat as an unsupported instruction. CONFIDENCE: HIGH.
-uint32_t emit_f16_unary(SpirvCompute& b, uint32_t opcode, uint32_t x) {
-    const auto turns = [&] { return b.uconst(fbits(6.28318530717958647692f)); };
-    switch (opcode) {
-        case 0x54: return b.frcp(x);   // v_rcp_f16
-        case 0x55: return b.fext1(Glsl_Sqrt, x);   // v_sqrt_f16
-        case 0x56: return b.fext1(Glsl_InverseSqrt, x);   // v_rsq_f16
-        case 0x57: return b.fext1(Glsl_Log2, x);   // v_log_f16
-        case 0x58: return b.fext1(Glsl_Exp2, x);   // v_exp_f16
-        case 0x5B: return b.fext1(Glsl_Floor, x);   // v_floor_f16
-        case 0x5C: return b.fext1(Glsl_Ceil, x);   // v_ceil_f16
-        case 0x5D: return b.fext1(Glsl_Trunc, x);   // v_trunc_f16
-        case 0x5E: return b.fext1(Glsl_RoundEven, x);   // v_rndne_f16
-        case 0x5F: return b.fext1(Glsl_Fract, x);   // v_fract_f16
-        case 0x60: return b.fext1(Glsl_Sin, b.fbin(Op_FMul, x, turns()));   // v_sin_f16
-        case 0x61: return b.fext1(Glsl_Cos, b.fbin(Op_FMul, x, turns()));   // v_cos_f16
-        default: return 0;   // outside the family — fail visibly
-    }
-}
-
-}   // namespace
 std::optional<bool> lower_vop1_unary_f16(SpirvCompute& b, RegState& rs, const Rdna2Inst& in,
                                          uint32_t a, uint32_t& d, uint32_t old_d, bool& ok) {
     if (in.fmt != Rdna2Format::VOP1) return std::nullopt;
+    const VectorOpDef* def = find_vector_half_unary_op(in.fmt, in.opcode);
+    if (!def) return std::nullopt;
     // Packed unary f16 SDWA: select one source half, compute in f32, round back to f16, and
     // insert while preserving the opposite destination half. The admitted opcode set is the
-    // whole VOP1 f16 unary family (see emit_f16_unary), matching the plain e32 lowering
+    // whole VOP1 f16 unary family (see vector_half_unary_defs), matching the plain e32 lowering
     // below; the decoder gates the operand shape (WORD dst + UNUSED_PRESERVE, WORD/DWORD
     // source, no sext/neg/abs/clamp/omod).
     if (vop1_is_f16_unary(in.opcode) && in.sdwa_dst_sel != 6) {
@@ -52,12 +26,11 @@ std::optional<bool> lower_vop1_unary_f16(SpirvCompute& b, RegState& rs, const Rd
         else if (in.src[0].kind == OperandKind::InlineInt)
             raw = b.uconst(static_cast<uint32_t>(in.src[0].value));
         uint32_t x = b.unpack_half(raw, in.sdwa_src0_sel == 5 ? 1 : 0);
-        uint32_t result = emit_f16_unary(b, in.opcode, x);
-        if (!result) {
+        uint32_t r16 = emit_vector_op(b, *def, x, 0);
+        if (!r16) {
             ok = false;
             return true;
         }
-        uint32_t r16 = b.pack_half_lo(result);
         d = in.sdwa_dst_sel == 5
                 ? b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0x0000FFFFu)),
                          b.ibin(Op_ShiftLeftLogical, r16, b.uconst(16)))
@@ -96,12 +69,11 @@ std::optional<bool> lower_vop1_unary_f16(SpirvCompute& b, RegState& rs, const Rd
         // Plain e32 has no source modifiers and no half select; the SDWA forms that would
         // carry them are rejected by the `!has_sdwa` gate above.
         const uint32_t x = b.unpack_half(raw, 0);
-        const uint32_t result = emit_f16_unary(b, in.opcode, x);
-        if (!result) {
+        const uint32_t r16 = emit_vector_op(b, *def, x, 0);
+        if (!r16) {
             ok = false;
             return true;
         }
-        const uint32_t r16 = b.pack_half_lo(result);
         d = b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)), r16);
         predicate_write(b, rs, in.dst.value, old_d);
         return true;

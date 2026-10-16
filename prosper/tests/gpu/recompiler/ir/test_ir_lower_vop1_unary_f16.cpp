@@ -3,7 +3,7 @@
 #include "gpu/recompiler/ir/lowering_fixture.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include <gtest/gtest.h>
-#include <cstdint>
+#include <optional>
 using namespace prosper::gpu;
 using namespace prosper::test::ir;
 namespace {
