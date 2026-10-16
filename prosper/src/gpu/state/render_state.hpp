@@ -11,6 +11,7 @@
 #include "gpu/pm4/command_processor.hpp"
 #include "gpu/recompiler/fragment_float_mode.hpp"
 #include "gpu/recompiler/fragment_float_flags.hpp"
+#include "gpu/recompiler/graphics_float_mode.hpp"
 #include "gpu/recompiler/raster_launch_facts.hpp"
 #include <array>
 #include <cstddef>
@@ -155,6 +156,7 @@ struct RenderState {
     uint64_t gs_addr = 0;   // geometry (…_GS)
     uint64_t es_addr = 0;   // export/vertex (…_ES)
     uint64_t hs_addr = 0;   // hull/tess (…_HS)
+    GraphicsFloatMode vertex_float_mode{};
 
     // Pixel-input wiring (SPI_PS_INPUT_CNTL_0..31). Each programmed word maps a PS interpolant
     // number to an ES/VS PARAM export slot, or selects one of the hardware constant defaults when

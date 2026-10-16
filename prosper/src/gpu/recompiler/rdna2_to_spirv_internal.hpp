@@ -445,6 +445,7 @@ struct SpirvCompute {
     FragmentFloatMode fragment_float_mode{};
     // Explicit packet-owned launch facts only; native fragment arithmetic remains unchanged.
     FragmentFloatFlags fragment_float_flags{};
+    GraphicsFloatMode vertex_float_mode{};
     FragmentArithmeticObservation* fragment_arithmetic_observation = nullptr;
     void observe_fragment_arithmetic_site(uint32_t pc, FragmentArithmeticFamily family) {
         if (is_fragment && fragment_arithmetic_observation)

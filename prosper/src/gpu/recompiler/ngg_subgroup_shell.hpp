@@ -74,6 +74,8 @@ struct NggSubgroupShellConfig {
     // portable shell emulates cross-lane operations through workgroup memory. (The name predates
     // Wave32: for a Wave32 program it means a native 32-lane subgroup.)
     bool native_wave64 = false;
+    GraphicsFloatMode
+        float_mode{};   // actual merged GS launch; physical compute defaults are separate
 };
 
 // Returns the SPIR-V module, or {} with `refusal` set ("reason=<name> ..."). `layout_out`, when

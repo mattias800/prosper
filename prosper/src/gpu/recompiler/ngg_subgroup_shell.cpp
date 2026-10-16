@@ -73,7 +73,8 @@ std::vector<uint32_t> recompile_ngg_subgroup(const uint32_t* linked_code, size_t
     if (layout_out) *layout_out = {};
     const uint32_t push_words = config.user_sgprs + (config.user_data_address_known ? 2u : 0u);
     const uint32_t lanes = config.wave_lanes;
-    if (!linked_code || !dwords || (lanes != 32u && lanes != 64u) || config.waves == 0 ||
+    if (!config.float_mode.canonical() || !linked_code || !dwords ||
+        (lanes != 32u && lanes != 64u) || config.waves == 0 ||
         config.waves * lanes > kMaxShellLanes || config.rsrc2_gs_lds_size > kNggMaxLdsGranules ||
         config.user_sgprs > 98u || push_words > kMaxPushWords) {
         fail(refusal, diagnostic, "ngg-shell-config");
@@ -136,6 +137,7 @@ std::vector<uint32_t> recompile_ngg_subgroup(const uint32_t* linked_code, size_t
 
     const bool original_has_waterfall = !waterfall_branches(ins).empty();
     SpirvCompute b;
+    b.vertex_float_mode = config.float_mode;
     b.diagnostic = diagnostic;
     b.ngg_workgroup_shell = true;
     b.shell_io_descriptor_set = kNggShellDescriptorSet;

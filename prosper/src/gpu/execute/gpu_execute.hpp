@@ -172,6 +172,7 @@ struct DrawItem {
     bool ps_wave32 = false;
     // Actual producing launch MODE, independent of requested/effective replay wave width.
     FragmentFloatMode ps_float_mode{};
+    GraphicsFloatMode vertex_float_mode{};
     FloatTransportConfig float_transport{}; // actual producing host profile, not guest MODE
     FragmentFloatFlags ps_float_flags{};
     FragmentLaunchRsrc1 ps_launch_rsrc1{};
@@ -797,7 +798,7 @@ std::vector<uint32_t> recompile_graphics_shader_cached(
     FragmentFloatMode fragment_float_mode = {}, FloatTransportConfig float_transport = {},
     FragmentFloatFlags fragment_float_flags = {}, FragmentLaunchRsrc1 fragment_launch_rsrc1 = {},
     RefusedShaderSource* original_source = nullptr,
-    FragmentExportFormats fragment_export_formats = {});
+    FragmentExportFormats fragment_export_formats = {}, GraphicsFloatMode vertex_float_mode = {});
 SharedShaderWords recompile_graphics_shader_cached_shared(
     ShaderProgramStage stage, const uint32_t* code, size_t dwords,
     const ShaderResourceTable* resources = nullptr, const PixelInputMapping* pixel_inputs = nullptr,
@@ -809,7 +810,7 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
     RefusedShaderSource* original_source = nullptr,
     const CheckedGraphicsSource* checked_source = nullptr,
     std::shared_ptr<const NativeGraphicsStageCompilation>* checked_compilation = nullptr,
-    FragmentExportFormats fragment_export_formats = {});
+    FragmentExportFormats fragment_export_formats = {}, GraphicsFloatMode vertex_float_mode = {});
 // Compute uses the same bounded content-addressed cache as graphics. Launch geometry that changes
 // generated SPIR-V participates in the key; ordinary per-dispatch push-constant values do not.
 // Conditional marker lowerings validate their value-dependent dispatch proof before cache lookup.
@@ -918,7 +919,7 @@ SharedShaderWords recompile_vertex_chain_cached_shared(
     const ShaderResourceTable* resources = nullptr, const PixelInputMapping* pixel_inputs = nullptr,
     uint64_t* cache_identity = nullptr, uint32_t vertex_lds_dwords = 0,
     bool capture_position = false, FloatTransportConfig float_transport = {},
-    RefusedShaderSource* original_source = nullptr);
+    RefusedShaderSource* original_source = nullptr, GraphicsFloatMode vertex_float_mode = {});
 ShaderRecompileCacheStats shader_recompile_cache_stats();
 void clear_shader_recompile_cache();
 
@@ -1241,6 +1242,7 @@ struct OperationRealizationFailure {
     // Exact arguments of a graphics vertex retry. Early failures leave this unavailable rather
     // than letting offline replay silently substitute a zero LDS allocation or empty PS mapping.
     bool vertex_retry_config_available = false;
+    GraphicsFloatMode vertex_float_mode{};
     uint32_t vertex_lds_dwords = 0;
     PixelInputMapping pixel_inputs{};
     bool has_pixel_inputs = false;
@@ -2325,6 +2327,7 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
         *failure = {};
         failure->kind = SubmitOperationKind::Draw;
         failure->ps_float_mode = rs.ps_addr ? rs.ps_float_mode : FragmentFloatMode{};
+        failure->vertex_float_mode = rs.es_addr ? rs.vertex_float_mode : GraphicsFloatMode{};
         failure->ps_float_flags = rs.ps_addr ? rs.ps_float_flags : FragmentFloatFlags{};
         failure->ps_launch_rsrc1 = rs.ps_addr ? rs.ps_launch_rsrc1 : FragmentLaunchRsrc1{};
         failure->float_transport = float_transport;
@@ -2906,13 +2909,14 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
                 vertex_dwords,
                 reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(chain_addr)), chain_dwords,
                 vrt.get(), pixel_input_ptr, &vs_identity, vertex_lds_dwords,
-                capture_vertex_position, float_transport, &vs_original);
+                capture_vertex_position, float_transport, &vs_original, rs.vertex_float_mode);
         else
             vs_shared = recompile_graphics_shader_cached_shared(
                 ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)vs_program_addr,
                 vs_program_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity, false,
                 vertex_lds_dwords, capture_vertex_position, {}, {}, float_transport, {}, {},
-                &vs_original, checked_vertex.get(), &out.native_vs_source);
+                &vs_original, checked_vertex.get(), &out.native_vs_source, {},
+                rs.vertex_float_mode);
         if (!owned_fragment && !scalar_bank)
             fs_shared = recompile_graphics_shader_cached_shared(
                 ShaderProgramStage::Fragment, (const uint32_t*)(uintptr_t)rs.ps_addr,
@@ -2929,14 +2933,14 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
                 vertex_dwords,
                 reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(chain_addr)), chain_dwords,
                 vrt.get(), pixel_input_ptr, &vs_identity, vertex_lds_dwords,
-                capture_vertex_position, float_transport, &vs_original);
+                capture_vertex_position, float_transport, &vs_original, rs.vertex_float_mode);
             if (linked) vs = *linked;
         } else {
             vs = recompile_graphics_shader_cached(
                 ShaderProgramStage::Vertex, (const uint32_t*)(uintptr_t)vs_program_addr,
                 vs_program_dwords, vrt.get(), pixel_input_ptr, nullptr, &vs_identity, false,
                 vertex_lds_dwords, capture_vertex_position, {}, {}, float_transport, {}, {},
-                &vs_original);
+                &vs_original, {}, rs.vertex_float_mode);
         }
         if (!owned_fragment && !scalar_bank)
             fs = recompile_graphics_shader_cached(
@@ -3827,6 +3831,7 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
     out.fragment_wave_config_available = rs.ps_addr != 0;
     out.ps_wave32 = out.fragment_wave_config_available && rs.ps_wave32;
     out.ps_float_mode = rs.ps_addr ? rs.ps_float_mode : FragmentFloatMode{};
+    out.vertex_float_mode = rs.es_addr ? rs.vertex_float_mode : GraphicsFloatMode{};
     out.ps_float_flags = rs.ps_addr ? rs.ps_float_flags : FragmentFloatFlags{};
     out.ps_launch_rsrc1 = rs.ps_addr ? rs.ps_launch_rsrc1 : FragmentLaunchRsrc1{};
     out.float_transport = float_transport;

@@ -11,9 +11,9 @@
 #include <memory>
 
 namespace prosper::gpu {
-// Schema 3 keeps terminal text in the diagnostic envelope, independently of the bounded
-// INCOMPLETE resource carrier. Legacy schema 2 and compute schema 1 remain readable.
-inline constexpr uint32_t kRefusedGraphicsInputsSchema = 3;
+// Schema 5 adds explicit native/NGG graphics modes after the resource carrier. Schema 3 keeps
+// terminal text outside that bounded carrier. Both legacy graphics schemas remain readable.
+inline constexpr uint32_t kRefusedGraphicsInputsSchema = 5;
 inline constexpr size_t kRefusedGraphicsRejectMaxBytes = 512;
 struct GpuState;
 struct RefusedShaderInputs;
@@ -49,6 +49,7 @@ struct RefusedGraphicsInputs {
     bool capture_position = false;
     uint32_t vertex_lds_dwords = 0;
     NggSubgroupShellConfig shell;
+    GraphicsFloatMode vertex_float_mode{};
     RefusedGraphicsLaunch launch;
     bool payload_omitted = false;
     std::string incomplete;

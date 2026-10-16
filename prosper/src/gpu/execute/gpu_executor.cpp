@@ -1137,7 +1137,7 @@ ShaderCompileKey make_shader_compile_key(
     FragmentFloatMode fragment_float_mode = {}, FloatTransportConfig float_transport = {},
     FragmentFloatFlags fragment_float_flags = {}, FragmentLaunchRsrc1 fragment_launch_rsrc1 = {},
     RefusedShaderSource* original_source = nullptr, bool checked_graphics_source = false,
-    FragmentExportFormats fragment_export_formats = {}) {
+    FragmentExportFormats fragment_export_formats = {}, GraphicsFloatMode vertex_float_mode = {}) {
     ShaderCompileKey key;
     key.resources = ShaderKeyResourceScratch::acquire();
     key.stage = stage;
@@ -1156,6 +1156,8 @@ ShaderCompileKey make_shader_compile_key(
     key.has_system_inputs = stage == ShaderProgramStage::Fragment && system_inputs != nullptr;
     if (key.has_system_inputs) key.system_inputs = *system_inputs;
     key.fragment_wave32 = stage == ShaderProgramStage::Fragment && fragment_wave32;
+    key.vertex_float_mode =
+        stage == ShaderProgramStage::Vertex ? vertex_float_mode : GraphicsFloatMode{};
     key.fragment_float_mode = stage == ShaderProgramStage::Fragment
         ? fragment_float_mode : FragmentFloatMode{};
     key.fragment_float_flags = stage == ShaderProgramStage::Fragment
@@ -1829,7 +1831,7 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
     FragmentLaunchRsrc1 fragment_launch_rsrc1, RefusedShaderSource* original_source,
     const CheckedGraphicsSource* checked_source,
     std::shared_ptr<const NativeGraphicsStageCompilation>* checked_compilation,
-    FragmentExportFormats fragment_export_formats) {
+    FragmentExportFormats fragment_export_formats, GraphicsFloatMode vertex_float_mode) {
     if (cache_identity) *cache_identity = 0;
     if (original_source) *original_source = {};
     if (checked_compilation) *checked_compilation = {};
@@ -1838,7 +1840,7 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
         return {};
     if (!fragment_float_mode.canonical() || !float_transport.canonical() ||
         !fragment_float_flags.canonical() || !fragment_launch_rsrc1.canonical() ||
-        !fragment_export_formats.canonical()) {
+        !fragment_export_formats.canonical() || !vertex_float_mode.canonical()) {
         if (stage == ShaderProgramStage::Fragment)
             observe_fragment_arithmetic({}, reinterpret_cast<uintptr_t>(code), false);
         return {};
@@ -1848,7 +1850,7 @@ SharedShaderWords recompile_graphics_shader_cached_shared(
         nullptr, fragment_wave32, vertex_capture_position,
         checked_source ? checked_source->analysis() : captured_analysis, fragment_float_mode,
         float_transport, fragment_float_flags, fragment_launch_rsrc1, original_source,
-        checked_source != nullptr, fragment_export_formats);
+        checked_source != nullptr, fragment_export_formats, vertex_float_mode);
     // Guest memory is 1:1-mapped, so the caller's code pointer IS the guest program address; it must
     // be captured here because the key owns a copy of the words rather than pointing at them.
     const uint64_t program_address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(code));
@@ -1884,10 +1886,11 @@ SharedShaderWords recompile_vertex_chain_cached_shared(
     const uint32_t* prolog, size_t prolog_dwords, const uint32_t* main, size_t main_dwords,
     const ShaderResourceTable* resources, const PixelInputMapping* pixel_inputs,
     uint64_t* cache_identity, uint32_t vertex_lds_dwords, bool capture_position,
-    FloatTransportConfig float_transport, RefusedShaderSource* original_source) {
+    FloatTransportConfig float_transport, RefusedShaderSource* original_source,
+    GraphicsFloatMode vertex_float_mode) {
     if (cache_identity) *cache_identity = 0;
     if (original_source) *original_source = {};
-    if (!float_transport.canonical()) return {};
+    if (!float_transport.canonical() || !vertex_float_mode.canonical()) return {};
     // This must precede lookup: the direct-stage key cannot authenticate rebased main PCs or
     // recover owners discarded by the legacy chain table merge, including a warm entry.
     if (resources && (!resources->owned_raw_snapshot_requirements.empty() ||
@@ -1903,7 +1906,7 @@ SharedShaderWords recompile_vertex_chain_cached_shared(
     ShaderCompileKey key = make_shader_compile_key(
         ShaderProgramStage::Vertex, prolog, prolog_dwords, resources, pixel_inputs, nullptr, main,
         main_dwords, vertex_lds_dwords, nullptr, false, capture_position, {}, {}, float_transport,
-        {}, {}, original_source);
+        {}, {}, original_source, false, {}, vertex_float_mode);
     if (!key.chain_code) {
         return {};
     }
@@ -1936,12 +1939,12 @@ std::vector<uint32_t> recompile_graphics_shader_cached(
     const SharedShaderAnalysis& captured_analysis, FragmentFloatMode fragment_float_mode,
     FloatTransportConfig float_transport, FragmentFloatFlags fragment_float_flags,
     FragmentLaunchRsrc1 fragment_launch_rsrc1, RefusedShaderSource* original_source,
-    FragmentExportFormats fragment_export_formats) {
+    FragmentExportFormats fragment_export_formats, GraphicsFloatMode vertex_float_mode) {
     SharedShaderWords words = recompile_graphics_shader_cached_shared(
         stage, code, dwords, resources, pixel_inputs, system_inputs, cache_identity,
         fragment_wave32, vertex_lds_dwords, vertex_capture_position, captured_analysis,
         fragment_float_mode, float_transport, fragment_float_flags, fragment_launch_rsrc1,
-        original_source, nullptr, nullptr, fragment_export_formats);
+        original_source, nullptr, nullptr, fragment_export_formats, vertex_float_mode);
     return words ? *words : std::vector<uint32_t>{};
 }
 

@@ -3391,13 +3391,13 @@ int main(int argc, char** argv) {
                     vs = prosper::gpu::recompile_vertex_chain(
                         raw.words.data(), raw.words.size(), main.words.data(), main.words.size(),
                         it.vrt.get(), pixel_inputs, false, it.vertex_lds_dwords,
-                        {prosper::gpu::RecompileDiagnosticStage::Vertex, 0}, it.float_transport);
+                        {prosper::gpu::RecompileDiagnosticStage::Vertex, 0}, it.float_transport,
+                        it.vertex_float_mode);
                 } else {
-                    vs = prosper::gpu::recompile_vertex(raw.words.data(), raw.words.size(),
-                                                        it.vrt.get(), pixel_inputs, false,
-                                                        it.vertex_lds_dwords,
-                                                        {prosper::gpu::RecompileDiagnosticStage::Vertex, 0},
-                                                        it.float_transport);
+                    vs = prosper::gpu::recompile_vertex(
+                        raw.words.data(), raw.words.size(), it.vrt.get(), pixel_inputs, false,
+                        it.vertex_lds_dwords, {prosper::gpu::RecompileDiagnosticStage::Vertex, 0},
+                        it.float_transport, it.vertex_float_mode);
                 }
             } else if (!owned_vertex)
                 ++vs_kept;
@@ -3558,13 +3558,13 @@ int main(int argc, char** argv) {
                     xfb = prosper::gpu::recompile_vertex_chain(
                         raw.words.data(), raw.words.size(), main.words.data(), main.words.size(),
                         it.vrt.get(), pixel_inputs, true, it.vertex_lds_dwords,
-                        {prosper::gpu::RecompileDiagnosticStage::Vertex, 0}, it.float_transport);
+                        {prosper::gpu::RecompileDiagnosticStage::Vertex, 0}, it.float_transport,
+                        it.vertex_float_mode);
                 } else {
-                    xfb = prosper::gpu::recompile_vertex(raw.words.data(), raw.words.size(),
-                                                         it.vrt.get(), pixel_inputs, true,
-                                                         it.vertex_lds_dwords,
-                                                         {prosper::gpu::RecompileDiagnosticStage::Vertex, 0},
-                                                         it.float_transport);
+                    xfb = prosper::gpu::recompile_vertex(
+                        raw.words.data(), raw.words.size(), it.vrt.get(), pixel_inputs, true,
+                        it.vertex_lds_dwords, {prosper::gpu::RecompileDiagnosticStage::Vertex, 0},
+                        it.float_transport, it.vertex_float_mode);
                 }
                 if (xfb.empty()) {
                     std::fprintf(stderr, "[geom-probe] draw %llu: xfb re-recompile produced no VS "
@@ -4039,7 +4039,7 @@ int main(int argc, char** argv) {
                 resources, pixel_inputs, exact && failure.capture_vertex_position,
                 exact ? failure.vertex_lds_dwords : 0u,
                 {prosper::gpu::RecompileDiagnosticStage::Vertex, main_stage.program_addr},
-                failure.float_transport);
+                failure.float_transport, failure.vertex_float_mode);
         }
         const std::string reason = spirv.empty()
             ? prosper::gpu::last_terminal_reject_reason(main_stage.program_addr) : "";
@@ -4147,7 +4147,7 @@ int main(int argc, char** argv) {
                 spirv = prosper::gpu::recompile_vertex(
                     raw.words.data(), raw.words.size(), resources, nullptr, false, 0,
                     {prosper::gpu::RecompileDiagnosticStage::Vertex, stage.program_addr},
-                    failure.float_transport);
+                    failure.float_transport, failure.vertex_float_mode);
                 break;
             case prosper::gpu::ShaderProgramStage::Fragment: {
                 // v61 carries the same pixel/system-input and wave ABI used by live compilation.

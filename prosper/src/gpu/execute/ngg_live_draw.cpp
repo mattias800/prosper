@@ -5,6 +5,7 @@
 
 #include "gpu/pm4/command_processor.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
+#include "gpu/state/graphics_float_mode.hpp"
 #include "gpu/recompiler/ngg_subgroup_abi.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/resources/shader_resources.hpp"
@@ -89,6 +90,7 @@ std::vector<uint32_t> pixel_input_shape(const PixelInputMapping* mapping) {
 
 // Everything a compiled stage depends on besides W (see the header's CACHING note).
 struct StageKey {
+    GraphicsFloatMode float_mode{};
     std::vector<uint32_t> program;   // the linked chain, compared exactly
     ResourceKey resources;
     std::vector<uint32_t> pixel_inputs;   // pixel_input_shape()
@@ -111,6 +113,9 @@ struct StageKeyHash {
         hash = mix(hash, (uint64_t{key.user_sgprs} << 32) | key.layer_slices);
         hash = mix(hash, key.lds_granules ^ (uint64_t{key.depth_slice_fanout} << 32));
         hash = mix(hash, key.wave_lanes);
+        hash = mix(hash, key.float_mode.available);
+        hash = mix(hash, key.float_mode.value);
+        hash = mix(hash, key.float_mode.ieee_mode);
         hash = mix(hash, key.interpolation_layout);
         hash = mix(
             hash,
@@ -222,6 +227,7 @@ uint32_t reg(const RegisterFile& file, uint32_t offset, const char* name, const 
 
 NggDrawRegisters read_ngg_draw_registers(const GpuState& state, uint32_t primitive_type) {
     NggDrawRegisters r;
+    r.float_mode = graphics_float_mode(state, GraphicsHardwareStage::Geometry);
     const char** m = &r.missing;
     r.vgt_shader_stages_en = reg(state.cx, P::VGT_SHADER_STAGES_EN, "VGT_SHADER_STAGES_EN", m);
     r.vgt_gs_onchip_cntl = reg(state.cx, P::VGT_GS_ONCHIP_CNTL, "VGT_GS_ONCHIP_CNTL", m);
@@ -382,6 +388,7 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
     if (interpolation && !input.interpolation.valid) return refuse("ngg-interpolation-invalid");
 
     StageKey key;
+    key.float_mode = input.registers.float_mode;
     key.program = *input.linked;
     key.resources = resource_key(input.resources, input.linked);
     key.pixel_inputs = pixel_input_shape(input.pixel_inputs);
@@ -402,6 +409,7 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
     key.user_data_address = supply_address;
 
     NggSubgroupDrawRequest request;
+    request.shell.float_mode = input.registers.float_mode;
     request.resources = input.resources;
     request.shell.rsrc2_gs_lds_size = admission.lds_granules;
     request.shell.user_sgprs = user_sgprs;

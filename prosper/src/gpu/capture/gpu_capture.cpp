@@ -622,6 +622,10 @@ public:
             error = "invalid realized-draw fragment float flags";
             return false;
         }
+        if (!x.vertex_float_mode.canonical()) {
+            error = "invalid realized-draw graphics float mode";
+            return false;
+        }
         if (!x.ps_float_mode.canonical() || !x.float_transport.canonical()) {
             error = "invalid realized-draw fragment float mode";
             return false;
@@ -663,6 +667,7 @@ public:
         d.fragment_wave_config_available = x.fragment_wave_config_available;
         d.ps_wave32 = x.ps_wave32;
         d.ps_float_mode = x.ps_float_mode;
+        d.vertex_float_mode = x.vertex_float_mode;
         d.ps_float_flags = x.ps_float_flags;
         d.ps_launch_rsrc1 = x.ps_launch_rsrc1;
         d.ps_entry = x.ps_entry;

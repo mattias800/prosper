@@ -20,6 +20,7 @@
 #include <span>
 #include "gpu/recompiler/fragment_float_mode.hpp"
 #include "gpu/recompiler/fragment_float_flags.hpp"
+#include "gpu/recompiler/graphics_float_mode.hpp"
 #include "gpu/recompiler/fragment_export_formats.hpp"
 #include "gpu/recompiler/fragment_arithmetic_observation.hpp"
 #include "gpu/recompiler/compiler_choices.hpp"
@@ -1111,28 +1112,23 @@ uint32_t fragment_color_export_mask(const uint32_t* code, size_t dwords);
 // `virtual_lds_dwords` is the exact SPI_SHADER_PGM_RSRC2_GS allocation for an NGG program.  The
 // portable vertex shell represents one live guest lane, so that lane's LDS is private to the host
 // invocation; zero keeps graphics DS operations fail-closed.
-std::vector<uint32_t> recompile_vertex(const uint32_t* code, size_t dwords,
-                                       const ShaderResourceTable* rt = nullptr,
-                                       const PixelInputMapping* pixel_inputs = nullptr,
-                                       bool capture_position = false,
-                                       uint32_t virtual_lds_dwords = 0,
-                                       RecompileDiagnosticContext diagnostic = {
-                                           RecompileDiagnosticStage::Vertex, 0},
-                                       FloatTransportConfig float_transport = {});
+std::vector<uint32_t>
+recompile_vertex(const uint32_t* code, size_t dwords, const ShaderResourceTable* rt = nullptr,
+                 const PixelInputMapping* pixel_inputs = nullptr, bool capture_position = false,
+                 uint32_t virtual_lds_dwords = 0,
+                 RecompileDiagnosticContext diagnostic = {RecompileDiagnosticStage::Vertex, 0},
+                 FloatTransportConfig float_transport = {}, GraphicsFloatMode float_mode = {});
 
 // Recompile a separately-installed vertex-fetch prolog and its main shader as one architectural
 // program. The validated tail transfer is replaced by fallthrough, preserving every SGPR/VGPR value
 // produced by the prolog. Resource fetch_pc values for the main program must already be shifted by
 // VertexPrologInfo::prefix_dwords in `rt`.
-std::vector<uint32_t> recompile_vertex_chain(const uint32_t* prolog, size_t prolog_dwords,
-                                             const uint32_t* main, size_t main_dwords,
-                                             const ShaderResourceTable* rt = nullptr,
-                                             const PixelInputMapping* pixel_inputs = nullptr,
-                                             bool capture_position = false,
-                                             uint32_t virtual_lds_dwords = 0,
-                                             RecompileDiagnosticContext diagnostic = {
-                                                 RecompileDiagnosticStage::Vertex, 0},
-                                             FloatTransportConfig float_transport = {});
+std::vector<uint32_t> recompile_vertex_chain(
+    const uint32_t* prolog, size_t prolog_dwords, const uint32_t* main, size_t main_dwords,
+    const ShaderResourceTable* rt = nullptr, const PixelInputMapping* pixel_inputs = nullptr,
+    bool capture_position = false, uint32_t virtual_lds_dwords = 0,
+    RecompileDiagnosticContext diagnostic = {RecompileDiagnosticStage::Vertex, 0},
+    FloatTransportConfig float_transport = {}, GraphicsFloatMode float_mode = {});
 
 // Test hook: allow a tiny synthetic NGG shader to reach the terminal EXEC-gated export lowering so
 // Vulkan tests can execute both active and inactive outcomes. Production recompile_vertex keeps that

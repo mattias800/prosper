@@ -1,5 +1,6 @@
 // render_state.cpp — see render_state.hpp.
 #include "gpu/state/render_state.hpp"
+#include "gpu/state/graphics_float_mode.hpp"
 
 #include <cstdlib>
 #include "gpu/pm4/pm4_registers.hpp"
@@ -426,6 +427,7 @@ RenderState extract_render_state_uncached(const GpuState& st) {
     rs.gs_addr = addr_of(rd(st.sh, P::SPI_SHADER_PGM_LO_GS), rd(st.sh, P::SPI_SHADER_PGM_HI_GS));
     rs.es_addr = addr_of(rd(st.sh, P::SPI_SHADER_PGM_LO_ES), rd(st.sh, P::SPI_SHADER_PGM_HI_ES));
     rs.hs_addr = addr_of(rd(st.sh, P::SPI_SHADER_PGM_LO_HS), rd(st.sh, P::SPI_SHADER_PGM_HI_HS));
+    rs.vertex_float_mode = vertex_graphics_float_mode(st);
     for (uint32_t i = 0; i < rs.ps_input_cntl.size(); ++i) {
         const uint32_t reg = P::SPI_PS_INPUT_CNTL_0 + i;
         auto it = st.cx.find(reg);
