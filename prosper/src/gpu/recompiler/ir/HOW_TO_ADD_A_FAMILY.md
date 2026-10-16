@@ -177,6 +177,22 @@ definition, rebuild, and confirm the gate reports `output-changed`. Swapping `s_
 operands gave `output-changed 24`. Without that control, a clean result could mean the corpus never
 reaches your code.
 
+**If the positive control reports `changes: none`, the corpus does not reach your family.** That
+happened with the VOP1 f16 unary ops (#5233), and it makes the gate vacuous for that PR. Build a
+synthetic witness corpus:
+
+1. Write small RDNA2 programs that use every op in the family, in each encoding form the lowering
+   handles (plain, SDWA, both destination halves, and so on). Reuse the per-lane harness's program
+   builder.
+2. Save them as sidecars in a scratch directory such as `~/<slug>-witness/`. Never add them to
+   `~/shader-corpus`.
+3. Run the same `compare` over that directory, base build against candidate. It must report
+   `changes: none` with every program accepted.
+4. Repeat the positive control on the witness corpus. It must now report changes. Revert it and
+   re-run clean.
+5. Put the witness command, the program count and both reports in the PR body. Commit the generator
+   if it is small; otherwise describe it.
+
 ## 7. Size rules and the ratchet
 
 ```bash
@@ -186,6 +202,11 @@ python3 prosper/tools/ci/check_arch_ratchet.py --root . --update   # lowers the 
 
 - `dir-file-cap` fails any file under `gpu/recompiler/ir/` over 1,000 lines. Split by role: one file
   per family or sub-family, with routes grouped by theme at around 300-400 lines each.
+- Every family adds to the same core files: `ir.hpp`'s `Opcode`, `ir.cpp`, `eval.cpp`,
+  `emit/spirv_emitter.cpp` and `builder.hpp`. Do not let them grow towards the cap. When `eval.cpp` or
+  `spirv_emitter.cpp` passes about 400 lines, split it by category (integer, f32, f16, and so on)
+  into `eval_<category>.cpp` / `emit/<category>.cpp`, in a behaviour-neutral commit gated by the
+  corpus. Order the `Opcode` enum by category too, so concurrent families conflict less.
 - `host-throw` fails a `throw` in recompiler code. Use a loud abort with a message for a lowering bug
   (`ir.cpp` `malformed`).
 - `recompiler-include` fails an include of `gpu/diagnostics` or `gpu/execute`. Do not copy
