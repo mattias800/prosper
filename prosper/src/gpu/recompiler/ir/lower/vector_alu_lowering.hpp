@@ -8,5 +8,8 @@
 namespace prosper::gpu::ir {
 
 bool lower_vop2(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool allow_wave);
+// Every VOPC compare, in both its VOPC and VOP3 encodings (ir/lower/vopc.cpp).
+bool lower_vopc(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok,
+                bool allow_exec_update);
 
 } // namespace prosper::gpu::ir
