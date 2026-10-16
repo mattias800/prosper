@@ -69,6 +69,7 @@
 #include "gpu/recompiler/ir/lower/vop3_mad_float_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_binary_float_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_float_modifiers.hpp"
+#include "gpu/recompiler/ir/lower/vop3_round_float_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_legacy_mul_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_minmax_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_minmax_float_lowering.hpp"
@@ -1207,6 +1208,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 ok = false;
             } else if (ir::lower_vop3_rtz_pack(b, rs, in, ok, allow_wave, fv)) {
             } else if (ir::lower_vop3_float_integer(b, rs, in, ok)) {
+            } else if (ir::lower_vop3_round_float(b, rs, in, ok, std::cref(fv),
+                                                  std::cref(fresult))) {
             } else if (ir::lower_vop3_binary_float(b, rs, in, ok, allow_wave, fv, fresult)) {
             } else if (ir::lower_vop3_legacy_mul(b, rs, in, ok, allow_wave, fv, fresult)) {
             } else if (in.opcode == 0x101) {   // v_cndmask_b32_e64: src2_mask ? src1 : src0

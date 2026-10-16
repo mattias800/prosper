@@ -2,6 +2,7 @@
 // old rounded 2*pi multiplication and nesting. CONFIDENCE: MED: the retained GLSL math
 // inherits driver approximation/FP-mode behavior, not native-unit bit identity. IFLAG's
 // numeric reciprocal is unchanged; this migration adds no floating/integer exception model.
+#include "gpu/recompiler/ir/ir.hpp"
 #include "gpu/recompiler/ir/builder.hpp"
 #include "gpu/recompiler/ir/ops/vector_alu.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -9,15 +10,30 @@
 #include <cstdint>
 #include "gpu/recompiler/ir/ops/vector_float_unary.hpp"
 namespace prosper::gpu::ir {
+Value build_vector_fract(Builder& ir, const VectorOpIn& x) {
+    return ir.f32fract(x.s0);
+}
+Value build_vector_trunc(Builder& ir, const VectorOpIn& x) {
+    return ir.f32trunc(x.s0);
+}
+Value build_vector_ceil(Builder& ir, const VectorOpIn& x) {
+    return ir.f32ceil(x.s0);
+}
+Value build_vector_roundeven(Builder& ir, const VectorOpIn& x) {
+    return ir.f32roundeven(x.s0);
+}
+Value build_vector_floor(Builder& ir, const VectorOpIn& x) {
+    return ir.f32floor(x.s0);
+}
 namespace {
 using F = Rdna2Format;
 using In = VectorOpIn;
 constexpr VectorOpDef kDefs[] = {
-    {F::VOP1, 0x20, [](Builder& ir, const In& x) { return ir.f32fract(x.s0); }},
-    {F::VOP1, 0x21, [](Builder& ir, const In& x) { return ir.f32trunc(x.s0); }},
-    {F::VOP1, 0x22, [](Builder& ir, const In& x) { return ir.f32ceil(x.s0); }},
-    {F::VOP1, 0x23, [](Builder& ir, const In& x) { return ir.f32roundeven(x.s0); }},
-    {F::VOP1, 0x24, [](Builder& ir, const In& x) { return ir.f32floor(x.s0); }},
+    {F::VOP1, 0x20, build_vector_fract},
+    {F::VOP1, 0x21, build_vector_trunc},
+    {F::VOP1, 0x22, build_vector_ceil},
+    {F::VOP1, 0x23, build_vector_roundeven},
+    {F::VOP1, 0x24, build_vector_floor},
     {F::VOP1, 0x25, [](Builder& ir, const In& x) { return ir.f32exp2(x.s0); }},
     {F::VOP1, 0x27, [](Builder& ir, const In& x) { return ir.f32log2(x.s0); }},
     {F::VOP1, 0x2a, [](Builder& ir, const In& x) { return ir.f32rcp(x.s0); }},
