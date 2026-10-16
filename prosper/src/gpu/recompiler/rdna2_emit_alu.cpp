@@ -212,20 +212,16 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         : in.src_neg[source];
                     return negate ? b.fneg(v) : v;
                 };
-                // 0x0e v_pk_fma_f16 is the only three-source form; min/max return the OTHER operand
-                // when exactly one input is NaN (ISA 12.7), which is GLSL NMin/NMax, not FMin/FMax.
-                // VERIFIED(round-trip llvm-mc gfx1030) for 0x0e/0x11/0x12.
                 auto operation = [&](bool high) {
                     uint32_t r;
-                    switch (in.opcode) {
-                        case 0x0E: r = b.fbin(Op_FAdd,
-                                              b.fbin(Op_FMul, half(0, high), half(1, high)),
-                                              half(2, high)); break;
-                        case 0x0F: r = b.fbin(Op_FAdd, half(0, high), half(1, high)); break;
-                        case 0x10: r = b.fbin(Op_FMul, half(0, high), half(1, high)); break;
-                        case 0x11: r = b.fext2(Glsl_NMin, half(0, high), half(1, high)); break;
-                        default:   r = b.fext2(Glsl_NMax, half(0, high), half(1, high)); break;
-                    }
+                    if (!ir::lower_vop3p_packed_float(b, in, std::cref(half), high, r))
+                        switch (in.opcode) {
+                            case 0x0E:
+                                r = b.fbin(Op_FAdd, b.fbin(Op_FMul, half(0, high), half(1, high)),
+                                           half(2, high));
+                                break;
+                            default: ok = false; return b.uconst(0);
+                        }
                     if (in.clamp) r = b.clamp01(r);
                     return r;
                 };
