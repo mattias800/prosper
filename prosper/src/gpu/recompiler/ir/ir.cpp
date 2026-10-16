@@ -74,6 +74,8 @@ constexpr OpcodeInfo kInfo[] = {
     {"bfe.s", 3, Type::U32},
     {"unpack.half", 1, Type::U32},
     {"f32.ge", 2, Type::Bool},
+    {"f32.abs", 1, Type::U32},
+    {"f32.lt", 2, Type::Bool},
     {"f32.unord.ne", 2, Type::Bool},
     {"f32.eq", 2, Type::Bool},
     {"f32.ldexp", 2, Type::U32},

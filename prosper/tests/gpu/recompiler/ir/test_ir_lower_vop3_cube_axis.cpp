@@ -7,6 +7,7 @@
 #include "support/death_test.hpp"
 #include <gtest/gtest.h>
 #include <cstdint>
+#include <cstddef>
 #include <functional>
 #include <vector>
 using namespace prosper::gpu;
