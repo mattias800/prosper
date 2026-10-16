@@ -16,6 +16,16 @@ Value build_f32_to_u32_sat(Builder& ir, const ConversionIn& x) {
 Value build_f32_to_i32_sat(Builder& ir, const ConversionIn& x) {
     return ir.f32_to_i32_sat(x.s0);
 }
+Value build_half_to_u16_sat(Builder& ir, const ConversionIn& x) {
+    const Value f = ir.unpack_half(x.s0, 0);
+    const Value result = ir.umin(ir.f32_to_u32_sat(f), ir.c32(0xffff));
+    return ir.and_(result, ir.c32(0xffff));
+}
+Value build_half_to_i16_sat(Builder& ir, const ConversionIn& x) {
+    const Value f = ir.unpack_half(x.s0, 0);
+    const Value result = ir.smin(ir.smax(ir.f32_to_i32_sat(f), ir.c32(0xffff8000)), ir.c32(0x7fff));
+    return ir.and_(result, ir.c32(0xffff));
+}
 namespace {
 using F = Rdna2Format;
 using In = ConversionIn;
@@ -61,19 +71,8 @@ constexpr ConversionDef kHalfIntegerDefs[] = {
          const Value result = ir.pack_half_lo(ir.i32_to_f32(ir.bfe_s(word, ir.c32(0), ir.c32(16))));
          return ir.and_(result, ir.c32(0xffff));
      }},
-    {F::VOP1, 0x52,
-     [](Builder& ir, const In& x) {
-         const Value f = ir.unpack_half(x.s0, 0);
-         const Value result = ir.umin(ir.f32_to_u32_sat(f), ir.c32(0xffff));
-         return ir.and_(result, ir.c32(0xffff));
-     }},
-    {F::VOP1, 0x53,
-     [](Builder& ir, const In& x) {
-         const Value f = ir.unpack_half(x.s0, 0);
-         const Value result =
-             ir.smin(ir.smax(ir.f32_to_i32_sat(f), ir.c32(0xffff8000)), ir.c32(0x7fff));
-         return ir.and_(result, ir.c32(0xffff));
-     }},
+    {F::VOP1, 0x52, build_half_to_u16_sat},
+    {F::VOP1, 0x53, build_half_to_i16_sat},
 };
 struct Built {
     Block block;
