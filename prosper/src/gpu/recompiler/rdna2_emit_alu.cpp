@@ -59,6 +59,7 @@
 #include "gpu/recompiler/ir/lower/vop3_integer16_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_minmax_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_minmax_float_lowering.hpp"
+#include "gpu/recompiler/ir/lower/vop3_ldexp_lowering.hpp"
 #include <functional>
 #include "gpu/recompiler/ir/lower/vop1_conversion_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop1_unary_float_lowering.hpp"
@@ -1522,32 +1523,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 uint32_t lo = b.uext2(Glsl_UMin, val(in.src[0]), b.uconst(0xFFFFu));
                 uint32_t hi = b.uext2(Glsl_UMin, val(in.src[1]), b.uconst(0xFFFFu));
                 vreg[in.dst.value] = b.ibin(Op_BitwiseOr, lo, b.ibin(Op_ShiftLeftLogical, hi, b.uconst(16)));
-            } else if (in.opcode == 0x362) {   // v_ldexp_f32
-                // AMD opcode 866: D.f = S0.f * 2**S1.i. The exact GTA V production packet is
-                // d7620000,0002030d (`v_ldexp_f32 v0,v13,v1`) with no modifiers. Admit that proven
-                // shape only for now: ABS/NEG on the integer exponent and output-modifier denormal
-                // behavior need separate contracts, and silently ignoring either would corrupt
-                // mip/scale reconstruction. ldexp_f32_bits covers the full unmodified i32 exponent
-                // domain without relying on GLSL.std.450 Ldexp's undefined overflow cases.
-                // src0 is the FLOAT operand, and ABS/NEG on a float source is the ordinary VOP3
-                // modifier every other float op here already applies through fv() -- hardware order
-                // ABS then NEG. Admitting it is not a new contract (#3138). The original gate
-                // rejected all three sources together, which also refused this well-defined case:
-                // Stray's `0x3011560000` is `v_ldexp_f32 v39, |v35|, -2` (`d7620127,00018523`,
-                // ABS[2:0]=001), and that ONE instruction failed a 3684-dword fragment stage and
-                // discarded 1536 full-screen 3840x2160 draws per routed boot.
-                //
-                // src1 keeps rejecting, and for a reason the gate's own comment gives: it is the
-                // integer EXPONENT, where "absolute value" and "negate" are not float modifiers at
-                // all and silently ignoring either would corrupt mip/scale reconstruction. CLAMP is
-                // the ordinary float saturate of the exact result via fresult() (Kena #4706,
-                // `d762800c,0001850c`; CONFIDENCE: HIGH). OMOD keeps rejecting: hardware ignores it
-                // on f32 with denormals enabled, so it needs the MODE contract.
-                if (in.src_abs[1] || in.src_abs[2] || in.src_neg[1] || in.src_neg[2] || in.omod) {
-                    ok = false;
-                } else {
-                    vreg[in.dst.value] = fresult(b.ldexp_f32_bits(fv(0), val(in.src[1])));
-                }
+            } else if (ir::lower_vop3_ldexp(b, rs, in, ok, allow_wave, std::cref(fv),
+                                            std::cref(fresult))) {
             } else if (in.opcode >= 0x144 && in.opcode <= 0x147) {
                 // Cubemap coordinate ops (#273 — DOLL's title post PSes' reflection-probe math):
                 // v_cubeid_f32 (0x144) face id, v_cubesc_f32 (0x145) S numerator, v_cubetc_f32
