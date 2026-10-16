@@ -20,4 +20,7 @@ bool lower_vop3_binary_float(SpirvCompute& b, RegState& rs, const Rdna2Inst& in,
     const BinaryFloatResult modify = std::cref(fresult);
     return lower_vop3_binary_float_erased(b, rs, in, ok, allow_wave, read, modify);
 }
+using PackedFloatHalfSource = std::function<uint32_t(int, bool)>;
+bool lower_vop3p_packed_float(SpirvCompute& b, const Rdna2Inst& in,
+                              const PackedFloatHalfSource& half, bool high, uint32_t& r);
 }   // namespace prosper::gpu::ir

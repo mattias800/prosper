@@ -8,30 +8,31 @@
 #include <cstdint>
 #include <span>
 namespace prosper::gpu::ir {
-namespace {
 using In = TernaryInputs;
-Value add(Builder& ir, const In& x) {
+Value build_float_add(Builder& ir, const In& x) {
     return ir.f32add(x.s0(), x.s1());
 }
+Value build_float_mul(Builder& ir, const In& x) {
+    return ir.f32mul(x.s0(), x.s1());
+}
+Value build_float_nmin(Builder& ir, const In& x) {
+    return ir.f32nmin(x.s0(), x.s1());
+}
+Value build_float_nmax(Builder& ir, const In& x) {
+    return ir.f32nmax(x.s0(), x.s1());
+}
+namespace {
 Value sub(Builder& ir, const In& x) {
     return ir.f32sub(x.s0(), x.s1());
 }
 Value subrev(Builder& ir, const In& x) {
     return ir.f32sub(x.s1(), x.s0());
 }
-Value mul(Builder& ir, const In& x) {
-    return ir.f32mul(x.s0(), x.s1());
-}
-Value min(Builder& ir, const In& x) {
-    return ir.f32nmin(x.s0(), x.s1());
-}
-Value max(Builder& ir, const In& x) {
-    return ir.f32nmax(x.s0(), x.s1());
-}
+
 constexpr TernaryIntegerDef kDefs[] = {
-    {Rdna2Format::VOP3, 0x103, add},    {Rdna2Format::VOP3, 0x104, sub},
-    {Rdna2Format::VOP3, 0x105, subrev}, {Rdna2Format::VOP3, 0x108, mul},
-    {Rdna2Format::VOP3, 0x10f, min},    {Rdna2Format::VOP3, 0x110, max}};
+    {Rdna2Format::VOP3, 0x103, build_float_add},  {Rdna2Format::VOP3, 0x104, sub},
+    {Rdna2Format::VOP3, 0x105, subrev},           {Rdna2Format::VOP3, 0x108, build_float_mul},
+    {Rdna2Format::VOP3, 0x10f, build_float_nmin}, {Rdna2Format::VOP3, 0x110, build_float_nmax}};
 }   // namespace
 std::span<const TernaryIntegerDef> vector_binary_float_defs() {
     return kDefs;
