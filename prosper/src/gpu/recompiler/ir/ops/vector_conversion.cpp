@@ -10,14 +10,20 @@
 #include "gpu/recompiler/ir/ops/vector_conversion.hpp"
 #include "gpu/recompiler/ir/emit/spirv_emitter.hpp"
 namespace prosper::gpu::ir {
+Value build_f32_to_u32_sat(Builder& ir, const ConversionIn& x) {
+    return ir.f32_to_u32_sat(x.s0);
+}
+Value build_f32_to_i32_sat(Builder& ir, const ConversionIn& x) {
+    return ir.f32_to_i32_sat(x.s0);
+}
 namespace {
 using F = Rdna2Format;
 using In = ConversionIn;
 constexpr ConversionDef kDefs[] = {
     {F::VOP1, 0x05, [](Builder& ir, const In& x) { return ir.i32_to_f32(x.s0); }},
     {F::VOP1, 0x06, [](Builder& ir, const In& x) { return ir.u32_to_f32(x.s0); }},
-    {F::VOP1, 0x07, [](Builder& ir, const In& x) { return ir.f32_to_u32_sat(x.s0); }},
-    {F::VOP1, 0x08, [](Builder& ir, const In& x) { return ir.f32_to_i32_sat(x.s0); }},
+    {F::VOP1, 0x07, build_f32_to_u32_sat},
+    {F::VOP1, 0x08, build_f32_to_i32_sat},
     {F::VOP1, 0x0a, [](Builder& ir, const In& x) { return ir.pack_half_lo(x.s0); }},
     {F::VOP1, 0x0b, [](Builder& ir, const In& x) { return ir.unpack_half(x.s0, x.high ? 1 : 0); }},
     {F::VOP1, 0x0c,

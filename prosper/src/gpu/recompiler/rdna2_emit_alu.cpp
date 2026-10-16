@@ -55,6 +55,7 @@
 #include "gpu/recompiler/ir/lower/vector_alu_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop1_integer_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_unary_integer_lowering.hpp"
+#include "gpu/recompiler/ir/lower/vop3_float_integer_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_bitfield_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_align_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_ternary_integer_lowering.hpp"
@@ -1625,6 +1626,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 b.stage_reject_reason = reason;
                 ok = false;
             } else if (ir::lower_vop3_rtz_pack(b, rs, in, ok, allow_wave, fv)) {
+            } else if (ir::lower_vop3_float_integer(b, rs, in, ok)) {
             } else if (ir::lower_vop3_binary_float(b, rs, in, ok, allow_wave, fv, fresult)) {
             } else if (ir::lower_vop3_legacy_mul(b, rs, in, ok, allow_wave, fv, fresult)) {
             } else if (in.opcode == 0x101) {   // v_cndmask_b32_e64: src2_mask ? src1 : src0
