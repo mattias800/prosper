@@ -186,6 +186,71 @@ struct Interpreter {
   // GLSL.std.450 unary math and core OpFDiv (136), nominal binary32 host reference.
   // See registry.khronos.org/SPIR-V/specs/unified1/GLSL.std.450.html. Approximation bits
   // and implicit device FP modes are not established by this interpreter.
+  // SPIR-V 1.6 conversion/relational instructions and GLSL.std.450 4/37/40:
+  // https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html#Conversion
+  // Every source must be defined; a nonrepresentable core conversion fails loudly.
+  bool conversion_alu_op(Lane& l, uint32_t op, const std::vector<uint32_t>& a) {
+      if (op != 109 && op != 111 && op != 112) return false;
+      if (a.size() != 3) fail("malformed numeric conversion");
+      const auto x = value(l, a[2]);
+      if (!x.defined || x.words.size() != 1) fail("undefined numeric conversion input");
+      const auto f32 = [&](uint32_t t) {
+          return ty(t).op == 22 && ty(t).a == std::vector<uint32_t>{32};
+      };
+      if (op == 109) {
+          if (!f32(x.type) || !uint_type(a[0])) fail("FToU conversion types");
+          const float f = std::bit_cast<float>(x.words[0]);
+          if (!std::isfinite(f) || f < 0 || f >= 0x1p32f) fail("undefined FToU conversion domain");
+          set(l, a[1], a[0], {static_cast<uint32_t>(f)});
+      } else {
+          if (!f32(a[0]) || (op == 111 ? !int_type(x.type) : !uint_type(x.type)))
+              fail("integer-to-float conversion types");
+          const float f = op == 111 ? static_cast<float>(std::bit_cast<int32_t>(x.words[0]))
+                                    : static_cast<float>(x.words[0]);
+          set(l, a[1], a[0], {std::bit_cast<uint32_t>(f)});
+      }
+      return true;
+  }
+  bool float_comparison_op(Lane& l, uint32_t op, const std::vector<uint32_t>& a) {
+      if (op != 183 && op != 184 && op != 190) return false;
+      if (a.size() != 4 || ty(a[0]).op != 20) fail("malformed float comparison");
+      const auto x = value(l, a[2]), y = value(l, a[3]);
+      if (!x.defined || !y.defined || x.words.size() != 1 || y.words.size() != 1 ||
+          x.type != y.type || ty(x.type).op != 22 || ty(x.type).a != std::vector<uint32_t>{32})
+          fail("undefined or mistyped float comparison");
+      const float f = std::bit_cast<float>(x.words[0]), g = std::bit_cast<float>(y.words[0]);
+      // FUnordNotEqual includes either NaN; ordered comparisons are false on NaN.
+      const bool result = op == 183   ? std::isnan(f) || std::isnan(g) || f != g
+                          : op == 184 ? f < g
+                                      : f >= g;
+      set(l, a[1], a[0], {uint32_t(result)});
+      return true;
+  }
+  bool float_conversion_bound_op(Lane& l, uint32_t op, const std::vector<uint32_t>& a) {
+      if (op != 12 || !glsl || a.size() < 4 || a[2] != glsl ||
+          (a[3] != 4 && a[3] != 37 && a[3] != 40))
+          return false;
+      const bool abs = a[3] == 4;
+      if (a.size() != (abs ? 5u : 6u) || ty(a[0]).op != 22 ||
+          ty(a[0]).a != std::vector<uint32_t>{32})
+          fail("unsupported float bound type");
+      const auto x = value(l, a[4]);
+      if (!x.defined || x.type != a[0] || x.words.size() != 1) fail("undefined float bound input");
+      const float f = std::bit_cast<float>(x.words[0]);
+      if (std::isnan(f)) fail("unspecified float bound NaN");
+      float r = std::fabs(f);
+      if (!abs) {
+          const auto y = value(l, a[5]);
+          if (!y.defined || y.type != a[0] || y.words.size() != 1)
+              fail("undefined float bound input");
+          const float g = std::bit_cast<float>(y.words[0]);
+          if (std::isnan(g)) fail("unspecified float bound NaN");
+          // Select an allowed zero sign; the conversion tests observe only the integer result.
+          r = a[3] == 37 ? std::fmin(f, g) : std::fmax(f, g);
+      }
+      set(l, a[1], a[0], {std::bit_cast<uint32_t>(r)});
+      return true;
+  }
   bool unary_float_alu_op(Lane& l, uint32_t op, const std::vector<uint32_t>& a) {
       const bool divide = op == 136;
       if (!divide && (op != 12 || a.size() != 5 || !glsl || a[2] != glsl)) return false;
@@ -364,13 +429,19 @@ struct Interpreter {
                           static_cast<uint32_t>(static_cast<uint64_t>(product) >> 32)});
       return true;
     }
-    if (op == 203) {   // OpBitFieldUExtract: undefined when offset + count > 32
-      if (a.size() != 5 || !uint_type(a[0])) fail("unsupported BitFieldUExtract");
-      const uint32_t base = int_word(l, a[2]), offset = int_word(l, a[3]), count = int_word(l, a[4]);
-      if (uint64_t{offset} + count > 32) fail("BitFieldUExtract range out of bounds");
-      const uint32_t field = offset == 32 ? 0 : base >> offset;
-      set(l, a[1], a[0], {count == 32 ? field : field & ((1u << count) - 1u)});
-      return true;
+    if (op == 202 || op == 203) {   // OpBitField[S/U]Extract: undefined if offset+count > 32.
+        if (a.size() != 5 || (op == 202 ? !int_type(a[0]) : !uint_type(a[0])))
+            fail("unsupported bitfield extract");
+        const auto base = value(l, a[2]);
+        if (base.type != a[0] || !base.defined || base.words.size() != 1)
+            fail("undefined or mistyped bitfield base");
+        const uint32_t offset = int_word(l, a[3]), count = int_word(l, a[4]);
+        if (uint64_t{offset} + count > 32) fail("bitfield extract range out of bounds");
+        const uint32_t mask = count == 32 ? 0xffffffffu : (1u << count) - 1u;
+        uint32_t field = offset == 32 ? 0 : (base.words[0] >> offset) & mask;
+        if (op == 202 && count && (field & (1u << (count - 1)))) field |= ~mask;
+        set(l, a[1], a[0], {field});
+        return true;
     }
     if (op == 204) {   // OpBitReverse
       if (a.size() != 3 || !uint_type(a[0])) fail("unsupported BitReverse");
@@ -593,8 +664,9 @@ struct Interpreter {
           continue;
       }
       ++l.pc;
-      if (unary_float_alu_op(l, op, a) || half_alu_op(l, op, a) || float_alu_op(l, op, a) ||
-          scalar_alu_op(l, op, a))
+      if (conversion_alu_op(l, op, a) || float_comparison_op(l, op, a) ||
+          float_conversion_bound_op(l, op, a) || unary_float_alu_op(l, op, a) ||
+          half_alu_op(l, op, a) || float_alu_op(l, op, a) || scalar_alu_op(l, op, a))
           continue;
       if (op == 248) {
         l.label = a.at(0);
@@ -770,16 +842,6 @@ struct Interpreter {
           auto v = value(l, a[2]);
           if (op == 83 && v.type != a[0]) fail("CopyObject type mismatch");
           set(l, a[1], a[0], std::move(v.words), v.defined);
-      } else if (op == 112) {
-          if (a.size() != 3 || !uint_type(value(l, a[2]).type) || ty(a[0]).op != 22)
-              fail("unsupported unsigned-to-float conversion");
-          set(l, a[1], a[0], {std::bit_cast<uint32_t>(static_cast<float>(word(l, a[2])))});
-      } else if (op == 184) {
-          if (a.size() != 4 || ty(value(l, a[2]).type).op != 22 || ty(value(l, a[3]).type).op != 22)
-              fail("unsupported float comparison");
-          set(l, a[1], a[0],
-              {uint32_t(std::bit_cast<float>(word(l, a[2])) <
-                        std::bit_cast<float>(word(l, a[3])))});
       } else if (op == 169) {
           if (a.size() != 5) fail("malformed Select");
         // Both arms must be defined and typed even when only one is selected.

@@ -63,6 +63,21 @@ public:
     Value f32sqrt(Value a) { return block_.append({Opcode::F32Sqrt, Type::U32, 0, {a}}); }
     Value f32sin(Value a) { return block_.append({Opcode::F32Sin, Type::U32, 0, {a}}); }
     Value f32cos(Value a) { return block_.append({Opcode::F32Cos, Type::U32, 0, {a}}); }
+    Value i32_to_f32(Value a) { return block_.append({Opcode::I32ToF32, Type::U32, 0, {a}}); }
+    Value u32_to_f32(Value a) { return block_.append({Opcode::U32ToF32, Type::U32, 0, {a}}); }
+    Value f32_to_u32_sat(Value a) {
+        return block_.append({Opcode::F32ToU32Sat, Type::U32, 0, {a}});
+    }
+    Value f32_to_i32_sat(Value a) {
+        return block_.append({Opcode::F32ToI32Sat, Type::U32, 0, {a}});
+    }
+    Value bfe_s(Value base, Value offset, Value count) {
+        return block_.append({Opcode::BfeS, Type::U32, 0, {base, offset, count}});
+    }
+    Value unpack_half(Value a, uint32_t component) {
+        return block_.append({Opcode::UnpackHalf, Type::U32, component, {a}});
+    }
+    Value f32ge(Value a, Value b) { return cmp(Opcode::F32Ge, a, b); }
     Value bfe_u(Value base, Value offset, Value count) {
         return block_.append({Opcode::BfeU, Type::U32, 0, {base, offset, count}});
     }

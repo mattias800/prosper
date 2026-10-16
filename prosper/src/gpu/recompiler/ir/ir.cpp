@@ -65,8 +65,15 @@ constexpr OpcodeInfo kInfo[] = {
     {"f32.sqrt", 1, Type::U32},
     {"f32.sin", 1, Type::U32},
     {"f32.cos", 1, Type::U32},
+    {"i32.to.f32", 1, Type::U32},
+    {"u32.to.f32", 1, Type::U32},
+    {"f32.to.u32.sat", 1, Type::U32},
+    {"f32.to.i32.sat", 1, Type::U32},
+    {"bfe.s", 3, Type::U32},
+    {"unpack.half", 1, Type::U32},
+    {"f32.ge", 2, Type::Bool},
 };
-static_assert(std::size(kInfo) == static_cast<size_t>(Opcode::F32Cos) + 1);
+static_assert(std::size(kInfo) == static_cast<size_t>(Opcode::F32Ge) + 1);
 
 // The type argument `slot` of `op` must have.
 Type argument_type(Opcode op, size_t slot) {
@@ -109,6 +116,8 @@ Value Block::append(const Inst& inst) {
         if (inst.imm != input_count_) malformed("inputs must be numbered in order", info);
         ++input_count_;
     }
+    if (inst.op == Opcode::UnpackHalf && inst.imm > 1)
+        malformed("half component out of range", info);
     insts_.push_back(inst);
     return Value{static_cast<uint32_t>(insts_.size() - 1)};
 }
