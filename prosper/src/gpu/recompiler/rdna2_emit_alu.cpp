@@ -1772,8 +1772,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 b.stage_reject_pc = in.pc;
                 b.stage_reject_reason = reason;
                 ok = false;
-            } else if (in.opcode == 0x12F) {   // v_cvt_pkrtz_f16_f32 = pack(s0->lo, s1->hi)
-                vreg[in.dst.value] = b.pack_half2x16_rtz(fv(0), fv(1)); // v_cvt_pkrtz VOP3: RTZ clamp (#452)
+            } else if (ir::lower_vop3_rtz_pack(b, rs, in, ok, allow_wave, fv)) {
             } else if (ir::lower_vop3_binary_float(b, rs, in, ok, allow_wave, fv, fresult)) {
             } else if (in.opcode == 0x107) {   // v_mul_legacy_f32: DX9 multiply —
                 // 0 * x == 0 for ALL x including ±Inf/NaN (that guarantee is WHY compilers emit it,

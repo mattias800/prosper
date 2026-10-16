@@ -9,12 +9,7 @@
 #include <cstdint>
 #include <span>
 namespace prosper::gpu::ir {
-namespace {
-using F = Rdna2Format;
-using In = HalfOpIn;
-Value pack_rtz(Builder& ir, const In& x) {
-    const Value a = x.s0, b = x.s1;
-
+Value build_half_rtz(Builder& ir, Value a, Value b) {
     // GLSL PackHalf2x16 does not guarantee RTZ, and its preceding floating-point min/max can
     // turn a NaN or true infinity into a finite endpoint. V_CVT_PKRTZ_F16_F32 always rounds
     // finite operands toward zero. Work on the source bits so host float controls and GLSL
@@ -49,6 +44,12 @@ Value pack_rtz(Builder& ir, const In& x) {
         return ir.or_(sign, magnitude);
     };
     return ir.or_(half_rtz(a), ir.shl(half_rtz(b), ir.c32(16)));
+}
+namespace {
+using F = Rdna2Format;
+using In = HalfOpIn;
+Value pack_rtz(Builder& ir, const In& x) {
+    return build_half_rtz(ir, x.s0, x.s1);
 }
 Value finish(Builder& ir, Value value, bool clamp) {
     if (clamp) value = ir.f32clamp01(value);
