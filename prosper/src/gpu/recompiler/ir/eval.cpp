@@ -72,6 +72,20 @@ Known evaluate_op(Opcode op, uint32_t imm, uint32_t a, uint32_t b, uint32_t c) {
                 std::scalbn(std::bit_cast<float>(a), std::clamp(s(b), -512, 512)));
         case Opcode::PackNorm16: return evaluate_pack_norm16(a, imm);
         case Opcode::PackHalfLo: return pack_half_rte(a);
+        case Opcode::F32Fma: {
+            // Selected finite, normal-or-zero binary32 RTE reference. GLSL.std.450 Fma's
+            // Vulkan accuracy is inherited from Mul+Add, so this is not a portable device
+            // guarantee. Like the other float ALU evaluator, it is not a guest constant fold.
+            const float x = std::bit_cast<float>(a), y = std::bit_cast<float>(b),
+                        z = std::bit_cast<float>(c);
+            const auto supported = [](float value) {
+                return std::isfinite(value) && std::fpclassify(value) != FP_SUBNORMAL;
+            };
+            if (!supported(x) || !supported(y) || !supported(z)) return std::nullopt;
+            const float d = std::fma(x, y, z);
+            if (!supported(d)) return std::nullopt;
+            return std::bit_cast<uint32_t>(d);
+        }
         case Opcode::F32AddNoContraction: return evaluate_op(Opcode::F32Add, imm, a, b, c);
         case Opcode::F32MulNoContraction: return evaluate_op(Opcode::F32Mul, imm, a, b, c);
         case Opcode::F32Add:

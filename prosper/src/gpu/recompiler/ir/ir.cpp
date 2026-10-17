@@ -51,6 +51,7 @@ constexpr OpcodeInfo kInfo[] = {
     {"f32.nmax", 2, Type::U32},
     {"f32.add.nocontraction", 2, Type::U32},
     {"f32.mul.nocontraction", 2, Type::U32},
+    {"f32.fma", 3, Type::U32},
     {"bool.and", 2, Type::Bool},
     {"bool.or", 2, Type::Bool},
     {"f32.clamp01", 1, Type::U32},

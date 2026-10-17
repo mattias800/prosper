@@ -6,6 +6,14 @@
 
 namespace prosper::gpu {
 
+uint32_t SpirvCompute::fma(uint32_t a, uint32_t b, uint32_t c) {
+    const uint32_t result = id();
+    // GLSL.std.450 Fma expresses fusion intent, as requested in #5225. Vulkan permits
+    // Mul+Add accuracy; this does not provide OpFmaKHR's correctly-rounded guarantee.
+    putv(code, Op_ExtInst, {t_f32, result, glsl, Glsl_Fma, bcf(a), bcf(b), bcf(c)});
+    return bcu(result);
+}
+
 uint32_t SpirvCompute::fbin_no_contraction(uint32_t op, uint32_t a, uint32_t b) {
     const uint32_t result = id();
     put(code, op, {t_f32, result, bcf(a), bcf(b)});
