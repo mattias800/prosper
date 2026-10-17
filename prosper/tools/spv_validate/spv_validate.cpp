@@ -32,6 +32,7 @@
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/recompiler/spirv_builder.hpp"
 #include "../../tests/fixtures/ds_address_ir.hpp"
+#include "../../tests/fixtures/smem_index_ir.hpp"
 #include "../../tests/fixtures/spirv_wave_width_fixtures.hpp"
 #include "../../tests/fixtures/ngg_lane_slots.hpp"
 #include "../../tests/fixtures/ngg_bool_copy.hpp"
@@ -1062,6 +1063,12 @@ int main(int argc, char** argv) {
         builder.begin(2, nullptr, 32, 1, 1, 32, 0, true, true);
         prosper::test::ir::ds_address::emit_fixture(builder);
         dump(dir, "ir_ds_address_values", builder.finish(), "emit_ds_address_values");
+    }
+    {
+        SpirvCompute builder;
+        builder.begin(1, nullptr, 32, 1, 1, 32, 0, true, true);
+        prosper::test::ir::smem_index::emit_fixture(builder);
+        dump(dir, "ir_smem_index_values", builder.finish(), "emit_smem_index_value");
     }
     // This VOP3 LSHL_ADD route calls the ordered IR input resolver; validate its containing module.
     {
