@@ -151,6 +151,33 @@ TEST(IrVectorCvtRpiExactE64Execution,
                     expect_lanes(compile(cases::program(255, bits, encoding, wave, prefix)),
                                  cases::inputs(prefix), bits, prefix);
 }
+TEST(IrVectorCvtRpiExactE64Execution, RemovingExecMaskOverwritesInactiveCanaries) {
+    // The paired full-EXEC program deliberately omits CMPX. A checker that ignored inactive
+    // destinations would miss this corruption, so count its wrong canaries independently.
+    const auto in = cases::inputs();
+    for (uint32_t wave : {32u, 64u})
+        for (uint32_t encoding : {0u, 1u}) {
+            expect_lanes(compile(cases::program(255, 0x3fc00000, encoding, wave)), in, 0x3fc00000);
+            const auto unmasked = compile(cases::program(255, 0x3fc00000, encoding, wave, 1));
+            ASSERT_FALSE(unmasked.empty());
+            for (bool flush : {false, true}) {
+                const auto run = execute(unmasked, in, flush);
+                ASSERT_TRUE(run.error.empty()) << run.error;
+                ASSERT_EQ(run.d.size(), in.lanes());
+                size_t inactive = 0, overwritten = 0;
+                for (size_t lane = 0; lane < in.lanes(); ++lane) {
+                    ASSERT_EQ(run.d[lane], 2u); // ISA: floor(1.5 + 0.5), independent of eval.
+                    ASSERT_NE(in.old_d[lane], 2u);
+                    if (!in.active[lane]) {
+                        ++inactive;
+                        overwritten += run.d[lane] != in.old_d[lane];
+                    }
+                }
+                ASSERT_GT(inactive, 0u);
+                EXPECT_EQ(overwritten, inactive);
+            }
+        }
+}
 TEST(IrVectorCvtRpiExactE64Execution, AllProducingModeBytesAndUnknownKeepTheExactIntegerAnswer) {
     for (uint32_t mode = 0; mode <= 256; ++mode)
         for (uint32_t ieee : {0u, 1u})
