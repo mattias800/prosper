@@ -31,6 +31,20 @@ alignas(256) constexpr uint32_t failed_fragment[] = {
     0x7e000280u,0xf800180fu,0u,0xbf810000u,
 };
 alignas(256) constexpr uint32_t utility[] = {0x7e000280u,0xf8001803u,0u,0xbf810000u};
+// Legacy profile/byte-offset controls need a genuine historical writer payload, not a relabel.
+GpuCaptureFile without_half_overflow(GpuCaptureFile historical) {
+    for (auto& draw : historical.draws) {
+        draw.vertex_float_mode.fp16_overflow = {};
+        draw.ps_float_flags.fp16_overflow = {};
+    }
+    for (auto& compute : historical.computes) compute.recompile_config.fp16_overflow = {};
+    for (auto& failure : historical.failure_diagnostics) {
+        failure.vertex_float_mode.fp16_overflow = {};
+        failure.ps_float_flags.fp16_overflow = {};
+        for (auto& stage : failure.stages) stage.recompile_config.fp16_overflow = {};
+    }
+    return historical;
+}
 void program(GpuState& state, uint32_t lo, uint32_t hi, const uint32_t* words) {
     const auto address = reinterpret_cast<uint64_t>(words);
     state.sh[lo] = static_cast<uint32_t>(address >> 8);
@@ -416,7 +430,9 @@ int main(int argc, char** argv) {
             CHECK(capture_draw_items({draw},metadata,reader,single,error),"CLI fixture captures exact producing input");
             // Wrong stored pixels must not pass for regenerated source. Oppose the known mode.
             single.draws[0].fs=entry.mode.available && entry.mode.value==0 ? preserve : flush;
-            CHECK(write_gpu_capture((directory/(std::string(entry.name)+".prgcap")).string(),single,error),"CLI fixture writes");
+            CHECK(write_gpu_capture((directory / (std::string(entry.name) + ".prgcap")).string(),
+                                    without_half_overflow(single), error),
+                  "CLI fixture writes");
             auto retry=single; retry.draws.clear(); retry.operations={{SubmitOperationKind::Draw,7,1,false}};
             retry.failure_diagnostics_available=true;
             GpuCapturedOperationFailure f; f.source_index=7; f.command_order=1;
@@ -429,7 +445,10 @@ int main(int argc, char** argv) {
             // Remove the otherwise unreferenced vertex raw version and remap fragment index.
             const auto raw=retry.raw_shader_versions[stage.raw_shader_index]; retry.raw_shader_versions={raw};
             retry.failure_diagnostics[0].stages[0].raw_shader_index=0;
-            CHECK(write_gpu_capture((directory/(std::string(entry.name)+"-failed.prgcap")).string(),retry,error),"retry CLI fixture writes");
+            CHECK(write_gpu_capture(
+                      (directory / (std::string(entry.name) + "-failed.prgcap")).string(),
+                      without_half_overflow(retry), error),
+                  "retry CLI fixture writes");
         }
     }
     std::printf("== %s (%d failures) ==\n",failures?"FAIL":"PASS",failures);

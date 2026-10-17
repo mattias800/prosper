@@ -36,6 +36,20 @@ void set32(std::vector<uint8_t>& bytes, size_t at, uint32_t value) {
 void append32(std::vector<uint8_t>& bytes, uint32_t value) {
     for (size_t i=0; i<4; ++i) bytes.push_back(static_cast<uint8_t>(value >> (i*8)));
 }
+// Legacy profile/byte-offset controls need a genuine historical writer payload, not a relabel.
+GpuCaptureFile without_half_overflow(GpuCaptureFile historical) {
+    for (auto& draw : historical.draws) {
+        draw.vertex_float_mode.fp16_overflow = {};
+        draw.ps_float_flags.fp16_overflow = {};
+    }
+    for (auto& compute : historical.computes) compute.recompile_config.fp16_overflow = {};
+    for (auto& failure : historical.failure_diagnostics) {
+        failure.vertex_float_mode.fp16_overflow = {};
+        failure.ps_float_flags.fp16_overflow = {};
+        for (auto& stage : failure.stages) stage.recompile_config.fp16_overflow = {};
+    }
+    return historical;
+}
 GpuState state(const uint32_t* fs=fragment) {
     GpuState result;
     const auto program = [&](uint32_t lo, uint32_t hi, const uint32_t* words) {
@@ -203,7 +217,7 @@ int main(int argc, char** argv) {
     }
     std::vector<uint8_t> bytes;
     const bool roundtrip=serialize_gpu_capture(capture,bytes,error) && deserialize_gpu_capture(bytes,loaded,error);
-    CHECK(roundtrip && loaded.format_version == 71,
+    CHECK(roundtrip && loaded.format_version == 78,
           "current codec accepts exact bounded producing profile tails");
     if (!roundtrip) { std::printf("codec error: %s\n",error.c_str()); return 1; }
     GpuReplayFrame replay;
@@ -234,6 +248,34 @@ int main(int argc, char** argv) {
         append32(tail,static_cast<uint32_t>(item.stages.size()));
         for (const auto& stage:item.stages) tail.push_back(static_cast<uint8_t>(stage.recompile_config.float_transport.profile));
     }
+    // Keep the actual v78 roundtrip above; the established old-wire controls use an
+    // independently serialized v71 copy with only the new authority removed.
+    std::vector<uint8_t> historical_bytes;
+    CHECK(serialize_gpu_capture(without_half_overflow(capture), historical_bytes, error) &&
+              historical_bytes.size() > 12 && historical_bytes[8] == 71,
+          "historical profile copy selects genuine v71 wire");
+    size_t available_configs = 0, stage_count = 0;
+    for (const auto& compute : capture.computes)
+        available_configs += compute.recompile_config_available;
+    for (const auto& failure : capture.failure_diagnostics) {
+        stage_count += failure.stages.size();
+        for (const auto& stage : failure.stages)
+            available_configs += stage.recompile_config_available;
+    }
+    CHECK(available_configs == 0, "resource-free historical fixture has no v75 config records");
+    if (available_configs) return 1;
+    // v72(4+D), v73(4+9D), v74(4), v75(4), v76(8+D+F), v77(8+3D+3F),
+    // v78(16+4D+8F+2C+2S), in official append order; all config availability is false.
+    const size_t suffix = 48u + 18u * capture.draws.size() +
+                          12u * capture.failure_diagnostics.size() + 2u * capture.computes.size() +
+                          2u * stage_count;
+    CHECK(bytes.size() >= suffix, "all newer fixture appendices fit");
+    if (bytes.size() < suffix) return 1;
+    auto stripped = bytes;
+    stripped.resize(stripped.size() - suffix);
+    set32(stripped, 8, 71);
+    CHECK(stripped == historical_bytes, "stripped current prefix equals genuine v71 writer bytes");
+    bytes = historical_bytes;
     // These ordinary draws have no wave plan: v70 is exactly count plus zero flags.
     const size_t wave_tail = 4u + capture.draws.size();
     const size_t launch_tail = 4u + 25u * capture.draws.size();
@@ -325,7 +367,9 @@ int main(int argc, char** argv) {
             // Opposing stored capability markers must not replace captured producer configuration.
             single.draws[0].fs=*modules[i==2 ? 1 : 2];
             const std::string name=float_transport_profile_name(item.float_transport);
-            CHECK(write_gpu_capture((directory/(name+".prgcap")).string(),single,error),"CLI fixture writes current capture");
+            CHECK(write_gpu_capture((directory / (name + ".prgcap")).string(),
+                                    without_half_overflow(single), error),
+                  "CLI fixture writes current capture");
             auto retry=single; retry.draws.clear(); retry.operations={{SubmitOperationKind::Draw,7,1,false}};
             retry.failure_diagnostics_available=true;
             GpuCapturedOperationFailure failed; failed.source_index=7; failed.command_order=1;
@@ -340,7 +384,9 @@ int main(int argc, char** argv) {
             failed.stages.push_back(stage); retry.failure_diagnostics.push_back(failed);
             const auto raw=retry.raw_shader_versions[stage.raw_shader_index]; retry.raw_shader_versions={raw};
             retry.failure_diagnostics[0].stages[0].raw_shader_index=0;
-            CHECK(write_gpu_capture((directory/(name+"-failed.prgcap")).string(),retry,error),"synthetic retry metadata writes exact producer inputs");
+            CHECK(write_gpu_capture((directory / (name + "-failed.prgcap")).string(),
+                                    without_half_overflow(retry), error),
+                  "synthetic retry metadata writes exact producer inputs");
         }
     }
     reset_float_transport_config_for_test();
