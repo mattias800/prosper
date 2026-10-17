@@ -4,6 +4,9 @@
 
 #include "gpu/recompiler/ir/buffer_format_cases.hpp"
 #include "gpu/recompiler/ir/vector_lane_harness.hpp"
+#include "gpu/resources/shader_resources.hpp"
+#include <cstdlib>
+#include <iterator>
 
 #include <array>
 #include <cstdint>
@@ -159,7 +162,10 @@ inline Data data(const Case& c) {
         else {
             const auto s = shape(c, c.component);
             const uint32_t raw = packed ? packed_word : component_sample(c, lane, c.component);
-            answer = field_truth(raw, s).value();
+            const auto expected = field_truth(raw, s);
+            // This finite witness domain must never invent a value for an unknown result.
+            if (!expected) std::abort();
+            answer = *expected;
         }
         d.expected.push_back(d.lanes.active[lane] ? answer : d.lanes.old_d[lane]);
     }
@@ -168,4 +174,4 @@ inline Data data(const Case& c) {
     for (bool active : d.lanes.active) d.input.push_back(active ? 1u : 0u);
     return d;
 }
-} // namespace prosper::test::ir::buffer_format
+}   // namespace prosper::test::ir::buffer_format

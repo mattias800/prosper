@@ -1,6 +1,8 @@
 // AMD 70648 memory-format widths: 10_11_11 has low-to-high R11/G11/B10; 2_10_10_10
 // has R10/G10/B10/A2. All operations below consume values, never memory/proof authority.
 #include "gpu/recompiler/ir/ops/buffer_format.hpp"
+#include "gpu/recompiler/ir/builder.hpp"
+#include "gpu/recompiler/ir/ir.hpp"
 
 #include "gpu/recompiler/ir/emit/spirv_emitter.hpp"
 

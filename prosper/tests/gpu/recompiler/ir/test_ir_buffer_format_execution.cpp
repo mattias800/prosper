@@ -1,17 +1,21 @@
 // Each admitted buffer format executes actual emitted SPIR-V with independent binding4 bytes.
 // The witness retains exact raw code, compile inputs and the saved/reopened/executed module.
 #include "gpu/diagnostics/refused_shader_inputs.hpp"
+#include "gpu/recompiler/bpermute_spirv_oracle.hpp"
+#include "gpu/recompiler/ir/buffer_format_cases.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/ir/buffer_format_execution_cases.hpp"
 #include "gpu/recompiler/ir/vector_compare_harness.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 
 #include <gtest/gtest.h>
 
-#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <ios>
+#include <system_error>
 #include <set>
 #include <string>
 #include <vector>

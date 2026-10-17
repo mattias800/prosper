@@ -3,6 +3,7 @@
 #include "gpu/recompiler/ir/lower/buffer_format_values.hpp"
 
 #include "gpu/recompiler/ir/ops/buffer_format.hpp"
+#include <cstdint>
 
 namespace prosper::gpu::ir {
 

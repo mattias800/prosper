@@ -1,7 +1,7 @@
 // Pure buffer component calculations. Memory access and architectural writes are caller-owned.
 #pragma once
 
-#include "gpu/recompiler/ir/builder.hpp"
+#include "gpu/recompiler/ir/ir.hpp"
 
 #include <array>
 #include <cstdint>
@@ -10,6 +10,7 @@ namespace prosper::gpu {
 struct SpirvCompute;
 }
 namespace prosper::gpu::ir {
+class Builder;
 
 enum class BufferFieldKind : uint8_t { Unsigned, Signed, Half, Unorm, Snorm, Ufloat };
 struct BufferFieldShape {

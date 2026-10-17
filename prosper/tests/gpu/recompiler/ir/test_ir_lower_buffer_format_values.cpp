@@ -9,6 +9,7 @@
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <cstddef>
 #include <functional>
 #include <vector>
 
@@ -33,7 +34,7 @@ std::vector<uint32_t> run(const std::vector<Words>& lanes, uint32_t outputs, con
     for (const auto& lane : lanes) data.insert(data.end(), lane.begin(), lane.end());
     bpermute_oracle::Interpreter vm(b.finish());
     vm.half_rte_preserve_denorm = half_profile;
-    auto out = vm.run_buffers(n, {{0, data}, {1, std::vector<uint32_t>(n * outputs)}}, 1);
+    auto out = vm.run_buffers(n, {{0, data}, {1, std::vector<uint32_t>(size_t{n} * outputs)}}, 1);
     EXPECT_TRUE(vm.error.empty()) << vm.error;
     return out;
 }
@@ -46,6 +47,7 @@ uint32_t extend(uint32_t raw, uint32_t bits) {
 TEST(IrLowerBufferFormatValues, RawShiftsJoinsAndExtensionsRetainBothWords) {
     for (uint32_t wave : {32u, 64u}) {
         std::vector<Words> lanes;
+        lanes.reserve(64);
         for (uint32_t lane = 0; lane < wave; ++lane)
             lanes.push_back(
                 {lane & 3u, 0x91827364u ^ (lane * 0x10001u), 0xfedcba98u ^ (lane * 0x1010101u), 0});
@@ -65,10 +67,10 @@ TEST(IrLowerBufferFormatValues, RawShiftsJoinsAndExtensionsRetainBothWords) {
             const auto& x = lanes[lane];
             const uint32_t shift = x[0] * 8;
             const uint32_t joined = static_cast<uint32_t>(((uint64_t{x[2]} << 32) | x[1]) >> shift);
-            EXPECT_EQ(out[lane * 6], shift);
-            EXPECT_EQ(out[lane * 6 + 1], x[1] >> shift);
-            for (uint32_t k = 2; k < 5; ++k) EXPECT_EQ(out[lane * 6 + k], joined);
-            EXPECT_EQ(out[lane * 6 + 5], extend(joined & 0xffffu, 16));
+            EXPECT_EQ(out[size_t{lane} * 6], shift);
+            EXPECT_EQ(out[size_t{lane} * 6 + 1], x[1] >> shift);
+            for (uint32_t k = 2; k < 5; ++k) EXPECT_EQ(out[size_t{lane} * 6 + k], joined);
+            EXPECT_EQ(out[size_t{lane} * 6 + 5], extend(joined & 0xffffu, 16));
         }
     }
 }
@@ -77,6 +79,7 @@ TEST(IrLowerBufferFormatValues, ComponentLocationsWrapWithoutDroppingByteOffsets
     for (uint32_t bytes : {1u, 2u})
         for (uint32_t component = 0; component < 4; ++component) {
             std::vector<Words> lanes;
+            lanes.reserve(64);
             for (uint32_t lane = 0; lane < 64; ++lane)
                 lanes.push_back(
                     {lane < 4 ? 0xfffffffcu + lane : lane * 33u + 3u, 0xfffffffeu + lane, 0, 0});
@@ -91,12 +94,12 @@ TEST(IrLowerBufferFormatValues, ComponentLocationsWrapWithoutDroppingByteOffsets
             for (uint32_t lane = 0; lane < 64; ++lane) {
                 const uint32_t dynamic_address = lanes[lane][0] + component * bytes;
                 const uint32_t half_address = lanes[lane][0] + component * 2;
-                EXPECT_EQ(out[lane * 6], dynamic_address / 4);
-                EXPECT_EQ(out[lane * 6 + 1], (dynamic_address % 4) * 8);
-                EXPECT_EQ(out[lane * 6 + 2], half_address / 4);
-                EXPECT_EQ(out[lane * 6 + 3], (half_address % 4) * 8);
-                EXPECT_EQ(out[lane * 6 + 4], lanes[lane][1] + component * bytes / 4);
-                EXPECT_EQ(out[lane * 6 + 5], (component * bytes % 4) * 8);
+                EXPECT_EQ(out[size_t{lane} * 6], dynamic_address / 4);
+                EXPECT_EQ(out[size_t{lane} * 6 + 1], (dynamic_address % 4) * 8);
+                EXPECT_EQ(out[size_t{lane} * 6 + 2], half_address / 4);
+                EXPECT_EQ(out[size_t{lane} * 6 + 3], (half_address % 4) * 8);
+                EXPECT_EQ(out[size_t{lane} * 6 + 4], lanes[lane][1] + component * bytes / 4);
+                EXPECT_EQ(out[size_t{lane} * 6 + 5], (component * bytes % 4) * 8);
             }
         }
 }
@@ -104,6 +107,7 @@ TEST(IrLowerBufferFormatValues, ComponentLocationsWrapWithoutDroppingByteOffsets
 TEST(IrLowerBufferFormatValues, IntegerPackedFieldsUseTheArchitecturalWidths) {
     for (uint32_t component = 0; component < 4; ++component) {
         std::vector<Words> lanes;
+        lanes.reserve(64);
         for (uint32_t lane = 0; lane < 64; ++lane)
             lanes.push_back({0x81c37e55u ^ (lane * 0x1020304u), 0, 0, 0});
         const auto out = run(lanes, 2, [=](SpirvCompute& b, const Words& x) {
@@ -115,8 +119,8 @@ TEST(IrLowerBufferFormatValues, IntegerPackedFieldsUseTheArchitecturalWidths) {
         const uint32_t width = component == 3 ? 2 : 10;
         for (uint32_t lane = 0; lane < 64; ++lane) {
             const uint32_t raw = (lanes[lane][0] >> (component * 10)) & ((1u << width) - 1);
-            EXPECT_EQ(out[lane * 2], raw);
-            EXPECT_EQ(out[lane * 2 + 1], extend(raw, width));
+            EXPECT_EQ(out[size_t{lane} * 2], raw);
+            EXPECT_EQ(out[size_t{lane} * 2 + 1], extend(raw, width));
         }
     }
 }
@@ -126,6 +130,7 @@ TEST(IrLowerBufferFormatValues, HalfAndUnsignedFloatFieldsHaveHandWorkedFiniteVa
     constexpr uint32_t halves[] = {0, 0x3c00, 0xbc00, 0x3800};
     constexpr uint32_t float_bits[] = {0, 0x3f800000, 0xbf800000, 0x3f000000};
     std::vector<Words> lanes;
+    lanes.reserve(64);
     for (uint32_t lane = 0; lane < 64; ++lane)
         lanes.push_back({halves[lane % 4] | (halves[(lane + 1) % 4] << 16),
                          0x3c0u | (0x380u << 11) | (0x1e0u << 22), 0, 0});
@@ -142,11 +147,11 @@ TEST(IrLowerBufferFormatValues, HalfAndUnsignedFloatFieldsHaveHandWorkedFiniteVa
         true);
     ASSERT_EQ(out.size(), 320u);
     for (uint32_t lane = 0; lane < 64; ++lane) {
-        EXPECT_EQ(out[lane * 5], float_bits[lane % 4]);
-        EXPECT_EQ(out[lane * 5 + 1], float_bits[(lane + 1) % 4]);
-        EXPECT_EQ(out[lane * 5 + 2], 0x3f800000u);
-        EXPECT_EQ(out[lane * 5 + 3], 0x3f000000u);
-        EXPECT_EQ(out[lane * 5 + 4], 0x3f800000u);
+        EXPECT_EQ(out[size_t{lane} * 5], float_bits[lane % 4]);
+        EXPECT_EQ(out[size_t{lane} * 5 + 1], float_bits[(lane + 1) % 4]);
+        EXPECT_EQ(out[size_t{lane} * 5 + 2], 0x3f800000u);
+        EXPECT_EQ(out[size_t{lane} * 5 + 3], 0x3f000000u);
+        EXPECT_EQ(out[size_t{lane} * 5 + 4], 0x3f800000u);
     }
 }
 
@@ -167,6 +172,7 @@ TEST(IrLowerBufferFormatValues, NormalizedAndIntegerFieldsRetainEndpointsAndSign
         const uint32_t sign = 1u << (width - 1);
         const float norm = static_cast<float>(sign - 1);
         std::vector<Words> lanes;
+        lanes.reserve(64);
         const uint32_t edges[] = {0, 1, sign - 1, sign, mask};
         for (uint32_t lane = 0; lane < 64; ++lane) lanes.push_back({edges[lane % 5], 0, 0, 0});
         const auto out = run(lanes, 4, [=](SpirvCompute& b, const Words& x) {
@@ -186,10 +192,10 @@ TEST(IrLowerBufferFormatValues, NormalizedAndIntegerFieldsRetainEndpointsAndSign
                                     ? -1.0f
                                     : static_cast<float>(signed_value) / norm;
             const float unorm = static_cast<float>(raw) / static_cast<float>(mask);
-            EXPECT_EQ(out[lane * 4], std::bit_cast<uint32_t>(snorm));
-            EXPECT_EQ(out[lane * 4 + 1], raw);
-            EXPECT_EQ(out[lane * 4 + 2], extend(raw, width));
-            EXPECT_EQ(out[lane * 4 + 3], std::bit_cast<uint32_t>(unorm));
+            EXPECT_EQ(out[size_t{lane} * 4], std::bit_cast<uint32_t>(snorm));
+            EXPECT_EQ(out[size_t{lane} * 4 + 1], raw);
+            EXPECT_EQ(out[size_t{lane} * 4 + 2], extend(raw, width));
+            EXPECT_EQ(out[size_t{lane} * 4 + 3], std::bit_cast<uint32_t>(unorm));
         }
     }
 }

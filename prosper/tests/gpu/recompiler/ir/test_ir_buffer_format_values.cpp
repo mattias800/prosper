@@ -1,6 +1,9 @@
 // Buffer arithmetic and loaded fields: emitted SPIR-V versus eval and independent ISA truth.
 // Distinct lanes and masked old destinations expose a discarded byte, sign or source component.
 #include "gpu/recompiler/bpermute_spirv_oracle.hpp"
+#include "gpu/recompiler/ir/builder.hpp"
+#include "gpu/recompiler/ir/ir.hpp"
+#include <cstddef>
 #include "gpu/recompiler/ir/buffer_format_cases.hpp"
 #include "gpu/recompiler/ir/emit/spirv_emitter.hpp"
 #include "gpu/recompiler/ir/eval.hpp"
@@ -29,6 +32,7 @@ std::vector<uint32_t> execute(const Block& block, const std::vector<Value>& outp
     SpirvCompute b;
     b.begin(slots, nullptr, n, 1, 1, n, 0, true, true);
     std::vector<uint32_t> inputs;
+    inputs.reserve(slots);
     for (uint32_t slot = 0; slot < slots; ++slot) inputs.push_back(b.load_input(slot));
     const auto ids = emit_spirv(b, block, inputs);
     const auto count = static_cast<uint32_t>(outputs.size());
@@ -40,7 +44,7 @@ std::vector<uint32_t> execute(const Block& block, const std::vector<Value>& outp
     }
     bpermute_oracle::Interpreter vm(b.finish());
     vm.half_rte_preserve_denorm = true; // selected interpreter profile; no device-mode claim
-    auto out = vm.run_buffers(n, {{0, buffer}, {1, std::vector<uint32_t>(n * count)}}, 1);
+    auto out = vm.run_buffers(n, {{0, buffer}, {1, std::vector<uint32_t>(size_t{n} * count)}}, 1);
     EXPECT_TRUE(vm.error.empty()) << vm.error;
     return out;
 }
@@ -58,6 +62,7 @@ TEST(IrBufferFormatValues, EveryFieldMatchesIndependentTruthEvalAndSpirvPerLane)
         const Value output = ir.select(ir.ine(active, ir.c32(0)), field, old);
         for (uint32_t wave : {32u, 64u}) {
             std::vector<std::vector<uint32_t>> rows;
+            rows.reserve(64);
             for (uint32_t lane = 0; lane < wave; ++lane) {
                 seed = seed * 1664525u + 1013904223u;
                 uint32_t raw = lane < 4 ? std::array{0u, 1u, 0x80008000u, 0xffffffffu}[lane] : seed;
@@ -100,6 +105,7 @@ TEST(IrBufferFormatValues, AddressesAndJoinsMatchEvalAndIndependentByteArithmeti
                                              buffer_index_offset(ir, index, component),
                                              buffer_low_shift(ir, high, raw.shift)};
             std::vector<std::vector<uint32_t>> rows;
+            rows.reserve(64);
             for (uint32_t lane = 0; lane < 64; ++lane)
                 rows.push_back({lane < 4 ? 0xfffffffcu + lane : lane * 33u + 3u,
                                 0x8192a3b4u ^ lane * 0x10101u, 0xc5d6e7f8u ^ lane * 0x1020304u,
@@ -121,7 +127,7 @@ TEST(IrBufferFormatValues, AddressesAndJoinsMatchEvalAndIndependentByteArithmeti
                 const auto values = evaluate(block, known);
                 for (size_t k = 0; k < outputs.size(); ++k) {
                     EXPECT_EQ(values[outputs[k].index], Known(want[k]));
-                    EXPECT_EQ(out[lane * outputs.size() + k], want[k]);
+                    EXPECT_EQ(out[size_t{lane} * outputs.size() + k], want[k]);
                 }
             }
         }
@@ -155,6 +161,7 @@ TEST(IrBufferFormatValues, MalformedDivisorsFailLoudly) {
                           std::numeric_limits<float>::quiet_NaN()}) {
         EXPECT_DEATH_IF_SUPPORTED(
             {
+                prosper::test::suppress_coredump();
                 Block block;
                 Builder ir(block);
                 ir.normalize_field(ir.c32(1), divisor, false);

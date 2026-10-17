@@ -2,6 +2,8 @@
 // Loaded fields are at most 16 bits, so their initial integer-to-float conversion is exact.
 // The divide's reference is nominal binary32 RTE, not a portable device bit-accuracy promise.
 #include "gpu/recompiler/ir/eval_normalized_field.hpp"
+#include "gpu/recompiler/ir/eval.hpp"
+#include <optional>
 
 #include <algorithm>
 #include <bit>
