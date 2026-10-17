@@ -4,6 +4,7 @@
 #include <atomic>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/ir/lower/buffer_address_lowering.hpp"
+#include "gpu/recompiler/ir/lower/buffer_format_values.hpp"
 #include "gpu/recompiler/ir/lower/ds_cross_lane_lowering.hpp"
 #include "gpu/recompiler/ir/lower/carry_mask_write.hpp"
 #include "gpu/recompiler/ir/lower/native_half_fma_lowering.hpp"
@@ -2656,23 +2657,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // loads whose component packing is descriptor-defined. A 16-bit access may begin
                     // at byte 3 and straddle two dwords, so join the adjacent words before extracting.
                     const uint32_t dw0 = load_dword(idx);
-                    const uint32_t byte_in_dw = b.ibin(Op_BitwiseAnd, addr, b.uconst(3));
-                    const uint32_t shift = b.ibin(Op_ShiftLeftLogical, byte_in_dw, b.uconst(3));
-                    uint32_t joined = b.ibin(Op_ShiftRightLogical, dw0, shift);
+                    const auto raw_shift = ir::lower_buffer_raw_shift(b, addr, dw0);
+                    const uint32_t shift = raw_shift.shift;
+                    uint32_t joined = raw_shift.joined;
                     if (raw_bits == 16) {
                         const uint32_t dw1 = load_dword(
                             b.ibin(Op_IAdd, idx, b.uconst(1)));
-                        const uint32_t inv_shift = b.ibin(
-                            Op_BitwiseAnd,
-                            b.ibin(Op_ISub, b.uconst(32), shift), b.uconst(31));
-                        const uint32_t upper = b.ibin(Op_ShiftLeftLogical, dw1, inv_shift);
-                        joined = b.ibin(Op_BitwiseOr, joined,
-                                        b.sel(b.ucmp(Op_IEqual, shift, b.uconst(0)),
-                                              b.uconst(0), upper));
+                        joined = ir::lower_buffer_raw_join(b, joined, dw1, shift);
                     }
-                    value = raw_signed
-                        ? b.bfe_s(joined, b.uconst(0), b.uconst(raw_bits))
-                        : b.bfe_u(joined, b.uconst(0), b.uconst(raw_bits));
+                    value = ir::lower_buffer_raw_field(b, joined, raw_bits, raw_signed);
                 } else if (!packed) {
                     uint32_t kidx = sk ? b.ibin(Op_IAdd, idx, b.uconst(sk)) : idx;
                     value = load_dword(kidx);  // raw 32-bit component
@@ -2685,74 +2678,46 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // search `packed_word_ncomp`. The two must agree or a store will not round-trip
                     // through this load. If you edit this table, edit that one.
                     uint32_t dw = load_dword(idx);
-                    uint32_t boff = packed_10_11_11 ? (sk == 0 ? 0u : sk == 1 ? 11u : 22u)
-                                                    : (sk == 0 ? 0u : sk == 1 ? 10u : sk == 2 ? 20u : 30u);
-                    uint32_t bits = packed_10_11_11 ? (sk < 2 ? 11u : 10u) : (sk < 3 ? 10u : 2u);
-                    if (packed_10_11_11) {
-                        value = b.unpack_ufloat(dw, boff, bits);
-                    } else if (is_uint) {
-                        value = b.bfe_u(dw, b.uconst(boff), b.uconst(bits));
-                    } else if (is_sint) {
-                        value = b.bfe_s(dw, b.uconst(boff), b.uconst(bits));
-                    } else {
-                        float field_norm = is_snorm ? (bits == 2 ? 1.0f : 511.0f)
-                                                    : (bits == 2 ? 3.0f : 1023.0f);
-                        value = b.unpack_norm(dw, boff, bits, is_snorm, field_norm);
-                    }
+                    value = ir::lower_buffer_packed_field(b, dw, sk, packed_10_11_11, is_uint,
+                                                          is_sint, is_snorm);
                 } else if (dyn_half) {
                     // Float16 component k at byte address addr+k*2. Join the following dword when
                     // the field begins at byte 3; masking the inverse shift avoids SPIR-V's undefined
                     // shift-by-32 case, and the select discards that word when shift==0.
-                    const uint32_t caddr = sk ? b.ibin(Op_IAdd, addr, b.uconst(sk * 2)) : addr;
-                    const uint32_t cidx  = b.ibin(Op_ShiftRightLogical, caddr, b.uconst(2));
-                    const uint32_t shift = b.ibin(Op_ShiftLeftLogical,
-                                                  b.ibin(Op_BitwiseAnd, caddr, b.uconst(3)), b.uconst(3));
+                    const auto location = ir::lower_buffer_half_location(b, addr, sk);
+                    const uint32_t cidx = location.index, shift = location.shift;
                     uint32_t joined = b.ibin(
                         Op_ShiftRightLogical, load_dword(cidx), shift);
                     const uint32_t dw1 = load_dword(
                         b.ibin(Op_IAdd, cidx, b.uconst(1)));
-                    const uint32_t inv_shift = b.ibin(Op_BitwiseAnd,
-                        b.ibin(Op_ISub, b.uconst(32), shift), b.uconst(31));
-                    const uint32_t upper = b.ibin(Op_ShiftLeftLogical, dw1, inv_shift);
-                    joined = b.ibin(Op_BitwiseOr, joined,
-                                    b.sel(b.ucmp(Op_IEqual, shift, b.uconst(0)), b.uconst(0), upper));
-                    value = b.unpack_half(joined, 0);
+                    joined = ir::lower_buffer_half_join(b, joined, dw1, shift);
+                    value = ir::lower_buffer_half_field(b, joined);
                 } else if (dyn_int || dyn_norm) {
                     // Integer/normalized sub-dword FORMAT component k at a runtime byte address
                     // (addr + k*comp_bytes):
                     // shift the loaded dword right by (byteaddr&3)*8, join the next dword when a 16-bit
                     // field straddles the boundary, then extend or normalize the low field. Mirrors the
                     // raw_subword path but per packed component (stride-1 Uint8, unaligned u16/SNORM16).
-                    const uint32_t caddr = sk ? b.ibin(Op_IAdd, addr, b.uconst(sk * comp_bytes)) : addr;
-                    const uint32_t cidx  = b.ibin(Op_ShiftRightLogical, caddr, b.uconst(2));
-                    const uint32_t shift = b.ibin(Op_ShiftLeftLogical,
-                                                  b.ibin(Op_BitwiseAnd, caddr, b.uconst(3)), b.uconst(3));
+                    const auto location =
+                        ir::lower_buffer_dynamic_location(b, addr, sk, comp_bytes);
+                    const uint32_t cidx = location.index, shift = location.shift;
                     uint32_t joined = b.ibin(
                         Op_ShiftRightLogical, load_dword(cidx), shift);
                     if (comp_bytes == 2) {
                         const uint32_t dw1 = load_dword(
                             b.ibin(Op_IAdd, cidx, b.uconst(1)));
-                        const uint32_t inv_shift = b.ibin(Op_BitwiseAnd,
-                            b.ibin(Op_ISub, b.uconst(32), shift), b.uconst(31));
-                        const uint32_t upper = b.ibin(Op_ShiftLeftLogical, dw1, inv_shift);
-                        joined = b.ibin(Op_BitwiseOr, joined,
-                                        b.sel(b.ucmp(Op_IEqual, shift, b.uconst(0)), b.uconst(0), upper));
+                        joined = ir::lower_buffer_dynamic_join(b, joined, dw1, shift);
                     }
-                    value = dyn_norm
-                        ? b.unpack_norm(joined, 0, comp_bytes * 8, is_snorm, norm)
-                        : is_sint ? b.bfe_s(joined, b.uconst(0), b.uconst(comp_bytes * 8))
-                                  : b.bfe_u(joined, b.uconst(0), b.uconst(comp_bytes * 8));
+                    value = ir::lower_buffer_dynamic_field(b, joined, comp_bytes, dyn_norm,
+                                                           is_snorm, norm, is_sint);
                 } else {
                     // Source component sk lives at byte sk*comp_bytes within the element: pick its
                     // dword + field.
-                    uint32_t byte_off = sk * comp_bytes;
-                    uint32_t drel = byte_off / 4, boff = (byte_off % 4) * 8;
-                    uint32_t did = drel ? b.ibin(Op_IAdd, idx, b.uconst(drel)) : idx;
+                    const auto location = ir::lower_buffer_static_location(b, idx, sk, comp_bytes);
+                    const uint32_t did = location.index, boff = location.bit_offset;
                     uint32_t dw  = load_dword(did);
-                    value = is_half ? b.unpack_half(dw, boff ? 1u : 0u)
-                          : is_uint ? b.bfe_u(dw, b.uconst(boff), b.uconst(comp_bytes * 8))
-                          : is_sint ? b.bfe_s(dw, b.uconst(boff), b.uconst(comp_bytes * 8))
-                                    : b.unpack_norm(dw, boff, comp_bytes * 8, is_snorm, norm);
+                    value = ir::lower_buffer_static_field(b, dw, boff, comp_bytes, is_half, is_uint,
+                                                          is_sint, is_snorm, norm);
                 }
                 rs.vreg[d] = value;
                 predicate_write(b, rs, d, old);
