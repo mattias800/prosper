@@ -6,8 +6,10 @@
 #include "gpu/recompiler/float64_support.hpp"
 #include "gpu/recompiler/ir/lower/launch_float_mode.hpp"
 #include "gpu/recompiler/ir/lower/vopc_lowering_internal.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 
 #include <bit>
+#include <cstdint>
 
 namespace prosper::gpu::ir {
 
@@ -90,4 +92,4 @@ VopcLowering::Integer64Halves VopcLowering::float64_source(int k, uint32_t raw) 
     return h;
 }
 
-} // namespace prosper::gpu::ir
+}   // namespace prosper::gpu::ir

@@ -38,8 +38,12 @@ Value relation(Builder& ir, const In& x) {
     return (ir.*R)(w.lhs, w.rhs);
 }
 
-Value cmp_f(Builder& ir, const In&) { return ir.cfalse(); }
-Value cmp_tru(Builder& ir, const In&) { return ir.ctrue(); }
+Value cmp_f(Builder& ir, const In&) {
+    return ir.cfalse();
+}
+Value cmp_tru(Builder& ir, const In&) {
+    return ir.ctrue();
+}
 
 // O: neither source is a NaN. A value equals itself exactly when it is not a NaN.
 Value cmp_o(Builder& ir, const In& x) {

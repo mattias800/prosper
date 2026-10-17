@@ -25,11 +25,11 @@ bool VopcLowering::lower() {
         (eff >= 0xA1u && eff <= 0xA6u) ||
         (eff >= 0xE1u && eff <= 0xE6u);
     float64_compare = eff >= 0x20u && eff <= 0x2Fu;
-    compare_wave_uniform = !is_cmpx && !rs.exec_narrowed &&
+    compare_wave_uniform =
+        !is_cmpx && !rs.exec_narrowed &&
         (integer64_compare || float64_compare
-            ? scalar_integer64_operand(in.src[0]) &&
-              scalar_integer64_operand(in.src[1])
-            : scalar_data_operand(in.src[0]) && scalar_data_operand(in.src[1]));
+             ? scalar_integer64_operand(in.src[0]) && scalar_integer64_operand(in.src[1])
+             : scalar_data_operand(in.src[0]) && scalar_data_operand(in.src[1]));
     // Integer compares have no ABS/NEG source semantics. A malformed e64 packet carrying
     // those bits must not be lowered as an unmodified integer operation.
     if (integer64_compare &&

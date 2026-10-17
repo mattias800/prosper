@@ -5,15 +5,17 @@ RDNA2 instructions are moving, one instruction family at a time, from direct SPI
 (SOP1, SOP2, SOPC, SOPK), VOP2's integer and bitwise group, and the later VALU groups the
 family table in `HOW_TO_ADD_A_FAMILY.md` lists. VOPC compares are two halves: the per-lane value
 (`ops/vector_compare*.cpp`) and the shared lane-mask write (`lower/vopc_mask_write.cpp`).
+The F64 compares are the first binary64 family (`HOW_TO_ADD_A_FAMILY.md`, "F64 values"): every
+F64 instruction is gated on the device verdict in `../float64_support.hpp`.
 `v_cndmask_b32` and the carry ops split the same way: `ops/vector_cndmask.cpp` and
 `ops/vector_carry.cpp` hold the values, `lower/carry_mask_write.cpp` the shared carry-mask write.
 Everything here is private to `gpu/recompiler`.
 
 | path | role |
 | --- | --- |
-| `ir.hpp`, `ir.cpp` | the IR core: `Type` (U32, Bool, and the 64-bit word U64), `Value`, `Opcode`, `Inst`, `Block` and the rules a Block enforces |
+| `ir.hpp`, `ir.cpp` | the IR core: `Type` (U32, Bool, and the 64-bit word U64, which the F64 relations read as binary64), `Value`, `Opcode`, `Inst`, `Block` and the rules a Block enforces |
 | `builder.hpp` | typed helpers that append instructions to a Block |
-| `eval.hpp`, `eval.cpp` | the evaluation half of every opcode: what the constant folder computes (`eval_integer64.cpp` for the 64-bit words) |
+| `eval.hpp`, `eval.cpp` | the evaluation half of every opcode: what the constant folder computes (`eval_integer64.cpp` for the 64-bit words, `eval_float64.cpp` for the binary64 relations, which the folder never evaluates) |
 | `emit/` | the SPIR-V half of every opcode: a Block emitted through `SpirvCompute`, in Block order |
 | `ops/` | ONE definition per guest operation (`scalar_alu.cpp`, `scalar_compare.cpp`, `vector_alu.cpp`), used by both evaluation and emission |
 | `lower/` | RDNA2 -> IR per format: `sop1.cpp`, `sop2.cpp`, `sopc.cpp`, `sopk.cpp`, `vop2.cpp`, the relocated `*_routes.cpp` / `*_stages.cpp`, and `lowering_context.hpp` (emit_alu's shared locals) |

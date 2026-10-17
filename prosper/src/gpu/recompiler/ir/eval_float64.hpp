@@ -17,4 +17,4 @@ bool is_float64_opcode(Opcode op);
 // constant folder never evaluates an F64 opcode.
 Known64 evaluate_float64(Opcode op, uint64_t a, uint64_t b);
 
-} // namespace prosper::gpu::ir
+}   // namespace prosper::gpu::ir

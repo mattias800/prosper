@@ -1,8 +1,12 @@
 // eval_float64.cpp — the evaluation half of the binary64 relations (see ir.hpp).
 #include "gpu/recompiler/ir/eval_float64.hpp"
+#include "gpu/recompiler/ir/eval.hpp"
+#include "gpu/recompiler/ir/ir.hpp"
 
 #include <bit>
 #include <cmath>
+#include <cstdint>
+#include <optional>
 
 namespace prosper::gpu::ir {
 

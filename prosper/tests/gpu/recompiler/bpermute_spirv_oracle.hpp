@@ -67,8 +67,8 @@ struct Interpreter {
   // Optional fixture-owned words for the closed uint32 array PushConstant ABI. The default
   // supplies nothing: a declared block cannot read invented zeros or infer a launch value.
     std::vector<uint32_t> supplied_push_constants;
-  // Set by the module's own `OpExecutionMode DenormPreserve 64`. Without it Vulkan lets a device
-  // flush binary64 subnormals, so an F64 relation that reads one fails instead of guessing.
+    // Set by the module's own `OpExecutionMode DenormPreserve 64`. Without it Vulkan lets a device
+    // flush binary64 subnormals, so an F64 relation that reads one fails instead of guessing.
     bool denorm_preserve64 = false;
     uint32_t main = 0, storage = 0;
   // Default compute fixtures stay strict set 0. Actual NGG modules explicitly select their

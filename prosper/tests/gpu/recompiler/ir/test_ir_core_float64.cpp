@@ -99,8 +99,8 @@ TEST(IrCoreFloat64, AFloat64RelationEvaluatesThroughTheWideView) {
 }
 
 // One module per case, as test_ir_core_integer64: lane l computes `block` on inputs base[i] ^ l.
-std::vector<uint32_t> run_per_lane(const Block& block, Value result,
-                                   std::span<const uint32_t> base, std::vector<uint32_t>* words) {
+std::vector<uint32_t> run_per_lane(const Block& block, Value result, std::span<const uint32_t> base,
+                                   std::vector<uint32_t>* words) {
     SpirvCompute b;
     static uint64_t next_address = 0x64f40000u;
     b.diagnostic = {RecompileDiagnosticStage::Compute, next_address++};
@@ -222,4 +222,4 @@ TEST(IrCoreFloat64, InterpreterRefusesSubnormalsWithoutDenormPreserve) {
     EXPECT_NE(vm.error.find("DenormPreserve"), std::string::npos) << vm.error;
 }
 
-} // namespace
+}   // namespace

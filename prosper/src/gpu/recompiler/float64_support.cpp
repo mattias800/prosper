@@ -14,7 +14,8 @@ std::atomic<bool> g_float64_supported{true};
 
 void publish_float64_support(bool shader_float64_enabled, bool denorm_preserve_float64,
                              bool float_controls_permitted) {
-    const bool usable = shader_float64_enabled && denorm_preserve_float64 && float_controls_permitted;
+    const bool usable =
+        shader_float64_enabled && denorm_preserve_float64 && float_controls_permitted;
     if (!usable) {
         static std::atomic<unsigned> said{0};
         g_float64_supported.store(false, std::memory_order_relaxed);

@@ -132,8 +132,8 @@ void check_run(const VectorCompareDef& def, Form form, uint32_t wave, const Lane
         ASSERT_EQ(run.d[lane],
                   expected_mask_read(form, in.active[lane], *test != 0, in.old_d[lane]))
             << "op " << std::hex << def.opcode << " form " << int(form) << " wave " << wave
-            << " rsrc1 " << rsrc1 << " lane " << lane << " s0 " << in.s1[lane] << ':'
-            << in.s0[lane] << " s1 " << in.s3[lane] << ':' << in.s2[lane];
+            << " rsrc1 " << rsrc1 << " lane " << lane << " s0 " << in.s1[lane] << ':' << in.s0[lane]
+            << " s1 " << in.s3[lane] << ':' << in.s2[lane];
     }
 }
 
@@ -200,8 +200,8 @@ TEST_F(IrVectorCompareF64Execution, HandWorkedIeeeBinary64RelationsInBothDenorma
                                   expected_mask_read(form, in.active[lane],
                                                      truth[lane % std::size(kPairs)] == '1',
                                                      in.old_d[lane]))
-                            << "op " << std::hex << row.opcode << " form " << int(form)
-                            << " rsrc1 " << rsrc1 << " lane " << std::dec << lane;
+                            << "op " << std::hex << row.opcode << " form " << int(form) << " rsrc1 "
+                            << rsrc1 << " lane " << std::dec << lane;
                 }
         }
     }
@@ -246,18 +246,17 @@ TEST_F(IrVectorCompareF64Execution, ConstantSourcesAreBinary64Values) {
                 in.s2[lane] = uint32_t(source.value);
                 in.s3[lane] = uint32_t(source.value >> 32);
             }
-            const auto run = run_vector_op_per_lane(
-                constant_program(def.opcode, source.operand, source.literal), in, 64, false,
-                kPreserve);
+            const auto run =
+                run_vector_op_per_lane(constant_program(def.opcode, source.operand, source.literal),
+                                       in, 64, false, kPreserve);
             ASSERT_TRUE(run.error.empty()) << run.error;
             ASSERT_EQ(run.d.size(), in.lanes());
             for (size_t lane = 0; lane < in.lanes(); ++lane) {
-                const Known test =
-                    eval_vector_compare_pairs(def, uint32_t(source.value),
-                                              uint32_t(source.value >> 32), in.s2[lane],
-                                              in.s3[lane]);
+                const Known test = eval_vector_compare_pairs(def, uint32_t(source.value),
+                                                             uint32_t(source.value >> 32),
+                                                             in.s2[lane], in.s3[lane]);
                 ASSERT_TRUE(test.has_value());
-                ASSERT_EQ(run.d[lane], in.active[lane] && *test ? 1u : 0u)
+                ASSERT_EQ(run.d[lane], in.active[lane] && test.value_or(0u) != 0u ? 1u : 0u)
                     << "op " << std::hex << def.opcode << " src0 " << source.operand << " lane "
                     << std::dec << lane;
             }
@@ -272,18 +271,19 @@ TEST_F(IrVectorCompareF64Execution, AbsAndNegModifySignBits) {
                 const auto* def = find_vector_compare(opcode);
                 ASSERT_NE(def, nullptr);
                 const auto in = pair_inputs(opcode * 16 + abs * 4 + neg);
-                const auto run = run_vector_op_per_lane(
-                    compare_program(opcode, Form::Vop3Vcc, abs, neg, kVsrc2), in, 64, false,
-                    kPreserve);
+                const auto run =
+                    run_vector_op_per_lane(compare_program(opcode, Form::Vop3Vcc, abs, neg, kVsrc2),
+                                           in, 64, false, kPreserve);
                 ASSERT_TRUE(run.error.empty()) << run.error;
                 for (size_t lane = 0; lane < in.lanes(); ++lane) {
-                    const uint64_t a = modified(uint64_t(in.s1[lane]) << 32 | in.s0[lane],
-                                                abs & 1u, neg & 1u);
-                    const uint64_t c = modified(uint64_t(in.s3[lane]) << 32 | in.s2[lane],
-                                                abs & 2u, neg & 2u);
+                    const uint64_t a =
+                        modified(uint64_t(in.s1[lane]) << 32 | in.s0[lane], abs & 1u, neg & 1u);
+                    const uint64_t c =
+                        modified(uint64_t(in.s3[lane]) << 32 | in.s2[lane], abs & 2u, neg & 2u);
                     const Known test = eval_vector_compare_pairs(
                         *def, uint32_t(a), uint32_t(a >> 32), uint32_t(c), uint32_t(c >> 32));
-                    ASSERT_EQ(run.d[lane], in.active[lane] && *test ? 1u : 0u)
+                    ASSERT_TRUE(test.has_value());
+                    ASSERT_EQ(run.d[lane], in.active[lane] && test.value_or(0u) != 0u ? 1u : 0u)
                         << "op " << std::hex << opcode << " abs " << abs << " neg " << neg
                         << " lane " << std::dec << lane;
                 }
@@ -298,12 +298,12 @@ TEST_F(IrVectorCompareF64Execution, RefusalsAreNamed) {
     };
     const auto lt = compare_program(0x21, Form::VopcVcc, 0, 0, kVsrc2);
     // A nonzero inline integer in a binary64 operand: bit pattern or value, the ISA does not say.
-    EXPECT_NE(reason(constant_program(0x21, 0xc1, 0), kPreserve).find(
-                  "f64-inline-integer-unspecified"),
-              std::string::npos);
-    EXPECT_NE(reason(constant_program(0x21, 0x81, 0), kPreserve).find(
-                  "f64-inline-integer-unspecified"),
-              std::string::npos);
+    EXPECT_NE(
+        reason(constant_program(0x21, 0xc1, 0), kPreserve).find("f64-inline-integer-unspecified"),
+        std::string::npos);
+    EXPECT_NE(
+        reason(constant_program(0x21, 0x81, 0), kPreserve).find("f64-inline-integer-unspecified"),
+        std::string::npos);
     // No launch FLOAT_MODE: the denormal mode is unknown.
     EXPECT_NE(reason(lt, UINT32_MAX).find("f64-float-mode-unavailable"), std::string::npos);
     // No device has published, then a device without the feature has.
@@ -314,8 +314,8 @@ TEST_F(IrVectorCompareF64Execution, RefusalsAreNamed) {
     EXPECT_NE(reason(lt, kPreserve).find("f64-device-unavailable"), std::string::npos);
     // F and TRU read no value: they need neither the device feature nor the mode.
     for (const uint32_t opcode : {0x20u, 0x2fu}) {
-        const auto run = run_vector_op_per_lane(compare_program(opcode, Form::VopcVcc, 0, 0, kVsrc2),
-                                                in, 64, false, UINT32_MAX);
+        const auto run = run_vector_op_per_lane(
+            compare_program(opcode, Form::VopcVcc, 0, 0, kVsrc2), in, 64, false, UINT32_MAX);
         ASSERT_TRUE(run.error.empty()) << run.error;
         for (size_t lane = 0; lane < in.lanes(); ++lane)
             EXPECT_EQ(run.d[lane], in.active[lane] && opcode == 0x2fu ? 1u : 0u);

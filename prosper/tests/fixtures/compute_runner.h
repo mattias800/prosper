@@ -235,6 +235,10 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     // supported, vkCreateDevice must fail rather than allowing OOB-sensitive tests to run with UB.
     feats.robustBufferAccess = VK_TRUE;
     feats.shaderInt64 = supported.shaderInt64;
+    // Binary64 guest compares (#5325) need Float64 and DenormPreserve 64; the module declares the
+    // latter through SPV_KHR_float_controls, which this 1.1 device must enable as an extension.
+    // Enabling both changes nothing for a module that does not declare them.
+    feats.shaderFloat64 = supported.shaderFloat64;
     dci.pEnabledFeatures = &feats;
     VkPhysicalDeviceShaderAtomicInt64Features atomic_int64_features{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES};
@@ -244,6 +248,9 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     std::vector<VkExtensionProperties> available_extensions(extension_count);
     vkEnumerateDeviceExtensionProperties(
         phys, nullptr, &extension_count, available_extensions.data());
+    for (const auto& extension : available_extensions)
+        if (!std::strcmp(extension.extensionName, VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME))
+            device_extensions.push_back(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME);
     for (const auto& extension : available_extensions) {
         if (std::strcmp(extension.extensionName,
                         VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME))

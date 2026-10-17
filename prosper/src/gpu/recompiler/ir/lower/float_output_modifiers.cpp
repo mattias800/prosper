@@ -3,6 +3,7 @@
 #include "gpu/recompiler/ir/lower/launch_float_mode.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include <cstdint>
 namespace prosper::gpu::ir {
 FloatOutputModifier float_output_modifier(SpirvCompute& b, const Rdna2Inst& in,
                                           FloatResultWidth width, bool& ok) {

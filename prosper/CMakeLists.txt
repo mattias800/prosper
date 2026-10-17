@@ -3766,6 +3766,13 @@ if(TARGET prosper_core)
       INCLUDES tests
       LIBRARIES prosper_core Vulkan::Vulkan
       PROPERTIES TIMEOUT 120)
+    # #5325: the admitted V_CMP(X)_*_F64 modules on the executing device (shaderFloat64 +
+    # DenormPreserve 64); skips with the reason on a device without them.
+    prosper_add_gtest(test_compute_f64_compare
+      SOURCES tests/gpu/execute/test_compute_f64_compare.cpp
+      INCLUDES tests
+      LIBRARIES prosper_core Vulkan::Vulkan
+      PROPERTIES TIMEOUT 300)
     prosper_add_gtest(test_compute_f32_fma_rounding
       SOURCES tests/gpu/execute/test_compute_f32_fma_rounding.cpp
       INCLUDES tests
