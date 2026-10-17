@@ -1,4 +1,5 @@
 // AMD 70648 12.8: truncate, saturate out-of-range values, and convert NaN to zero.
+#include "gpu/recompiler/ir/ops/vector_conversion.hpp"
 #include "gpu/recompiler/ir/ops/vector_float_integer_e64.hpp"
 namespace prosper::gpu::ir {
 namespace {
@@ -14,5 +15,15 @@ const ConversionDef* find_vector_float_integer_e64_op(Rdna2Format fmt, uint32_t 
     for (const auto& def : kDefs)
         if (def.fmt == fmt && def.opcode == opcode) return &def;
     return nullptr;
+}
+const ConversionDef* find_vector_cvt_flr_e64_op(Rdna2Format fmt, uint32_t opcode) {
+    // CONFIDENCE: MED: reuse FLR's existing exceptional-value/exception convention;
+    // this adds no numerical policy, folding domain or second implementation.
+    if (fmt != Rdna2Format::VOP3 || opcode != 0x18d) return nullptr;
+    static const ConversionDef alias = [] {
+        const auto* old = find_vector_conversion_op(Rdna2Format::VOP1, 0x0d);
+        return ConversionDef{Rdna2Format::VOP3, 0x18d, old ? old->build : nullptr};
+    }();
+    return alias.build ? &alias : nullptr;
 }
 } // namespace prosper::gpu::ir
