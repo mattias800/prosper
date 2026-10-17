@@ -471,7 +471,7 @@ change, so the carry ops have their own shared write.
 | --- | --- |
 | `ops/vector_carry.hpp`, `ops/vector_carry.cpp` | `VectorCarryDef {fmt, opcode, reads_carry_in, build}`: D and the carry Bool, from S0, S1 and the lane's carry-in **bit** |
 | `ops/vector_cndmask.hpp`, `ops/vector_cndmask.cpp` | `VectorCndmaskDef`: D = bit ? S1 : S0 |
-| `lower/carry_mask_write.cpp` | the shared mask write: `exec_masked_carry` (ISA 3.9), `write_vop2_carry_mask` (VCC) and `write_vop3b_carry_mask` (SDST: VCC, an SGPR pair, or one Wave32 B32 word; emit_alu's old `write_vop3b_carry_output`, verbatim) |
+| `lower/carry_mask_write.cpp` | the shared mask write: `exec_masked_carry` (ISA 3.9), `write_vop2_carry_mask` (VCC; in Wave32 the VCC_LO B32 word, #5348), `write_vop3b_carry_mask` (SDST: VCC, an SGPR pair, or one Wave32 B32 word; emit_alu's old `write_vop3b_carry_output`) and `write_mad64_carry_mask` (v_mad_u64_u32 / v_mad_i64_i32, emit_alu's old write) |
 | `lower/vop3_carry.cpp`, `lower/vop3_cndmask.cpp` | the VOP3 routes: the mask READ (verbatim), then the definition, then the write |
 | `lower/vop2_mask.cpp` | the VOP2 forms: VCC is the selector, the carry-in and the carry-out |
 | `tests/gpu/recompiler/ir/vector_mask_harness.hpp` | the per-lane harness and the witness exporter |
@@ -531,7 +531,11 @@ Two harness traps, each found the hard way:
   (CONFIDENCE: MED, from reading the code; not A/B-tested). The refusal comes from emit_alu's
   prologue (`refuse_mask_write`), which this migration does not touch, so it is the pre-IR verdict.
   `Wave32RefusalsStay` pins it, and the witness exporter leaves those programs out of Wave32.
-- **Read VCC back with `v_cndmask_b32_e32`** (`read_mask`), not the e64 form, because of #5348.
+- **`read_mask` reads VCC back with `v_cndmask_b32_e32`.** It was written that way because the
+  e64 form read a stale VCC_LO lifetime after a VOP2 carry (#5348). That is fixed, and
+  `E64CndmaskReadsTheVop2CarryNotTheStaleVccLo` covers the e64 reader. The VOP3B carry-in from
+  `vcc_lo` is admitted in Wave32 once VCC_HI is defined (`s_mov_b32 vcc_hi, 0`), so
+  `Vop3bCarryInFromVccLoReadsTheVop2Carry` covers that reader too.
 
 The four tests per family: every definition in every form and both waves against eval; a
 hand-worked ISA table (it must include rows that separate `<` from `<=`, such as a zero addend: the
@@ -570,7 +574,7 @@ The recorded corpus never reaches four of the seven definitions, so the witness 
 | --- | --- | --- |
 | `v_div_scale_f32` (VOP3B 0x16D) | Codex with this recipe, as an **admission** in its own explained PR | emit_alu has no case for it today. The value is an F32 definition, and the flag goes through `write_vop3b_carry_mask`. |
 | `v_div_scale_f64` (0x16E) | stop at the F64 point | no F64 type |
-| `v_mad_u64_u32` / `v_mad_i64_i32` (0x176 / 0x177) | **stop and report (lead)** | Its carry write is not `write_vop3b_carry_mask`: it has no Wave32 B32 branch and does not erase the old SGPR word, and `for_each_scalar_write` charges it a pair. Sharing the write is a behaviour change in Wave32. Its 64-bit result also needs the two-Block order (see "64-bit values"). |
+| `v_mad_u64_u32` / `v_mad_i64_i32` (0x176 / 0x177) | **stop and report (lead)** | Its carry write is `write_mad64_carry_mask`, not `write_vop3b_carry_mask`. Since #5348, `sdst = vcc_lo` in Wave32 writes the same VCC_LO word as the carry ops do. An SGPR SDST still writes a pair, with no Wave32 B32 branch and no erase of the old SGPR word, and `for_each_scalar_write` charges it a pair. Sharing the write is a behaviour change in Wave32. Its 64-bit result also needs the two-Block order (see "64-bit values"). |
 | `v_mbcnt_lo/hi` | lead | cross-lane |
 | the VOPC mask write | lead | unchanged |
 
