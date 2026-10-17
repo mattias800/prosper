@@ -4,6 +4,7 @@
 #include "gpu/recompiler/ir/lower/vop3_binary_float_lowering.hpp"
 #include "gpu/recompiler/ir/ops/vector_alu.hpp"
 #include "gpu/recompiler/ir/lower/vop3_round_float_lowering.hpp"
+#include "gpu/recompiler/ir/lower/vop3_half_float_exact_lowering.hpp"
 #include "gpu/recompiler/ir/lower/f32_round_input.hpp"
 #include "gpu/recompiler/ir/ops/vector_round_float.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
@@ -37,6 +38,7 @@ bool lower_vop3_round_float(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, 
 bool lower_vop3_float_values_erased(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok,
                                     bool allow_wave, const BinaryFloatSource& fv,
                                     const BinaryFloatResult& fresult) {
+    if (lower_vop3_half_float_exact(b, rs, in, ok)) return true;
     if (lower_vop3_round_float(b, rs, in, ok, fv, fresult)) return true;
     return lower_vop3_binary_float_erased(b, rs, in, ok, allow_wave, fv, fresult);
 }
