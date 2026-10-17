@@ -382,7 +382,7 @@ TEST(IrVectorCarryExecution, Wave32MadCarryToVccLoReplacesTheLifetime) {
                 const __int128 sum = __int128{int64_t{static_cast<int32_t>(in.s0[lane])} *
                                               static_cast<int32_t>(in.s1[lane])} +
                                      static_cast<int64_t>(add);
-                // Bit 64 of the sign-extended 65-bit sum, i.e. its sign (rdna2_mad_64.cpp).
+                // Bit 64 of the sign-extended 65-bit sum, i.e. its sign (ops/vector_mad64.cpp).
                 return sum < 0 ? 1u : 0u;
             };
             size_t visible = 0;   // positive control: lanes where the stale mask differs

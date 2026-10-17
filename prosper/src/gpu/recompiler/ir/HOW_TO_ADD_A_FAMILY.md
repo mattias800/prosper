@@ -574,7 +574,7 @@ The recorded corpus never reaches four of the seven definitions, so the witness 
 | --- | --- | --- |
 | `v_div_scale_f32` (VOP3B 0x16D) | Codex with this recipe, as an **admission** in its own explained PR | emit_alu has no case for it today. The value is an F32 definition, and the flag goes through `write_vop3b_carry_mask`. |
 | `v_div_scale_f64` (0x16E) | stop at the F64 point | no F64 type |
-| `v_mad_u64_u32` / `v_mad_i64_i32` (0x176 / 0x177) | **stop and report (lead)** | Its carry write is `write_mad64_carry_mask`, not `write_vop3b_carry_mask`. Since #5348, `sdst = vcc_lo` in Wave32 writes the same VCC_LO word as the carry ops do. An SGPR SDST still writes a pair, with no Wave32 B32 branch and no erase of the old SGPR word, and `for_each_scalar_write` charges it a pair. Sharing the write is a behaviour change in Wave32. Its 64-bit result also needs the two-Block order (see "64-bit values"). |
+| `v_mad_u64_u32` / `v_mad_i64_i32` (0x176 / 0x177) | values in `ops/vector_mad64.cpp`; carry write remains **lead** | The existing 32-bit graph computes U32 low, U32 high and Bool carry in one Block, all before the old-high lookup. Keep that order. `write_mad64_carry_mask` remains protected: Wave32 `sdst = vcc_lo` writes VCC_LO, while an SGPR SDST still writes a pair, with no B32 branch or erase of the old SGPR word. Do not share or change that write. |
 | `v_mbcnt_lo/hi` | lead | cross-lane |
 | the VOPC mask write | lead | unchanged |
 
@@ -727,8 +727,9 @@ and leave the reserved ones in the `switch`.
 | 14 | VOP3 F64 arithmetic (`v_add/mul/fma_f64`, `v_min/max_f64`, `v_ldexp_f64`, `v_div_*_f64`, ...) | Codex, using the 64-bit recipe; same F64 stop point |
 | 15 | 64-bit conversions (`v_cvt_f64_*`, `v_cvt_*_f64`, `v_frexp_*_f64`) | Codex, using the 64-bit recipe; same F64 stop point |
 | 16 | VOP3B `v_div_scale_f32`: an admission (emit_alu has no case for it) | Codex, using the mask recipe ("Mask-reading and mask-writing VALU"), in its own explained PR; `v_div_scale_f64` stops at the F64 point |
+| 17 | VOP3B `v_mad_u64_u32` / `v_mad_i64_i32`: values in `ops/vector_mad64.cpp` | Codex, value-only; preserve all three outputs before the old-high lookup and the existing `write_mad64_carry_mask` call |
 | - | Admitting any compare the switch refuses today | lead, then Codex |
-| - | `v_mad_u64_u32` / `v_mad_i64_i32` (their carry write differs from the shared one in Wave32), the VOPC mask write (`lower/vopc_mask_write.cpp`), the carry mask write (`lower/carry_mask_write.cpp`), `v_mbcnt` | lead (wave masks) |
+| - | `write_mad64_carry_mask` (its SGPR write differs from the shared one in Wave32), the VOPC mask write (`lower/vopc_mask_write.cpp`), the carry mask write (`lower/carry_mask_write.cpp`), `v_mbcnt` | lead (wave masks) |
 | - | DPP (the VOP1/VOP2 DPP routes and SRC0 stage), `v_permlane*`, `v_readlane/writelane/readfirstlane`, `ds_bpermute/permute`, quad and swizzle ops | lead (cross-lane) |
 | - | `v_movrel*`, `s_movrel*`, and the memory families SMEM, MUBUF/MTBUF, FLAT, MIMG, DS (descriptor provenance, raw windows, active-word marks) | lead (proof and definedness) |
 | - | SOPP, `rdna2_emit_cfg.cpp`, the SOP `*_routes.cpp` | lead (control flow, mask routes) |
