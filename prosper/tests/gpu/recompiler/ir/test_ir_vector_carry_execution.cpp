@@ -283,7 +283,9 @@ std::vector<uint32_t> e64_reader_program(const VectorCarryDef& def) {
     return concat({carry_from_s2(kVcc), {vop2(def.opcode)}, read_vcc_e64()});
 }
 std::vector<uint32_t> carry_in_program(const VectorCarryDef& twin) {
-    return concat({{kSMovVccHiZero}, carry_from_s2(kVcc), {vop2(twin.opcode - 0x100)},
+    return concat({{kSMovVccHiZero},
+                   carry_from_s2(kVcc),
+                   {vop2(twin.opcode - 0x100)},
                    vop3_words(twin.opcode, kCarryOut, kVcc)});
 }
 std::vector<uint32_t> mad_program(uint32_t opcode) {
@@ -332,9 +334,12 @@ TEST(IrVectorCarryExecution, Vop3bCarryInFromVccLoReadsTheVop2Carry) {
             for (size_t lane = 0; lane < in.lanes(); ++lane) {
                 if (!in.active[lane]) continue;
                 const uint32_t stale = in.s2[lane] != 0 ? 1u : 0u;
-                visible += *eval_vector_carry(*twin, in.s0[lane], in.s1[lane], stale).d !=
-                           *eval_vector_carry(*twin, in.s0[lane], in.s1[lane],
-                                              vop2_carry(*def, in, lane)).d;
+                visible +=
+                    // NOLINTNEXTLINE(bugprone-unchecked-optional-access): concrete carry inputs give a known D.
+                    *eval_vector_carry(*twin, in.s0[lane], in.s1[lane], stale).d !=
+                    // NOLINTNEXTLINE(bugprone-unchecked-optional-access): concrete carry inputs give a known D.
+                    *eval_vector_carry(*twin, in.s0[lane], in.s1[lane], vop2_carry(*def, in, lane))
+                         .d;
             }
             ASSERT_GT(visible, 0u);
             for (const uint32_t wave : {64u, 32u}) {
@@ -344,7 +349,8 @@ TEST(IrVectorCarryExecution, Vop3bCarryInFromVccLoReadsTheVop2Carry) {
                 for (size_t lane = 0; lane < in.lanes(); ++lane) {
                     const uint32_t expected =
                         in.active[lane] ? *eval_vector_carry(*twin, in.s0[lane], in.s1[lane],
-                                                             vop2_carry(*def, in, lane)).d
+                                                             vop2_carry(*def, in, lane))
+                                               .d
                                         : in.old_d[lane];
                     ASSERT_EQ(run.d[lane], expected)
                         << "wave " << wave << " lane " << lane << " active " << in.active[lane];
