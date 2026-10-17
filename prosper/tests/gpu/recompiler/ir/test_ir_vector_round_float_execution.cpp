@@ -8,6 +8,7 @@
 #include "gpu/recompiler/ir/ops/vector_round_float.hpp"
 #include "gpu/recompiler/ir/ops/vector_float_unary.hpp"
 #include "gpu/recompiler/ir/vector_lane_harness.hpp"
+#include "gpu/recompiler/bpermute_spirv_oracle.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/diagnostics/refused_shader_inputs.hpp"
 #include "fixtures/test_scratch.h"
@@ -225,7 +226,11 @@ TEST(IrVectorRoundFloatExecution, EveryProducingModeKeepsInputPolicyAndInactiveW
                         !in.active[lane] ? Known(in.old_d[lane])
                         : sensitive ? Known(rounded(source, def.opcode == 0x1a2, !(mode & 0x10)))
                                     : expected(def, in.s0[lane], f, rsrc1);
-                    ASSERT_TRUE(want);
+                    if (!want) {
+                        ADD_FAILURE()
+                            << "opcode " << def.opcode << " mode " << mode << " lane " << lane;
+                        return;
+                    }
                     EXPECT_EQ(run.d[lane], *want) << "opcode " << def.opcode << " wave " << wave
                                                   << " mode " << mode << " lane " << lane;
                 }
