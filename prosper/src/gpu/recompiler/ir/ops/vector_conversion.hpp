@@ -19,6 +19,7 @@ struct ConversionDef {
     uint32_t opcode;
     Value (*build)(Builder&, const ConversionIn&);
 };
+Value prepare_cvt_flr_input(Builder& ir, Value bits);
 Value build_f32_to_u32_sat(Builder& ir, const ConversionIn& in);
 Value build_f32_to_i32_sat(Builder& ir, const ConversionIn& in);
 Value build_half_to_u16_sat(Builder& ir, const ConversionIn& x);
