@@ -1,6 +1,9 @@
 // vop3_cross_lane.cpp — emit_alu's VOP3 cross-lane cases, moved verbatim by
 // tools/refactor/extract_case_routes.py. Their order in lower() is the old `if` chain's order.
+// v_readlane_b32's native-subgroup value goes through ops/vector_cross_lane.cpp; every scalar
+// write, lane-slot, mask-half and retirement step around it is the moved text, unchanged.
 #include "gpu/recompiler/ir/lower/vop3_cross_lane_lowering_internal.hpp"
+#include "gpu/recompiler/ir/ops/vector_cross_lane.hpp"
 
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_native_launch.hpp"
@@ -155,16 +158,10 @@ std::optional<bool> Vop3CrossLaneLowering::route_readlane() {
                 // scratch even when a Wave64 guest does not fit in the host subgroup.
                 result = b.guest_wave_readlane(source->second, selector);
             } else {
+                // The subgroup-size contract is the lowering's; the value is the definition's.
                 if (b.wave_size == 64) b.mark_subgroup_min64();
                 else b.mark_subgroup_min32();
-                const uint32_t native_lane = b.subgroup_local_id();
-                const uint32_t wave_mask = b.uconst(b.wave_size - 1u);
-                const uint32_t wave_base = b.ibin(
-                    Op_BitwiseAnd, native_lane, b.uconst(~(b.wave_size - 1u)));
-                const uint32_t source_lane = b.ibin(
-                    Op_BitwiseOr, wave_base,
-                    b.ibin(Op_BitwiseAnd, selector, wave_mask));
-                result = b.subgroup_shuffle(source->second, source_lane);
+                result = emit_readlane_b32(b, source->second, selector, b.wave_size);
             }
             rs.sreg[in.dst.value] = result;
             if (b.wave_size == 64)

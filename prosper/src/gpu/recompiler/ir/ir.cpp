@@ -118,8 +118,10 @@ constexpr OpcodeInfo kInfo[] = {
     {"f64.unord.gt", 2, Type::Bool},
     {"f64.unord.ne", 2, Type::Bool},
     {"f64.unord.ge", 2, Type::Bool},
+    {"lane.id", 0, Type::U32},
+    {"shuffle", 2, Type::U32},
 };
-static_assert(std::size(kInfo) == static_cast<size_t>(Opcode::F64UnordGe) + 1);
+static_assert(std::size(kInfo) == static_cast<size_t>(Opcode::Shuffle) + 1);
 
 // The type argument `slot` of `op` must have.
 Type argument_type(Opcode op, size_t slot) {

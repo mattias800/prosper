@@ -127,6 +127,10 @@ uint32_t emit_one(SpirvCompute& b, const Inst& inst, const uint32_t* x) {
         case Opcode::F64UnordGt: return b.fcmp64(Op_FUnordGreaterThan, x[0], x[1]);
         case Opcode::F64UnordNe: return b.fcmp64(Op_FUnordNotEqual, x[0], x[1]);
         case Opcode::F64UnordGe: return b.fcmp64(Op_FUnordGreaterThanEqual, x[0], x[1]);
+        // Cross-lane: SubgroupLocalInvocationId and OpGroupNonUniformShuffle. Each helper also
+        // raises the module's subgroup contract (at least a quad), as the pre-IR calls did.
+        case Opcode::LaneId: return b.subgroup_local_id();
+        case Opcode::Shuffle: return b.subgroup_shuffle(x[0], x[1]);
     }
     std::fprintf(stderr, "[ir] emit_one reached an input\n");   // emit_spirv binds inputs itself
     std::abort();

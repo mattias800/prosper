@@ -157,6 +157,12 @@ enum class Opcode : uint8_t {
     F64UnordGt,
     F64UnordNe,
     F64UnordGe,
+    // Cross-lane values (HOW_TO_ADD_A_FAMILY.md, "Cross-lane operations"). Their result depends on
+    // other invocations of the host subgroup, so `evaluate` (one invocation; the constant folder)
+    // never knows one. eval_lanes.hpp evaluates a Block over an explicit vector of invocations.
+    LaneId,    // () -> u32: this invocation's index in the host subgroup
+    Shuffle,   // (u32 value, u32 lane) -> u32: `value` of invocation `lane`; undefined (unknown)
+               // when `lane` is not an invocation of the subgroup
 };
 
 struct OpcodeInfo {
