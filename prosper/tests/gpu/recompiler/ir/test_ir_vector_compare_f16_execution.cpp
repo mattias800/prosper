@@ -9,6 +9,8 @@
 #include "gpu/recompiler/ir/ir.hpp"
 #include "gpu/recompiler/ir/ops/vector_compare.hpp"
 #include "gpu/recompiler/ir/vector_compare_harness.hpp"
+#include "gpu/recompiler/ir/vector_lane_harness.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
@@ -20,6 +22,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <ios>
 #include <iterator>
 #include <optional>
 #include <set>
@@ -128,7 +131,7 @@ void check_output(const VectorCompareDef& def, Form form, Shape shape, const Lan
             ADD_FAILURE() << "finite fixture contains a half NaN";
             return;
         }
-        const Known result = eval_vector_compare(def, *a, *b);
+        const Known result = eval_vector_compare(def, a, b);
         if (!result) {
             ADD_FAILURE() << "prepared relation is unknown";
             return;
