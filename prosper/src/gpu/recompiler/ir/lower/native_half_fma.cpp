@@ -1,5 +1,7 @@
 // Native half FMA numeric body, mechanically relocated without changing the old graph.
 #include "gpu/recompiler/ir/lower/native_half_fma_lowering.hpp"
+#include "gpu/recompiler/ir/lower/half_fma_finite.hpp"
+#include <array>
 #include "gpu/recompiler/ir/lower/native_half_fma_lowering_internal.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -14,9 +16,11 @@ void NativeHalfFmaLowering::lower() {
     // names its two siblings 0x351 v_min3_f16 and 0x357 v_med3_f16 — Sonic Racing:
     // CrossWorlds' upscale kernel emits `d7571003,02020af2`
     // = `v_med3_f16 v3, 1.0, v5, 0 op_sel:[0,1,0,0]` (#2013).
+    std::array<uint32_t, 3> raw_sources{};
     auto f16src = [&](int k) {
         const Operand& operand = in.src[k];
         uint32_t raw = val(operand);
+        raw_sources[k] = raw;
         // Inline constants supply the dword their operand width produces (see
         // inline_16bit_operand_dword) and OPSEL[k] selects a half of THAT — a float
         // reads 0.0h from the high half rather than the constant again (#2119,
@@ -36,6 +40,8 @@ void NativeHalfFmaLowering::lower() {
     }
     result = fresult(result);
     uint32_t r16 = b.pack_half_lo(result);
+    if (ok && use_half_fma_finite(b, in))
+        r16 = emit_native_half_fma_finite(b, in, raw_sources, r16);
     vreg[in.dst.value] =
         (in.vop3p_opsel & 8u)
             ? b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0x0000FFFFu)),

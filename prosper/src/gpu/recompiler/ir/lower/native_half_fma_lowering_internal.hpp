@@ -1,5 +1,6 @@
 // Borrow the original source/result callbacks without inserting a destination.
 #pragma once
+#include <cstdint>
 #include "gpu/recompiler/ir/lower/lowering_context.hpp"
 #include "gpu/recompiler/ir/lower/native_half_fma_lowering.hpp"
 namespace prosper::gpu::ir {

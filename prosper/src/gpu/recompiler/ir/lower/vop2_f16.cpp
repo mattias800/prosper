@@ -4,6 +4,7 @@
 #include "gpu/recompiler/ir/lower/vector_lowering_internal.hpp"
 #include "gpu/recompiler/ir/ops/vector_half.hpp"
 #include "gpu/recompiler/ir/lower/float_output_modifiers.hpp"
+#include "gpu/recompiler/ir/lower/half_fma_finite.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <cstdint>
@@ -49,8 +50,7 @@ bool Vop2Lowering::compute_f16(uint32_t& d) {
         return true;
     }
     switch (in.opcode) {
-        // CONFIDENCE: HIGH: this legacy F32 intermediate double-rounds the half result; #5225.
-        // Its body is preserved; no new IR definition claims it implements fused half arithmetic.
+        // Keep the legacy graph outside the bounded exact finite profile (#5225).
         case 0x3C: {   // v_pk_fmac_f16: packed dst += src0*src1
             auto fmac_half = [&](uint32_t half) {
                 return b.fbin(Op_FAdd,
@@ -60,6 +60,8 @@ bool Vop2Lowering::compute_f16(uint32_t& d) {
             uint32_t lo = b.pack_half_lo(fmac_half(0));
             uint32_t hi = b.ibin(Op_ShiftLeftLogical, b.pack_half_lo(fmac_half(1)), b.uconst(16));
             d = b.ibin(Op_BitwiseOr, lo, hi);
+            if (ok && use_half_fma_finite(b, in))
+                d = emit_packed_fmac_half_finite(b, a, c, old_d, d);
             break;
         }
 

@@ -1,8 +1,10 @@
 // rdna2_emit_alu.cpp — emit_alu: the RDNA2 instruction-family translator, split out of
 // rdna2_to_spirv.cpp. Shared state lives in gpu/recompiler/rdna2_to_spirv_internal.hpp.
+#include <array>
 #include <atomic>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/ir/lower/native_half_fma_lowering.hpp"
+#include "gpu/recompiler/ir/lower/half_fma_finite.hpp"
 #include "gpu/recompiler/ir/ops/vector_fma_float.hpp"
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
@@ -201,8 +203,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if (ir::lower_vop3p_packed_integer(b, rs, in, ok, allow_wave)) return true;
             if (in.opcode >= 0x0Eu && in.opcode <= 0x12u) {  // v_pk_fma/add/mul/min/max_f16
                 const uint32_t old_d = vreg_old(b, rs, in.dst.value);
+                std::array<std::array<uint32_t, 3>, 2> raw_sources{};
                 auto half = [&](int source, bool high_result) -> uint32_t {
                     uint32_t v = val(in.src[source]);
+                    raw_sources[high_result][source] = v;
                     const uint8_t selectors = high_result ? in.vop3p_opsel_hi : in.vop3p_opsel;
                     const uint32_t sel = (selectors >> source) & 1u;
                     // An inline constant is the raw dword its width produces (see
@@ -237,7 +241,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 };
                 const uint32_t lo = b.pack_half_lo(operation(false));
                 const uint32_t hi = b.ibin(Op_ShiftLeftLogical, b.pack_half_lo(operation(true)), b.uconst(16));
-                rs.vreg[in.dst.value] = b.ibin(Op_BitwiseOr, lo, hi);
+                uint32_t packed = b.ibin(Op_BitwiseOr, lo, hi);
+                if (ok && in.opcode == 0x0e && ir::use_half_fma_finite(b, in))
+                    packed = ir::emit_packed_half_fma_finite(b, in, raw_sources, packed);
+                rs.vreg[in.dst.value] = packed;
                 predicate_write(b, rs, in.dst.value, old_d);
                 return true;
             }
