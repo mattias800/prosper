@@ -11,7 +11,18 @@
 namespace prosper::gpu::ir {
 bool Vop3MacFloatLowering::lower() {
     const auto* def = find_vector_mac_float_op(in.fmt, in.opcode);
-    if (!def) return false;
+    if (!def) {
+        def = find_vector_fmac_float_op(in.fmt, in.opcode);
+        if (!def) return false;
+        // Admit only the verified two-source spelling. Do not inherit ignored modifiers
+        // on implicit oldD, or make the unused encoded SRC2 a semantic/literal source.
+        if (in.has_modifier || in.has_sdwa || in.has_dpp || in.clamp || in.omod ||
+            ((in.words[0] >> 11) & 0xfu) || (in.words[1] & (0x1ffu << 18)) || in.src_abs[0] ||
+            in.src_abs[1] || in.src_abs[2] || in.src_neg[0] || in.src_neg[1] || in.src_neg[2]) {
+            ok = false;
+            return true;
+        }
+    }
     if (!fv || !fresult) {
         std::fprintf(stderr, "[ir] MAC float callbacks missing\n");
         std::abort();

@@ -8,6 +8,7 @@
 #include "fixtures/test_scratch.h"
 #include "gpu/diagnostics/refused_shader_inputs.hpp"
 #include "gpu/recompiler/bpermute_spirv_oracle.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <gtest/gtest.h>
 #include <vulkan/vulkan.h>
@@ -157,13 +158,22 @@ std::string device_receipt() {
     return out;
 }
 std::vector<uint32_t> gpu_run(const Encoding& e, uint32_t wave,
-                              const LaneInputs* independent_inputs = nullptr) {
+                              const LaneInputs* independent_inputs = nullptr,
+                              bool legacy_prefix = false) {
     auto p = program(e, {}, wave, 0);
+    if (e.format == Rdna2Format::VOP3 && e.opcode == 0x12b && !legacy_prefix) {
+        // Use the exact LLVM gfx1030 spelling, with unused SRC2 zero and implicit oldD.
+        const auto instruction = std::find(p.code.begin(), p.code.end(), 0xd12b0001u);
+        EXPECT_NE(instruction, p.code.end());
+        if (instruction == p.code.end()) return {};
+        *instruction = 0xd52b0001u;
+    }
     const auto module = recompile_compute(p.code.data(), p.code.size(), &p.table, p.config);
     EXPECT_FALSE(module.empty());
     if (module.empty()) return {};
     const auto stem = std::string(e.name) + "_wave" + std::to_string(wave) +
-                      (independent_inputs ? "_distinct" : "");
+                      (independent_inputs ? "_distinct" : "") +
+                      (legacy_prefix ? "_legacy-prefix" : "");
     const auto root = artifact_root();
     std::ofstream spv(root / (stem + ".spv"), std::ios::binary);
     spv.write(reinterpret_cast<const char*>(module.data()),
@@ -253,4 +263,46 @@ TEST(ComputeF32FmaRounding, EveryGuestFormMatchesAnIndependentNativeFmaControl) 
                     << "lane " << lane;
         }
     }
+}
+TEST(ComputeF32FmaRounding, CanonicalE64FmacAlwaysMatchesTheIndependentNativeControl) {
+    constexpr Encoding e{"fmac_e64", Rdna2Format::VOP3, 0x12b, Addend::Destination, false};
+    auto in = inputs(&e);
+    for (size_t lane = 0; lane < in.lanes(); ++lane) {
+        in.old_d[lane] = lane % 2 ? 0xc0500000u : 0x40500000u;
+        in.s2[lane] = lane % 2 ? 0xbf400000u : 0x3f400000u;
+    }
+    const auto reference = native_fma_results(e, in);
+    ASSERT_EQ(reference.size(), 64u);
+    for (bool legacy_prefix : {false, true})
+        for (uint32_t wave : {32u, 64u}) {
+            const auto output = gpu_run(e, wave, &in, legacy_prefix);
+            ASSERT_EQ(output.size(), 64u);
+            for (size_t lane = 0; lane < in.lanes(); ++lane)
+                EXPECT_EQ(output[lane], in.active[lane] ? reference[lane] : in.old_d[lane])
+                    << "wave " << wave << " lane " << lane;
+        }
+}
+TEST(ComputeF32FmaRounding, CanonicalE64FmacKeepsTheQualifiedFiniteRteWitness) {
+    constexpr Encoding e{"fmac_e64", Rdna2Format::VOP3, 0x12b, Addend::Destination, false};
+    const auto receipt = device_receipt();
+    ASSERT_FALSE(receipt.empty());
+    RecordProperty("executing_driver", receipt);
+    const auto in = inputs(&e);
+    const auto control = native_fma_results(e, in);
+    ASSERT_EQ(control.size(), 64u);
+    RecordProperty("native_fma_witness", control[4]);
+    if (control[4] == 0)
+        GTEST_SKIP() << "Independent native Fma also rounds separately; strict guest "
+                        "accuracy remains unsupported (#5225). "
+                     << receipt;
+    ASSERT_EQ(control[4], 0xa8800000u) << receipt;
+    for (bool legacy_prefix : {false, true})
+        for (uint32_t wave : {32u, 64u}) {
+            const auto output = gpu_run(e, wave, nullptr, legacy_prefix);
+            ASSERT_EQ(output.size(), 64u);
+            for (size_t lane = 0; lane < in.lanes(); ++lane)
+                EXPECT_EQ(output[lane], fused_expected(e, {}, in, lane, 0)) << lane;
+            EXPECT_EQ(output[4], 0xa8800000u);
+            EXPECT_EQ(output[0], in.old_d[0]);
+        }
 }

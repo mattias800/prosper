@@ -7,4 +7,6 @@
 namespace prosper::gpu::ir {
 std::span<const TernaryIntegerDef> vector_mac_float_defs();
 const TernaryIntegerDef* find_vector_mac_float_op(Rdna2Format fmt, uint32_t opcode);
+// Canonical e64 FMAC uses the existing Fma graph, separate from the nonfused inventory.
+const TernaryIntegerDef* find_vector_fmac_float_op(Rdna2Format fmt, uint32_t opcode);
 }   // namespace prosper::gpu::ir

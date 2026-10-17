@@ -170,3 +170,65 @@ TEST(IrLowerVop3MacFloat, MissingCallbacksForAHandledInstructionStopLoudly) {
         },
         "MAC float callbacks missing");
 }
+TEST(IrLowerVop3MacFloat, CanonicalFmacUsesTwoCallbacksAndImplicitOldDAfterBothMultiplicands) {
+    FloatMac t;
+    const auto exec = t.rs.exec, vcc = t.rs.vcc, scc = t.rs.scc;
+    ASSERT_TRUE(t.lower(instruction(0x12b)));
+    ASSERT_TRUE(t.ok);
+    EXPECT_EQ((std::set<int>(t.reads.begin(), t.reads.end())), (std::set<int>{0, 1}));
+    EXPECT_EQ(t.reads.size(), 2u);
+    EXPECT_GT(t.modify_at, t.read_at[0]);
+    EXPECT_GT(t.modify_at, t.read_at[1]);
+    EXPECT_EQ(t.modified.size(), 1u);
+    ASSERT_TRUE(t.rs.vreg.contains(1));
+    EXPECT_EQ(t.rs.vreg.at(1), t.modified[0]);
+    EXPECT_EQ(t.count(Op_FMul), 0u);
+    EXPECT_EQ(t.count(Op_FAdd), 0u);
+    EXPECT_EQ(t.rs.exec, exec);
+    EXPECT_EQ(t.rs.vcc, vcc);
+    EXPECT_EQ(t.rs.scc, scc);
+}
+TEST(IrLowerVop3MacFloat, FmacUnsupportedFieldsRefuseBeforeAnySourceOrResultCallback) {
+    for (uint32_t field = 0; field < 23; ++field) {
+        FloatMac t;
+        auto in = instruction(0x12b);
+        if (field < 3)
+            in.src_abs[field] = true;
+        else if (field < 6)
+            in.src_neg[field - 3] = true;
+        else if (field < 9)
+            in.omod = field - 5;
+        else if (field == 9)
+            in.clamp = true;
+        else if (field == 10)
+            in.has_sdwa = true;
+        else if (field == 11)
+            in.has_dpp = true;
+        else if (field == 12)
+            in.has_modifier = true;
+        else if (field < 17)
+            in.words[0] |= 1u << (field - 13 + 11);
+        else
+            in.words[1] |= (field - 16) << 18;
+        const auto before = t.code_words();
+        ASSERT_TRUE(t.lower(in));
+        EXPECT_FALSE(t.ok) << field;
+        EXPECT_TRUE(t.reads.empty()) << field;
+        EXPECT_TRUE(t.modified.empty()) << field;
+        EXPECT_TRUE(t.rs.vreg.empty()) << field;
+        EXPECT_EQ(t.code_words(), before) << field;
+    }
+}
+TEST(IrLowerVop3MacFloat, FmacSourceErrorsKeepValueResultOrderWithoutPublishingMaskFacts) {
+    for (int bad : {0, 1}) {
+        FloatMac t;
+        t.bad = bad;
+        ASSERT_TRUE(t.lower(instruction(0x12b)));
+        EXPECT_FALSE(t.ok);
+        EXPECT_EQ(t.reads.size(), 2u);
+        EXPECT_EQ(t.modified.size(), 1u);
+        EXPECT_TRUE(t.rs.vreg.contains(1));
+        EXPECT_GT(t.modify_at, t.read_at[0]);
+        EXPECT_GT(t.modify_at, t.read_at[1]);
+    }
+}
