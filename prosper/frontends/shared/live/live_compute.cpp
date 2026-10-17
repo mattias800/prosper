@@ -3445,6 +3445,7 @@ struct VulkanComputeContext {
         VkPhysicalDeviceFeatures enabled{};
         enabled.robustBufferAccess = VK_TRUE;
         enabled.shaderInt64 = supported.shaderInt64;
+        enabled.shaderFloat64 = supported.shaderFloat64;   // binary64 guest ops (#5325)
         // The standalone device must enable the same gather capability as the shared renderer.
         enabled.shaderImageGatherExtended = supported.shaderImageGatherExtended;
         // Image bindings (#590): enable the format-free storage-image features when available. The
@@ -3563,6 +3564,8 @@ struct VulkanComputeContext {
         prosper::gpu::publish_device_float_controls(
             "compute", physical, kVulkanRuntimeVersion,
             /*float_controls_extension_enabled=*/false);
+        prosper::gpu::publish_device_float64("compute", physical, kVulkanRuntimeVersion,
+                                             enabled.shaderFloat64 == VK_TRUE, false);
         prosper::gpu::publish_float_transport_config(float_transport);
         vkGetDeviceQueue(device, queue_family, 0, &queue);
         if (!create_pipeline_cache())

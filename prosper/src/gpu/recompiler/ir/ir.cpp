@@ -106,8 +106,20 @@ constexpr OpcodeInfo kInfo[] = {
     {"u64.lshr", 2, Type::U64},
     {"u64.ashr", 2, Type::U64},
     {"u64.bfe", 3, Type::U64},
+    {"f64.lt", 2, Type::Bool},
+    {"f64.eq", 2, Type::Bool},
+    {"f64.le", 2, Type::Bool},
+    {"f64.gt", 2, Type::Bool},
+    {"f64.lg", 2, Type::Bool},
+    {"f64.ge", 2, Type::Bool},
+    {"f64.unord.lt", 2, Type::Bool},
+    {"f64.unord.eq", 2, Type::Bool},
+    {"f64.unord.le", 2, Type::Bool},
+    {"f64.unord.gt", 2, Type::Bool},
+    {"f64.unord.ne", 2, Type::Bool},
+    {"f64.unord.ge", 2, Type::Bool},
 };
-static_assert(std::size(kInfo) == static_cast<size_t>(Opcode::U64Bfe) + 1);
+static_assert(std::size(kInfo) == static_cast<size_t>(Opcode::F64UnordGe) + 1);
 
 // The type argument `slot` of `op` must have.
 Type argument_type(Opcode op, size_t slot) {
@@ -117,6 +129,7 @@ Type argument_type(Opcode op, size_t slot) {
     if (op >= Opcode::U64Shl && op <= Opcode::U64AShr) return slot == 0 ? Type::U64 : Type::U32;
     if (op >= Opcode::U64Lo && op <= Opcode::U64Ge) return Type::U64;
     if (op == Opcode::U64Bfe && slot == 0) return Type::U64;
+    if (op >= Opcode::F64Lt && op <= Opcode::F64UnordGe) return Type::U64;   // binary64 words
     return Type::U32;
 }
 

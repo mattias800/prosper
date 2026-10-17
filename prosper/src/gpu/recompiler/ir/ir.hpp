@@ -140,6 +140,23 @@ enum class Opcode : uint8_t {
     U64LShr,
     U64AShr,   // (u64 raw word, u32 count) -> u64; unknown for count >= 64
     U64Bfe,   // (U64 base, U32 offset <= 63, U32 count), clamped at the word end
+    // Binary64 relations over raw U64 words, returning Bool (HOW_TO_ADD_A_FAMILY.md, "F64 values").
+    // There is no F64 Type: an F64 opcode reads its U64 word as an IEEE binary64 value, the way the
+    // F32 opcodes read U32 words, and the emitter bitcasts to OpTypeFloat 64. The same twelve
+    // relations as F32: ordered ones are false on a NaN, unordered ones true; F64Lg is ordered
+    // not-equal. Emitting one needs float64_admitted() (float64_support.hpp).
+    F64Lt,
+    F64Eq,
+    F64Le,
+    F64Gt,
+    F64Lg,
+    F64Ge,
+    F64UnordLt,
+    F64UnordEq,
+    F64UnordLe,
+    F64UnordGt,
+    F64UnordNe,
+    F64UnordGe,
 };
 
 struct OpcodeInfo {

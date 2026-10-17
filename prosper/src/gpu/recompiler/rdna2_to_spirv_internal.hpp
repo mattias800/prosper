@@ -293,13 +293,13 @@ enum : uint32_t {
     // 4467 RoundingModeRTE, 4468 RoundingModeRTZ. The first draft of this line said 4467, and
     // NVIDIA honoured the execution mode anyway while emitting an invalid module -- only
     // `spv_validate` (spirv-val, an instrument that does not share this header) reported it.
-    Cap_SignedZeroInfNanPreserve=4466,
+    Cap_Float64=10, Cap_DenormPreserve=4464, Cap_SignedZeroInfNanPreserve=4466,
     Cap_FloatControls2=6029,
     Cap_StorageBufferArrayNonUniformIndexing=5308,
     Addr_Logical=0, Mem_GLSL450=1, Exec_Vertex=0, Exec_Geometry=3, Exec_Fragment=4, Exec_GLCompute=5,
     EM_Invocations=0, EM_OriginUpperLeft=7, EM_DepthReplacing=12, EM_LocalSize=17, EM_Triangles=22,
     EM_OutputVertices=26, EM_OutputTriangleStrip=29, EM_Xfb=11,   // transform-feedback execution mode
-    EM_SignedZeroInfNanPreserve=4461,
+    EM_DenormPreserve=4459, EM_SignedZeroInfNanPreserve=4461,
     SC_Input=1, SC_UniformConstant=0, SC_Output=3, SC_Function=7, SC_PushConstant=9,
     SC_Image=11, SC_StorageBuffer=12, FC_None=0,
     Dim_1D=0, Dim_2D=1, Dim_3D=2, Dim_Cube=3,   // SPIR-V Dim. (2D coincides with the SQ_RSRC 2D dim value, but distinct.)
@@ -514,6 +514,13 @@ struct SpirvCompute {
     // reads the answer, and reads it as "no" until some device owner has measured a device.
     bool float_controls_declared = false;
     void declare_float_controls(uint32_t entry);
+    // Binary64 (float64.cpp, float64_support.hpp). t_f64() declares Float64, DenormPreserve 64 and
+    // the float-controls extension once, on first use; callers check float64_admitted() first.
+    uint32_t t_f64_cache = 0;
+    bool float_controls_extension_declared = false;
+    void declare_float_controls_extension();
+    uint32_t t_f64();
+    uint32_t fcmp64(uint32_t cmpop, uint32_t a64, uint32_t b64);   // U64 words -> Bool
     std::unordered_map<uint32_t, uint32_t> fconst_cache, uconst_cache;
     uint32_t next_id = 1;
     uint32_t stride = 1;

@@ -24,8 +24,9 @@ bool VopcLowering::lower() {
     integer64_compare =
         (eff >= 0xA1u && eff <= 0xA6u) ||
         (eff >= 0xE1u && eff <= 0xE6u);
+    float64_compare = eff >= 0x20u && eff <= 0x2Fu;
     compare_wave_uniform = !is_cmpx && !rs.exec_narrowed &&
-        (integer64_compare
+        (integer64_compare || float64_compare
             ? scalar_integer64_operand(in.src[0]) &&
               scalar_integer64_operand(in.src[1])
             : scalar_data_operand(in.src[0]) && scalar_data_operand(in.src[1]));
@@ -36,6 +37,7 @@ bool VopcLowering::lower() {
         ok = false;
         return true;
     }
+    if (float64_compare && !float64_admission()) return true;
     // Float source modifiers (abs then neg — hardware order), set only on FLOAT compares by the
     // assembler (VOP3-encoded e64 or SDWA forms; e.g. DOLL's `v_cmp_gt_f32_sdwa vcc, |v5|, s4`).
     guest_compare_fact = ok && !is_cmpx && !rs.exec_narrowed && !in.clamp && !in.omod &&
@@ -44,11 +46,15 @@ bool VopcLowering::lower() {
              !in.sdwa_src0_sext && !in.sdwa_src1_sext));
     zero_compare();
     magnitude_compare();
-    if (!magnitude_cmp && !zero_cmp) source_modifiers();
+    if (!magnitude_cmp && !zero_cmp && !float64_compare) source_modifiers();
     integer_sdwa_sources();
     if (integer64_compare) {
         a64 = integer64_halves(in.src[0], ra);
         c64 = integer64_halves(in.src[1], rc);
+    }
+    if (float64_compare) {
+        a64 = float64_source(0, ra);
+        c64 = float64_source(1, rc);
     }
     const uint32_t cmp = compare_value();
     if (ok) {

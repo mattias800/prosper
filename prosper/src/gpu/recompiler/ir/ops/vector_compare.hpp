@@ -47,6 +47,8 @@ std::span<const VectorCompareDef> vector_compare_f16_defs();
 std::span<const VectorCompareDef> vector_compare_class_f32_defs();
 // I64/U64 definitions read both halves of each source (pair_sources).
 std::span<const VectorCompareDef> vector_compare_i64_u64_defs();
+// F64 definitions read both halves of each source as one binary64 word (pair_sources).
+std::span<const VectorCompareDef> vector_compare_f64_defs();
 
 // Every group's definitions, and the one for a V_CMP_* opcode (nullptr when it has none yet).
 std::span<const std::span<const VectorCompareDef>> vector_compare_groups();

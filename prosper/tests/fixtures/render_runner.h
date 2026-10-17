@@ -1582,6 +1582,8 @@ inline const RenderVkCtx& render_vk_ctx() {
         // Enabled only when advertised, matching samplerAnisotropy (#275): on a device without them the
         // honest outcome is the layer error, not a silently miscompiled shader.
         if (supported.shaderInt64)      feats.shaderInt64 = VK_TRUE;
+        // Binary64 guest instructions (#5325): enabled when advertised, published after creation.
+        feats.shaderFloat64 = supported.shaderFloat64;
         if (supported.independentBlend) feats.independentBlend = VK_TRUE;
         // Dynamic texel offsets on OpImageGather require ImageGatherExtended (#3417).
         feats.shaderImageGatherExtended = supported.shaderImageGatherExtended;
@@ -1944,6 +1946,9 @@ inline const RenderVkCtx& render_vk_ctx() {
         prosper::gpu::publish_device_float_controls(
             "render", r.phys, prosper::frontend::kVulkanRuntimeVersion,
             /*float_controls_extension_enabled=*/false);
+        prosper::gpu::publish_device_float64("render", r.phys, prosper::frontend::kVulkanRuntimeVersion,
+                                             feats.shaderFloat64 == VK_TRUE,
+                                             /*float_controls_extension_enabled=*/false);
         prosper::gpu::publish_float_transport_config(r.float_transport);
         VkPipelineCacheCreateInfo cache_info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
         std::vector<uint8_t> initial_cache;

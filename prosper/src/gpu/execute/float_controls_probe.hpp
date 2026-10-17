@@ -24,6 +24,7 @@
 // both call sites do and what puts every publisher ahead of the first guest draw.
 #pragma once
 
+#include "gpu/recompiler/float64_support.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 
 #include <vulkan/vulkan.h>
@@ -80,6 +81,33 @@ inline bool publish_device_float_controls(const char* owner, VkPhysicalDevice ph
                  VK_API_VERSION_MAJOR(effective), VK_API_VERSION_MINOR(effective),
                  float_controls_extension_enabled ? "enabled" : "not enabled",
                  permitted ? (preserve_float32 ? "VK_TRUE" : "VK_FALSE") : "not queryable");
+    return usable;
+}
+
+// The binary64 half of the same measurement (float64_support.hpp, #5325). `shader_float64_enabled`
+// is what vkCreateDevice ENABLED, never what the device advertises. Returns what was published.
+inline bool publish_device_float64(const char* owner, VkPhysicalDevice physical,
+                                   uint32_t instance_api_version, bool shader_float64_enabled,
+                                   bool float_controls_extension_enabled) {
+    if (!physical) return false;
+    VkPhysicalDeviceProperties base{};
+    vkGetPhysicalDeviceProperties(physical, &base);
+    const uint32_t effective = std::min(instance_api_version, base.apiVersion);
+    const bool permitted = effective >= VK_API_VERSION_1_2 || float_controls_extension_enabled;
+    bool denorm_preserve = false;
+    if (permitted) {
+        VkPhysicalDeviceFloatControlsProperties float_controls{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
+        VkPhysicalDeviceProperties2 properties2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        properties2.pNext = &float_controls;
+        vkGetPhysicalDeviceProperties2(physical, &properties2);
+        denorm_preserve = float_controls.shaderDenormPreserveFloat64 == VK_TRUE;
+    }
+    publish_float64_support(shader_float64_enabled, denorm_preserve, permitted);
+    const bool usable = shader_float64_enabled && denorm_preserve && permitted;
+    std::fprintf(stderr, "[%s] F64 %s (shaderFloat64 %s, shaderDenormPreserveFloat64 %s)\n", owner,
+                 usable ? "ENABLED" : "unavailable", shader_float64_enabled ? "enabled" : "off",
+                 permitted ? (denorm_preserve ? "VK_TRUE" : "VK_FALSE") : "not queryable");
     return usable;
 }
 

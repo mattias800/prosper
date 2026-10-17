@@ -67,6 +67,9 @@ struct Interpreter {
   // Optional fixture-owned words for the closed uint32 array PushConstant ABI. The default
   // supplies nothing: a declared block cannot read invented zeros or infer a launch value.
     std::vector<uint32_t> supplied_push_constants;
+  // Set by the module's own `OpExecutionMode DenormPreserve 64`. Without it Vulkan lets a device
+  // flush binary64 subnormals, so an F64 relation that reads one fails instead of guessing.
+    bool denorm_preserve64 = false;
     uint32_t main = 0, storage = 0;
   // Default compute fixtures stay strict set 0. Actual NGG modules explicitly select their
   // separate set-2 launch/export ABI; no module words or resource ownership are rewritten.
@@ -112,6 +115,7 @@ struct Interpreter {
     if ((t.op == 21 || t.op == 22) && !t.a.empty() && t.a[0] == 32)
       return 1;
     if (t.op == 21 && t.a == std::vector<uint32_t>{64, 0}) return 2;
+    if (t.op == 22 && t.a == std::vector<uint32_t>{64}) return 2;   // binary64, the F64 relations
     if (t.op == 27 && t.a.size() == 1) return 1; // closed opaque sampled-image handle
     fail("not a 32-bit scalar");
   }
@@ -218,10 +222,21 @@ struct Interpreter {
       if (op < 180 || op > 191) return false;   // OpFOrdEqual .. OpFUnordGreaterThanEqual
       if (a.size() != 4 || ty(a[0]).op != 20) fail("malformed float comparison");
       const auto x = value(l, a[2]), y = value(l, a[3]);
-      if (!x.defined || !y.defined || x.words.size() != 1 || y.words.size() != 1 ||
-          x.type != y.type || ty(x.type).op != 22 || ty(x.type).a != std::vector<uint32_t>{32})
+      const bool f64 = ty(x.type).op == 22 && ty(x.type).a == std::vector<uint32_t>{64};
+      const size_t words = f64 ? 2 : 1;
+      if (!x.defined || !y.defined || x.words.size() != words || y.words.size() != words ||
+          x.type != y.type || ty(x.type).op != 22 ||
+          (!f64 && ty(x.type).a != std::vector<uint32_t>{32}))
           fail("undefined or mistyped float comparison");
-      const float f = std::bit_cast<float>(x.words[0]), g = std::bit_cast<float>(y.words[0]);
+      // A binary64 operand is compared as a double (SPIR-V's relation is the same IEEE one).
+      const auto to_double = [&](const Value& v) {
+          if (!f64) return double(std::bit_cast<float>(v.words[0]));
+          const double d = std::bit_cast<double>(uint64_t(v.words[0]) | uint64_t(v.words[1]) << 32);
+          if (std::fpclassify(d) == FP_SUBNORMAL && !denorm_preserve64)
+              fail("binary64 subnormal without DenormPreserve 64");
+          return d;
+      };
+      const double f = to_double(x), g = to_double(y);
       // SPIR-V 3.52.15: the even opcodes 180-190 are the ordered relations (false when either
       // operand is a NaN), the odd 181-191 the unordered ones (true when either is a NaN), in
       // the order Equal, NotEqual, LessThan, GreaterThan, LessThanEqual, GreaterThanEqual.
@@ -619,6 +634,8 @@ struct Interpreter {
                 fail("invalid or duplicate LocalSize");
         }
         if (op == 331 && a.size() >= 2 && a[1] == 38) specialized_local_sizes.insert(a[0]);
+        // OpExecutionMode DenormPreserve (4459) 64: binary64 subnormals reach the relations.
+        if (op == 16 && a.size() == 3 && a[1] == 4459 && a[2] == 64) denorm_preserve64 = true;
         if (op >= 19 && op <= 33 && !a.empty())
           types[a[0]] = {op, {a.begin() + 1, a.end()}};
         if (op == 71 && a.size() >= 2) {

@@ -154,6 +154,19 @@ public:
     Value u64le(Value a, Value b) { return cmp(Opcode::U64Le, a, b); }
     Value u64gt(Value a, Value b) { return cmp(Opcode::U64Gt, a, b); }
     Value u64ge(Value a, Value b) { return cmp(Opcode::U64Ge, a, b); }
+    // Binary64 relations over U64 words (HOW_TO_ADD_A_FAMILY.md, "F64 values").
+    Value f64lt(Value a, Value b) { return cmp(Opcode::F64Lt, a, b); }
+    Value f64eq(Value a, Value b) { return cmp(Opcode::F64Eq, a, b); }
+    Value f64le(Value a, Value b) { return cmp(Opcode::F64Le, a, b); }
+    Value f64gt(Value a, Value b) { return cmp(Opcode::F64Gt, a, b); }
+    Value f64lg(Value a, Value b) { return cmp(Opcode::F64Lg, a, b); }
+    Value f64ge(Value a, Value b) { return cmp(Opcode::F64Ge, a, b); }
+    Value f64unordlt(Value a, Value b) { return cmp(Opcode::F64UnordLt, a, b); }
+    Value f64unordeq(Value a, Value b) { return cmp(Opcode::F64UnordEq, a, b); }
+    Value f64unordle(Value a, Value b) { return cmp(Opcode::F64UnordLe, a, b); }
+    Value f64unordgt(Value a, Value b) { return cmp(Opcode::F64UnordGt, a, b); }
+    Value f64unordne(Value a, Value b) { return cmp(Opcode::F64UnordNe, a, b); }
+    Value f64unordge(Value a, Value b) { return cmp(Opcode::F64UnordGe, a, b); }
 
 private:
     Value u32(Opcode op, Value a, Value b) { return block_.append({op, Type::U32, 0, {a, b}}); }
