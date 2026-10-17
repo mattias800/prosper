@@ -99,8 +99,7 @@ TEST(IrCoreInteger64, RelationsAreUnsignedOverAllSixtyFourBits) {
     for (const Row& r : {Row{0x0000000100000000ull, 0x00000000ffffffffull, "010011"},   // high only
                          Row{0x0000000500000007ull, 0x0000000500000007ull, "100101"},
                          Row{0x0000000580000000ull, 0x000000057fffffffull, "010011"},   // low only
-                         Row{kMinI64, kMaxI64, "010011"},
-                         Row{0, ~0ull, "011100"}}) {
+                         Row{kMinI64, kMaxI64, "010011"}, Row{0, ~0ull, "011100"}}) {
         const Opcode ops[] = {Opcode::U64Eq, Opcode::U64Ne, Opcode::U64Lt,
                               Opcode::U64Le, Opcode::U64Gt, Opcode::U64Ge};
         for (size_t i = 0; i < std::size(ops); ++i)
@@ -115,15 +114,16 @@ TEST(IrCoreInteger64, SignedOrderKeysOrderTwosComplementValues) {
     Builder ir(block);
     const Value alo = ir.input(Type::U32), ahi = ir.input(Type::U32);
     const Value blo = ir.input(Type::U32), bhi = ir.input(Type::U32);
-    const Value lt = ir.u64lt(ir.pack_u64_signed_order(alo, ahi), ir.pack_u64_signed_order(blo, bhi));
+    const Value lt =
+        ir.u64lt(ir.pack_u64_signed_order(alo, ahi), ir.pack_u64_signed_order(blo, bhi));
     struct Row {
         uint64_t a, b;
         bool lt;
     };
-    for (const Row& r : {Row{kMinI64, kMaxI64, true}, Row{kMaxI64, kMinI64, false},
-                         Row{~0ull, 0, true}, Row{0, ~0ull, false},
-                         Row{0xfffffffeffffffffull, 0xffffffff00000000ull, true},
-                         Row{kMinI64, 0, true}, Row{kMinI64 + 1, kMinI64, false}}) {
+    for (const Row& r :
+         {Row{kMinI64, kMaxI64, true}, Row{kMaxI64, kMinI64, false}, Row{~0ull, 0, true},
+          Row{0, ~0ull, false}, Row{0xfffffffeffffffffull, 0xffffffff00000000ull, true},
+          Row{kMinI64, 0, true}, Row{kMinI64 + 1, kMinI64, false}}) {
         const std::array<Known, 4> in = {uint32_t(r.a), uint32_t(r.a >> 32), uint32_t(r.b),
                                          uint32_t(r.b >> 32)};
         EXPECT_EQ(evaluate(block, in)[lt.index], Known(r.lt)) << std::hex << r.a << " " << r.b;
@@ -247,7 +247,9 @@ TEST(IrCoreInteger64, EveryOpcodeRunsLikeItsEvaluationPerLane) {
                         ASSERT_TRUE(want.has_value());
                         ASSERT_EQ(run[lane], *want)
                             << opcode_info(opcode).name << " lane " << lane << std::hex
-                            << " in " << *in[0] << " " << *in[1] << " " << *in[2] << " " << *in[3];
+                            << " in "
+                            // NOLINTNEXTLINE(bugprone-unchecked-optional-access): all inputs set above.
+                            << *in[0] << " " << *in[1] << " " << *in[2] << " " << *in[3];
                     }
                     if (lo == hi) break;
                 }
@@ -257,7 +259,7 @@ TEST(IrCoreInteger64, EveryOpcodeRunsLikeItsEvaluationPerLane) {
         EXPECT_TRUE(seen.contains(static_cast<Opcode>(op))) << opcode_info(Opcode(op)).name;
 }
 
-} // namespace
+}   // namespace
 
 TEST(IrCoreInteger64Oracle, ArithmeticShiftPropagatesUndefinedAndRejectsPoisonCounts) {
     using bpermute_oracle::Interpreter;

@@ -28,7 +28,7 @@ struct VectorCarryIn {
     Value cin = {};   // Bool: the lane's carry-in bit (reads_carry_in only)
 };
 struct VectorCarryOut {
-    Value d;       // U32
+    Value d;   // U32
     Value carry;   // Bool: the carry-out (add) or borrow-out (sub, subrev)
 };
 

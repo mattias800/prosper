@@ -59,8 +59,8 @@ uint32_t emit_vector_compare(SpirvCompute& b, const VectorCompareDef& def, uint3
                              uint32_t s1);
 // The same for a pair_sources definition, given each source as its low and high words. Calling
 // the 32-bit form with a pair_sources definition, or this one without, is a lowering bug and aborts.
-Known eval_vector_compare_pairs(const VectorCompareDef& def, Known s0_lo, Known s0_hi,
-                                Known s1_lo, Known s1_hi);
+Known eval_vector_compare_pairs(const VectorCompareDef& def, Known s0_lo, Known s0_hi, Known s1_lo,
+                                Known s1_hi);
 uint32_t emit_vector_compare_pairs(SpirvCompute& b, const VectorCompareDef& def, uint32_t s0_lo,
                                    uint32_t s0_hi, uint32_t s1_lo, uint32_t s1_hi);
 

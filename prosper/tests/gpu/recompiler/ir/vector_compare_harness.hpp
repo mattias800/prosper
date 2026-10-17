@@ -43,8 +43,8 @@ inline bool is_cmpx(Form form) { return form == Form::CmpxVopc || form == Form::
 // VOPC e32: v_cmp_* vcc, v2, v3. VOP3 e64 (llvm-mc gfx1030): word 0 carries the opcode, the ABS
 // bits [10:8] and SDST [7:0]; word 1 SRC0, SRC1 and NEG [31:29].
 // `vsrc1` names SRC1's VGPR: a 64-bit group passes kVsrc2, so its sources are v[2:3] and v[5:6].
-inline std::vector<uint32_t> compare_words(uint32_t op, Form form, uint32_t abs = 0, uint32_t neg = 0,
-                                           uint32_t vsrc1 = kVsrc1) {
+inline std::vector<uint32_t> compare_words(uint32_t op, Form form, uint32_t abs = 0,
+                                           uint32_t neg = 0, uint32_t vsrc1 = kVsrc1) {
     const uint32_t opcode = is_cmpx(form) ? op + 0x10u : op;
     if (form == Form::VopcVcc || form == Form::CmpxVopc)
         return {0x7c000000u | (opcode << 17) | (vsrc1 << 9) | (256 + kVsrc0)};
@@ -54,8 +54,8 @@ inline std::vector<uint32_t> compare_words(uint32_t op, Form form, uint32_t abs 
 }
 
 // The instruction words under test: the compare, then a read of the mask it wrote into v1.
-inline std::vector<uint32_t> compare_program(uint32_t op, Form form, uint32_t abs = 0, uint32_t neg = 0,
-                                             uint32_t vsrc1 = kVsrc1) {
+inline std::vector<uint32_t> compare_program(uint32_t op, Form form, uint32_t abs = 0,
+                                             uint32_t neg = 0, uint32_t vsrc1 = kVsrc1) {
     auto words = compare_words(op, form, abs, neg, vsrc1);
     if (is_cmpx(form)) {
         words.push_back(kMovV1One);
@@ -92,8 +92,7 @@ inline void check_compare_run(const VectorCompareDef& def, Form form, uint32_t w
 inline std::filesystem::path compare_witness_root(const char* name) {
     // NOLINTNEXTLINE(concurrency-mt-unsafe): this process never mutates its launch environment.
     const char* configured = std::getenv("PROSPER_IR_WITNESS_DIR");
-    return configured ? std::filesystem::path(configured)
-                      : prosper_test::test_scratch_dir() / name;
+    return configured ? std::filesystem::path(configured) : prosper_test::test_scratch_dir() / name;
 }
 inline std::filesystem::path compare_witness_dump(const char* name) {
     return compare_witness_root(name) / "refused_shaders_20000101-000000Z_synthetic";
@@ -110,8 +109,8 @@ inline void write_compare_witness_program(const std::filesystem::path& dump, uin
     bin.close();
     EXPECT_TRUE(bin.good());
     const std::filesystem::path inputs = stem.string() + ".inputs";
-    EXPECT_TRUE(prosper::gpu::write_refused_compute_inputs(
-        inputs, address, &lp.table, lp.config, "synthetic-witness (no live refusal)"));
+    EXPECT_TRUE(prosper::gpu::write_refused_compute_inputs(inputs, address, &lp.table, lp.config,
+                                                           "synthetic-witness (no live refusal)"));
     const auto read = prosper::gpu::read_refused_shader_inputs(inputs);
     EXPECT_TRUE(read.incomplete.empty()) << read.incomplete;
     const auto replay = prosper::gpu::replay_refused_shader_inputs(lp.code, read);

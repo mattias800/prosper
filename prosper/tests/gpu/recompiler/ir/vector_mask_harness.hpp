@@ -96,4 +96,4 @@ inline size_t export_mask_witness(const std::vector<MaskWitness>& programs, cons
     return count;
 }
 
-} // namespace prosper::test::ir
+}   // namespace prosper::test::ir

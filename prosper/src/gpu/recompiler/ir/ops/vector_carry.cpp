@@ -52,20 +52,24 @@ Out sub_co_ci(Builder& ir, Value cin_bit, Value x, Value y) {
     return {d, ir.bselect(b1, ir.ctrue(), b2)};
 }
 
-Out sub(Builder& ir, const In& x) { return sub_co(ir, x.s0, x.s1); }
-Out subrev(Builder& ir, const In& x) { return sub_co(ir, x.s1, x.s0); }
-Out sub_ci(Builder& ir, const In& x) { return sub_co_ci(ir, x.cin, x.s0, x.s1); }
-Out subrev_ci(Builder& ir, const In& x) { return sub_co_ci(ir, x.cin, x.s1, x.s0); }
+Out sub(Builder& ir, const In& x) {
+    return sub_co(ir, x.s0, x.s1);
+}
+Out subrev(Builder& ir, const In& x) {
+    return sub_co(ir, x.s1, x.s0);
+}
+Out sub_ci(Builder& ir, const In& x) {
+    return sub_co_ci(ir, x.cin, x.s0, x.s1);
+}
+Out subrev_ci(Builder& ir, const In& x) {
+    return sub_co_ci(ir, x.cin, x.s1, x.s0);
+}
 
 constexpr VectorCarryDef kDefs[] = {
-    {F::VOP3, 0x30F, false, add_co},
-    {F::VOP3, 0x310, false, sub},
-    {F::VOP3, 0x319, false, subrev},
-    {F::VOP2, 0x28, true, add_co_ci},
-    {F::VOP2, 0x29, true, sub_ci},
-    {F::VOP2, 0x2A, true, subrev_ci},
-    {F::VOP3, 0x128, true, add_co_ci},
-    {F::VOP3, 0x129, true, sub_ci},
+    {F::VOP3, 0x30F, false, add_co},   {F::VOP3, 0x310, false, sub},
+    {F::VOP3, 0x319, false, subrev},   {F::VOP2, 0x28, true, add_co_ci},
+    {F::VOP2, 0x29, true, sub_ci},     {F::VOP2, 0x2A, true, subrev_ci},
+    {F::VOP3, 0x128, true, add_co_ci}, {F::VOP3, 0x129, true, sub_ci},
     {F::VOP3, 0x12A, true, subrev_ci},
 };
 
@@ -85,7 +89,9 @@ Built build(const VectorCarryDef& def) {
 
 }   // namespace
 
-std::span<const VectorCarryDef> vector_carry_defs() { return kDefs; }
+std::span<const VectorCarryDef> vector_carry_defs() {
+    return kDefs;
+}
 
 const VectorCarryDef* find_vector_carry(Rdna2Format fmt, uint32_t opcode) {
     for (const auto& def : kDefs)
