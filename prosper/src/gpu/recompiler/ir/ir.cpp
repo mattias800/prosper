@@ -91,14 +91,24 @@ constexpr OpcodeInfo kInfo[] = {
     {"f32.unord.le", 2, Type::Bool},
     {"f32.unord.gt", 2, Type::Bool},
     {"f32.unord.ge", 2, Type::Bool},
+    {"pack.u64", 2, Type::U64},
+    {"u64.lo", 1, Type::U32},
+    {"u64.hi", 1, Type::U32},
+    {"u64.eq", 2, Type::Bool},
+    {"u64.ne", 2, Type::Bool},
+    {"u64.lt", 2, Type::Bool},
+    {"u64.le", 2, Type::Bool},
+    {"u64.gt", 2, Type::Bool},
+    {"u64.ge", 2, Type::Bool},
 };
-static_assert(std::size(kInfo) == static_cast<size_t>(Opcode::F32UnordGe) + 1);
+static_assert(std::size(kInfo) == static_cast<size_t>(Opcode::U64Ge) + 1);
 
 // The type argument `slot` of `op` must have.
 Type argument_type(Opcode op, size_t slot) {
     if (op == Opcode::BoolAnd || op == Opcode::BoolOr) return Type::Bool;
     if ((op == Opcode::Select || op == Opcode::BoolSelect) && slot == 0) return Type::Bool;
     if (op == Opcode::BoolSelect) return Type::Bool;
+    if (op >= Opcode::U64Lo && op <= Opcode::U64Ge) return Type::U64;
     return Type::U32;
 }
 

@@ -97,6 +97,17 @@ uint32_t emit_one(SpirvCompute& b, const Inst& inst, const uint32_t* x) {
         case Opcode::SLe: return b.scmp(Op_SLessThanEqual, x[0], x[1]);
         case Opcode::SGt: return b.scmp(Op_SGreaterThan, x[0], x[1]);
         case Opcode::SGe: return b.scmp(Op_SGreaterThanEqual, x[0], x[1]);
+        // 64-bit words: SpirvCompute's u64 helpers. ucmp passes its operands through unchanged
+        // (scmp would bitcast them to a 32-bit signed type, which is why there is no S64 relation).
+        case Opcode::PackU64: return b.u64_from_lohi(x[0], x[1]);
+        case Opcode::U64Lo: return b.u64_lo(x[0]);
+        case Opcode::U64Hi: return b.u64_hi(x[0]);
+        case Opcode::U64Eq: return b.ucmp(Op_IEqual, x[0], x[1]);
+        case Opcode::U64Ne: return b.ucmp(Op_INotEqual, x[0], x[1]);
+        case Opcode::U64Lt: return b.ucmp(Op_ULessThan, x[0], x[1]);
+        case Opcode::U64Le: return b.ucmp(Op_ULessThanEqual, x[0], x[1]);
+        case Opcode::U64Gt: return b.ucmp(Op_UGreaterThan, x[0], x[1]);
+        case Opcode::U64Ge: return b.ucmp(Op_UGreaterThanEqual, x[0], x[1]);
     }
     std::fprintf(stderr, "[ir] emit_one reached an input\n");   // emit_spirv binds inputs itself
     std::abort();

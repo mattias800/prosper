@@ -5,6 +5,7 @@
 #include "gpu/recompiler/ir/eval_normalized_pack.hpp"
 #include "gpu/recompiler/ir/eval_float_unary.hpp"
 #include "gpu/recompiler/ir/eval_float_compare.hpp"
+#include "gpu/recompiler/ir/eval_integer64.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -159,28 +160,59 @@ Known evaluate_op(Opcode op, uint32_t imm, uint32_t a, uint32_t b, uint32_t c) {
         case Opcode::SLe: return static_cast<uint32_t>(s(a) <= s(b));
         case Opcode::SGt: return static_cast<uint32_t>(s(a) > s(b));
         case Opcode::SGe: return static_cast<uint32_t>(s(a) >= s(b));
+        // A 64-bit word does not fit these 32-bit arguments: evaluate_wide routes them to
+        // evaluate_integer64 (eval_integer64.cpp).
+        case Opcode::PackU64:
+        case Opcode::U64Lo:
+        case Opcode::U64Hi:
+        case Opcode::U64Eq:
+        case Opcode::U64Ne:
+        case Opcode::U64Lt:
+        case Opcode::U64Le:
+        case Opcode::U64Gt:
+        case Opcode::U64Ge: return std::nullopt;
     }
     return std::nullopt;
 }
 
-std::vector<Known> evaluate(const Block& block, std::span<const Known> inputs) {
-    std::vector<Known> values(block.size());
+std::vector<Known64> evaluate_wide(const Block& block, std::span<const Known64> inputs) {
+    std::vector<Known64> values(block.size());
     for (size_t i = 0; i < block.size(); ++i) {
         const Inst& inst = block.insts()[i];
         if (inst.op == Opcode::Input) {
             if (inst.imm < inputs.size()) values[i] = inputs[inst.imm];
+            if (inst.type != Type::U64 && values[i] && *values[i] > UINT32_MAX)
+                values[i] = std::nullopt;
             continue;
         }
         const uint8_t arity = opcode_info(inst.op).arity;
-        uint32_t args[3] = {0, 0, 0};
+        uint64_t args[3] = {0, 0, 0};
         bool known = true;
         for (uint8_t slot = 0; slot < arity; ++slot) {
-            const Known& arg = values[inst.args[slot].index];
+            const Known64& arg = values[inst.args[slot].index];
             known = known && arg.has_value();
             if (arg) args[slot] = *arg;
         }
-        if (known) values[i] = evaluate_op(inst.op, inst.imm, args[0], args[1], args[2]);
+        if (!known) continue;
+        if (is_integer64_opcode(inst.op)) {
+            values[i] = evaluate_integer64(inst.op, args[0], args[1]);
+            continue;
+        }
+        // Every other opcode's arguments are U32 or Bool, which fit in 32 bits.
+        const Known v = evaluate_op(inst.op, inst.imm, static_cast<uint32_t>(args[0]),
+                                    static_cast<uint32_t>(args[1]), static_cast<uint32_t>(args[2]));
+        if (v) values[i] = *v;
     }
+    return values;
+}
+
+std::vector<Known> evaluate(const Block& block, std::span<const Known> inputs) {
+    const std::vector<Known64> wide_inputs(inputs.begin(), inputs.end());
+    const std::vector<Known64> wide = evaluate_wide(block, wide_inputs);
+    std::vector<Known> values(block.size());
+    for (size_t i = 0; i < block.size(); ++i)
+        if (wide[i] && block.insts()[i].type != Type::U64)
+            values[i] = static_cast<uint32_t>(*wide[i]);
     return values;
 }
 

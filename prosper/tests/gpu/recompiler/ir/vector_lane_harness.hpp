@@ -9,6 +9,8 @@
 //   buffer_store_dword v1 -> out[lane]
 // so every lane has its own operands, and an EXEC-inactive lane must come back with its OLD VDST.
 // One buffer (binding 3, V# in s[8:11]) holds the four input arrays and receives the result.
+// Optional fifth and sixth arrays load v5 (S2) and v6 (S3); a 64-bit op reads the pairs v[2:3]
+// (S0 low, S1 high) and v[5:6] (S2 low, S3 high).
 #pragma once
 
 #include "gpu/recompiler/bpermute_spirv_oracle.hpp"
@@ -24,7 +26,7 @@
 namespace prosper::test::ir {
 
 inline constexpr uint32_t kVdst = 1, kVsrc0 = 2, kVsrc1 = 3,
-                          kVsrc2 = 5;   // the registers the op must name
+                          kVsrc2 = 5, kVsrc3 = 6;   // the registers the op must name
 
 // VOP2 `op v1, v2, v3` (SRC0 = VGPR v2 is operand 256 + 2).
 inline uint32_t vop2(uint32_t op, uint32_t vdst = kVdst, uint32_t src0 = 256 + kVsrc0,
@@ -42,6 +44,7 @@ struct LaneInputs {
     std::vector<bool> active;
     std::vector<uint32_t>
         s2; // optional independent fifth array; old four-array programs stay identical
+    std::vector<uint32_t> s3;   // optional sixth array (v6); requires s2
     size_t lanes() const { return s0.size(); }
 };
 
@@ -79,7 +82,8 @@ struct LaneProgram {
     prosper::gpu::ComputeShaderConfig config;
 };
 inline LaneProgram lane_program(const std::vector<uint32_t>& op_words, uint32_t lanes,
-                                uint32_t wave, bool third_source = false) {
+                                uint32_t wave, bool third_source = false,
+                                bool fourth_source = false) {
     using namespace prosper::gpu;
     const auto load = [&](uint32_t vdata, uint32_t array) -> std::vector<uint32_t> {
         // buffer_load_dword vN, v0 (idxen), s[8:11], offset = array * lanes * 4 bytes
@@ -90,6 +94,10 @@ inline LaneProgram lane_program(const std::vector<uint32_t>& op_words, uint32_t 
         code.insert(code.end(), words.begin(), words.end());
     if (third_source) {
         const auto words = load(kVsrc2, 4);
+        code.insert(code.end(), words.begin(), words.end());
+    }
+    if (fourth_source) {
+        const auto words = load(kVsrc3, 5);
         code.insert(code.end(), words.begin(), words.end());
     }
     code.push_back(0xbf8c3f70u);   // s_waitcnt vmcnt(0)
@@ -105,7 +113,7 @@ inline LaneProgram lane_program(const std::vector<uint32_t>& op_words, uint32_t 
     r.binding = 3;
     r.sgpr_base = 8;
     r.stride = 4;
-    r.size = (third_source ? 5u : 4u) * lanes * 4u;
+    r.size = (fourth_source ? 6u : third_source ? 5u : 4u) * lanes * 4u;
     ShaderResourceTable table;
     table.resources.push_back(r);
     ComputeShaderConfig config;
@@ -127,7 +135,9 @@ run_vector_op_per_lane(const std::vector<uint32_t>& op_words, const LaneInputs& 
     using namespace prosper::gpu;
     const uint32_t lanes = static_cast<uint32_t>(in.lanes());
     if (!in.s2.empty() && in.s2.size() != lanes) return {{}, "S2 lane count mismatch"};
-    auto program = lane_program(op_words, lanes, wave, !in.s2.empty());
+    if (!in.s3.empty() && in.s3.size() != lanes) return {{}, "S3 lane count mismatch"};
+    if (!in.s3.empty() && in.s2.empty()) return {{}, "S3 requires S2"};
+    auto program = lane_program(op_words, lanes, wave, !in.s2.empty(), !in.s3.empty());
     program.config.compute_pgm_rsrc1 = compute_pgm_rsrc1;
     const auto& code = program.code;
     const uint64_t address = lane_harness_address();
@@ -138,6 +148,7 @@ run_vector_op_per_lane(const std::vector<uint32_t>& op_words, const LaneInputs& 
     for (const auto* array : {&in.s0, &in.s1, &in.old_d}) buffer.insert(buffer.end(), array->begin(), array->end());
     for (bool active : in.active) buffer.push_back(active ? 1u : 0u);
     buffer.insert(buffer.end(), in.s2.begin(), in.s2.end());
+    buffer.insert(buffer.end(), in.s3.begin(), in.s3.end());
     bpermute_oracle::Interpreter vm(module);
     vm.half_rte_preserve_denorm = half_rte_preserve_denorm;
     auto out = vm.run_buffers(lanes, {{3, buffer}}, 3);

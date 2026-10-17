@@ -306,6 +306,7 @@ Where things are:
 | --- | --- |
 | `ops/vector_compare.hpp`, `ops/vector_compare.cpp` | `VectorCompareDef {opcode, build}`, the group list, `find_vector_compare`, `eval_vector_compare`, `emit_vector_compare` |
 | `ops/vector_compare_f32.cpp` | the worked example: 16 definitions, one per V_CMP_*_F32 opcode |
+| `ops/vector_compare_i64_u64.cpp` | the 64-bit worked example: `pair_sources` definitions that read both halves of each source |
 | `lower/vopc.cpp` | `VopcLowering::lower()`: source reads, admission and refusals, source modifiers, SDWA selects, 64-bit halves, the value overrides, then the value and the mask write |
 | `lower/vopc_compare_values.cpp` | `compare_value()`: the value overrides, then a definition if one exists, then the remaining `switch`, one function per not-yet-migrated group |
 | `lower/vopc_mask_write.cpp` | `write_vopc_mask`, the shared mask write |
@@ -388,9 +389,9 @@ Changing any of them is a lead change, even when it looks mechanical:
    do it in a separate, explained PR, as in Group 5.
 4. Run the corpus gate, a witness corpus and the controls (below).
 
-**64-bit groups (I64, U64, F64): stop and report.** The IR has no 64-bit type. The current
-lowering builds the operands with `u64_from_lohi`, which no IR opcode expresses, and an opcode has
-at most three arguments. The lead adds the type first.
+**64-bit groups.** I64 and U64 are done (`ops/vector_compare_i64_u64.cpp`), and they are the
+worked example of "64-bit values" below. F64 is not a migration: the switch never handled it, so it
+is an admission, and the IR has no F64 type for it (see the F64 stop point below).
 
 ### How to test the mask
 
@@ -457,6 +458,129 @@ The F32 group's results:
 So the witness corpus is required. The recorded corpus alone could not show that the constant
 compares still work.
 
+## 64-bit values
+
+The IR has one 64-bit type, `Type::U64`: a raw 64-bit word, as `U32` is a raw 32-bit word. The
+opcode decides what the bits mean. In SPIR-V it is `SpirvCompute::t_u64()`, the 64-bit unsigned
+integer whose `Int64` capability the pre-IR emitter already declared (lazily, on first use) for its
+register-pair arithmetic. The VOPC I64/U64 compares were moved onto it as the worked example
+(`ops/vector_compare_i64_u64.cpp`).
+
+The 64-bit opcodes sit together at the end of `Opcode`:
+
+| opcode | builder | SPIR-V (the pre-IR helper) | meaning |
+| --- | --- | --- | --- |
+| `PackU64` | `pack_u64(lo, hi)` | `u64_from_lohi` | two U32 words -> `hi << 32 \| lo` |
+| `U64Lo`, `U64Hi` | `u64lo(v)`, `u64hi(v)` | `u64_lo`, `u64_hi` | a U64 -> one of its U32 words |
+| `U64Eq` .. `U64Ge` | `u64eq` .. `u64ge` | `ucmp(Op_IEqual ..)` | unsigned relations, returning Bool |
+
+There are **no signed 64-bit relations**. `pack_u64_signed_order(lo, hi)` packs the word with its
+sign bit flipped, and the unsigned order of two such words is the signed order of the values. That
+is what the pre-IR emitter wrote, so it keeps the bytes. `scmp` would bitcast its operands to a
+32-bit signed type, and the interpreter's 64-bit relations are unsigned only, so an `S64Lt` would
+need both of those changed and cited first.
+
+### Evaluation
+
+`Known` stays a 32-bit `std::optional`, so the folder and every existing caller are unchanged.
+`evaluate_wide` holds every value in 64 bits (`Known64`), and `evaluate` is the same pass with a
+U64 entry always unknown, because a U64 word has no 32-bit view. A Block whose inputs and result are
+U32 or Bool, as every compare's are, needs nothing more than `evaluate`. The 64-bit opcodes are
+evaluated in `eval_integer64.cpp`, which `evaluate_wide` reaches through `is_integer64_opcode`.
+
+A new 64-bit opcode goes in the usual five places, with three more things to get right:
+
+- keep it inside the `PackU64` .. last-64-bit-opcode range, so `is_integer64_opcode` routes it;
+- say in `ir.cpp`'s `argument_type` which of its argument slots are U64 (today the range
+  `U64Lo` .. `U64Ge` takes U64 in every slot, and `PackU64` takes two U32 words). A shift is
+  `(U64 value, U32 count)`, so it needs a per-slot rule;
+- `evaluate_integer64` receives every argument zero-extended to 64 bits.
+
+### Reading a 64-bit operand
+
+A guest 64-bit operand reaches the definition as **two U32 words**, low and high. Getting them is
+operand bookkeeping, so it stays in `lower/`, and it must keep the old code's rules exactly
+(`VopcLowering::integer64_halves` is the model):
+
+- a VGPR, an SGPR or an addressable special pair: `val(source)` and `val(source + 1)`;
+- an inline integer: the high word is its sign (`-1` gives `0xffffffff`);
+- a 32-bit literal and `SGPR_NULL`: the high word is 0;
+- an inline float: refuse. In a 64-bit operand it is a double, not a pair built from its f32 bits;
+- keep each read where the old code read it. `lower()` reads the low words first (`ra`, `rc`) and
+  the high words later, and those reads can emit.
+
+The definition gets the four words and packs them itself, so the pack is part of its bytes. For a
+compare, mark the definition `pair_sources = true`. It then receives `s0`, `s0_hi`, `s1`, `s1_hi`
+in `VectorCompareIn`, the lowering calls `emit_vector_compare_pairs`, and tests call
+`eval_vector_compare_pairs`. Calling the 32-bit pair of functions with a `pair_sources` definition,
+or the reverse, aborts.
+
+**Unused values stay.** The old signed compare packed both sources plainly and as order keys, then
+used only one of the two pairs. The I64 definitions append all four packs for byte identity, so an
+I64 EQ emits two dead order keys. Removing dead values is a byte change for its own PR.
+
+### Writing a 64-bit result
+
+A VOP3 64-bit result (the shifts) is written as two VGPRs. The old code is:
+
+```cpp
+const uint32_t result = b.u64_shift(Op_ShiftLeftLogical, b.u64_from_lohi(lo, hi), amount);
+const uint32_t old_hi = vreg_old(b, rs, hi_dst);   // can emit uconst(0)
+vreg[in.dst.value] = b.u64_lo(result);
+vreg[hi_dst] = b.u64_hi(result);
+predicate_write(b, rs, hi_dst, old_hi);
+```
+
+`vreg_old` sits between the value and the unpack, and it can allocate a constant, so the unpack must
+stay after it. Build two Blocks: the definition's Block ends at the U64 value, and a second Block
+takes that value as an input (`ir.input(Type::U64)`) and appends `u64lo` then `u64hi`. Never move
+`vreg_old` or `predicate_write`: they are lowering bookkeeping.
+
+### Testing it
+
+- **Opcodes.** `test_ir_core_integer64.cpp` evaluates every 64-bit opcode on hand-worked values,
+  enforces the U32/U64 argument types, and runs each opcode's SPIR-V per lane in the interpreter
+  against `evaluate`. A new 64-bit opcode adds a row there and a hand-worked case.
+- **The per-lane harness takes 64-bit sources.** `LaneInputs::s2` and `s3` load v5 and v6, so a
+  64-bit op reads the pairs v[2:3] (`s0` low, `s1` high) and v[5:6] (`s2` low, `s3` high).
+  `compare_program(op, form, 0, 0, kVsrc2)` names v[5:6] as SRC1, and `export_compare_witness`
+  does that by itself for a `pair_sources` group.
+- **Inputs that catch a half-read operand.** Include pairs that differ only in the high word, only
+  in the low word with bit 31 set (an unsigned low comparison), the sign boundary
+  `0x80000000_00000000` against `0x7fffffff_ffffffff`, `-1` against `0`, and pairs whose signed and
+  unsigned orders disagree. Make the random lanes share high words in some lanes, so the low words
+  decide there.
+- **Constant operands.** Run inline integers, a literal and an inline float through the real
+  lowering: the first two extend, and the last refuses
+  (`test_ir_vector_compare_i64_u64_execution.cpp`, `ConstantSourcesExtendToSixtyFourBits` and
+  `RefusalsStay`). Put the constant-operand programs in the witness corpus too.
+
+The I64/U64 group's gate, with one positive control per definition (the relation mirrored with
+swapped operands, or EQ/NE's operands swapped):
+
+| | recorded corpus (1,442 modules) | witness (168 programs) |
+| --- | --- | --- |
+| the migration | `changes: none` | `changes: none` |
+| each of the 12 controls | **none** for 11; `output-changed 1` for `ne_u64` (one *House of the Dead 2* compute program) | `output-changed 14` for each: its own ten forms and four constant operands |
+
+The witness is 12 definitions in five forms and two wave sizes, plus four constant SRC0 operands
+per definition. So a 64-bit family needs the witness corpus: the recorded one reaches one of
+twelve definitions.
+
+### Stop and report: F64
+
+**The IR has no F64, and nothing in the recompiler declares the `Float64` capability.** The old
+emitter admits no F64 instruction at all (no F64 compare, arithmetic or conversion), so every F64
+family is an **admission**, a behaviour change, not a migration. Do not build it on `U64` bits with
+integer arithmetic, and do not add `Float64` yourself. Stop and report when a family needs any of:
+
+- an F64 value type or the `Float64` capability (any F64 arithmetic, compare or conversion);
+- F64 rounding modes or denormal handling (`MODE` FP_ROUND / FP_DENORM for 64-bit), or the F64
+  NaN and signed-zero rules beyond what the F32 compares pin;
+- a 64-bit literal: `uconst64` emits a two-word constant only for values above 32 bits, and its
+  comment records a driver that misparses that form;
+- a signed 64-bit relation that cannot be written with `pack_u64_signed_order`.
+
 ## Family list and order
 
 Remaining in `rdna2_emit_alu.cpp`, in the order to migrate them. Codex takes the open groups; the
@@ -478,7 +602,11 @@ and leave the reserved ones in the `switch`.
 | 9 | VOPC I16 and U16 (the same six relations; the [15:0] extension goes in the definition) | Codex, using the compare recipe |
 | 10 | VOPC F16 (`v_cmp/cmpx_{lt,eq,le,gt,lg,ge}_f16`: only the six the switch admits) | Codex, using the compare recipe |
 | 11 | VOPC `v_cmp/cmpx_class_f32` | Codex, using the compare recipe |
-| - | VOPC I64, U64 and F64 (needs a 64-bit IR type first), and admitting any compare the switch refuses today | lead, then Codex |
+| 12 | VOP3 64-bit shifts: `v_lshlrev_b64`, `v_lshrrev_b64` (the two the old code admits, with their exact SRC admission), using a new `(U64, U32)` shift opcode on `u64_shift`; `v_ashrrev_i64` is an admission | Codex, using the 64-bit recipe |
+| 13 | VOPC F64 compares (`v_cmp/cmpx_*_f64`) | Codex, using the 64-bit recipe; an admission that stops at the F64 point until the lead adds an F64 type |
+| 14 | VOP3 F64 arithmetic (`v_add/mul/fma_f64`, `v_min/max_f64`, `v_ldexp_f64`, `v_div_*_f64`, ...) | Codex, using the 64-bit recipe; same F64 stop point |
+| 15 | 64-bit conversions (`v_cvt_f64_*`, `v_cvt_*_f64`, `v_frexp_*_f64`) | Codex, using the 64-bit recipe; same F64 stop point |
+| - | Admitting any compare the switch refuses today | lead, then Codex |
 | - | VOP2 `v_cndmask_b32`, carry ops `v_add/sub/subrev_co_ci_u32` (VCC), the VOPC mask write (`lower/vopc_mask_write.cpp`), VOP3B (`v_add_co_u32`, `v_div_scale`, `v_mad_u64_u32`: SGPR carry masks), `v_mbcnt` | lead (wave masks) |
 | - | DPP (the VOP1/VOP2 DPP routes and SRC0 stage), `v_permlane*`, `v_readlane/writelane/readfirstlane`, `ds_bpermute/permute`, quad and swizzle ops | lead (cross-lane) |
 | - | `v_movrel*`, `s_movrel*`, and the memory families SMEM, MUBUF/MTBUF, FLAT, MIMG, DS (descriptor provenance, raw windows, active-word marks) | lead (proof and definedness) |

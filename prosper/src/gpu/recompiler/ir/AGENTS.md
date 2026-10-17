@@ -9,9 +9,9 @@ Everything here is private to `gpu/recompiler`.
 
 | path | role |
 | --- | --- |
-| `ir.hpp`, `ir.cpp` | the IR core: `Type`, `Value`, `Opcode`, `Inst`, `Block` and the rules a Block enforces |
+| `ir.hpp`, `ir.cpp` | the IR core: `Type` (U32, Bool, and the 64-bit word U64), `Value`, `Opcode`, `Inst`, `Block` and the rules a Block enforces |
 | `builder.hpp` | typed helpers that append instructions to a Block |
-| `eval.hpp`, `eval.cpp` | the evaluation half of every opcode: what the constant folder computes |
+| `eval.hpp`, `eval.cpp` | the evaluation half of every opcode: what the constant folder computes (`eval_integer64.cpp` for the 64-bit words) |
 | `emit/` | the SPIR-V half of every opcode: a Block emitted through `SpirvCompute`, in Block order |
 | `ops/` | ONE definition per guest operation (`scalar_alu.cpp`, `scalar_compare.cpp`, `vector_alu.cpp`), used by both evaluation and emission |
 | `lower/` | RDNA2 -> IR per format: `sop1.cpp`, `sop2.cpp`, `sopc.cpp`, `sopk.cpp`, `vop2.cpp`, the relocated `*_routes.cpp` / `*_stages.cpp`, and `lowering_context.hpp` (emit_alu's shared locals) |

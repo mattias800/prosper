@@ -23,42 +23,15 @@ uint32_t VopcLowering::compare_value() {
         case 0x88: return compare_class_f32();
         default: break;
     }
-    // Opcodes with an ir/ops definition (ops/vector_compare_*.cpp).
-    if (const VectorCompareDef* def = find_vector_compare(eff))
+    // Opcodes with an ir/ops definition (ops/vector_compare_*.cpp). A 64-bit group reads the
+    // source halves integer64_halves prepared in lower().
+    if (const VectorCompareDef* def = find_vector_compare(eff)) {
+        if (def->pair_sources)
+            return emit_vector_compare_pairs(b, *def, a64.lo, a64.hi, c64.lo, c64.hi);
         return emit_vector_compare(b, *def, a, c);
-    uint32_t cmp = 0;
-    switch (eff) {
-        case 0xA1: case 0xA2: case 0xA3: case 0xA4: case 0xA5: case 0xA6:
-            cmp = compare_integer64_signed();
-            break;
-        case 0xE1: case 0xE2: case 0xE3: case 0xE4: case 0xE5: case 0xE6:
-            cmp = compare_integer64_unsigned();
-            break;
-        default: ok = false;
     }
-    return cmp;
-}
-
-uint32_t VopcLowering::compare_integer64_signed() {
-    uint32_t cmp = 0;
-    const uint32_t lhs = b.u64_from_lohi(a64.lo, a64.hi);
-    const uint32_t rhs = b.u64_from_lohi(c64.lo, c64.hi);
-    // Flipping the sign bit maps two's-complement signed order onto unsigned order.
-    // Keep the values in the declared u64 type: the generic `scmp` helper bitcasts
-    // 32-bit operands and therefore cannot be used for a 64-bit scalar.
-    const uint32_t ordered_lhs = b.u64_from_lohi(
-        a64.lo, b.ibin(Op_BitwiseXor, a64.hi, b.uconst(0x80000000u)));
-    const uint32_t ordered_rhs = b.u64_from_lohi(
-        c64.lo, b.ibin(Op_BitwiseXor, c64.hi, b.uconst(0x80000000u)));
-    switch (eff) {
-        case 0xA1: cmp = b.ucmp(Op_ULessThan, ordered_lhs, ordered_rhs); break; // v_cmp_lt_i64
-        case 0xA2: cmp = b.ucmp(Op_IEqual, lhs, rhs); break;               // v_cmp_eq_i64
-        case 0xA3: cmp = b.ucmp(Op_ULessThanEqual, ordered_lhs, ordered_rhs); break; // v_cmp_le_i64
-        case 0xA4: cmp = b.ucmp(Op_UGreaterThan, ordered_lhs, ordered_rhs); break; // v_cmp_gt_i64
-        case 0xA5: cmp = b.ucmp(Op_INotEqual, lhs, rhs); break;            // v_cmp_ne_i64
-        default:   cmp = b.ucmp(Op_UGreaterThanEqual, ordered_lhs, ordered_rhs); break; // v_cmp_ge_i64
-    }
-    return cmp;
+    ok = false;
+    return 0;
 }
 
 uint32_t VopcLowering::compare_class_f32() {
@@ -74,21 +47,6 @@ uint32_t VopcLowering::compare_class_f32() {
         return emit_vector_compare(b, *def, class_raw, rc);
     ok = false;
     return 0;
-}
-
-uint32_t VopcLowering::compare_integer64_unsigned() {
-    uint32_t cmp = 0;
-    const uint32_t lhs = b.u64_from_lohi(a64.lo, a64.hi);
-    const uint32_t rhs = b.u64_from_lohi(c64.lo, c64.hi);
-    switch (eff) {
-        case 0xE1: cmp = b.ucmp(Op_ULessThan, lhs, rhs); break;             // v_cmp_lt_u64
-        case 0xE2: cmp = b.ucmp(Op_IEqual, lhs, rhs); break;                // v_cmp_eq_u64
-        case 0xE3: cmp = b.ucmp(Op_ULessThanEqual, lhs, rhs); break;        // v_cmp_le_u64
-        case 0xE4: cmp = b.ucmp(Op_UGreaterThan, lhs, rhs); break;          // v_cmp_gt_u64
-        case 0xE5: cmp = b.ucmp(Op_INotEqual, lhs, rhs); break;             // v_cmp_ne_u64
-        default:   cmp = b.ucmp(Op_UGreaterThanEqual, lhs, rhs); break;     // v_cmp_ge_u64
-    }
-    return cmp;
 }
 
 // f16 compares (0xC8-0xCF; cmpx at +0x10 = 0xD8-0xDF folds here too — DOLL's title
