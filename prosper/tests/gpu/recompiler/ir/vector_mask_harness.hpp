@@ -67,6 +67,7 @@ inline LaneInputs mask_lane_inputs(uint32_t seed) {
 struct MaskWitness {
     std::vector<uint32_t> words;
     std::vector<uint32_t> waves{64u, 32u};
+    bool fourth_source = false;   // also load v6 (S3), for an op that reads the pair v[5:6]
 };
 
 // Writes each program as a replayable sidecar pair under the witness root `name`
@@ -88,7 +89,7 @@ inline size_t export_mask_witness(const std::vector<MaskWitness>& programs, cons
     size_t count = 0;
     for (const auto& program : programs)
         for (uint32_t wave : program.waves) {
-            const auto lp = lane_program(program.words, 64, wave, true);
+            const auto lp = lane_program(program.words, 64, wave, true, program.fourth_source);
             write_compare_witness_program(dump, base_address + count * 0x100, count, lp);
             ++count;
         }

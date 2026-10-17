@@ -165,3 +165,30 @@ TEST(IrLowerVectorMask, Vop2CarryReadsAndReplacesVcc) {
     no_vcc.vop2_op(0x01);
     EXPECT_FALSE(no_vcc.ok);
 }
+
+// #5348: in a Wave32 B32-mask stage the implicit VCC is VCC_LO, so the e32 carry writes the same
+// word the VOP3B form's `sdst = vcc_lo` does: the VCC_LO B32 lifetime is the new carry, not the
+// previous mask the e64 readers would otherwise prefer. Wave64 has no B32 lifetime.
+TEST(IrLowerVectorMask, Wave32Vop2CarryReplacesTheVccLoLifetime) {
+    Mask t;
+    t.b.wave_size = 32;
+    t.b.allow_b32_masks = true;
+    t.rs.vcc = t.b.btrue();
+    t.rs.sreg_bool[106] = t.rs.vcc;
+    t.rs.sreg_bool_b32.insert(106);
+    t.set_sgpr(106, 0x1234);
+    ASSERT_TRUE(t.vop2_op(0x28));
+    EXPECT_TRUE(t.ok);
+    EXPECT_NE(t.rs.vcc, t.b.btrue());
+    EXPECT_EQ(t.rs.sreg_bool.at(106), t.rs.vcc) << "the lifetime and VCC are the same mask";
+    EXPECT_TRUE(t.rs.sreg_bool_b32.contains(106));
+    EXPECT_TRUE(t.rs.sreg_bool_narrowed[106]);
+    EXPECT_FALSE(t.rs.sreg.contains(106)) << "the old data word is retired";
+
+    Mask wave64;
+    wave64.rs.vcc = wave64.b.btrue();
+    ASSERT_TRUE(wave64.vop2_op(0x28));
+    EXPECT_NE(wave64.rs.vcc, wave64.b.btrue());
+    EXPECT_FALSE(wave64.rs.sreg_bool.contains(106)) << "Wave64: VCC only";
+    EXPECT_FALSE(wave64.rs.sreg_bool_b32.contains(106));
+}
