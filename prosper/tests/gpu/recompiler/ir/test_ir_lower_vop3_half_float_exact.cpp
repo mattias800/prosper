@@ -8,6 +8,7 @@
 #include "gpu/recompiler/ir/ops/vector_conversion.hpp"
 #include "gpu/recompiler/ir/ops/vector_half_float_exact_e64.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include <gtest/gtest.h>
 #include <cstdint>
 #include <initializer_list>

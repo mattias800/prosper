@@ -6,6 +6,7 @@
 #include "gpu/recompiler/ir/vector_lane_harness.hpp"
 #include "gpu/recompiler/bpermute_spirv_oracle.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/diagnostics/refused_shader_inputs.hpp"
 #include "fixtures/test_scratch.h"
 #include <gtest/gtest.h>
