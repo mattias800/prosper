@@ -1,5 +1,7 @@
 // Test-owned selector arrays and row arithmetic, independent of the production packed-nibble graph.
 #pragma once
+#include "gpu/recompiler/bpermute_spirv_oracle.hpp"
+#include <cstddef>
 #include "gpu/recompiler/ir/vector_lane_harness.hpp"
 #include <algorithm>
 #include <array>

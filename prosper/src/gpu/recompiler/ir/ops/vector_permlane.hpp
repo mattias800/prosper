@@ -1,5 +1,6 @@
 // PERMLANE16/X16 values. Register/source authority and final destination predication stay lower.
 #pragma once
+#include "gpu/recompiler/ir/ir.hpp"
 #include "gpu/recompiler/ir/builder.hpp"
 #include <cstdint>
 #include <functional>

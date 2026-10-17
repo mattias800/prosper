@@ -1,5 +1,13 @@
 // Actual RDNA2 scalar selector tables must gather different lanes and preserve destination EXEC.
 // FI=0/BC=0 expectations explicitly retain the old implementation's compatibility contract.
+#include "gpu/recompiler/ir/vector_lane_harness.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <ios>
+#include <string>
+#include <vector>
 #include "gpu/recompiler/ir/permlane_cases.hpp"
 #include "gpu/diagnostics/refused_shader_inputs.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"

@@ -1,5 +1,11 @@
 // Migration must retain source guards, native-row contracts, late inputs and caller-owned masks.
-#include "gpu/recompiler/ir/permlane_cases.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <vector>
 #include "gpu/recompiler/ir/lowering_fixture.hpp"
 #include "gpu/recompiler/ir/lower/vop3_cross_lane_lowering.hpp"
 #include "gpu/recompiler/ir/ops/vector_permlane.hpp"

@@ -1,4 +1,11 @@
 // Pin native row/nibble math independently, and label inherited FI/BC compatibility separately.
+#include "gpu/recompiler/bpermute_spirv_oracle.hpp"
+#include "gpu/recompiler/ir/builder.hpp"
+#include "gpu/recompiler/ir/ir.hpp"
+#include "gpu/recompiler/ir/eval.hpp"
+#include <cstddef>
+#include <cstdint>
+#include <vector>
 #include "gpu/recompiler/ir/permlane_cases.hpp"
 #include "gpu/recompiler/ir/ops/vector_permlane.hpp"
 #include "gpu/recompiler/ir/emit/spirv_emitter.hpp"
@@ -92,12 +99,12 @@ void check(bool compatibility) {
                 }
         }
 }
-} // namespace
+}   // namespace
 TEST(IrVectorPermlaneValues, IsaRowAndNibbleTruthMatchesEvalAndEmittedSpirv) {
     check(false);
 }
 TEST(IrVectorPermlaneValues, InheritedInactiveSourceOldDestinationChoiceStaysCompatible) {
-    check(true); // FI=0/BC=0 is compatibility, not an independently settled ISA interpretation.
+    check(true);   // FI=0/BC=0 is compatibility, not an independently settled ISA interpretation.
 }
 TEST(IrVectorPermlaneValues, EachNativeRowPairRetainsItsOwnWave32Slice) {
     const auto in = cases::inputs(64);
