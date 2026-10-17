@@ -85,6 +85,7 @@ constexpr OpcodeInfo kInfo[] = {
     {"f32.eq", 2, Type::Bool},
     {"f32.ldexp", 2, Type::U32},
     {"pack.norm16", 1, Type::U32},
+    {"normalize.field", 1, Type::U32},
     {"f32.le", 2, Type::Bool},
     {"f32.gt", 2, Type::Bool},
     {"f32.lg", 2, Type::Bool},
@@ -172,6 +173,9 @@ Value Block::append(const Inst& inst) {
         malformed("half component out of range", info);
     if (inst.op == Opcode::PackNorm16 && inst.imm > 1)
         malformed("normalized-pack mode out of range", info);
+    if (inst.op == Opcode::NormalizeField &&
+        (!(inst.imm & 0x7fffffffu) || (inst.imm & 0x7fffffffu) >= 0x7f800000u))
+        malformed("normalized-field divisor must be finite and positive", info);
     insts_.push_back(inst);
     return Value{static_cast<uint32_t>(insts_.size() - 1)};
 }

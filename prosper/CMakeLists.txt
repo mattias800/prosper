@@ -3817,6 +3817,9 @@ if(TARGET prosper_core)
           ir_buffer_address
           ir_buffer_address_execution
           ir_lower_buffer_address
+          ir_lower_buffer_format_values
+          ir_buffer_format_values
+          ir_buffer_format_execution
           ir_lower_vop3_half_float_exact
           ir_vector_half_float_exact_e64_execution
           )

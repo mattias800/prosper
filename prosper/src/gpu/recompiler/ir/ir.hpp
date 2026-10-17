@@ -113,6 +113,7 @@ enum class Opcode : uint8_t {
     F32Eq,   // ordered equality over binary32 words, returning Bool
     F32Ldexp,   // binary32 word scaled by a signed integer exponent
     PackNorm16,   // raw binary32 to normalized low half; imm0 unsigned, imm1 signed
+    NormalizeField,   // integer field / positive f32 divisor; imm31 signed/clamp, imm[30:0] divisor
     // The rest of the binary32 relations over raw words, returning Bool (with F32Lt, F32Eq, F32Ge
     // and F32UnordNe above). Ordered relations are false when either word is a NaN; unordered
     // ones are true.
@@ -160,9 +161,9 @@ enum class Opcode : uint8_t {
     // Cross-lane values (HOW_TO_ADD_A_FAMILY.md, "Cross-lane operations"). Their result depends on
     // other invocations of the host subgroup, so `evaluate` (one invocation; the constant folder)
     // never knows one. eval_lanes.hpp evaluates a Block over an explicit vector of invocations.
-    LaneId,    // () -> u32: this invocation's index in the host subgroup
+    LaneId,   // () -> u32: this invocation's index in the host subgroup
     Shuffle,   // (u32 value, u32 lane) -> u32: `value` of invocation `lane`; undefined (unknown)
-               // when `lane` is not an invocation of the subgroup
+    // when `lane` is not an invocation of the subgroup
 };
 
 struct OpcodeInfo {
