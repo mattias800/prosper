@@ -42,18 +42,21 @@ inline bool is_cmpx(Form form) { return form == Form::CmpxVopc || form == Form::
 
 // VOPC e32: v_cmp_* vcc, v2, v3. VOP3 e64 (llvm-mc gfx1030): word 0 carries the opcode, the ABS
 // bits [10:8] and SDST [7:0]; word 1 SRC0, SRC1 and NEG [31:29].
-inline std::vector<uint32_t> compare_words(uint32_t op, Form form, uint32_t abs = 0, uint32_t neg = 0) {
+// `vsrc1` names SRC1's VGPR: a 64-bit group passes kVsrc2, so its sources are v[2:3] and v[5:6].
+inline std::vector<uint32_t> compare_words(uint32_t op, Form form, uint32_t abs = 0, uint32_t neg = 0,
+                                           uint32_t vsrc1 = kVsrc1) {
     const uint32_t opcode = is_cmpx(form) ? op + 0x10u : op;
     if (form == Form::VopcVcc || form == Form::CmpxVopc)
-        return {0x7c000000u | (opcode << 17) | (kVsrc1 << 9) | (256 + kVsrc0)};
+        return {0x7c000000u | (opcode << 17) | (vsrc1 << 9) | (256 + kVsrc0)};
     const uint32_t sdst = form == Form::Vop3Sgpr ? kSgprPair : form == Form::Vop3Vcc ? kVcc : 0x7e;
     return {0xd4000000u | (opcode << 16) | (abs << 8) | sdst,
-            (256 + kVsrc0) | ((256 + kVsrc1) << 9) | (neg << 29)};
+            (256 + kVsrc0) | ((256 + vsrc1) << 9) | (neg << 29)};
 }
 
 // The instruction words under test: the compare, then a read of the mask it wrote into v1.
-inline std::vector<uint32_t> compare_program(uint32_t op, Form form, uint32_t abs = 0, uint32_t neg = 0) {
-    auto words = compare_words(op, form, abs, neg);
+inline std::vector<uint32_t> compare_program(uint32_t op, Form form, uint32_t abs = 0, uint32_t neg = 0,
+                                             uint32_t vsrc1 = kVsrc1) {
+    auto words = compare_words(op, form, abs, neg, vsrc1);
     if (is_cmpx(form)) {
         words.push_back(kMovV1One);
         return words;
@@ -85,44 +88,63 @@ inline void check_compare_run(const VectorCompareDef& def, Form form, uint32_t w
     }
 }
 
+// The witness root for `name`: PROSPER_IR_WITNESS_DIR when set, otherwise a scratch directory.
+inline std::filesystem::path compare_witness_root(const char* name) {
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): this process never mutates its launch environment.
+    const char* configured = std::getenv("PROSPER_IR_WITNESS_DIR");
+    return configured ? std::filesystem::path(configured)
+                      : prosper_test::test_scratch_dir() / name;
+}
+inline std::filesystem::path compare_witness_dump(const char* name) {
+    return compare_witness_root(name) / "refused_shaders_20000101-000000Z_synthetic";
+}
+
+// Writes one program as a replayable sidecar pair in `dump` and checks that it replays.
+inline void write_compare_witness_program(const std::filesystem::path& dump, uint64_t address,
+                                          size_t index, const LaneProgram& lp) {
+    const std::filesystem::path stem =
+        dump / ("cs_" + std::to_string(address) + "_" + std::to_string(index));
+    std::ofstream bin(stem.string() + ".bin", std::ios::binary);
+    bin.write(reinterpret_cast<const char*>(lp.code.data()),
+              static_cast<std::streamsize>(lp.code.size() * sizeof(uint32_t)));
+    bin.close();
+    EXPECT_TRUE(bin.good());
+    const std::filesystem::path inputs = stem.string() + ".inputs";
+    EXPECT_TRUE(prosper::gpu::write_refused_compute_inputs(
+        inputs, address, &lp.table, lp.config, "synthetic-witness (no live refusal)"));
+    const auto read = prosper::gpu::read_refused_shader_inputs(inputs);
+    EXPECT_TRUE(read.incomplete.empty()) << read.incomplete;
+    const auto replay = prosper::gpu::replay_refused_shader_inputs(lp.code, read);
+    EXPECT_TRUE(replay.produced) << replay.reject << " at " << address;
+}
+
 // Writes every definition of `defs` in every Form and both wave sizes as replayable sidecars, for
 // the corpus gate (HOW_TO_ADD_A_FAMILY.md, "synthetic witness corpus"). PROSPER_IR_WITNESS_DIR
 // names the output directory; without it the export goes to scratch, which still proves every
-// program replays. Returns the number of programs written.
+// program replays. Returns the number of programs written. A pair_sources definition is written
+// with its 64-bit sources v[2:3] and v[5:6], and the program loads v5 and v6.
 inline size_t export_compare_witness(std::span<const VectorCompareDef> defs, const char* name,
                                      uint64_t base_address) {
     namespace fs = std::filesystem;
     // NOLINTNEXTLINE(concurrency-mt-unsafe): this process never mutates its launch environment.
-    const char* configured = std::getenv("PROSPER_IR_WITNESS_DIR");
-    const fs::path root = configured ? fs::path(configured) : prosper_test::test_scratch_dir() / name;
+    const bool configured = std::getenv("PROSPER_IR_WITNESS_DIR") != nullptr;
+    const fs::path root = compare_witness_root(name);
     if (!configured) {
         std::error_code error;
         fs::remove_all(root, error);
         EXPECT_FALSE(error) << error.message();
     }
     EXPECT_FALSE(fs::exists(root)) << "witness export requires a new directory";
-    const fs::path dump = root / "refused_shaders_20000101-000000Z_synthetic";
+    const fs::path dump = compare_witness_dump(name);
     if (!fs::create_directories(dump)) return 0;
     size_t count = 0;
     for (const auto& def : defs)
         for (Form form : kForms)
             for (uint32_t wave : {64u, 32u}) {
-                const auto lp = lane_program(compare_program(def.opcode, form), 64, wave);
-                const uint64_t address = base_address + count * 0x100;
-                const fs::path stem =
-                    dump / ("cs_" + std::to_string(address) + "_" + std::to_string(count));
-                std::ofstream bin(stem.string() + ".bin", std::ios::binary);
-                bin.write(reinterpret_cast<const char*>(lp.code.data()),
-                          static_cast<std::streamsize>(lp.code.size() * sizeof(uint32_t)));
-                bin.close();
-                EXPECT_TRUE(bin.good());
-                const fs::path inputs = stem.string() + ".inputs";
-                EXPECT_TRUE(prosper::gpu::write_refused_compute_inputs(
-                    inputs, address, &lp.table, lp.config, "synthetic-witness (no live refusal)"));
-                const auto read = prosper::gpu::read_refused_shader_inputs(inputs);
-                EXPECT_TRUE(read.incomplete.empty()) << read.incomplete;
-                const auto replay = prosper::gpu::replay_refused_shader_inputs(lp.code, read);
-                EXPECT_TRUE(replay.produced) << replay.reject << " op " << def.opcode;
+                const uint32_t vsrc1 = def.pair_sources ? kVsrc2 : kVsrc1;
+                const auto lp = lane_program(compare_program(def.opcode, form, 0, 0, vsrc1), 64,
+                                             wave, def.pair_sources, def.pair_sources);
+                write_compare_witness_program(dump, base_address + count * 0x100, count, lp);
                 ++count;
             }
     return count;

@@ -1,8 +1,8 @@
 // ir.hpp — the recompiler's SSA intermediate representation (ADR 0012).
 //
 // A Block is a straight-line list of instructions; each instruction defines exactly one Value, and
-// its arguments name Values defined earlier in the same Block. Values are typed (32-bit word or
-// boolean). The IR is private to gpu/recompiler.
+// its arguments name Values defined earlier in the same Block. Values are typed (32-bit word,
+// boolean, or 64-bit word). The IR is private to gpu/recompiler.
 //
 // Today a Block is built for ONE guest instruction and then either EVALUATED on known inputs
 // (ir/eval.hpp, used by constant folding) or EMITTED as SPIR-V (ir/emit/spirv_emitter.hpp), in
@@ -17,7 +17,11 @@
 
 namespace prosper::gpu::ir {
 
-enum class Type : uint8_t { U32, Bool };
+// U32 is a raw 32-bit word and U64 a raw 64-bit word: neither says integer or float, the opcode
+// does. U64 is SPIR-V's 64-bit unsigned integer (SpirvCompute::t_u64, the Int64 capability the
+// pre-IR emitter already declared for SGPR-pair and VGPR-pair arithmetic). A guest register pair
+// enters as two U32 words and is packed (PackU64); results leave through U64Lo/U64Hi.
+enum class Type : uint8_t { U32, Bool, U64 };
 
 // A reference to the instruction that defines it, by position in its Block.
 struct Value {
@@ -118,6 +122,18 @@ enum class Opcode : uint8_t {
     F32UnordLe,
     F32UnordGt,
     F32UnordGe,
+    // 64-bit words (HOW_TO_ADD_A_FAMILY.md, "64-bit values"). There are no signed 64-bit relations:
+    // signed order is the unsigned order of the word with its sign bit flipped
+    // (Builder::pack_u64_signed_order), which is how the pre-IR emitter wrote it.
+    PackU64,   // (u32 lo, u32 hi) -> u64 = hi << 32 | lo
+    U64Lo,   // u64 -> its low u32 word
+    U64Hi,   // u64 -> its high u32 word
+    U64Eq,
+    U64Ne,
+    U64Lt,
+    U64Le,
+    U64Gt,
+    U64Ge,   // u64 x u64 -> bool, unsigned order
 };
 
 struct OpcodeInfo {

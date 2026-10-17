@@ -123,6 +123,24 @@ public:
     Value sgt(Value a, Value b) { return cmp(Opcode::SGt, a, b); }
     Value sge(Value a, Value b) { return cmp(Opcode::SGe, a, b); }
 
+    // 64-bit words (HOW_TO_ADD_A_FAMILY.md, "64-bit values").
+    Value pack_u64(Value lo, Value hi) {
+        return block_.append({Opcode::PackU64, Type::U64, 0, {lo, hi}});
+    }
+    // The word whose UNSIGNED order is the SIGNED order of hi:lo: the sign bit flipped. Compare two
+    // of these with u64lt..u64ge for a signed 64-bit relation.
+    Value pack_u64_signed_order(Value lo, Value hi) {
+        return pack_u64(lo, xor_(hi, c32(0x80000000u)));
+    }
+    Value u64lo(Value v) { return block_.append({Opcode::U64Lo, Type::U32, 0, {v}}); }
+    Value u64hi(Value v) { return block_.append({Opcode::U64Hi, Type::U32, 0, {v}}); }
+    Value u64eq(Value a, Value b) { return cmp(Opcode::U64Eq, a, b); }
+    Value u64ne(Value a, Value b) { return cmp(Opcode::U64Ne, a, b); }
+    Value u64lt(Value a, Value b) { return cmp(Opcode::U64Lt, a, b); }
+    Value u64le(Value a, Value b) { return cmp(Opcode::U64Le, a, b); }
+    Value u64gt(Value a, Value b) { return cmp(Opcode::U64Gt, a, b); }
+    Value u64ge(Value a, Value b) { return cmp(Opcode::U64Ge, a, b); }
+
 private:
     Value u32(Opcode op, Value a, Value b) { return block_.append({op, Type::U32, 0, {a, b}}); }
     Value cmp(Opcode op, Value a, Value b) { return block_.append({op, Type::Bool, 0, {a, b}}); }
