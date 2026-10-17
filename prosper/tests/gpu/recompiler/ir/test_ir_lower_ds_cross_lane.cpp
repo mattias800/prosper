@@ -125,4 +125,27 @@ TEST(IrLowerDsCrossLane, ComputeSubgroupContractsRetainTheirOriginalWidths) {
         EXPECT_EQ(t.b.compute_min_subgroup_size, control & 0x8000u ? 4u : 32u);
     }
 }
+TEST(IrLowerDsCrossLane, MissingSwizzleSourceIsResolvedAfterThePeerArithmetic) {
+    LoweringFixture t;
+    t.b.uconst_cache.erase(0);
+    const auto before = t.b.code.size();
+    // AND=15, OR=2, XOR=1: lane arithmetic itself does not intern zero.
+    ASSERT_EQ(lower_ds_cross_lane(t.b, t.rs, swizzle(0x044fu), t.ok), std::optional<bool>{true});
+    ASSERT_TRUE(t.ok);
+    uint32_t peer = 0, shuffled_source = 0;
+    for (size_t i = before; i < t.b.code.size();) {
+        const auto words = t.b.code[i] >> 16;
+        ASSERT_GT(words, 0u);
+        if ((t.b.code[i] & 0xffffu) == Op_GroupNonUniformShuffle) {
+            shuffled_source = t.b.code[i + 4];
+            peer = t.b.code[i + 5];
+            break;
+        }
+        i += words;
+    }
+    ASSERT_NE(peer, 0u);
+    ASSERT_TRUE(t.constant_cached(0));
+    EXPECT_EQ(shuffled_source, t.b.uconst_cache.at(0));
+    EXPECT_GT(shuffled_source, peer);
+}
 } // namespace
