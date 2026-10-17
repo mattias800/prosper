@@ -108,6 +108,30 @@ TEST(IrLowerVop3HalfFloatExact, KnownRegisterWordsAndForgedDecodedConstantsDoNot
             EXPECT_FALSE(t.rs.vreg.contains(1));
             EXPECT_EQ(t.b.code, before);
         }
+    for (uint32_t arm = 0; arm < 3; ++arm) {
+        LoweringFixture t;
+        auto in = LoweringFixture::decode(cases::words(242));
+        if (arm == 0) in.src[0] = {OperandKind::InlineFloat, 243};
+        if (arm == 1) {
+            in.src[0] = {OperandKind::Literal, 0};
+            in.has_literal = true;
+            in.len_dwords = 3;
+            in.literal = 0x3c00;
+        }
+        if (arm == 2) {
+            in = LoweringFixture::decode(cases::words(255, 0x3c00));
+            in.src[0] = {OperandKind::Literal, 1};
+        }
+        const auto before = t.b.code;
+        EXPECT_FALSE(lower_vop3_half_float_exact(t.b, t.rs, in, t.ok));
+        EXPECT_TRUE(t.ok);
+        EXPECT_TRUE(t.rs.vreg.empty());
+        EXPECT_EQ(t.b.code, before);
+        const auto genuine = LoweringFixture::decode(cases::words(242));
+        EXPECT_TRUE(lower_vop3_half_float_exact(t.b, t.rs, genuine, t.ok));
+        EXPECT_TRUE(t.ok);
+        EXPECT_TRUE(t.rs.vreg.contains(1));
+    }
 }
 TEST(IrLowerVop3HalfFloatExact, LiteralPresenceLengthAndInlineCoherenceCannotInventHalfBits) {
     for (uint32_t arm = 0; arm < 5; ++arm) {

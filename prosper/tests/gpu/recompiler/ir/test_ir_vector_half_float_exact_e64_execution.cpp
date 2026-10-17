@@ -177,9 +177,9 @@ TEST(IrVectorHalfFloatExactE64Execution, RemovingExecMaskOverwritesEveryInactive
 TEST(IrVectorHalfFloatExactE64Execution, AllModeBytesAndUnknownLeaveExactNormalWideningUnchanged) {
     for (uint32_t mode = 0; mode <= 256; ++mode)
         for (uint32_t ieee : {0u, 1u})
-            for (uint32_t overflow : {0u, 1u}) {
+            for (uint32_t rsrc1_bit26 : {0u, 1u}) {
                 const auto launch =
-                    mode == 256 ? UINT32_MAX : (mode << 12) | (ieee << 23) | (overflow << 26);
+                    mode == 256 ? UINT32_MAX : (mode << 12) | (ieee << 23) | (rsrc1_bit26 << 26);
                 const auto half = mode & 1 ? 0xbc01u : 0x3c01u;
                 expect_lanes(
                     compile(cases::program(255, half, mode & 1, mode & 2 ? 32u : 64u, 0, launch)),
