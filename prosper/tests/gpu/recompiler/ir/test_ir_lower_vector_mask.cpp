@@ -140,8 +140,8 @@ TEST(IrLowerVectorMask, OtherOpcodesAreNotTheirs) {
     Mask t;
     EXPECT_FALSE(t.carry_out(0x128, kVcc)) << "a carry-in op is not a carry-out-only op";
     EXPECT_FALSE(t.carry_in_out(0x30F, kVcc, kVcc));
-    EXPECT_FALSE(ir::lower_vop3_carry_out(t.b, t.rs, t.decode(vop3_words(0x103, 0, 0)), t.ok,
-                                          false));
+    EXPECT_FALSE(
+        ir::lower_vop3_carry_out(t.b, t.rs, t.decode(vop3_words(0x103, 0, 0)), t.ok, false));
     EXPECT_TRUE(t.ok);
 }
 

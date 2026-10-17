@@ -34,7 +34,9 @@ Built build(const VectorCndmaskDef& def) {
 
 }   // namespace
 
-std::span<const VectorCndmaskDef> vector_cndmask_defs() { return kDefs; }
+std::span<const VectorCndmaskDef> vector_cndmask_defs() {
+    return kDefs;
+}
 
 const VectorCndmaskDef* find_vector_cndmask(Rdna2Format fmt, uint32_t opcode) {
     for (const auto& def : kDefs)

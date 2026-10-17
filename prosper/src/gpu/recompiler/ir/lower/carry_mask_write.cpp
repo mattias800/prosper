@@ -75,9 +75,12 @@ void write_mad64_carry_mask(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, 
     // `sdst = vcc_lo` in Wave32 is the same word write as the carry ops' (#5348).
     if (in.sdst.value == 106 && in.sdst.kind == OperandKind::SGPR && wave32_b32_masks(b))
         write_b32_carry_word(rs, 106, carry_masked);
-    else if (in.sdst.value == 106 || in.sdst.value == 107) rs.vcc = carry_masked;
-    else if (in.sdst.kind == OperandKind::SGPR) rs.sreg_bool[in.sdst.value] = carry_masked;
-    else ok = false;
+    else if (in.sdst.value == 106 || in.sdst.value == 107)
+        rs.vcc = carry_masked;
+    else if (in.sdst.kind == OperandKind::SGPR)
+        rs.sreg_bool[in.sdst.value] = carry_masked;
+    else
+        ok = false;
 }
 
 }   // namespace prosper::gpu::ir

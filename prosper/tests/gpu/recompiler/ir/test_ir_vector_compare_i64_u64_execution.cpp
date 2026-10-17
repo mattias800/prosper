@@ -87,7 +87,8 @@ Known lane_truth(const VectorCompareDef& def, const LaneInputs& in, size_t lane)
 }
 
 void check_run(const VectorCompareDef& def, Form form, uint32_t wave, const LaneInputs& in) {
-    const auto run = run_vector_op_per_lane(compare_program(def.opcode, form, 0, 0, kVsrc2), in, wave);
+    const auto run =
+        run_vector_op_per_lane(compare_program(def.opcode, form, 0, 0, kVsrc2), in, wave);
     ASSERT_TRUE(run.error.empty()) << run.error;
     ASSERT_EQ(run.d.size(), in.lanes());
     for (size_t lane = 0; lane < in.lanes(); ++lane) {
@@ -106,13 +107,13 @@ void check_run(const VectorCompareDef& def, Form form, uint32_t wave, const Lane
 struct ConstantSource {
     uint32_t operand;   // the SRC0 field
     uint32_t literal;   // follows the instruction when operand == 0xff
-    uint32_t lo, hi;    // the 64-bit value the compare must see
+    uint32_t lo, hi;   // the 64-bit value the compare must see
 };
 constexpr ConstantSource kConstants[] = {
     {0xc1, 0, 0xffffffffu, 0xffffffffu},   // inline -1
-    {0x85, 0, 5u, 0u},                     // inline 5
-    {0x80, 0, 0u, 0u},                     // inline 0
-    {0xff, 0x80000000u, 0x80000000u, 0u},  // a 32-bit literal: zero-extended
+    {0x85, 0, 5u, 0u},   // inline 5
+    {0x80, 0, 0u, 0u},   // inline 0
+    {0xff, 0x80000000u, 0x80000000u, 0u},   // a 32-bit literal: zero-extended
 };
 std::vector<uint32_t> constant_program(uint32_t opcode, const ConstantSource& source) {
     std::vector<uint32_t> words{0x7c000000u | (opcode << 17) | (kVsrc2 << 9) | source.operand};
@@ -120,7 +121,7 @@ std::vector<uint32_t> constant_program(uint32_t opcode, const ConstantSource& so
     words.insert(words.end(), {kSMovExecAll, 0xd5010001u, 0x80u | (0x81u << 9) | (kVcc << 18)});
     return words;
 }
-} // namespace
+}   // namespace
 
 TEST(IrVectorCompareI64U64Execution, EveryDefinitionWritesTheExecMaskedLaneMask) {
     for (const auto& def : vector_compare_i64_u64_defs()) {
@@ -199,8 +200,8 @@ TEST(IrVectorCompareI64U64Execution, ConstantSourcesExtendToSixtyFourBits) {
             ASSERT_TRUE(run.error.empty()) << run.error;
             ASSERT_EQ(run.d.size(), in.lanes());
             for (size_t lane = 0; lane < in.lanes(); ++lane) {
-                const Known test = eval_vector_compare_pairs(def, source.lo, source.hi,
-                                                             in.s2[lane], in.s3[lane]);
+                const Known test =
+                    eval_vector_compare_pairs(def, source.lo, source.hi, in.s2[lane], in.s3[lane]);
                 ASSERT_TRUE(test.has_value());
                 ASSERT_EQ(run.d[lane], in.active[lane] && *test ? 1u : 0u)
                     << "op " << std::hex << def.opcode << " src0 " << source.operand << " lane "
@@ -216,15 +217,16 @@ TEST(IrVectorCompareI64U64Execution, RefusalsStay) {
     const auto abs_words = compare_program(0xa1, Form::Vop3Vcc, 1, 0, kVsrc2);
     const auto neg_words = compare_program(0xe1, Form::Vop3Vcc, 0, 1, kVsrc2);
     // V_CMP_F/T_I64/U64 have no definition.
-    for (const auto& words : {constant_program(0xa1, one_f), constant_program(0xe4, one_f),
-                              abs_words, neg_words,
-                              compare_program(0xa0, Form::VopcVcc, 0, 0, kVsrc2),
-                              compare_program(0xe7, Form::Vop3Sgpr, 0, 0, kVsrc2)}) {
+    for (const auto& words :
+         {constant_program(0xa1, one_f), constant_program(0xe4, one_f), abs_words, neg_words,
+          compare_program(0xa0, Form::VopcVcc, 0, 0, kVsrc2),
+          compare_program(0xe7, Form::Vop3Sgpr, 0, 0, kVsrc2)}) {
         const auto lp = lane_program(words, 64, 64, true, true);
         EXPECT_TRUE(recompile_compute(lp.code.data(), lp.code.size(), &lp.table, lp.config).empty())
             << std::hex << words[0];
     }
-    for (const uint32_t op : {0xa0u, 0xa7u, 0xe0u, 0xe7u}) EXPECT_EQ(find_vector_compare(op), nullptr);
+    for (const uint32_t op : {0xa0u, 0xa7u, 0xe0u, 0xe7u})
+        EXPECT_EQ(find_vector_compare(op), nullptr);
 }
 
 TEST(IrVectorCompareI64U64Execution, DefinitionsAgreeWithEffectsAndUseEverySixtyFourBitRelation) {
@@ -260,7 +262,8 @@ TEST(IrVectorCompareI64U64Execution, DefinitionsAgreeWithEffectsAndUseEverySixty
 
 TEST(IrVectorCompareI64U64Execution, ExportsEveryFormAndConstantSourceForTheCorpusGate) {
     const char* name = "vopc-i64-u64-witness";
-    const size_t plain = export_compare_witness(vector_compare_i64_u64_defs(), name, 0x6464000000ull);
+    const size_t plain =
+        export_compare_witness(vector_compare_i64_u64_defs(), name, 0x6464000000ull);
     ASSERT_EQ(plain, vector_compare_i64_u64_defs().size() * std::size(kForms) * 2u);
     size_t count = 0;
     for (const auto& def : vector_compare_i64_u64_defs())

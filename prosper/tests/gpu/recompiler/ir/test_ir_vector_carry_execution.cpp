@@ -72,9 +72,9 @@ void check_carry_run(const VectorCarryDef& def, const CarryForm& form, uint32_t 
                                                  : (in.active[lane] ? *out.d : in.old_d[lane]);
             ASSERT_EQ(run.d[lane], expected)
                 << "op " << std::hex << def.opcode << ' ' << form.name << " wave " << std::dec
-                << wave << (read_carry ? " carry" : " d") << " lane " << lane << std::hex
-                << " s0 " << in.s0[lane] << " s1 " << in.s1[lane] << " s2 " << in.s2[lane]
-                << " active " << in.active[lane];
+                << wave << (read_carry ? " carry" : " d") << " lane " << lane << std::hex << " s0 "
+                << in.s0[lane] << " s1 " << in.s1[lane] << " s2 " << in.s2[lane] << " active "
+                << in.active[lane];
         }
     }
 }
@@ -93,23 +93,40 @@ struct Table {
 };
 const Table kTruth[] = {
     {"v_add_co_u32",
-     {{0xffffffffu, 1, 0, 0, 1}, {1, 2, 0, 3, 0}, {0x80000000u, 0x80000000u, 0, 0, 1},
-      {0x7fffffffu, 1, 0, 0x80000000u, 0}, {5, 0, 0, 5, 0}, {0, 0, 0, 0, 0}}},
+     {{0xffffffffu, 1, 0, 0, 1},
+      {1, 2, 0, 3, 0},
+      {0x80000000u, 0x80000000u, 0, 0, 1},
+      {0x7fffffffu, 1, 0, 0x80000000u, 0},
+      {5, 0, 0, 5, 0},
+      {0, 0, 0, 0, 0}}},
     {"v_sub_co_u32",
-     {{0, 1, 0, 0xffffffffu, 1}, {5, 3, 0, 2, 0}, {3, 3, 0, 0, 0},
+     {{0, 1, 0, 0xffffffffu, 1},
+      {5, 3, 0, 2, 0},
+      {3, 3, 0, 0, 0},
       {0x80000000u, 1, 0, 0x7fffffffu, 0}}},
     {"v_subrev_co_u32",
-     {{1, 0, 0, 0xffffffffu, 1}, {3, 5, 0, 2, 0}, {3, 3, 0, 0, 0},
+     {{1, 0, 0, 0xffffffffu, 1},
+      {3, 5, 0, 2, 0},
+      {3, 3, 0, 0, 0},
       {1, 0x80000000u, 0, 0x7fffffffu, 0}}},
     {"v_add_co_ci_u32",
-     {{0xffffffffu, 0, 1, 0, 1}, {0xffffffffu, 0, 0, 0xffffffffu, 0},
-      {0xffffffffu, 0xffffffffu, 1, 0xffffffffu, 1}, {1, 2, 1, 4, 0},
-      {0x80000000u, 0x80000000u, 0, 0, 1}, {5, 0, 0, 5, 0}}},
+     {{0xffffffffu, 0, 1, 0, 1},
+      {0xffffffffu, 0, 0, 0xffffffffu, 0},
+      {0xffffffffu, 0xffffffffu, 1, 0xffffffffu, 1},
+      {1, 2, 1, 4, 0},
+      {0x80000000u, 0x80000000u, 0, 0, 1},
+      {5, 0, 0, 5, 0}}},
     {"v_sub_co_ci_u32",
-     {{0, 0, 1, 0xffffffffu, 1}, {5, 3, 1, 1, 0}, {3, 3, 0, 0, 0}, {0, 0xffffffffu, 1, 0, 1},
+     {{0, 0, 1, 0xffffffffu, 1},
+      {5, 3, 1, 1, 0},
+      {3, 3, 0, 0, 0},
+      {0, 0xffffffffu, 1, 0, 1},
       {3, 3, 1, 0xffffffffu, 1}}},
     {"v_subrev_co_ci_u32",
-     {{0, 0, 1, 0xffffffffu, 1}, {3, 5, 1, 1, 0}, {3, 3, 0, 0, 0}, {0xffffffffu, 0, 1, 0, 1},
+     {{0, 0, 1, 0xffffffffu, 1},
+      {3, 5, 1, 1, 0},
+      {3, 3, 0, 0, 0},
+      {0xffffffffu, 0, 1, 0, 1},
       {3, 3, 1, 0xffffffffu, 1}}},
 };
 
@@ -134,7 +151,8 @@ TEST(IrVectorCarryExecution, HandWorkedIsaTruthTable) {
         ASSERT_NE(table, nullptr) << effects_name(def);
         for (const Row& row : table->rows) {
             const KnownCarry out = eval_vector_carry(def, row.s0, row.s1, row.cin);
-            EXPECT_EQ(out.d, Known(row.d)) << table->name << ' ' << std::hex << row.s0 << ' ' << row.s1;
+            EXPECT_EQ(out.d, Known(row.d))
+                << table->name << ' ' << std::hex << row.s0 << ' ' << row.s1;
             EXPECT_EQ(out.carry, Known(row.carry)) << table->name << ' ' << std::hex << row.s0;
             ++checked;
         }
@@ -265,7 +283,9 @@ std::vector<uint32_t> e64_reader_program(const VectorCarryDef& def) {
     return concat({carry_from_s2(kVcc), {vop2(def.opcode)}, read_vcc_e64()});
 }
 std::vector<uint32_t> carry_in_program(const VectorCarryDef& twin) {
-    return concat({{kSMovVccHiZero}, carry_from_s2(kVcc), {vop2(twin.opcode - 0x100)},
+    return concat({{kSMovVccHiZero},
+                   carry_from_s2(kVcc),
+                   {vop2(twin.opcode - 0x100)},
                    vop3_words(twin.opcode, kCarryOut, kVcc)});
 }
 std::vector<uint32_t> mad_program(uint32_t opcode) {
@@ -314,9 +334,12 @@ TEST(IrVectorCarryExecution, Vop3bCarryInFromVccLoReadsTheVop2Carry) {
             for (size_t lane = 0; lane < in.lanes(); ++lane) {
                 if (!in.active[lane]) continue;
                 const uint32_t stale = in.s2[lane] != 0 ? 1u : 0u;
-                visible += *eval_vector_carry(*twin, in.s0[lane], in.s1[lane], stale).d !=
-                           *eval_vector_carry(*twin, in.s0[lane], in.s1[lane],
-                                              vop2_carry(*def, in, lane)).d;
+                visible +=
+                    // NOLINTNEXTLINE(bugprone-unchecked-optional-access): concrete carry inputs give a known D.
+                    *eval_vector_carry(*twin, in.s0[lane], in.s1[lane], stale).d !=
+                    // NOLINTNEXTLINE(bugprone-unchecked-optional-access): concrete carry inputs give a known D.
+                    *eval_vector_carry(*twin, in.s0[lane], in.s1[lane], vop2_carry(*def, in, lane))
+                         .d;
             }
             ASSERT_GT(visible, 0u);
             for (const uint32_t wave : {64u, 32u}) {
@@ -326,7 +349,8 @@ TEST(IrVectorCarryExecution, Vop3bCarryInFromVccLoReadsTheVop2Carry) {
                 for (size_t lane = 0; lane < in.lanes(); ++lane) {
                     const uint32_t expected =
                         in.active[lane] ? *eval_vector_carry(*twin, in.s0[lane], in.s1[lane],
-                                                             vop2_carry(*def, in, lane)).d
+                                                             vop2_carry(*def, in, lane))
+                                               .d
                                         : in.old_d[lane];
                     ASSERT_EQ(run.d[lane], expected)
                         << "wave " << wave << " lane " << lane << " active " << in.active[lane];

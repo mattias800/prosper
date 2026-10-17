@@ -16,16 +16,20 @@ std::optional<bool> Vop3MaskLowering::route_carry_in_out() {
     // Carry-in from an UNTRACKED mask must reject (like cndmask), not silently
     // default to 0 — a wrong carry produces 64-bit address math off by one in the low
     // word with no diagnostic.
-    const Operand& s2 = in.src[2]; uint32_t cin_mask = 0;
+    const Operand& s2 = in.src[2];
+    uint32_t cin_mask = 0;
     if (s2.value == 106 || s2.value == 107) {
         auto it = rs.sreg_bool.find(s2.value);
         if (rs.sreg_bool_b32.contains(s2.value) && it != rs.sreg_bool.end())
             cin_mask = it->second;
         else
             cin_mask = rs.vcc;
+    } else if (s2.kind == OperandKind::SGPR) {
+        auto it = rs.sreg_bool.find(s2.value);
+        if (it != rs.sreg_bool.end()) cin_mask = it->second;
     }
-    else if (s2.kind == OperandKind::SGPR) { auto it = rs.sreg_bool.find(s2.value); if (it != rs.sreg_bool.end()) cin_mask = it->second; }
-    if (!cin_mask) ok = false;
+    if (!cin_mask)
+        ok = false;
     else {
         uint32_t a = val(in.src[0]), c = val(in.src[1]);
         const CarryIds out = emit_vector_carry(b, *def, a, c, cin_mask);

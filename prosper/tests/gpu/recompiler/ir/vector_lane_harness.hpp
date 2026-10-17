@@ -25,8 +25,8 @@
 
 namespace prosper::test::ir {
 
-inline constexpr uint32_t kVdst = 1, kVsrc0 = 2, kVsrc1 = 3,
-                          kVsrc2 = 5, kVsrc3 = 6;   // the registers the op must name
+inline constexpr uint32_t kVdst = 1, kVsrc0 = 2, kVsrc1 = 3, kVsrc2 = 5,
+                          kVsrc3 = 6;   // the registers the op must name
 
 // VOP2 `op v1, v2, v3` (SRC0 = VGPR v2 is operand 256 + 2).
 inline uint32_t vop2(uint32_t op, uint32_t vdst = kVdst, uint32_t src0 = 256 + kVsrc0,

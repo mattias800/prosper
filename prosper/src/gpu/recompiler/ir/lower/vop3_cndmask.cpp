@@ -9,7 +9,8 @@ namespace prosper::gpu::ir {
 std::optional<bool> Vop3MaskLowering::route_cndmask() {
     const VectorCndmaskDef* def = find_vector_cndmask(in.fmt, in.opcode);
     if (!def) return std::nullopt;
-    const Operand& s2 = in.src[2]; uint32_t m = 0;        // src2 is an SGPR-pair (or VCC) wave mask
+    const Operand& s2 = in.src[2];
+    uint32_t m = 0;   // src2 is an SGPR-pair (or VCC) wave mask
     if (s2.value == 106 || s2.value == 107) {
         // Wave32 e64/SDWA forms may explicitly select either physical VCC word as an
         // independent one-dword mask. Prefer that typed lifetime when present. Only
@@ -20,8 +21,7 @@ std::optional<bool> Vop3MaskLowering::route_cndmask() {
             m = it->second;
         else if (s2.value == 106)
             m = rs.vcc;
-    }
-    else if (s2.kind == OperandKind::SGPR) {
+    } else if (s2.kind == OperandKind::SGPR) {
         auto it = rs.sreg_bool.find(s2.value);
         if (it != rs.sreg_bool.end()) {
             m = it->second;
@@ -33,16 +33,18 @@ std::optional<bool> Vop3MaskLowering::route_cndmask() {
             // its low dword's bit zero. Keep arbitrary vertex shaders fail-closed.
             auto data = rs.sreg.find(s2.value);
             if (data != rs.sreg.end())
-                m = b.ucmp(Op_INotEqual,
-                    b.ibin(Op_BitwiseAnd, data->second, b.uconst(1)),
-                    b.uconst(0));
+                m = b.ucmp(Op_INotEqual, b.ibin(Op_BitwiseAnd, data->second, b.uconst(1)),
+                           b.uconst(0));
         }
     }
     // fv (not val): cndmask is float-modifier-capable and compilers emit it with -v/|v|
     // sources (sign-select idioms). Raw val() silently dropped neg/abs — the shader
     // recompiled "successfully" and computed the un-negated value. fv == val when no
     // modifier bits are set.
-    if (!m) ok = false; else vreg[in.dst.value] = emit_vector_cndmask(b, *def, m, fv(1), fv(0));
+    if (!m)
+        ok = false;
+    else
+        vreg[in.dst.value] = emit_vector_cndmask(b, *def, m, fv(1), fv(0));
     return true;
 }
 

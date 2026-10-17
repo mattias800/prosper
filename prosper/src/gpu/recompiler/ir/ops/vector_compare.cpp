@@ -41,9 +41,8 @@ BuiltCompare build(const VectorCompareDef& def, bool pairs) {
 std::span<const std::span<const VectorCompareDef>> vector_compare_groups() {
     // A new group adds its table here.
     static const std::array<std::span<const VectorCompareDef>, 6> groups = {
-        vector_compare_f32_defs(),       vector_compare_i32_u32_defs(),
-        vector_compare_i16_u16_defs(),   vector_compare_f16_defs(),
-        vector_compare_class_f32_defs(), vector_compare_i64_u64_defs(),
+        vector_compare_f32_defs(), vector_compare_i32_u32_defs(),   vector_compare_i16_u16_defs(),
+        vector_compare_f16_defs(), vector_compare_class_f32_defs(), vector_compare_i64_u64_defs(),
     };
     return groups;
 }
@@ -68,8 +67,8 @@ uint32_t emit_vector_compare(SpirvCompute& b, const VectorCompareDef& def, uint3
     return emit_spirv(b, built.block, inputs)[built.result.index];
 }
 
-Known eval_vector_compare_pairs(const VectorCompareDef& def, Known s0_lo, Known s0_hi,
-                                Known s1_lo, Known s1_hi) {
+Known eval_vector_compare_pairs(const VectorCompareDef& def, Known s0_lo, Known s0_hi, Known s1_lo,
+                                Known s1_hi) {
     const BuiltCompare built = build(def, true);
     const Known inputs[] = {s0_lo, s1_lo, s0_hi, s1_hi};
     return evaluate(built.block, inputs)[built.result.index];
