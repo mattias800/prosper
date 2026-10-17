@@ -1,12 +1,16 @@
 // The exact half-step domain avoids all FP rounding/FTZ/saturation guesses, not just a fixture.
 #include "gpu/recompiler/ir/cvt_rpi_exact_e64_cases.hpp"
+#include "gpu/recompiler/ir/eval.hpp"
 #include "gpu/recompiler/ir/lower/vop3_cvt_rpi_exact_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_float_integer_lowering.hpp"
 #include "gpu/recompiler/ir/lowering_fixture.hpp"
 #include "gpu/recompiler/ir/ops/vector_cvt_rpi_exact_e64.hpp"
+#include "gpu/recompiler/ir/ops/vector_conversion.hpp"
 #include "gpu/recompiler/ir/ops/vector_float_integer_e64.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include <gtest/gtest.h>
+#include <cstdint>
 #include <initializer_list>
 using namespace prosper::gpu;
 using namespace prosper::gpu::ir;

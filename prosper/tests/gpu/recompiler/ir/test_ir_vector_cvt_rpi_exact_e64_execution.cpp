@@ -2,7 +2,12 @@
 // Hand half-integer answers and integer normalization are independent of the shared builder/eval.
 #include "gpu/recompiler/ir/cvt_rpi_exact_e64_cases.hpp"
 #include "gpu/recompiler/ir/ops/vector_cvt_rpi_exact_e64.hpp"
+#include "gpu/recompiler/ir/ops/vector_conversion.hpp"
+#include "gpu/recompiler/ir/vector_lane_harness.hpp"
 #include "gpu/diagnostics/refused_shader_inputs.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/bpermute_spirv_oracle.hpp"
 #include "fixtures/test_scratch.h"
 #include <gtest/gtest.h>
 #include <cstddef>

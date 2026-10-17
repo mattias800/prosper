@@ -4,6 +4,7 @@
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include <array>
 #include <bit>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <vector>

@@ -1,6 +1,7 @@
 // AMD70648 12.8: for x=k/2, |x|<2^23, Floor/frac/add and the final I32 cast are exact.
 // Nonzero intermediates are normal; all round/denorm modes agree. FP zero sign cannot affect I32.
 #include "gpu/recompiler/ir/lower/vop3_cvt_rpi_exact_lowering.hpp"
+#include "gpu/recompiler/ir/ops/vector_conversion.hpp"
 #include "gpu/recompiler/ir/ops/vector_cvt_rpi_exact_e64.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
