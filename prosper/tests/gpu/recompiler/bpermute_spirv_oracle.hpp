@@ -864,7 +864,8 @@ struct Interpreter {
               uint32_t bit = UINT32_MAX;
               for (uint32_t n = 0; n < 32; ++n)
                   if (x.words[0] & (uint32_t{1} << n)) bit = n;
-              set(l, a[1], a[0], {bit}, x.defined && x.words[0] != 0);
+              // GLSL.std.450 instruction75 defines zero as all bits set, not undefined.
+              set(l, a[1], a[0], {bit}, x.defined);
           } else
               fail("unsupported live ExtInst");
       } else if (op == 88) {

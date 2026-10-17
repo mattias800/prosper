@@ -245,6 +245,11 @@ TEST(IrScalarInteger64ValuesExecution, InlineAndLiteralSourcesKeepExistingExtens
 // GLSL.std.450 instruction75 explicitly returns all bits set for zero. The scalar
 // FLBIT route keeps its old OR1 safeguard; the raw IR primitive still models the builtin itself.
 TEST(IrScalarInteger64ValuesExecution, RawFindUMsbZeroOneAndHighBitRunAsSpecified) {
+    Block unknown_block;
+    Builder unknown_ir(unknown_block);
+    const auto unknown_result = unknown_ir.find_umsb_u32(unknown_ir.input(Type::U32));
+    const Known unknown_input[] = {std::nullopt};
+    EXPECT_FALSE(evaluate(unknown_block, unknown_input)[unknown_result.index]);
     struct Row {
         uint32_t input, expected;
     };
