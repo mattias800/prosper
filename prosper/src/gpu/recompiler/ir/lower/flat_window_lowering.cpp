@@ -3,6 +3,8 @@
 #include "gpu/recompiler/ir/emit/spirv_emitter.hpp"
 #include "gpu/recompiler/ir/ops/flat_window.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include <array>
+#include <cstdint>
 namespace prosper::gpu::ir {
 std::array<uint32_t, 2> lower_flat_window_component(SpirvCompute& b, uint32_t byte0,
                                                     const FlatAccessInfo& access, uint32_t c) {

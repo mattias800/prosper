@@ -1,10 +1,12 @@
 // Window loads read the original base from push constants; exercise that fixture ABI explicitly.
 #include "fixtures/compute_runner.h"
 #include "gpu/recompiler/ir/flat_window_cases.hpp"
+#include "gpu/recompiler/ir/vector_lane_harness.hpp"
 #include "gpu/recompiler/ir/vector_compare_harness.hpp"
 #include "gpu/diagnostics/refused_shader_inputs.hpp"
 #include "gpu/recompiler/bpermute_spirv_oracle.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include <gtest/gtest.h>
 #include <bit>
 #include <cstddef>

@@ -1,6 +1,8 @@
 // Preserve the relocated subtraction, component-add and truncating shift, in that order.
 #include "gpu/recompiler/ir/ops/flat_window.hpp"
 #include "gpu/recompiler/ir/builder.hpp"
+#include "gpu/recompiler/ir/ir.hpp"
+#include <cstdint>
 namespace prosper::gpu::ir {
 FlatWindowOffsetBlock build_flat_window_byte_offset() {
     FlatWindowOffsetBlock out;

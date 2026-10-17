@@ -3,6 +3,7 @@
 #include "gpu/recompiler/bpermute_spirv_oracle.hpp"
 #include "gpu/recompiler/ir/eval.hpp"
 #include "gpu/recompiler/ir/ops/flat_window.hpp"
+#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <gtest/gtest.h>
 #include <array>
 #include <cstddef>
@@ -80,18 +81,19 @@ TEST(IrFlatWindowValues, EmittedValuesMatchEvalAndIndependentMathPerLaneUnderPar
                 const auto offset = build_flat_window_byte_offset();
                 const auto comp = build_flat_window_component(bits, component);
                 for (uint32_t lane = 0; lane < wave; ++lane) {
-                    const uint32_t byte0 = input[lane * 4] - input[lane * 4 + 1];
+                    const size_t at = size_t{lane} * 4;
+                    const uint32_t byte0 = input[at] - input[at + 1];
                     const uint32_t address = byte0 + (bits == 32 ? component * 4 : 0);
                     const std::array expected{byte0, address, address / 4u};
-                    const auto a = evaluate(
-                        offset.block, std::array<Known, 2>{input[lane * 4], input[lane * 4 + 1]});
+                    const auto a =
+                        evaluate(offset.block, std::array<Known, 2>{input[at], input[at + 1]});
                     const auto c = evaluate(comp.block, std::array{a[offset.byte_offset.index]});
                     EXPECT_EQ(a[offset.byte_offset.index], Known(expected[0]));
                     EXPECT_EQ(c[comp.byte_address.index], Known(expected[1]));
                     EXPECT_EQ(c[comp.dword_index.index], Known(expected[2]));
                     for (size_t k = 0; k < expected.size(); ++k)
                         EXPECT_EQ(actual[size_t{lane} * 3 + k],
-                                  input[lane * 4 + 2] ? expected[k] : input[lane * 4 + 3]);
+                                  input[at + 2] ? expected[k] : input[at + 3]);
                 }
             }
 }

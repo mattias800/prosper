@@ -162,6 +162,7 @@ inline bool default_compute_buffer_int64_atomics_supported() {
 // threads are dispatched (default = input.size()) in groups of `local_size_x` (default 64); the
 // output buffer holds `out_count` floats (default = input.size()). Returns the output, or {} on any
 // Vulkan failure (including rejected SPIR-V).
+// NOLINTBEGIN(readability-function-size): this fixture owns dispatch setup, submission and cleanup.
 inline std::vector<float>
 run_compute(const std::vector<uint32_t>& spirv, const std::vector<float>& input,
             uint32_t invocations = 0, uint32_t out_count = 0,
@@ -700,5 +701,6 @@ run_compute(const std::vector<uint32_t>& spirv, const std::vector<float>& input,
     vkDestroyDevice(dev, nullptr); vkDestroyInstance(inst, nullptr);
     return out;
 }
+// NOLINTEND(readability-function-size)
 
 } // namespace prosper::test
