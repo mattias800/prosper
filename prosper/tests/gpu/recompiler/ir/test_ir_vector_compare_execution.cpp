@@ -180,7 +180,7 @@ TEST(IrVectorCompareExecution, DefinitionsAgreeWithEffectsAndUseEveryF32Relation
     for (uint32_t op = uint32_t(Opcode::F32Le); op <= uint32_t(Opcode::F32UnordGe); ++op)
         EXPECT_TRUE(seen.contains(Opcode(op))) << opcode_info(Opcode(op)).name;
     EXPECT_EQ(find_vector_compare(0x10), nullptr) << "lookup takes the V_CMP_* opcode";
-    EXPECT_EQ(find_vector_compare(0x81), nullptr) << "v_cmp_lt_i32 has no definition yet";
+    EXPECT_EQ(find_vector_compare(0x80), nullptr) << "integer false remains unsupported";
 }
 
 // The recorded corpus never runs v_cmp_f_f32 / v_cmp_tru_f32 (their positive control reports
