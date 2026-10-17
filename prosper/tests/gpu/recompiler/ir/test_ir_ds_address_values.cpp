@@ -2,7 +2,6 @@
 // interpreter pin wrap, ordering and missing-input behavior independently of the lowering caller.
 #include "fixtures/ds_address_ir.hpp"
 #include "gpu/recompiler/bpermute_spirv_oracle.hpp"
-#include "gpu/recompiler/ir/builder.hpp"
 #include "gpu/recompiler/ir/eval.hpp"
 #include "gpu/recompiler/ir/emit/spirv_emitter.hpp"
 #include "gpu/recompiler/ir/ops/ds_address.hpp"
@@ -12,6 +11,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstddef>
 #include <span>
 #include <vector>
 
@@ -68,8 +68,8 @@ TEST(IrDsAddressValues, DefinitionsMatchHandWorkedUint32Boundaries) {
             const uint32_t base = address / 4u;
             ASSERT_TRUE(values[built.outputs[0].index]);
             ASSERT_TRUE(values[built.outputs[1].index]);
-            EXPECT_EQ(*values[built.outputs[0].index], base + offset0);
-            EXPECT_EQ(*values[built.outputs[1].index], base + offset1);
+            EXPECT_EQ(values[built.outputs[0].index].value_or(0), base + offset0);
+            EXPECT_EQ(values[built.outputs[1].index].value_or(0), base + offset1);
         }
     }
 

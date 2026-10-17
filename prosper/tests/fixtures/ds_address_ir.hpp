@@ -5,7 +5,6 @@
 #include "gpu/recompiler/ir/ops/ds_address.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
-#include <array>
 #include <cstdint>
 #include <vector>
 
@@ -17,7 +16,7 @@ inline void emit_fixture(prosper::gpu::SpirvCompute& b) {
     const uint32_t c = b.load_input(1);
     std::vector<uint32_t> outputs;
     outputs.reserve(9);
-    const auto append = [&](DsAddressBlock built, const DsAddressValueReader& read) {
+    const auto append = [&](const DsAddressBlock& built, const DsAddressValueReader& read) {
         const auto values = emit_ds_address_values(b, built, read);
         outputs.insert(outputs.end(), values.begin(), values.end());
     };

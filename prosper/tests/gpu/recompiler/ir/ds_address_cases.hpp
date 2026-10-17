@@ -115,8 +115,8 @@ struct Data {
 inline Data data(const Case& c) {
     const auto& f = forms[c.form];
     Data d;
-    d.input.reserve(c.wave * 14);
-    d.initial.reserve(c.wave * 4 + 4);
+    d.input.reserve(size_t{c.wave} * 14);
+    d.initial.reserve(size_t{c.wave} * 4 + 4);
     for (uint32_t array = 0; array < 14; ++array)
         for (uint32_t lane = 0; lane < c.wave; ++lane)
             d.input.push_back(array == 0   ? base(c, lane)

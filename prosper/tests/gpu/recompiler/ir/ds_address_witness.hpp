@@ -1,6 +1,7 @@
 // Bind each saved DS module to its independently derived buffers and matched refusal contract.
 #pragma once
 #include "gpu/recompiler/ir/ds_address_cases.hpp"
+#include "gpu/recompiler/ir/vector_lane_harness.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include <filesystem>
 #include <fstream>

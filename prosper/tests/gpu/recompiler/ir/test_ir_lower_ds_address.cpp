@@ -7,6 +7,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstddef>
 #include <functional>
 #include <vector>
 
@@ -45,9 +46,6 @@ std::vector<uint32_t> lanes() {
 
 std::vector<uint32_t> pair_result(const std::vector<uint32_t>& input, const char* name,
                                   const PairEmit& emit, const std::array<uint32_t, 2>& offsets) {
-    Rdna2Inst in{};
-    in.src[0].value = 27;
-    in.literal = 0x0503u;
     std::vector<int> reads;
     const auto out = run(input, 2, [&](SpirvCompute& b, uint32_t source) {
         const Read read = [&](int reg) {
