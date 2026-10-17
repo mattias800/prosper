@@ -284,7 +284,7 @@ TEST(IrScalarInteger64ValuesExecution, ExportsAllNumericReadbackAndAliasForms) {
     const auto dump = compare_witness_dump("scalar-integer64-values");
     ASSERT_TRUE(fs::create_directories(dump));
     const auto cases = scalar64_cases();
-    size_t count = 0;
+    size_t count = 0, executed = 0, strict_zero_boundary = 0;
     for (const auto& def : scalar_integer64_value_defs())
         for (uint32_t form : scalar64_forms(def))
             for (uint32_t output : outputs(def))
@@ -293,8 +293,49 @@ TEST(IrScalarInteger64ValuesExecution, ExportsAllNumericReadbackAndAliasForms) {
                     const auto words = scalar64_program(def, x, output, form);
                     check_real(def, x, wave, output, form);
                     const auto lp = lane_program(words, 64, wave);
-                    write_compare_witness_program(dump, 0x5350000000ull + count * 0x100, count, lp);
+                    const uint64_t address = 0x5350000000ull + count * 0x100;
+                    write_compare_witness_program(dump, address, count, lp);
+                    const auto stem =
+                        dump / ("cs_" + std::to_string(address) + "_" + std::to_string(count));
+                    std::vector<uint32_t> saved_code(lp.code.size());
+                    std::ifstream raw(stem.string() + ".bin", std::ios::binary);
+                    raw.read(reinterpret_cast<char*>(saved_code.data()),
+                             static_cast<std::streamsize>(saved_code.size() * sizeof(uint32_t)));
+                    ASSERT_EQ(raw.gcount(),
+                              static_cast<std::streamsize>(lp.code.size() * sizeof(uint32_t)));
+                    ASSERT_EQ(saved_code, lp.code);
+                    const auto saved = read_refused_shader_inputs(stem.string() + ".inputs");
+                    ASSERT_TRUE(saved.incomplete.empty()) << saved.incomplete;
+                    const auto replay = replay_refused_shader_inputs(saved_code, saved);
+                    ASSERT_TRUE(replay.produced) << replay.reject;
+                    ASSERT_FALSE(replay.spirv.empty());
+                    std::ofstream spv(stem.string() + ".spv", std::ios::binary);
+                    spv.write(reinterpret_cast<const char*>(replay.spirv.data()),
+                              static_cast<std::streamsize>(replay.spirv.size() * sizeof(uint32_t)));
+                    spv.close();
+                    ASSERT_TRUE(spv.good());
+                    const auto in = lane_inputs(0x5350);
+                    std::vector<uint32_t> buffer;
+                    for (const auto* a : {&in.s0, &in.s1, &in.old_d})
+                        buffer.insert(buffer.end(), a->begin(), a->end());
+                    for (const bool active : in.active) buffer.push_back(active ? 1u : 0u);
+                    bpermute_oracle::Interpreter vm(replay.spirv);
+                    const auto out = vm.run_buffers(64, {{3, buffer}}, 3);
+                    const auto effective = scalar64_form_case(x, form);
+                    if (def.fmt == Rdna2Format::SOP2 && def.opcode == kSop2OpcodeBfeU64 &&
+                        ((effective.other_lo >> 16) & 127) == 0) {
+                        ASSERT_EQ(vm.error, "poison shift");
+                        ++strict_zero_boundary;
+                    } else {
+                        ASSERT_TRUE(vm.error.empty()) << vm.error;
+                        ASSERT_GE(out.size(), 64u);
+                        const auto expected = expected_word(def, effective, output);
+                        for (size_t lane = 0; lane < 64; ++lane) ASSERT_EQ(out[lane], expected);
+                        ++executed;
+                    }
                     ++count;
                 }
     EXPECT_EQ(count, 228u);
+    EXPECT_EQ(executed, 222u);
+    EXPECT_EQ(strict_zero_boundary, 6u);
 }
