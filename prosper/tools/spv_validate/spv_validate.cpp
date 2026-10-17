@@ -31,6 +31,7 @@
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include "gpu/recompiler/spirv_builder.hpp"
+#include "../../tests/fixtures/ds_address_ir.hpp"
 #include "../../tests/fixtures/spirv_wave_width_fixtures.hpp"
 #include "../../tests/fixtures/ngg_lane_slots.hpp"
 #include "../../tests/fixtures/ngg_bool_copy.hpp"
@@ -1056,6 +1057,12 @@ int main(int argc, char** argv) {
     }
     { const uint32_t c[] = {0x06000300u, 0x10000500u, 0xBF810000u};
       dump(dir, "compute_alu", recompile_valu(c, 3, 3, 0), "recompile_valu"); }
+    {
+        SpirvCompute builder;
+        builder.begin(2, nullptr, 32, 1, 1, 32, 0, true, true);
+        prosper::test::ir::ds_address::emit_fixture(builder);
+        dump(dir, "ir_ds_address_values", builder.finish(), "emit_ds_address_values");
+    }
     // This VOP3 LSHL_ADD route calls the ordered IR input resolver; validate its containing module.
     {
         const uint32_t c[] = {

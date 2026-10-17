@@ -4,6 +4,7 @@
 #include <atomic>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/ir/lower/buffer_address_lowering.hpp"
+#include "gpu/recompiler/ir/lower/ds_address_lowering.hpp"
 #include "gpu/recompiler/ir/lower/buffer_format_values.hpp"
 #include "gpu/recompiler/ir/lower/buffer_store_values.hpp"
 #include "gpu/recompiler/ir/lower/ds_cross_lane_lowering.hpp"
@@ -4235,9 +4236,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if (in.opcode == 0x0e) {                    // ds_write2_b32: two dwords at offset0/offset1
                 // AMD RDNA2 ISA 12.13: MEM[ADDR + OFFSET0/1 * 4] = DATA0/1. The packed offsets
                 // mirror ds_read2_b32 below; Astro Bot's world-map reduction uses both operations.
-                const uint32_t base = b.ibin(Op_ShiftRightLogical, vread(in.src[0].value), b.uconst(2));
-                const uint32_t idx0 = b.ibin(Op_IAdd, base, b.uconst(in.literal & 0xFFu));
-                const uint32_t idx1 = b.ibin(Op_IAdd, base, b.uconst((in.literal >> 8) & 0xFFu));
+                const auto address_pair = ir::lower_ds_write2_b32_address(b, in, std::cref(vread));
+                const uint32_t idx0 = address_pair.first, idx1 = address_pair.second;
                 b.lds_store(idx0, vread(in.src[1].value), rs.exec_narrowed, rs.exec,
                             atomicize_store);
                 // Equal offsets encode one memory access and use DATA0; DATA1 is ignored.
@@ -4267,9 +4267,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (!lds_const_index_in_range(off0) || !lds_const_index_in_range(off1)) {
                     ok = false; return true;
                 }
-                const uint32_t base = b.ibin(Op_ShiftRightLogical, vread(in.src[0].value), b.uconst(2));
-                const uint32_t idx0 = b.ibin(Op_IAdd, base, b.uconst(off0));
-                const uint32_t idx1 = b.ibin(Op_IAdd, base, b.uconst(off1));
+                const auto address_pair =
+                    ir::lower_ds_write2st64_b32_address(b, in, std::cref(vread), off0, off1);
+                const uint32_t idx0 = address_pair.first, idx1 = address_pair.second;
                 b.lds_store(idx0, vread(in.src[1].value), rs.exec_narrowed, rs.exec,
                             atomicize_store);
                 if ((in.literal & 0xFFu) != ((in.literal >> 8) & 0xFFu))
@@ -4278,12 +4278,11 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 return true;
             }
             if (in.opcode == 0x4e) {                    // ds_write2_b64: two VGPR pairs at offset0/offset1
-                const uint32_t base = b.ibin(Op_ShiftRightLogical, vread(in.src[0].value), b.uconst(2));
-                const uint32_t idx0 = b.ibin(Op_IAdd, base, b.uconst((in.literal & 0xFFu) * 2u));
-                const uint32_t idx1 = b.ibin(Op_IAdd, base, b.uconst(((in.literal >> 8) & 0xFFu) * 2u));
+                const auto address_pair = ir::lower_ds_write2_b64_address(b, in, std::cref(vread));
+                const uint32_t idx0 = address_pair.first, idx1 = address_pair.second;
                 b.lds_store(idx0, vread(in.src[1].value), rs.exec_narrowed, rs.exec,
                             atomicize_store);
-                b.lds_store(b.ibin(Op_IAdd, idx0, b.uconst(1)), vread(in.src[1].value + 1),
+                b.lds_store(ir::lower_ds_store_word_index(b, idx0, 1), vread(in.src[1].value + 1),
                             rs.exec_narrowed, rs.exec, atomicize_store);
                 // OFFSET0 == OFFSET1 selects ONE address: the hardware performs a single write and
                 // uses DATA0 only (RDNA2 ISA 70648 §10.4.3). Writing DATA1 as well leaves the later
@@ -4293,8 +4292,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if ((in.literal & 0xFFu) != ((in.literal >> 8) & 0xFFu)) {
                     b.lds_store(idx1, vread(in.src[2].value), rs.exec_narrowed, rs.exec,
                                 atomicize_store);
-                    b.lds_store(b.ibin(Op_IAdd, idx1, b.uconst(1)), vread(in.src[2].value + 1),
-                                rs.exec_narrowed, rs.exec, atomicize_store);
+                    b.lds_store(ir::lower_ds_store_word_index(b, idx1, 1),
+                                vread(in.src[2].value + 1), rs.exec_narrowed, rs.exec,
+                                atomicize_store);
                 }
                 return true;
             }
@@ -4305,13 +4305,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // check, an encoding refinement) would have silently handed 0x0e to a copy with the
             // #1473 defect still in it, and the tests would have kept passing. Deleted (#1473).
             if (in.opcode == 0x77) {                    // ds_read2_b64: two pairs at scaled offsets
-                const uint32_t base = b.ibin(Op_ShiftRightLogical, vread(in.src[0].value), b.uconst(2));
-                const uint32_t idx0 = b.ibin(Op_IAdd, base, b.uconst((in.literal & 0xFFu) * 2u));
-                const uint32_t idx1 = b.ibin(Op_IAdd, base, b.uconst(((in.literal >> 8) & 0xFFu) * 2u));
-                const uint32_t indices[4] = {
-                    idx0, b.ibin(Op_IAdd, idx0, b.uconst(1)),
-                    idx1, b.ibin(Op_IAdd, idx1, b.uconst(1)),
-                };
+                const auto indices = ir::lower_ds_read2_b64_address(b, in, std::cref(vread));
                 for (int k = 0; k < 4; ++k) {
                     const uint32_t old = vreg_old(b, rs, in.dst.value + k);
                     rs.vreg[in.dst.value + k] = b.lds_load(
@@ -4323,11 +4317,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // AMD RDNA2 ISA 12.13: RETURN_DATA[0/1] = MEM[ADDR + OFFSET0/1 * 4].
                 // The two 8-bit offsets share the instruction's 16-bit offset field. Astro's
                 // loading compositor uses both adjacent (0,1) and non-zero (16,17) pairs.
-                const uint32_t base = b.ibin(Op_ShiftRightLogical, vread(in.src[0].value), b.uconst(2));
-                const uint32_t indices[2] = {
-                    b.ibin(Op_IAdd, base, b.uconst(in.literal & 0xFFu)),
-                    b.ibin(Op_IAdd, base, b.uconst((in.literal >> 8) & 0xFFu)),
-                };
+                const auto indices = ir::lower_ds_read2_b32_address(b, in, std::cref(vread));
                 for (int k = 0; k < 2; ++k) {
                     const uint32_t old = vreg_old(b, rs, in.dst.value + k);
                     rs.vreg[in.dst.value + k] = b.lds_load(
@@ -4349,11 +4339,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (!lds_const_index_in_range(roff0) || !lds_const_index_in_range(roff1)) {
                     ok = false; return true;
                 }
-                const uint32_t base = b.ibin(Op_ShiftRightLogical, vread(in.src[0].value), b.uconst(2));
-                const uint32_t indices[2] = {
-                    b.ibin(Op_IAdd, base, b.uconst(roff0)),
-                    b.ibin(Op_IAdd, base, b.uconst(roff1)),
-                };
+                const auto indices =
+                    ir::lower_ds_read2st64_b32_address(b, in, std::cref(vread), roff0, roff1);
                 for (int k = 0; k < 2; ++k) {
                     const uint32_t old = vreg_old(b, rs, in.dst.value + k);
                     rs.vreg[in.dst.value + k] = b.lds_load(
@@ -4373,10 +4360,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 predicate_write(b, rs, in.dst.value, old);
                 return true;
             }
-            uint32_t addr = b.ibin(Op_IAdd, vread(in.src[0].value), b.uconst(in.literal));
-            if (in.ds_gds)
-                addr = b.ibin(Op_BitwiseAnd, addr, b.uconst(0xFFFFu));
-            uint32_t idx  = b.ibin(Op_ShiftRightLogical, addr, b.uconst(2));
+            const uint32_t idx = ir::lower_ds_byte_address(b, in, std::cref(vread));
             if (in.ds_gds && in.opcode == 0x0d) {
                 b.compute_gds_store(idx, vread(in.src[1].value), rs.exec_narrowed, rs.exec);
                 return true;
@@ -4433,7 +4417,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // DATA0 VGPRs and write consecutive LDS dwords from the ordinary byte address.
                 const int dwords = in.opcode == 0x4d ? 2 : in.opcode == 0xde ? 3 : 4;
                 for (int k = 0; k < dwords; ++k) {
-                    const uint32_t at = k ? b.ibin(Op_IAdd, idx, b.uconst((uint32_t)k)) : idx;
+                    const uint32_t at = ir::lower_ds_store_word_index(b, idx, k);
                     b.lds_store(at, vread(in.src[1].value + k), rs.exec_narrowed, rs.exec,
                                 atomicize_store);
                 }
@@ -4443,7 +4427,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const int dwords = in.opcode == 0x76 ? 2 : in.opcode == 0xfe ? 3 : 4;
                 for (int k = 0; k < dwords; ++k) {
                     const uint32_t old = vreg_old(b, rs, in.dst.value + k);
-                    const uint32_t at = k ? b.ibin(Op_IAdd, idx, b.uconst((uint32_t)k)) : idx;
+                    const uint32_t at = ir::lower_ds_read_word_index(b, idx, k);
                     rs.vreg[in.dst.value + k] = b.lds_load(
                         at, rs.exec_narrowed, rs.exec, old);
                 }
