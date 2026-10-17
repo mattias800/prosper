@@ -5,6 +5,7 @@
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/ir/lower/buffer_address_lowering.hpp"
 #include "gpu/recompiler/ir/lower/smem_index_lowering.hpp"
+#include "gpu/recompiler/ir/lower/flat_window_lowering.hpp"
 #include "gpu/recompiler/ir/lower/ds_address_lowering.hpp"
 #include "gpu/recompiler/ir/lower/buffer_format_values.hpp"
 #include "gpu/recompiler/ir/lower/buffer_store_values.hpp"
@@ -1452,11 +1453,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // the address's own IAdd). A negative offset (address < base) becomes a huge unsigned index
                 // -> out-of-window -> robustBufferAccess returns 0 (defined, but a loose-bounds divergence
                 // from HW; decode kernels use non-negative offsets).
-                const uint32_t byte0 = b.ibin(Op_ISub, addr_lo, base_lo);
+                const uint32_t byte0 = ir::lower_flat_window_byte_offset(b, addr_lo, base_lo);
                 for (uint32_t c = 0; c < access.components; ++c) {
-                    const uint32_t addr = access.bits == 32
-                        ? b.ibin(Op_IAdd, byte0, b.uconst(c * 4)) : byte0;
-                    const uint32_t idx = b.ibin(Op_ShiftRightLogical, addr, b.uconst(2));
+                    const auto [addr, idx] = ir::lower_flat_window_component(b, byte0, access, c);
                     uint32_t value;
                     if (access.bits == 32) {
                         value = b.cbuf_load(idx, fw->binding);

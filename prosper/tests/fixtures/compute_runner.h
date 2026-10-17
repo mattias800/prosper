@@ -162,26 +162,26 @@ inline bool default_compute_buffer_int64_atomics_supported() {
 // threads are dispatched (default = input.size()) in groups of `local_size_x` (default 64); the
 // output buffer holds `out_count` floats (default = input.size()). Returns the output, or {} on any
 // Vulkan failure (including rejected SPIR-V).
-inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const std::vector<float>& input,
-                                      uint32_t invocations = 0, uint32_t out_count = 0,
-                                      const std::vector<uint32_t>& cbuf = {},
-                                      const std::vector<uint32_t>& cbuf1 = {},
-                                      std::vector<uint32_t>* cbuf1_out = nullptr,
-                                      uint32_t local_size_x = 64,
-                                      std::vector<uint32_t>* cbuf_out = nullptr,
-                                      // Internal-GDS binding (kComputeInternalGdsBinding = 127).
-                                      // Declared and bound UNCONDITIONALLY below: a recompiled module
-                                      // that statically uses it -- anything carrying the
-                                      // PROSPER_CFG_TRIP_BOUND witness does -- is an invalid pipeline
-                                      // without it (VUID-VkComputePipelineCreateInfo-layout-07988 and
-                                      // VUID-vkCmdDispatch-None-08114), and a test that dispatches an
-                                      // invalid pipeline is measuring undefined behaviour however
-                                      // confidently its assertions print. Pass this to read the buffer
-                                      // back; leave it null to bind the storage and ignore it.
-                                      std::vector<uint32_t>* gds_out = nullptr,
-                                      const std::array<std::vector<uint32_t>, 3>* extra_cbufs = nullptr,
-                                      uint32_t required_subgroup_size = 0,
-                                      ComputeOwnedDispatch* owned_dispatch = nullptr) {
+// NOLINTBEGIN(readability-function-size): this fixture owns dispatch setup, submission and cleanup.
+inline std::vector<float>
+run_compute(const std::vector<uint32_t>& spirv, const std::vector<float>& input,
+            uint32_t invocations = 0, uint32_t out_count = 0,
+            const std::vector<uint32_t>& cbuf = {}, const std::vector<uint32_t>& cbuf1 = {},
+            std::vector<uint32_t>* cbuf1_out = nullptr, uint32_t local_size_x = 64,
+            std::vector<uint32_t>* cbuf_out = nullptr,
+            // Internal-GDS binding (kComputeInternalGdsBinding = 127).
+            // Declared and bound UNCONDITIONALLY below: a recompiled module
+            // that statically uses it -- anything carrying the
+            // PROSPER_CFG_TRIP_BOUND witness does -- is an invalid pipeline
+            // without it (VUID-VkComputePipelineCreateInfo-layout-07988 and
+            // VUID-vkCmdDispatch-None-08114), and a test that dispatches an
+            // invalid pipeline is measuring undefined behaviour however
+            // confidently its assertions print. Pass this to read the buffer
+            // back; leave it null to bind the storage and ignore it.
+            std::vector<uint32_t>* gds_out = nullptr,
+            const std::array<std::vector<uint32_t>, 3>* extra_cbufs = nullptr,
+            uint32_t required_subgroup_size = 0, ComputeOwnedDispatch* owned_dispatch = nullptr,
+            const std::vector<uint32_t>& push_constants = {}) {
     uint32_t IN_N = (uint32_t)input.size();
     const std::vector<uint32_t>* selected_spirv = &spirv;
     const std::vector<float>* selected_input = &input;
@@ -194,7 +194,7 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
         owned_dispatch->enabled = {};
         owned_dispatch->plan = {};
         if (!owned_dispatch->prepare || required_subgroup_size || !cbuf.empty() || !cbuf1.empty() ||
-            extra_cbufs)
+            extra_cbufs || !push_constants.empty())
             return out;
     } else if (!IN_N || !out_count || !invocations || !local_size_x)
         return out;
@@ -209,6 +209,14 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     if (!ndev) { vkDestroyInstance(inst, nullptr); return out; }
     std::vector<VkPhysicalDevice> devs(ndev); vkEnumeratePhysicalDevices(inst, &ndev, devs.data());
     VkPhysicalDevice phys = devs[0];
+    if (!push_constants.empty()) {
+        VkPhysicalDeviceProperties properties{};
+        vkGetPhysicalDeviceProperties(phys, &properties);
+        if (push_constants.size() > properties.limits.maxPushConstantsSize / sizeof(uint32_t)) {
+            vkDestroyInstance(inst, nullptr);
+            return out;
+        }
+    }
     if (required_subgroup_size &&
         !compute_required_subgroup_supported(phys, required_subgroup_size, local_size_x)) {
         vkDestroyInstance(inst, nullptr);
@@ -567,6 +575,13 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
         return decline_setup("shader module creation failed");
     VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     plci.setLayoutCount = 1; plci.pSetLayouts = &dsl;
+    const VkPushConstantRange push_range{
+        VK_SHADER_STAGE_COMPUTE_BIT, 0,
+        static_cast<uint32_t>(push_constants.size() * sizeof(uint32_t))};
+    if (!push_constants.empty()) {
+        plci.pushConstantRangeCount = 1;
+        plci.pPushConstantRanges = &push_range;
+    }
     if (vkCreatePipelineLayout(dev, &plci, nullptr, &layout) != VK_SUCCESS)
         return decline_setup("pipeline layout creation failed");
     VkComputePipelineCreateInfo cpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
@@ -598,6 +613,9 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     for (const auto& upload : sampled_uploads) upload.record(cmd);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &dset, 0, nullptr);
+    if (!push_constants.empty())
+        vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_range.size,
+                           push_constants.data());
     vkCmdDispatch(cmd, (invocations + local_size_x - 1) / local_size_x, 1, 1);
     // The fence below waits for execution; it does not make shader writes available to host
     // reads. Record this after the final device write, including each optional readback buffer.
@@ -683,5 +701,6 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     vkDestroyDevice(dev, nullptr); vkDestroyInstance(inst, nullptr);
     return out;
 }
+// NOLINTEND(readability-function-size)
 
 } // namespace prosper::test

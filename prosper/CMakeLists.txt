@@ -3672,6 +3672,8 @@ if(TARGET prosper_core)
   # test_ir_scalar_alu_execution runs each scalar-op definition's SPIR-V in the integer interpreter
   # against its own constant evaluation (#2514).
   foreach(ir_test
+          ir_flat_window_values
+          ir_lower_flat_window
           ir_buffer_store_values
           ir_core
           ir_half_fma_finite
@@ -6241,6 +6243,11 @@ endif()
         LIBRARIES prosper_core Vulkan::Vulkan)
       prosper_add_gtest(test_ir_ds_address_execution
         SOURCES tests/gpu/recompiler/ir/test_ir_ds_address_execution.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      prosper_add_gtest(test_ir_flat_window_execution
+        SOURCES tests/gpu/recompiler/ir/test_ir_flat_window_execution.cpp
         INCLUDES tests
         LIBRARIES prosper_core Vulkan::Vulkan)
 
