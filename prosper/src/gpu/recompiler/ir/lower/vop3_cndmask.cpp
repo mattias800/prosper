@@ -1,10 +1,14 @@
-// vop3_cndmask.cpp — v_cndmask_b32_e64: SRC2's lane mask selects SRC1 or SRC0. Moved verbatim
-// from emit_alu.
+// vop3_cndmask.cpp — v_cndmask_b32_e64: SRC2's lane mask selects SRC1 or SRC0. The select is the
+// IR definition (ir/ops/vector_cndmask.cpp); the mask read and the source modifiers are emit_alu's,
+// unchanged.
 #include "gpu/recompiler/ir/lower/vop3_mask_lowering_internal.hpp"
+#include "gpu/recompiler/ir/ops/vector_cndmask.hpp"
 
 namespace prosper::gpu::ir {
 
 std::optional<bool> Vop3MaskLowering::route_cndmask() {
+    const VectorCndmaskDef* def = find_vector_cndmask(in.fmt, in.opcode);
+    if (!def) return std::nullopt;
     const Operand& s2 = in.src[2]; uint32_t m = 0;        // src2 is an SGPR-pair (or VCC) wave mask
     if (s2.value == 106 || s2.value == 107) {
         // Wave32 e64/SDWA forms may explicitly select either physical VCC word as an
@@ -38,13 +42,13 @@ std::optional<bool> Vop3MaskLowering::route_cndmask() {
     // sources (sign-select idioms). Raw val() silently dropped neg/abs — the shader
     // recompiled "successfully" and computed the un-negated value. fv == val when no
     // modifier bits are set.
-    if (!m) ok = false; else vreg[in.dst.value] = b.sel(m, fv(1), fv(0));
-    return std::nullopt;
+    if (!m) ok = false; else vreg[in.dst.value] = emit_vector_cndmask(b, *def, m, fv(1), fv(0));
+    return true;
 }
 
-void lower_vop3_cndmask(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok,
+bool lower_vop3_cndmask(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok,
                         bool allow_wave, const Vop3MaskSource& fv) {
-    Vop3MaskLowering({b, rs, in, ok, allow_wave}, &fv).route_cndmask();
+    return Vop3MaskLowering({b, rs, in, ok, allow_wave}, &fv).route_cndmask().has_value();
 }
 
 }   // namespace prosper::gpu::ir

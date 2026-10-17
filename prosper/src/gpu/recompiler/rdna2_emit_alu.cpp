@@ -856,8 +856,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     else if (in.sdst.kind == OperandKind::SGPR) rs.sreg_bool[in.sdst.value] = carry_masked;
                     else ok = false;
                 }
-            } else if (in.opcode == 0x30F || in.opcode == 0x310 || in.opcode == 0x319) {
-                ir::lower_vop3_carry_out(b, rs, in, ok, allow_wave);
+            } else if (ir::lower_vop3_carry_out(b, rs, in, ok, allow_wave)) {
             } else if (ir::lower_vop3_multiply(b, rs, in, ok, allow_wave)) {
             } else if (in.opcode == 0x157 &&
                        ir::lower_vop3_minmax_float(b, rs, in, ok, allow_wave, std::cref(fv),
@@ -968,8 +967,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             } else if (ir::lower_vop3_subword_to_float(b, rs, in, ok)) {
             } else if (ir::lower_vop3_ternary_integer(b, rs, in, ok, allow_wave)) {
                 // The common modifier and predicated destination stages still follow.
-            } else if (in.opcode == 0x128 || in.opcode == 0x129 || in.opcode == 0x12A) {
-                ir::lower_vop3_carry_in_out(b, rs, in, ok, allow_wave);
+            } else if (ir::lower_vop3_carry_in_out(b, rs, in, ok, allow_wave)) {
             } else if ((in.opcode == 0x365 || in.opcode == 0x366) && b.ngg_logical_lane &&
                        in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1) {
                 // A proven no-GS passthrough executes only the logical vertex producer; Vulkan's
@@ -1108,8 +1106,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             } else if (ir::lower_vop3_float_integer(b, rs, in, ok)) {
             } else if (ir::lower_vop3_float_values(b, rs, in, ok, allow_wave, fv, fresult)) {
             } else if (ir::lower_vop3_legacy_mul(b, rs, in, ok, allow_wave, fv, fresult)) {
-            } else if (in.opcode == 0x101) {   // v_cndmask_b32_e64: src2_mask ? src1 : src0
-                ir::lower_vop3_cndmask(b, rs, in, ok, allow_wave, std::cref(fv));
+            } else if (ir::lower_vop3_cndmask(b, rs, in, ok, allow_wave, std::cref(fv))) {
             } else if (ir::lower_vop3_mac_float(b, rs, in, ok, allow_wave, std::cref(fv),
                                                 std::cref(fresult), old_d)) {
             } else

@@ -5,6 +5,8 @@ RDNA2 instructions are moving, one instruction family at a time, from direct SPI
 (SOP1, SOP2, SOPC, SOPK), VOP2's integer and bitwise group, and the later VALU groups the
 family table in `HOW_TO_ADD_A_FAMILY.md` lists. VOPC compares are two halves: the per-lane value
 (`ops/vector_compare*.cpp`) and the shared lane-mask write (`lower/vopc_mask_write.cpp`).
+`v_cndmask_b32` and the carry ops split the same way: `ops/vector_cndmask.cpp` and
+`ops/vector_carry.cpp` hold the values, `lower/carry_mask_write.cpp` the shared carry-mask write.
 Everything here is private to `gpu/recompiler`.
 
 | path | role |

@@ -23,7 +23,6 @@ private:
     decltype(RegState::vreg)& vreg;
     const Vop3MaskSource* source_;
     uint32_t fv(int k) const { return (*source_)(k); }
-    void write_vop3b_carry_output(uint32_t carry_mask);
 };
 
 }   // namespace prosper::gpu::ir
