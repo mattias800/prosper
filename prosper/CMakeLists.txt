@@ -3811,6 +3811,7 @@ if(TARGET prosper_core)
           ir_vector_permlane_execution
           ir_lower_vop3_cross_lane
           ir_vector_writelane_execution
+          ir_lower_ds_cross_lane
           ir_buffer_address
           ir_buffer_address_execution
           ir_lower_buffer_address
