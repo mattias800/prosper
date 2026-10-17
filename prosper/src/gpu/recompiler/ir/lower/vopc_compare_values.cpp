@@ -17,12 +17,6 @@ uint32_t VopcLowering::compare_value() {
         return emit_vector_compare(b, *def, a, c);
     uint32_t cmp = 0;
     switch (eff) {
-        case 0x81: cmp = b.scmp(Op_SLessThan, a, c); break;            // v_cmp_lt_i32
-        case 0x82: cmp = b.ucmp(Op_IEqual, a, c); break;               // v_cmp_eq_i32
-        case 0x83: cmp = b.scmp(Op_SLessThanEqual, a, c); break;       // v_cmp_le_i32
-        case 0x84: cmp = b.scmp(Op_SGreaterThan, a, c); break;         // v_cmp_gt_i32
-        case 0x85: cmp = b.ucmp(Op_INotEqual, a, c); break;            // v_cmp_ne_i32 (sign-agnostic)
-        case 0x86: cmp = b.scmp(Op_SGreaterThanEqual, a, c); break;    // v_cmp_ge_i32
         case 0x89: case 0x8A: case 0x8B: case 0x8C: case 0x8D: case 0x8E:
         case 0xA9: case 0xAA: case 0xAB: case 0xAC: case 0xAD: case 0xAE:
             cmp = compare_integer16();
@@ -31,12 +25,6 @@ uint32_t VopcLowering::compare_value() {
             cmp = compare_integer64_signed();
             break;
         case 0x88: cmp = compare_class_f32(); break;                   // v_cmp_class_f32
-        case 0xC1: cmp = b.ucmp(Op_ULessThan, a, c); break;            // v_cmp_lt_u32
-        case 0xC2: cmp = b.ucmp(Op_IEqual, a, c); break;               // v_cmp_eq_u32
-        case 0xC3: cmp = b.ucmp(Op_ULessThanEqual, a, c); break;       // v_cmp_le_u32
-        case 0xC4: cmp = b.ucmp(Op_UGreaterThan, a, c); break;         // v_cmp_gt_u32
-        case 0xC5: cmp = b.ucmp(Op_INotEqual, a, c); break;            // v_cmp_ne_u32
-        case 0xC6: cmp = b.ucmp(Op_UGreaterThanEqual, a, c); break;    // v_cmp_ge_u32
         case 0xE1: case 0xE2: case 0xE3: case 0xE4: case 0xE5: case 0xE6:
             cmp = compare_integer64_unsigned();
             break;
