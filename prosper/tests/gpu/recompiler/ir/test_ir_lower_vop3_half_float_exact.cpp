@@ -1,9 +1,11 @@
 // Bounded width conversion: integer bit answers are independent of the shared builder/eval.
 #include "gpu/recompiler/ir/half_float_exact_e64_cases.hpp"
+#include "gpu/recompiler/ir/eval.hpp"
 #include "gpu/recompiler/ir/lower/vop3_binary_float_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_half_float_exact_lowering.hpp"
 #include "gpu/recompiler/ir/lowering_fixture.hpp"
 #include "gpu/recompiler/ir/ops/vector_float_integer_e64.hpp"
+#include "gpu/recompiler/ir/ops/vector_conversion.hpp"
 #include "gpu/recompiler/ir/ops/vector_half_float_exact_e64.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include <gtest/gtest.h>

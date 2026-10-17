@@ -1,6 +1,7 @@
 // AMD70648 6.2/12.8: explicit normal F16 values widen exactly to normal F32 values.
 // No rounding, denormal, overflow, zero-sign or nonfinite policy is inferred for other inputs.
 #include "gpu/recompiler/ir/lower/vop3_half_float_exact_lowering.hpp"
+#include "gpu/recompiler/ir/ops/vector_conversion.hpp"
 #include "gpu/recompiler/ir/ops/vector_half_float_exact_e64.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"

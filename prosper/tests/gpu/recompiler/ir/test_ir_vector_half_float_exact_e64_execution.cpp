@@ -1,6 +1,11 @@
 // Execute actual guest modules against independent normal-half bit answers, including inactive D.
 #include "gpu/recompiler/ir/half_float_exact_e64_cases.hpp"
+#include "gpu/recompiler/ir/eval.hpp"
+#include "gpu/recompiler/ir/ops/vector_conversion.hpp"
 #include "gpu/recompiler/ir/ops/vector_half_float_exact_e64.hpp"
+#include "gpu/recompiler/ir/vector_lane_harness.hpp"
+#include "gpu/recompiler/bpermute_spirv_oracle.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/diagnostics/refused_shader_inputs.hpp"
 #include "fixtures/test_scratch.h"
 #include <gtest/gtest.h>
