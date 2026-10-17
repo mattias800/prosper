@@ -205,7 +205,7 @@ TEST(IrCoreInteger64, EveryOpcodeRunsLikeItsEvaluationPerLane) {
     const uint32_t words[] = {0u,          1u,          0x7fffffffu, 0x80000000u,
                               0xffffffffu, 0x12345678u, 0xffffffc0u, 0x0000003fu};
     std::set<Opcode> seen;
-    for (uint32_t op = uint32_t(Opcode::PackU64); op <= uint32_t(Opcode::U64AShr); ++op) {
+    for (uint32_t op = uint32_t(Opcode::PackU64); op <= uint32_t(Opcode::U64Bfe); ++op) {
         const Opcode opcode = static_cast<Opcode>(op);
         Block block;
         Builder ir(block);
@@ -221,6 +221,12 @@ TEST(IrCoreInteger64, EveryOpcodeRunsLikeItsEvaluationPerLane) {
         }
         if (opcode >= Opcode::U64Shl && opcode <= Opcode::U64AShr)
             result = block.append({opcode, Type::U64, 0, {a, ir.and_(c_lo, ir.c32(63))}});
+        if (opcode == Opcode::U64Bfe) {
+            const Value offset = ir.and_(c_lo, ir.c32(63));
+            const Value count = ir.iadd(ir.and_(c_hi, ir.c32(63)), ir.c32(1));
+            result = ir.u64bfe(a, offset, count);
+        }
+        // Positive widths keep both intermediate shifts defined in the unchanged BFE helper.
         // Every wide result leaves through both halves, so the store reads all 64 bits.
         const bool wide = block.at(result).type == Type::U64;
         const Value lo = wide ? ir.u64lo(result) : result;
@@ -246,7 +252,7 @@ TEST(IrCoreInteger64, EveryOpcodeRunsLikeItsEvaluationPerLane) {
                 }
             }
     }
-    for (uint32_t op = uint32_t(Opcode::PackU64); op <= uint32_t(Opcode::U64AShr); ++op)
+    for (uint32_t op = uint32_t(Opcode::PackU64); op <= uint32_t(Opcode::U64Bfe); ++op)
         EXPECT_TRUE(seen.contains(static_cast<Opcode>(op))) << opcode_info(Opcode(op)).name;
 }
 
