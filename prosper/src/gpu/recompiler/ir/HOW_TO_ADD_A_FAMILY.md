@@ -575,7 +575,7 @@ The recorded corpus never reaches four of the seven definitions, so the witness 
 | `v_div_scale_f32` (VOP3B 0x16D) | Codex with this recipe, as an **admission** in its own explained PR | emit_alu has no case for it today. The value is an F32 definition, and the flag goes through `write_vop3b_carry_mask`. |
 | `v_div_scale_f64` (0x16E) | Codex, after `v_div_scale_f32`, using the F64 recipe | an F64 result with a flag; it needs F64 arithmetic first (family 14) and the result-mode rules in "F64 values" |
 | `v_mad_u64_u32` / `v_mad_i64_i32` (0x176 / 0x177) | values in `ops/vector_mad64.cpp`; carry write remains **lead** | The existing 32-bit graph computes U32 low, U32 high and Bool carry in one Block, all before the old-high lookup. Keep that order. `write_mad64_carry_mask` remains protected: Wave32 `sdst = vcc_lo` writes VCC_LO, while an SGPR SDST still writes a pair, with no B32 branch or erase of the old SGPR word. Do not share or change that write. |
-| `v_mbcnt_lo/hi` | lead | cross-lane |
+| `v_mbcnt_lo/hi` | lead | cross-lane, and it reads EXEC as a mask |
 | the VOPC mask write | lead | unchanged |
 
 ## 64-bit values
@@ -822,6 +822,148 @@ uncontrolled candidate:
 
 The recorded corpus cannot see this family at all, so the witness is the whole gate.
 
+## Cross-lane operations
+
+A cross-lane value depends on another lane's data. `v_readlane_b32`'s native-subgroup value is
+done and is the worked example (`ops/vector_cross_lane.cpp`). It splits the way the compares and
+the carry ops do. The **value** is yours. The **side** stays where it is: the scalar destination,
+lane-slot spills, mask-half aliases, `retire_scalar_data_word_mask`, `sreg_bool` erasure,
+`lane_local_scalars`, and the subgroup-size contract.
+
+**Measure first.** Count programs by opcode and by DPP control, deduplicated by content, before the
+first `S_ENDPGM` (`tools/rdna2_ref/decode.py`). On 2026-10-17 the recorded corpus had 1,003
+distinct programs; 553 of them decode only partly, so these counts are lower bounds:
+
+| op | programs | instructions |
+| --- | --- | --- |
+| `v_readfirstlane_b32` | 144 | 834 |
+| `v_readlane_b32` | 126 | 2,697 |
+| `v_mbcnt_lo/hi_u32_b32` | 78 / 63 | 242 / 223 |
+| `v_writelane_b32` | 68 | 1,794 |
+| `v_permlanex16_b32` / `v_permlane16_b32` | 45 / 7 | 191 / 42 |
+| DPP16 `row_shr` (on `v_add_nc_u32`, `v_min/max_f32`, `v_or_b32`, ...) | 54 | 752 |
+| DPP16 `quad_perm` (fragment `v_mov/v_sub_f32`; compute `v_mov`, `v_cvt_u32_f32`) | 54 | 516 |
+| DPP16 `row_ror`, `row_xmask` | 1 | 16 |
+| DPP8, `ds_swizzle`, `ds_bpermute`, `ds_permute` | 0 decoded | |
+
+The 5,771 distinct programs of 443 `refused_shaders_*` dumps give the same ranking.
+
+### The two IR opcodes
+
+| opcode | builder | SPIR-V | meaning |
+| --- | --- | --- | --- |
+| `LaneId` | `lane_id()` | `subgroup_local_id` | this invocation's index in the **host** subgroup |
+| `Shuffle` | `shuffle(value, lane)` | `subgroup_shuffle` (`OpGroupNonUniformShuffle`) | `value` of invocation `lane` |
+
+These are the only cross-lane opcodes. Write every cross-lane value from them and the ordinary
+integer opcodes: quad, row and wave lane arithmetic is plain U32 arithmetic on `LaneId`. Both
+emitter helpers also raise the module's subgroup contract (`compute_min_subgroup_size` at least 4,
+or the fragment shuffle reason), as the pre-IR calls did, so the bytes and the contract both stay.
+
+**Evaluation is over a lane vector.** `evaluate` sees one invocation, so it returns unknown for
+both opcodes. The constant folder can therefore never fold a cross-lane value. `evaluate_lanes`
+(`eval_lanes.hpp`) evaluates a Block for every invocation of a subgroup at once, instruction by
+instruction, so a `Shuffle` reads its source invocation's value. The vector's size is the host
+subgroup size. Every invocation executes: guest EXEC is a Bool value, not host control flow. A
+`Shuffle` lane outside the vector is unknown, which is what SPIR-V calls undefined. U64 values
+are out of its domain and stay unknown.
+
+### Value and side
+
+- **A definition takes the wave size, not the subgroup size.** `readlane_b32(ir, s0, s1, W)`
+  computes the source invocation as `(LaneId & ~(W - 1)) | (S1 & (W - 1))`. The guest wave is the
+  aligned W-lane slice of the host subgroup. With an exact native subgroup the base is 0. With a
+  Wave32 guest in a 64-invocation subgroup, the second wave reads within its own slice. The ISA
+  says "Lane is S1 % (32 if wave32, 64 if wave64). Ignores exec mask." (AMD 70648, V_READLANE_B32).
+- **EXEC is an input, never a mask register.** Readlane ignores it. An op that honours an inactive
+  source lane (`v_permlane*` with FI=0, DPP with FI=0, `ds_swizzle`, `ds_bpermute`) receives the
+  lowering's `rs.exec` as a `Type::Bool` input. The definition shuffles `Select(exec, 1, 0)` from the
+  source lane, as the pre-IR helpers did.
+- **The subgroup-size contract stays in the lowering.** `mark_subgroup_min16/32/64` is called before
+  the definition, exactly where the old code called it. It describes the module, not the value.
+- **What never moves:** the scratch route for a guest wave wider than the host subgroup
+  (`guest_wave_readlane`), the lane-slot spill model (`vgpr_lane_slots`, `vgpr_lane_mask_slots`,
+  `invalidated_vgpr_lane_slots`), the Wave64 mask-half aliases, `expire_wave64_mask_half`, the NGG
+  one-lane projection, the portable dispatcher's CFG paths in `rdna2_emit_cfg.cpp`, and every
+  `ok = false` refusal. A cross-lane read of a hard lane is hard under #5185. That rule lives in the
+  definedness and proof passes over the decoded instructions (the vector-word marks,
+  `rdna2_loop_arbitrary_carry`), not in the IR, so a definition only changes how the value is
+  emitted.
+- **One emit function per definition, taking bound ids in the old order.**
+  `emit_readlane_b32(b, source, selector, W)` builds the Block with the source and selector as
+  inputs and returns the Shuffle's id. The old code read `val(src1)` before the contract call and
+  the lane arithmetic, so binding the inputs up front keeps the order. When an old operand read
+  sits between two emitted values, as `vreg_old` does inside `v_permlane*`'s and `v_writelane`'s
+  `sel(...)`, make it an Input at that position and emit with `emit_spirv_resolving_inputs`.
+
+### Steps for one member
+
+1. Relocate its case with `extract_case_routes.py` if it is still in `emit_alu`. The VOP3 cases
+   are in `lower/vop3_cross_lane.cpp`: `route_writelane`, `route_readlane` and `route_permlane16`.
+2. Write the definition in `ops/vector_cross_lane.cpp` from `LaneId`, `Shuffle` and the integer
+   opcodes, appending in the old order. Cite the ISA sentence it implements.
+3. In the route, replace only the value's `SpirvCompute` calls with the emit function. Leave every
+   other line of the route as it is.
+4. Gate the recorded corpus and a witness corpus, and run one positive control per definition.
+
+### Testing it
+
+- `test_ir_core_cross_lane.cpp` pins the opcodes. `evaluate` must never know them.
+  `evaluate_lanes` gets hand-worked vectors, with an out-of-range lane and an unknown source. Each
+  definition gets an ISA truth table worked by hand, not taken from eval, in three shapes: Wave64
+  in 64 invocations, Wave32 in 32, and Wave32 in 64. Every Block's SPIR-V then runs in the
+  interpreter's exact native subgroup (`vm.native_subgroup_width = lanes`, with `lanes` invocations)
+  against `evaluate_lanes`. Add your definition to those loops.
+- `test_ir_vector_cross_lane_execution.cpp` runs the real recompiler with
+  `config.native_subgroup_size = W` and the interpreter in an exact W-lane subgroup. It covers
+  lanes with differing data, the harness's partial EXEC, SGPR and inline selectors, and selectors
+  at and past W. It asserts the module contains `OpGroupNonUniformShuffle`, so a test that silently
+  took another route fails. Its positive control, `AnInactiveSourceLaneIsStillRead`, selects an
+  EXEC-inactive lane whose value no active lane holds.
+- **The interpreter cannot run a Wave32 guest in a 64-invocation subgroup through the recompiler.**
+  It requires the native width to equal the invocation count, and `recompile_compute` enables the
+  native subgroup only when it equals the wave size. So the Wave32-in-64 mapping is covered at the
+  IR level only. In production it applies wherever the native-shuffle path runs in a host
+  subgroup wider than the guest wave.
+
+Mutations that went red: the Shuffle evaluated from its own lane; an out-of-range lane wrapped
+instead of unknown; `LaneId` emitted as 0 (only the core test sees it, because an exact subgroup
+has wave base 0); the Shuffle emitted with its own lane id; the wave mask doubled; the wave base
+dropped (core only, for the same reason); the lowering passing a fixed wave size of 64; the
+lowering passing a zero selector; the harness without its `v_cmpx`; and the interpreter's shuffle
+reading its own lane.
+
+### Gate and controls
+
+Witness: `PROSPER_IR_WITNESS_DIR=~/<slug>-witness ./test_ir_vector_cross_lane_execution
+--gtest_filter='*Exports*'`, then `recompile_corpus.py harvest`. It writes 40 entries: ten
+selector forms in two wave sizes (20 distinct programs), each once with the native subgroup and
+once without it. Each control is a neutral byte change in the definition:
+
+| | recorded corpus (1,442 modules) | witness (40) |
+| --- | --- | --- |
+| the migration | `changes: none` | `changes: none` |
+| `and_(selector, mask)` -> `and_(mask, selector)` | output-changed 5 | output-changed 18 of 20 programs (not the two whose selector is the constant `W - 1`, the same SPIR-V id as the mask) |
+| `or_(base, lane)` -> `or_(lane, base)` | output-changed 5 | output-changed 20 of 20 programs |
+
+The recorded corpus reaches this route in 5 modules, so the witness is required.
+
+### The remaining cross-lane members
+
+| member | status | why |
+| --- | --- | --- |
+| `v_readlane_b32`, fragment static lane with mask slots (`subgroup_shuffle(val(src0), uconst(lane))`) | Codex, with this recipe | `Shuffle(s0, Const(lane))`; check `val`'s order against the constant with the gate |
+| `v_writelane_b32`, native dynamic selector | Codex, with this recipe | `Select(IEq(LaneId, S1 & (W-1)), S0, old)`; `vreg_old` sits inside the old `sel`, so it is an Input resolved at its position. The lane-slot forms are lead. |
+| `v_permlane16_b32` / `v_permlanex16_b32` | Codex, with this recipe | the value is `subgroup_permlane16`'s lane arithmetic plus a `Shuffle`. With FI=0 it is a second `Shuffle` of `Select(exec, 1, 0)` and a `Select` against `0` or `vreg_old`. `vreg_old` is called twice, once inside the `sel`; keep both calls. |
+| DPP16 `row_shr`, `quad_perm`, `row_ror`/`row_xmask` (compute) | Codex, with this recipe, after relocating VOP1's DPP stage (VOP2's is `lower/vop2_dpp_routes.cpp`) | SRC0 transforms built from `LaneId` and `Shuffle` (`subgroup_quad_permute`, `subgroup_row_xor`) |
+| DPP16 `quad_perm` (fragment) | lead | `dpp_quad` uses `OpDPdx/OpDPdy` on `FragCoord`, not a shuffle, so it needs a derivative opcode with its own semantics |
+| `ds_swizzle_b32`, `ds_bpermute_b32` (native arm in emit_alu's DS case) | Codex, with this recipe, after relocating the two arms out of the DS case | shuffle-only: no LDS. EXEC is a Bool input; `ds_bpermute_b32` reads `((ADDR + OFFSET) >> 2) & 31` within each 32-lane half |
+| `ds_bpermute_b32` (portable), `ds_permute_b32` | stop and report | the portable form is a workgroup rendezvous in `rdna2_emit_cfg.cpp`, and `ds_permute` (forward) is not admitted |
+| `v_readfirstlane_b32` | lead | emit_alu emits no cross-lane SPIR-V for it: it stores this lane's own value and taints it in `lane_local_scalars` (#3596). The real broadcast is the portable dispatcher in `rdna2_emit_cfg.cpp` |
+| `v_readlane_b32` other paths: `guest_wave_readlane`, NGG one-lane projection, lane slots, mask halves | lead | scratch, collapsed-wave and proof state |
+| `v_mbcnt_lo/hi` | lead | reads EXEC as a mask |
+| DPP8 | lead | not admitted; no decoded use |
+
 ## Family list and order
 
 Remaining in `rdna2_emit_alu.cpp`, in the order to migrate them. Codex takes the open groups; the
@@ -852,7 +994,8 @@ and leave the reserved ones in the `switch`.
 | 17 | VOP3B `v_mad_u64_u32` / `v_mad_i64_i32`: values in `ops/vector_mad64.cpp` | Codex, value-only; preserve all three outputs before the old-high lookup and the existing `write_mad64_carry_mask` call |
 | - | Admitting any compare the switch refuses today | lead, then Codex |
 | - | `write_mad64_carry_mask` (its SGPR write differs from the shared one in Wave32), the VOPC mask write (`lower/vopc_mask_write.cpp`), the carry mask write (`lower/carry_mask_write.cpp`), `v_mbcnt` | lead (wave masks) |
-| - | DPP (the VOP1/VOP2 DPP routes and SRC0 stage), `v_permlane*`, `v_readlane/writelane/readfirstlane`, `ds_bpermute/permute`, quad and swizzle ops | lead (cross-lane) |
+| 18 | Cross-lane values: `v_writelane_b32` (native dynamic selector), `v_permlane16/x16_b32`, the compute DPP16 SRC0 transforms, `ds_swizzle_b32` and the native `ds_bpermute_b32`, and the fragment static-lane readlane | Codex, using the cross-lane recipe ("Cross-lane operations"); `v_readlane_b32`'s native value is done |
+| - | `v_readfirstlane_b32`, fragment DPP `quad_perm` (`dpp_quad`), DPP8, the portable `ds_bpermute`, `ds_permute`, and the readlane/writelane scratch, lane-slot, mask-half and NGG paths | lead (cross-lane), see "The remaining cross-lane members" |
 | - | `v_movrel*`, `s_movrel*`, and the memory families SMEM, MUBUF/MTBUF, FLAT, MIMG, DS (descriptor provenance, raw windows, active-word marks) | lead (proof and definedness) |
 | - | SOPP, `rdna2_emit_cfg.cpp`, the SOP `*_routes.cpp` | lead (control flow, mask routes) |
 

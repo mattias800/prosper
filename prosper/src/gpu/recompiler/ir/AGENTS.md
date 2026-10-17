@@ -9,13 +9,16 @@ The F64 compares are the first binary64 family (`HOW_TO_ADD_A_FAMILY.md`, "F64 v
 F64 instruction is gated on the device verdict in `../float64_support.hpp`.
 `v_cndmask_b32` and the carry ops split the same way: `ops/vector_cndmask.cpp` and
 `ops/vector_carry.cpp` hold the values, `lower/carry_mask_write.cpp` the shared carry-mask write.
+Cross-lane values (`ops/vector_cross_lane.cpp`) are built from two opcodes, `LaneId` and `Shuffle`,
+whose evaluation needs every invocation of a subgroup (`eval_lanes.hpp`); `evaluate` never knows
+them, so the folder cannot fold one. Their lowerings are `lower/vop3_cross_lane.cpp`.
 Everything here is private to `gpu/recompiler`.
 
 | path | role |
 | --- | --- |
 | `ir.hpp`, `ir.cpp` | the IR core: `Type` (U32, Bool, and the 64-bit word U64, which the F64 relations read as binary64), `Value`, `Opcode`, `Inst`, `Block` and the rules a Block enforces |
 | `builder.hpp` | typed helpers that append instructions to a Block |
-| `eval.hpp`, `eval.cpp` | the evaluation half of every opcode: what the constant folder computes (`eval_integer64.cpp` for the 64-bit words, `eval_float64.cpp` for the binary64 relations, which the folder never evaluates) |
+| `eval.hpp`, `eval.cpp` | the evaluation half of every opcode: what the constant folder computes (`eval_integer64.cpp` for the 64-bit words, `eval_float64.cpp` for the binary64 relations, which the folder never evaluates; `eval_lanes.cpp` for the cross-lane opcodes, over a lane vector) |
 | `emit/` | the SPIR-V half of every opcode: a Block emitted through `SpirvCompute`, in Block order |
 | `ops/` | ONE definition per guest operation (`scalar_alu.cpp`, `scalar_compare.cpp`, `vector_alu.cpp`), used by both evaluation and emission |
 | `lower/` | RDNA2 -> IR per format: `sop1.cpp`, `sop2.cpp`, `sopc.cpp`, `sopk.cpp`, `vop2.cpp`, the relocated `*_routes.cpp` / `*_stages.cpp`, and `lowering_context.hpp` (emit_alu's shared locals) |
