@@ -13,3 +13,6 @@ it reads the mask back into v1 for every lane (inactive lanes must read 0) or, f
 v1 under the narrowed EXEC. A new family adds its tests here and to the
 `foreach(ir_test ...)` list in `prosper/CMakeLists.txt`; the recipe is
 `src/gpu/recompiler/ir/HOW_TO_ADD_A_FAMILY.md`.
+The interpreter fails an out-of-range buffer access instead of returning 0, so a memory family's
+robustness arm runs on Vulkan: `test_ir_buffer_address_robustness` links Vulkan and is registered
+beside `test_traversal_chase`, not in that list.

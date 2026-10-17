@@ -12,6 +12,9 @@ F64 instruction is gated on the device verdict in `../float64_support.hpp`.
 Cross-lane values (`ops/vector_cross_lane.cpp`) are built from two opcodes, `LaneId` and `Shuffle`,
 whose evaluation needs every invocation of a subgroup (`eval_lanes.hpp`); `evaluate` never knows
 them, so the folder cannot fold one. Their lowerings are `lower/vop3_cross_lane.cpp`.
+The first memory definition is the MUBUF/MTBUF address (`ops/buffer_address.cpp`, lowered by
+`lower/buffer_address.cpp`): the address arithmetic only. The access and every descriptor, provenance
+and proof step stay in emit_alu's MUBUF/MTBUF case (`HOW_TO_ADD_A_FAMILY.md`, "Memory instructions").
 Everything here is private to `gpu/recompiler`.
 
 | path | role |

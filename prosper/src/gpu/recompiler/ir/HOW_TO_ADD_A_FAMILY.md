@@ -975,6 +975,148 @@ The recorded corpus reaches this route in 5 modules, so the witness is required.
 | `v_mbcnt_lo/hi` | lead | reads EXEC as a mask |
 | DPP8 | lead | not admitted; no decoded use |
 
+## Memory instructions
+
+A memory instruction is three things, and only the first is a definition:
+
+1. **The value**: the address arithmetic (base, offsets, index times stride, SOFFSET, the dword
+   index), descriptor field extraction, and any pure conversion of a loaded word.
+2. **The access**: the SPIR-V load, store, atomic or sample, its coherence, the robustness rule,
+   the EXEC-predicated VGPR write (`vreg_old` / `predicate_write`), and the LDS bounds (#5193).
+3. **The proof machinery**: descriptor provenance (`rt->by_fetch_pc`, `by_srt_offset`,
+   `by_sgpr_base*`, SRT tags), PC-relative tables, raw and owned windows, the indirect-pointer
+   proof, the per-title exact sites, memory-pattern and active-word marks, and the loaded-data
+   arbitrary/hard rules (#5193).
+
+The access and the proof machinery stay at their call sites with the same arguments. A family PR
+moves the value and nothing else.
+
+**Measure first.** Count programs by family and opcode, deduplicated by content, before the first
+`S_ENDPGM` (`tools/rdna2_ref/decode.py`; it names SMEM only, so read the other opcodes from the
+encoding fields as `rdna2_decode.cpp` does). On 2026-10-17 the recorded corpus had 1,003 distinct
+programs, 227 of which stop decoding before `S_ENDPGM`, so the counts are lower bounds:
+
+| family | programs | instructions | most used |
+| --- | --- | --- | --- |
+| SMEM | 962 | 22,914 | `s_load_dwordx4` 769, `s_buffer_load_dword` 732, `s_buffer_load_dwordx4` 669, `s_buffer_load_dwordx2` 565, `s_load_dwordx8` 499 |
+| MIMG | 694 | 6,698 | `image_load` 305, `image_sample_lz` 277, `image_store` 205, `image_sample_b` 150, `image_sample_l` 115 |
+| MUBUF | 576 | 6,962 | `buffer_load_dword` 218, `buffer_load_dwordx3` 202, `buffer_load_dwordx4` 189, `buffer_load_format_xyzw` 163, `buffer_load_dwordx2` 163, `buffer_atomic_add` 138 |
+| DS | 221 | 6,304 | `ds_write_b32` 162, `ds_read_b32` 161, `ds_write2_b32` 81, `ds_read2_b32` 72 |
+| MTBUF | 18 | 96 | `tbuffer_load_format_xyzw` 11 |
+| GLOBAL | 15 | 71 | `global_load_dwordx4` 13 |
+
+The 6,423 distinct programs of 437 `refused_shaders_*` dumps put MUBUF first (5,993 programs,
+almost all `buffer_load_dword` and `buffer_store_dword`), then the same order.
+
+### The worked example: the MUBUF/MTBUF address
+
+`ops/buffer_address.cpp` is the byte address and dword index of every MUBUF and MTBUF access that
+reaches emit_alu's resource path: loads, stores, atomics and format fetches all consume the same
+`addr` and `idx`. It was chosen because it is used by every buffer access and is the least
+entangled value in the memory code: it reads only OFFSET, OFFEN, IDXEN, the resolved STRIDE, VADDR
+and SOFFSET, and the one provenance fact it depends on (whether the V# is a folded per-vertex
+fetch, #206) is decided before it and passed in. SMEM's index math is just as simple but every SMEM
+route sits behind a raw-window, owned-backing or descriptor-placeholder proof.
+
+Three forms, selected by the lowering (`lower/buffer_address.cpp`, `shape_of`) from emit_alu's
+facts exactly where the old `if` chose them:
+
+| form | value |
+| --- | --- |
+| `Faithful` | `OFFSET + (IDXEN && STRIDE ? VADDR[0] * STRIDE : 0) + (OFFEN ? VADDR[IDXEN] : 0) + SOFFSET` |
+| `FoldedElement` | `ELEMENT * STRIDE`; ELEMENT is `gl_VertexIndex`, `gl_InstanceIndex` or VADDR[0] |
+| `FoldedZero` | `0` (a folded V# with STRIDE 0 and no OFFEN) |
+
+and in every form `idx = addr >> 2`.
+
+**A statement run that is not a route still moves with the tool.** The address was a run of
+statements in the middle of the MUBUF case, declaring `addr` and `idx` for the code after it, so it
+cannot become a `route_*`. Move it as a RAW segment (`-`) into a file you have started with the
+function's signature, and close the function by hand:
+
+1. Pass the case's facts in a struct (`BufferAddressFacts`), and bind them to locals under the old
+   names at the top of the function, so the moved text compiles unchanged.
+2. `--replace` the run with one call that returns the ids and binds them to the old names
+   (`const uint32_t addr = address.addr, idx = address.idx;`). Check first that nothing after the
+   run reassigns them.
+3. Gate it (`changes: none`) and commit it alone.
+
+**The guest reads interleave with the constants**, so the definition reads its operands as inputs
+appended where the old code called `val(...)`, and the lowering emits it with
+`emit_spirv_resolving_inputs`, calling `val`, `load_vertex_index` or `load_instance_index` at each
+input's position. The Block records which word each input slot reads (`BufferAddressInput`), the way
+`TernaryInputs` does. Keep the old nesting: `ir.iadd(addr, ir.imul(read(Index), ir.c32(stride)))`
+for `b.ibin(Op_IAdd, addr, b.ibin(Op_IMul, val(src0), b.uconst(stride)))`, and the folded element
+read in its own statement before STRIDE's constant.
+
+What did not move, and must not: the descriptor resolution that decides STRIDE and the folded
+flags, the PC-relative table route (which computes its own address before the resource gate), the
+`load_dword` wrapper (indirect-pointer source clamp, the GTA V selected-sbuffer partition, coherent
+loads), every `cbuf_load` / `cbuf_store` / atomic, `mark_cbuf_coherent`,
+`capture_indirect_pointer_descriptor_source`, the packed and dynamic sub-dword format paths that
+consume `addr`, `vreg_old` / `predicate_write`, and every refusal. emit_alu's MUBUF/MTBUF case calls
+those with the same arguments it did before.
+
+### Testing it
+
+- `test_ir_buffer_address.cpp`: ISA addresses worked by hand for every form, including the
+  modulo-2^32 sum and the truncating dword index; the input order of every form; an unknown word
+  leaving the address unknown; and every form's Block run per lane in the integer interpreter
+  against its own evaluation.
+- `test_ir_buffer_address_execution.cpp`: `buffer_load_dword` through the real recompiler and the
+  vector harness, Wave64 and Wave32, in six forms (no VADDR, IDXEN, OFFEN, both; SOFFSET as an
+  SGPR, an inline constant and SGPR_NULL), every lane with its own index and byte offset, and the
+  harness's partial EXEC. **Keep every address past the harness buffer's first array**: the
+  interpreter runs the invocations one after another, and each one's final store overwrites its own
+  word of that array, so a lane reading another lane's first-array word sees a stored result.
+  The arm asserts it.
+- `test_ir_buffer_address_robustness.cpp` (Vulkan): the existing contract that an address past the
+  bound range reads 0, which prosper delegates to `robustBufferAccess` (`test_traversal_chase.cpp`,
+  #2795). Half the lanes read data and half leave the range, so a load that always returned 0 fails.
+  The interpreter cannot run this arm: it fails an out-of-range access chain instead of returning 0.
+- `test_ir_lower_buffer_address.cpp`: which form the facts select, observed through whether SOFFSET
+  is read. SOFFSET names an SGPR marked as an unavailable saved-mask word, so reading it clears `ok`;
+  the folded forms must leave `ok` set because SOFFSET is already in their bound base.
+
+Mutations that went red: SOFFSET dropped from the sum (core); STRIDE replaced by 4 (core; the
+harness's own STRIDE is 4, so only the hand-worked values see it); the OFFEN register always
+VADDR[0] (execution); the folded forms disabled (lowering); the dword index masked to 63 (core,
+execution and robustness).
+
+### Gate and controls
+
+Witness: `PROSPER_IR_WITNESS_DIR=~/<slug>-witness-src ./test_ir_buffer_address_execution
+--gtest_filter='*Exports*'`, then `recompile_corpus.py harvest ~/<slug>-witness --root
+~/<slug>-witness-src`: 12 entries, the six forms in two wave sizes (6 distinct programs).
+
+| | recorded corpus (1,442 modules) | witness (12) |
+| --- | --- | --- |
+| the relocation | `changes: none` | |
+| the migration | `changes: none` | `changes: none` |
+| `Faithful`: SOFFSET's add with swapped operands | output-changed 582 | output-changed 12 |
+| `FoldedElement`: the multiply with swapped operands | output-changed 3 | not reachable (vertex only) |
+| `FoldedZero`: `0` as `0 >> 2` | `changes: none` | not reachable (vertex only) |
+
+The recorded corpus never reaches `FoldedZero`. Its reach comes from `test_folded_stride_zero`
+instead: returning 4 from it turns that test red, and restoring it turns it green.
+
+### The remaining memory groups
+
+| group | who | why |
+| --- | --- | --- |
+| MUBUF/MTBUF PC-relative table route (`addr`, `idx`, and the constant select chain per dword) | Codex, value-only | pure arithmetic on OFFSET and VADDR plus a select chain over constants; `vreg_old` / `predicate_write` stay |
+| MUBUF/MTBUF format decode of a loaded word (UNORM/SNORM/FLOAT16/sub-dword integer, 10_11_11, 2_10_10_10, the runtime byte-address join and `bfe`) | Codex, value-only | pure functions of loaded dwords and the byte address; `load_dword`, the `dyn_*` admission and `dst_sel` routing stay |
+| MUBUF/MTBUF store data packing (format encode, the sub-dword atomic clear/set masks) | Codex, value-only | the masks and packed words are pure; the stores, atomics and coherence stay |
+| DS address (`base + OFFSET`, `read2/write2` OFFSET0/OFFSET1 and `st64` scaling, the B64 pair indices) | Codex, value-only | pure index arithmetic; `lds_load` / `lds_store`, the LDS bounds (#5193) and the cross-lane arms stay |
+| SMEM dynamic dword index (`(SOFFSET + imm) >> 2` plus k, the PC-relative select chain, the table selector `SOFFSET / stride`) | Codex, value-only, after relocating those statements out of the SMEM case | pure; but every SMEM route around them is proof state, so move only these expressions |
+| SMEM bounded scalar-buffer load (`in_bounds`, safe index, zero select around `cbuf_load`) | lead | the value straddles the access: the clamp must stay before the load and the select after it |
+| SMEM descriptor and raw-window routes (owned raw windows, owned/nested wide chains, pointer and x2/x16 descriptor loads, SRT tags, GTA V selected sbuffer) | lead | provenance and proof state |
+| MUBUF/MTBUF descriptor resolution, folded vertex fetch decision, indirect-pointer source and per-title exact sites | lead | provenance |
+| FLAT/GLOBAL window path (`addr_lo - base_lo`, plus 4 per component, `>> 2`) | Codex, value-only | pure; the window resolution (`by_fetch_pc`, `flat_base_sgpr`, the push-constant base load) stays |
+| FLAT/GLOBAL relocated indirect carriers and the packed-pointer shadow | lead | the address is checked against the indirect-pointer proof's records |
+| MIMG (T#/S# resolution, sampled arrays, coordinates, LOD, `image_get_lod`) | lead first, then Codex for the coordinate and result-packing values | descriptor provenance and fragment derivatives; the coordinate conversions are pure once relocated |
+| DS atomics, `ds_append/consume`, GWS | lead | memory side effects with ordering |
+
 ## Family list and order
 
 Remaining in `rdna2_emit_alu.cpp`, in the order to migrate them. Codex takes the open groups; the
@@ -1007,7 +1149,8 @@ and leave the reserved ones in the `switch`.
 | - | `write_mad64_carry_mask` (its SGPR write differs from the shared one in Wave32), the VOPC mask write (`lower/vopc_mask_write.cpp`), the carry mask write (`lower/carry_mask_write.cpp`), `v_mbcnt` | lead (wave masks) |
 | 18 | Cross-lane values: `v_writelane_b32` (native dynamic selector), `v_permlane16/x16_b32`, the compute DPP16 SRC0 transforms, `ds_swizzle_b32` and the native `ds_bpermute_b32`, and the fragment static-lane readlane | Codex, using the cross-lane recipe ("Cross-lane operations"); `v_readlane_b32`'s native value is done |
 | - | `v_readfirstlane_b32`, fragment DPP `quad_perm` (`dpp_quad`), DPP8, the portable `ds_bpermute`, `ds_permute`, and the readlane/writelane scratch, lane-slot, mask-half and NGG paths | lead (cross-lane), see "The remaining cross-lane members" |
-| - | `v_movrel*`, `s_movrel*`, and the memory families SMEM, MUBUF/MTBUF, FLAT, MIMG, DS (descriptor provenance, raw windows, active-word marks) | lead (proof and definedness) |
+| 19 | Memory values: the MUBUF/MTBUF PC-relative table, format decode and store packing; the DS address; the SMEM dynamic index; the FLAT window address | Codex, value-only, using the memory recipe ("Memory instructions"); the MUBUF/MTBUF address is **done** (`ops/buffer_address.cpp`) |
+| - | `v_movrel*`, `s_movrel*`, and the memory families' access and proof state: SMEM routes, descriptor resolution, FLAT/GLOBAL, MIMG, DS atomics (see "The remaining memory groups") | lead (proof and definedness) |
 | - | SOPP, `rdna2_emit_cfg.cpp`, the SOP `*_routes.cpp` | lead (control flow, mask routes) |
 
 ## Byte-identical, or explained
