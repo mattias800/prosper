@@ -12,6 +12,16 @@ uint32_t VopcLowering::compare_value() {
     // (zero_compare, magnitude_compare). Only the f32 EQ/NEQ and LE/GE compares produce one.
     if (zero_cmp) return zero_cmp;
     if (magnitude_cmp) return magnitude_cmp;
+    // F16 definitions consume the existing unpacked sources, after the overrides.
+    switch (eff) {
+        case 0xC9:
+        case 0xCA:
+        case 0xCB:
+        case 0xCC:
+        case 0xCD:
+        case 0xCE: return compare_f16();
+        default: break;
+    }
     // Opcodes with an ir/ops definition (ops/vector_compare_*.cpp).
     if (const VectorCompareDef* def = find_vector_compare(eff))
         return emit_vector_compare(b, *def, a, c);
@@ -23,9 +33,6 @@ uint32_t VopcLowering::compare_value() {
         case 0x88: cmp = compare_class_f32(); break;                   // v_cmp_class_f32
         case 0xE1: case 0xE2: case 0xE3: case 0xE4: case 0xE5: case 0xE6:
             cmp = compare_integer64_unsigned();
-            break;
-        case 0xC9: case 0xCA: case 0xCB: case 0xCC: case 0xCD: case 0xCE:
-            cmp = compare_f16();
             break;
         default: ok = false;
     }
@@ -116,7 +123,6 @@ uint32_t VopcLowering::compare_integer64_unsigned() {
 // inline FLOAT constant is already an f32 value, so it is used directly. abs/neg
 // modifiers are applied after conversion (equivalent, conversion is monotone/exact).
 uint32_t VopcLowering::compare_f16() {
-    uint32_t cmp = 0;
     auto f16v = [&](int k, uint32_t raw) -> uint32_t {
         // Inline constants supply their 16-bit operand encoding: floats the f16
         // pattern (0x3C00 for 1.0), ints raw two's-complement low bits (1 -> the
@@ -133,15 +139,10 @@ uint32_t VopcLowering::compare_f16() {
         return v;
     };
     uint32_t ha = f16v(0, ra), hc = f16v(1, rc);
-    switch (eff) {
-        case 0xC9: cmp = b.fcmp(Op_FOrdLessThan, ha, hc); break;          // v_cmp_lt_f16
-        case 0xCA: cmp = b.fcmp(Op_FOrdEqual, ha, hc); break;             // v_cmp_eq_f16
-        case 0xCB: cmp = b.fcmp(Op_FOrdLessThanEqual, ha, hc); break;     // v_cmp_le_f16
-        case 0xCC: cmp = b.fcmp(Op_FOrdGreaterThan, ha, hc); break;       // v_cmp_gt_f16
-        case 0xCD: cmp = b.fcmp(Op_FOrdNotEqual, ha, hc); break;          // v_cmp_lg_f16
-        default:   cmp = b.fcmp(Op_FOrdGreaterThanEqual, ha, hc); break;  // v_cmp_ge_f16
-    }
-    return cmp;
+    if (const VectorCompareDef* def = find_vector_compare(eff))
+        return emit_vector_compare(b, *def, ha, hc);
+    ok = false;
+    return 0;
 }
 
 } // namespace prosper::gpu::ir
