@@ -49,7 +49,6 @@ private:
 
     // The comparison value (vopc_compare_values.cpp). Clears `ok` for an opcode it lacks.
     uint32_t compare_value();
-    uint32_t compare_integer16();
     uint32_t compare_integer64_signed();
     uint32_t compare_integer64_unsigned();
     uint32_t compare_class_f32();

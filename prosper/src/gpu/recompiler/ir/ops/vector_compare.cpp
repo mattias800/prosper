@@ -28,9 +28,10 @@ BuiltCompare build(const VectorCompareDef& def) {
 
 std::span<const std::span<const VectorCompareDef>> vector_compare_groups() {
     // A new group adds its table here.
-    static const std::array<std::span<const VectorCompareDef>, 2> groups = {
+    static const std::array<std::span<const VectorCompareDef>, 3> groups = {
         vector_compare_f32_defs(),
         vector_compare_i32_u32_defs(),
+        vector_compare_i16_u16_defs(),
     };
     return groups;
 }
