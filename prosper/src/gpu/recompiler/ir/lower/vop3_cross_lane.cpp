@@ -4,6 +4,7 @@
 // write, lane-slot, mask-half and retirement step around it is the moved text, unchanged.
 #include "gpu/recompiler/ir/lower/vop3_cross_lane_lowering_internal.hpp"
 #include "gpu/recompiler/ir/ops/vector_cross_lane.hpp"
+#include "gpu/recompiler/ir/ops/vector_permlane.hpp"
 
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_native_launch.hpp"
@@ -323,20 +324,10 @@ std::optional<bool> Vop3CrossLaneLowering::route_permlane16() {
         }
         if (in.opcode == 0x378) b.mark_subgroup_min32();
         else b.mark_subgroup_min16();
-        uint32_t source_lane = 0;
-        const uint32_t shuffled = b.subgroup_permlane16(
-            val(in.src[0]), val(in.src[1]), val(in.src[2]),
-            in.opcode == 0x378, &source_lane);
-        uint32_t result = shuffled;
-        if (!in.permlane_fetch_inactive) {
-            const uint32_t active_word = b.sel(rs.exec, b.uconst(1), b.uconst(0));
-            const uint32_t fetched_active = b.subgroup_shuffle(active_word, source_lane);
-            const uint32_t source_active = b.ucmp(
-                Op_INotEqual, fetched_active, b.uconst(0));
-            result = b.sel(source_active, shuffled,
-                           in.permlane_bound_ctrl ? b.uconst(0)
-                                                  : vreg_old(b, rs, in.dst.value));
-        }
+        const uint32_t result = emit_permlane_b32(
+            b, val(in.src[0]), val(in.src[1]), val(in.src[2]), in.opcode == 0x378,
+            in.permlane_fetch_inactive, in.permlane_bound_ctrl, [&] { return rs.exec; },
+            [&] { return vreg_old(b, rs, in.dst.value); });
         const uint32_t old_d = vreg_old(b, rs, in.dst.value);
         vreg[in.dst.value] = result;
         predicate_write(b, rs, in.dst.value, old_d);

@@ -1152,24 +1152,6 @@ struct SpirvCompute {
     // The caller owns mask destination/lifetime writes. No raster topology is inferred here.
     std::pair<uint32_t, uint32_t> packet_wqm_b64(
         uint32_t source, uint32_t pending, uint32_t event, uint32_t result_slot);
-    uint32_t subgroup_permlane16(uint32_t value, uint32_t selectors_lo,
-                                uint32_t selectors_hi, bool across_rows,
-                                uint32_t* source_lane_out = nullptr) {
-        const uint32_t lane = subgroup_local_id();
-        const uint32_t row_lane = ibin(Op_BitwiseAnd, lane, uconst(15));
-        const uint32_t selector_word = sel(
-            ucmp(Op_ULessThan, row_lane, uconst(8)), selectors_lo, selectors_hi);
-        const uint32_t selector_index = ibin(Op_BitwiseAnd, row_lane, uconst(7));
-        const uint32_t selector_shift = ibin(Op_ShiftLeftLogical, selector_index, uconst(2));
-        const uint32_t selected = ibin(
-            Op_BitwiseAnd,
-            ibin(Op_ShiftRightLogical, selector_word, selector_shift), uconst(15));
-        uint32_t row_base = ibin(Op_BitwiseAnd, lane, uconst(~15u));
-        if (across_rows) row_base = ibin(Op_BitwiseXor, row_base, uconst(16));
-        const uint32_t source_lane = ibin(Op_BitwiseOr, row_base, selected);
-        if (source_lane_out) *source_lane_out = source_lane;
-        return subgroup_shuffle(value, source_lane);
-    }
     // Fragment discard: OpKill any lane where `alive` is false, survivors fall through to `mergeL`. Used to
     // lower an EXP done under a narrowed EXEC (an alpha-test / WQM discard — the surviving lanes are the
     // ones that pass the kill test) to a real per-invocation discard. OpKill is a block terminator, so the
