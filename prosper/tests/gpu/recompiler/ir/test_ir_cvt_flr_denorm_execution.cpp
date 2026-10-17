@@ -3,11 +3,16 @@
 // module proves that the opt-in interpreter profile exposes the original defect.
 #include "fixtures/test_scratch.h"
 #include "gpu/diagnostics/refused_shader_inputs.hpp"
+#include "gpu/recompiler/bpermute_spirv_oracle.hpp"
+#include "gpu/recompiler/ir/builder.hpp"
+#include "gpu/recompiler/ir/eval.hpp"
+#include "gpu/recompiler/ir/ir.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/ir/ops/vector_conversion.hpp"
 #include "gpu/recompiler/ir/vector_lane_harness.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <gtest/gtest.h>
-#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -15,6 +20,7 @@
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
+#include <ios>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -168,6 +174,7 @@ TEST(IrCvtFlrDenormExecution, IndependentFloorControlProvesOnlyTheSelectedProfil
                            Example{0xc0100000, 0xc0400000},
                            Example{0x40100000, 0x40000000}};
     std::vector<uint32_t> data;
+    data.reserve(64);
     for (size_t lane = 0; lane < 64; ++lane) data.push_back(cases[lane % cases.size()].bits);
     for (bool flush : {false, true}) {
         bpermute_oracle::Interpreter vm(module);
@@ -224,6 +231,7 @@ TEST(IrCvtFlrDenormExecution, GeneratedSubnormalMantissasUseTheirConstructionSig
         for (uint32_t seed : {1u, 17u, 5344u, 0xdeadbeefu}) {
             auto in = lane_inputs(seed);
             std::vector<uint32_t> wants;
+            wants.reserve(in.lanes());
             for (size_t lane = 0; lane < in.lanes(); ++lane) {
                 seed = seed * 1664525u + 1013904223u;
                 const uint32_t mantissa = 1u + seed % 0x007fffffu;
