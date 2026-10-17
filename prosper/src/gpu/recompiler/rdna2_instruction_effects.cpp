@@ -610,6 +610,11 @@ constexpr Row kVop2[] = {
     {F::VOP2, 0x03b, half(valu("v_ldexp_f16", 1, 1, 0))},
     {F::VOP2, 0x03c, accumulate(valu("v_pk_fmac_f16", 1, 1, 0))},
 };
+constexpr Rdna2InstructionEffects f32_input_sensitive_round(const char* name) {
+    auto result = valu(name, 1, 0, 0);
+    result.f32_rounding_input_sensitive = true;
+    return result;
+}
 constexpr Row kVop1[] = {
     {F::VOP1, 0x000, no_result("v_nop")},
     {F::VOP1, 0x001, valu("v_mov_b32", 1, 0, 0)},
@@ -641,9 +646,9 @@ constexpr Row kVop1[] = {
     {F::VOP1, 0x01b, no_result("v_pipeflush")},
     {F::VOP1, 0x020, valu("v_fract_f32", 1, 0, 0)},
     {F::VOP1, 0x021, valu("v_trunc_f32", 1, 0, 0)},
-    {F::VOP1, 0x022, valu("v_ceil_f32", 1, 0, 0)},
+    {F::VOP1, 0x022, f32_input_sensitive_round("v_ceil_f32")},
     {F::VOP1, 0x023, valu("v_rndne_f32", 1, 0, 0)},
-    {F::VOP1, 0x024, valu("v_floor_f32", 1, 0, 0)},
+    {F::VOP1, 0x024, f32_input_sensitive_round("v_floor_f32")},
     {F::VOP1, 0x025, valu("v_exp_f32", 1, 0, 0)},
     {F::VOP1, 0x027, valu("v_log_f32", 1, 0, 0)},
     {F::VOP1, 0x02a, valu("v_rcp_f32", 1, 0, 0)},
@@ -1010,9 +1015,9 @@ constexpr Row kVop3[] = {
     {F::VOP3, 0x19b, no_result("v_pipeflush")},
     {F::VOP3, 0x1a0, valu("v_fract_f32", 1, 0, 0)},
     {F::VOP3, 0x1a1, valu("v_trunc_f32", 1, 0, 0)},
-    {F::VOP3, 0x1a2, valu("v_ceil_f32", 1, 0, 0)},
+    {F::VOP3, 0x1a2, f32_input_sensitive_round("v_ceil_f32")},
     {F::VOP3, 0x1a3, valu("v_rndne_f32", 1, 0, 0)},
-    {F::VOP3, 0x1a4, valu("v_floor_f32", 1, 0, 0)},
+    {F::VOP3, 0x1a4, f32_input_sensitive_round("v_floor_f32")},
     {F::VOP3, 0x1a5, valu("v_exp_f32", 1, 0, 0)},
     {F::VOP3, 0x1a7, valu("v_log_f32", 1, 0, 0)},
     {F::VOP3, 0x1aa, valu("v_rcp_f32", 1, 0, 0)},

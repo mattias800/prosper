@@ -15,7 +15,7 @@ TEST(IrLowerVop1UnaryFloat, FractEmitsTheExistingBitcastsAndExtendedInstruction)
     const auto source = t.b.uconst(0x3fa00000), old = t.b.uconst(7);
     auto d = old;
     const auto words = t.code_words();
-    EXPECT_TRUE(ir::lower_vop1_unary_float(t.b, in, source, d));
+    EXPECT_TRUE(ir::lower_vop1_unary_float(t.b, in, source, d, t.ok));
     EXPECT_NE(d, old);
     EXPECT_EQ(t.code_words() - words, 14u);
 }
@@ -26,7 +26,7 @@ TEST(IrLowerVop1UnaryFloat, TrigRetainsItsRevolutionsConstant) {
     in.opcode = 0x35;
     const auto source = t.b.uconst(0x3e800000);
     auto d = source;
-    EXPECT_TRUE(ir::lower_vop1_unary_float(t.b, in, source, d));
+    EXPECT_TRUE(ir::lower_vop1_unary_float(t.b, in, source, d, t.ok));
     EXPECT_TRUE(t.constant_cached(0x40c90fdb));
     EXPECT_FALSE(t.constant_cached(0x3f800000));
 }
@@ -39,7 +39,7 @@ TEST(IrLowerVop1UnaryFloat, OtherFamiliesAndReservedFormsRemainUntouched) {
         const auto old = t.b.uconst(7);
         auto d = old;
         const auto words = t.code_words();
-        EXPECT_FALSE(ir::lower_vop1_unary_float(t.b, in, old, d));
+        EXPECT_FALSE(ir::lower_vop1_unary_float(t.b, in, old, d, t.ok));
         EXPECT_EQ(d, old);
         EXPECT_EQ(t.code_words(), words);
     }

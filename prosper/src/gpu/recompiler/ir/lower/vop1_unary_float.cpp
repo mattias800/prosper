@@ -3,11 +3,14 @@
 #include <cstdint>
 #include "gpu/recompiler/ir/lower/vop1_unary_float_lowering.hpp"
 #include "gpu/recompiler/ir/ops/vector_float_unary.hpp"
+#include "gpu/recompiler/ir/lower/f32_round_input.hpp"
 namespace prosper::gpu::ir {
-bool lower_vop1_unary_float(SpirvCompute& b, const Rdna2Inst& in, uint32_t a, uint32_t& d) {
+bool lower_vop1_unary_float(SpirvCompute& b, const Rdna2Inst& in, uint32_t a, uint32_t& d,
+                            bool& ok) {
     const auto* def = find_vector_float_unary_op(in.fmt, in.opcode);
     if (!def) return false;
-    d = emit_vector_op(b, *def, a, 0); // no definition reads the unused second input slot
+    const auto result = emit_f32_rounding_op(b, in, *def, a, ok);
+    if (ok) d = result;
     return true;
 }
 } // namespace prosper::gpu::ir

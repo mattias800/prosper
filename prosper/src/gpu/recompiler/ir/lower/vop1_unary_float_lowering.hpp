@@ -6,5 +6,6 @@ struct SpirvCompute;
 struct Rdna2Inst;
 }   // namespace prosper::gpu
 namespace prosper::gpu::ir {
-bool lower_vop1_unary_float(SpirvCompute& b, const Rdna2Inst& in, uint32_t a, uint32_t& d);
+bool lower_vop1_unary_float(SpirvCompute& b, const Rdna2Inst& in, uint32_t a, uint32_t& d,
+                            bool& ok);
 }
