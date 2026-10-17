@@ -3,15 +3,18 @@
 // #5331: keep guest-to-native mapping active when an independent driver control lacks
 // strict fused accuracy; qualify only the strict witness and retain the #5225 gap.
 #include "fixtures/f32_fma_rounding.hpp"
+#include "fixtures/f32_mad_rounding.hpp"
 #include "fixtures/compute_runner.h"
 #include "fixtures/test_scratch.h"
 #include "gpu/diagnostics/refused_shader_inputs.hpp"
+#include "gpu/recompiler/bpermute_spirv_oracle.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <gtest/gtest.h>
 #include <vulkan/vulkan.h>
 #include <algorithm>
 #include <bit>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -94,7 +97,7 @@ std::vector<uint32_t> native_fma_results(const Encoding& encoding, const LaneInp
                                                      64, 64, {}, data, &result);
     EXPECT_EQ(dispatch.size(), 64u);
     if (result.size() != data.size()) return {};
-    return {result.begin() + 3 * 64, result.end()};
+    return {result.begin() + 192, result.end()};
 }
 
 std::filesystem::path artifact_root() {
@@ -196,7 +199,7 @@ TEST(ComputeF32FmaRounding, IndependentControlKeepsTheHandWorkedFusedWitness) {
     ASSERT_EQ(output.size(), data.size());
     // (1+2^-23)*(1-2^-23)-1 = -2^-46, independent of the guest IR evaluator.
     EXPECT_EQ(output[3 * 64 + 4], 0xa8800000u);
-    EXPECT_TRUE(std::equal(data.begin(), data.begin() + 3 * 64, output.begin()));
+    EXPECT_TRUE(std::equal(data.begin(), data.begin() + 192, output.begin()));
 }
 
 TEST(ComputeF32FmaRounding, FourFusedGuestGraphsMatchTheFiniteRteReferenceOnTheExecutingDriver) {
