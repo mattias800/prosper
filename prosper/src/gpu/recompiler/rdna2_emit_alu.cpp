@@ -4282,7 +4282,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 const uint32_t idx0 = address_pair.first, idx1 = address_pair.second;
                 b.lds_store(idx0, vread(in.src[1].value), rs.exec_narrowed, rs.exec,
                             atomicize_store);
-                b.lds_store(b.ibin(Op_IAdd, idx0, b.uconst(1)), vread(in.src[1].value + 1),
+                b.lds_store(ir::lower_ds_store_word_index(b, idx0, 1), vread(in.src[1].value + 1),
                             rs.exec_narrowed, rs.exec, atomicize_store);
                 // OFFSET0 == OFFSET1 selects ONE address: the hardware performs a single write and
                 // uses DATA0 only (RDNA2 ISA 70648 §10.4.3). Writing DATA1 as well leaves the later
@@ -4292,8 +4292,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if ((in.literal & 0xFFu) != ((in.literal >> 8) & 0xFFu)) {
                     b.lds_store(idx1, vread(in.src[2].value), rs.exec_narrowed, rs.exec,
                                 atomicize_store);
-                    b.lds_store(b.ibin(Op_IAdd, idx1, b.uconst(1)), vread(in.src[2].value + 1),
-                                rs.exec_narrowed, rs.exec, atomicize_store);
+                    b.lds_store(ir::lower_ds_store_word_index(b, idx1, 1),
+                                vread(in.src[2].value + 1), rs.exec_narrowed, rs.exec,
+                                atomicize_store);
                 }
                 return true;
             }
