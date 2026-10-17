@@ -219,6 +219,166 @@ TEST(IrVectorCarryExecution, DefinitionsAgreeWithTheEffectsTable) {
     }
 }
 
+// #5348: an e32 carry op replaces VCC, and in a Wave32 B32-mask stage VCC_LO is also a B32 mask
+// lifetime (sreg_bool[106]) that the e64 readers naming vcc_lo prefer. The previous VCC here is the
+// carry_from_s2 mask (S2 != 0), so a reader that still sees it disagrees with the new carry on the
+// lanes the positive control counts.
+namespace {
+
+// v_cndmask_b32_e64 v1, 0, 1, vcc_lo after s_mov_b64 exec, -1: VCC read through the e64 operand,
+// the form whose route prefers the B32 lifetime (read_mask(kVcc) uses the e32 form instead).
+std::vector<uint32_t> read_vcc_e64() {
+    return {kSMovExecAll, 0xd5010001u, 0x80u | (0x81u << 9) | (kVcc << 18)};
+}
+// s_mov_b32 vcc_hi, 0: defines the high word, which the fresh-mask proof charges a Wave32 VOP3B
+// carry-in from vcc_lo (Wave32RefusalsStay); without it the carry-in program below is refused.
+constexpr uint32_t kSMovVccHiZero = 0xbeeb0380u;
+
+std::vector<const VectorCarryDef*> vop2_carry_defs() {
+    std::vector<const VectorCarryDef*> out;
+    for (const auto& def : vector_carry_defs())
+        if (def.fmt == Rdna2Format::VOP2) out.push_back(&def);
+    return out;
+}
+
+// The new carry of the e32 op for one lane (the carry-in is the masked S2 != 0 mask).
+uint32_t vop2_carry(const VectorCarryDef& def, const LaneInputs& in, size_t lane) {
+    const uint32_t cin = in.active[lane] && in.s2[lane] != 0 ? 1u : 0u;
+    return in.active[lane] ? *eval_vector_carry(def, in.s0[lane], in.s1[lane], cin).carry : 0u;
+}
+
+// Lanes where a stale VCC read would differ from the new one: the case the tests can see.
+size_t stale_visible_lanes(const VectorCarryDef& def, const LaneInputs& in) {
+    size_t lanes = 0;
+    for (size_t lane = 0; lane < in.lanes(); ++lane) {
+        const uint32_t previous = in.active[lane] && in.s2[lane] != 0 ? 1u : 0u;
+        lanes += vop2_carry(def, in, lane) != previous;
+    }
+    return lanes;
+}
+
+// The three #5348 programs. The e32 carry op replaces the VCC that carry_from_s2 wrote, and then:
+// v_cndmask_b32_e64 reads it back through vcc_lo; or its VOP3B twin takes its carry-in from vcc_lo
+// (carry-out to s[20:21], D over the e32 op's D); or v_mad_u64_u32 / v_mad_i64_i32 replaces VCC
+// through `sdst = vcc_lo` (64-bit result to v[7:8], so the sources v2, v3, v[5:6] stay intact).
+std::vector<uint32_t> e64_reader_program(const VectorCarryDef& def) {
+    return concat({carry_from_s2(kVcc), {vop2(def.opcode)}, read_vcc_e64()});
+}
+std::vector<uint32_t> carry_in_program(const VectorCarryDef& twin) {
+    return concat({{kSMovVccHiZero}, carry_from_s2(kVcc), {vop2(twin.opcode - 0x100)},
+                   vop3_words(twin.opcode, kCarryOut, kVcc)});
+}
+std::vector<uint32_t> mad_program(uint32_t opcode) {
+    return concat({carry_from_s2(kVcc),
+                   {0xd4000000u | (opcode << 16) | (kVcc << 8) | 7u,
+                    (256u + kVsrc0) | ((256u + kVsrc1) << 9) | ((256u + kVsrc2) << 18)},
+                   read_vcc_e64()});
+}
+
+}   // namespace
+
+TEST(IrVectorCarryExecution, E64CndmaskReadsTheVop2CarryNotTheStaleVccLo) {
+    ASSERT_EQ(vop2_carry_defs().size(), 3u);
+    for (const VectorCarryDef* def : vop2_carry_defs()) {
+        SCOPED_TRACE(effects_name(*def));
+        const auto program = e64_reader_program(*def);
+        for (uint32_t seed = 1; seed <= 2; ++seed) {
+            const LaneInputs in = mask_lane_inputs(seed * 0x5348u + def->opcode);
+            ASSERT_GT(stale_visible_lanes(*def, in), 0u);   // positive control
+            for (const uint32_t wave : {64u, 32u}) {   // Wave64 has no B32 lifetime: the control
+                const auto run = run_vector_op_per_lane(program, in, wave);
+                ASSERT_TRUE(run.error.empty()) << "wave " << wave << ": " << run.error;
+                ASSERT_EQ(run.d.size(), in.lanes());
+                for (size_t lane = 0; lane < in.lanes(); ++lane)
+                    ASSERT_EQ(run.d[lane], vop2_carry(*def, in, lane))
+                        << "wave " << wave << " lane " << lane << " active " << in.active[lane]
+                        << std::hex << " s0 " << in.s0[lane] << " s1 " << in.s1[lane] << " s2 "
+                        << in.s2[lane];
+            }
+        }
+    }
+}
+
+TEST(IrVectorCarryExecution, Vop3bCarryInFromVccLoReadsTheVop2Carry) {
+    for (const VectorCarryDef* def : vop2_carry_defs()) {
+        SCOPED_TRACE(effects_name(*def));
+        // The VOP3B twin of the same op takes its carry-in from vcc_lo and writes D over the e32
+        // op's D; its carry-out goes to s[20:21] so VCC is not written again.
+        const VectorCarryDef* twin = find_vector_carry(Rdna2Format::VOP3, def->opcode + 0x100);
+        ASSERT_NE(twin, nullptr);
+        const auto program = carry_in_program(*twin);
+        for (uint32_t seed = 1; seed <= 2; ++seed) {
+            const LaneInputs in = mask_lane_inputs(seed * 0x5348u + def->opcode);
+            // Positive control: the carry-in seen through a stale VCC changes the active D.
+            size_t visible = 0;
+            for (size_t lane = 0; lane < in.lanes(); ++lane) {
+                if (!in.active[lane]) continue;
+                const uint32_t stale = in.s2[lane] != 0 ? 1u : 0u;
+                visible += *eval_vector_carry(*twin, in.s0[lane], in.s1[lane], stale).d !=
+                           *eval_vector_carry(*twin, in.s0[lane], in.s1[lane],
+                                              vop2_carry(*def, in, lane)).d;
+            }
+            ASSERT_GT(visible, 0u);
+            for (const uint32_t wave : {64u, 32u}) {
+                const auto run = run_vector_op_per_lane(program, in, wave);
+                ASSERT_TRUE(run.error.empty()) << "wave " << wave << ": " << run.error;
+                ASSERT_EQ(run.d.size(), in.lanes());
+                for (size_t lane = 0; lane < in.lanes(); ++lane) {
+                    const uint32_t expected =
+                        in.active[lane] ? *eval_vector_carry(*twin, in.s0[lane], in.s1[lane],
+                                                             vop2_carry(*def, in, lane)).d
+                                        : in.old_d[lane];
+                    ASSERT_EQ(run.d[lane], expected)
+                        << "wave " << wave << " lane " << lane << " active " << in.active[lane];
+                }
+            }
+        }
+    }
+}
+
+// v_mad_u64_u32 / v_mad_i64_i32 write their carry to SDST the same way (#5349 noted the missing
+// Wave32 word write): with `sdst = vcc_lo`, the e64 reader must see the mad's carry.
+TEST(IrVectorCarryExecution, Wave32MadCarryToVccLoReplacesTheLifetime) {
+    for (const uint32_t opcode : {0x176u, 0x177u}) {
+        SCOPED_TRACE(opcode == 0x176u ? "v_mad_u64_u32" : "v_mad_i64_i32");
+        const auto program = mad_program(opcode);
+        for (uint32_t seed = 1; seed <= 2; ++seed) {
+            LaneInputs in = mask_lane_inputs(seed * 0x5349u + opcode);
+            uint32_t state = seed * 0x2545f491u;
+            for (size_t lane = 0; lane < in.lanes(); ++lane)
+                in.s3.push_back(state = state * 1664525u + 1013904223u);
+            // AMD 70648: {carry, D} = S0 * S1 + S2 as a 65-bit sum, unsigned or signed.
+            auto carry = [&](size_t lane) -> uint32_t {
+                if (!in.active[lane]) return 0u;
+                const uint64_t add = (uint64_t{in.s3[lane]} << 32) | in.s2[lane];
+                if (opcode == 0x176u) {
+                    const uint64_t product = uint64_t{in.s0[lane]} * in.s1[lane];
+                    return product + add < product ? 1u : 0u;
+                }
+                const __int128 sum = __int128{int64_t{static_cast<int32_t>(in.s0[lane])} *
+                                              static_cast<int32_t>(in.s1[lane])} +
+                                     static_cast<int64_t>(add);
+                // Bit 64 of the sign-extended 65-bit sum, i.e. its sign (rdna2_mad_64.cpp).
+                return sum < 0 ? 1u : 0u;
+            };
+            size_t visible = 0;   // positive control: lanes where the stale mask differs
+            for (size_t lane = 0; lane < in.lanes(); ++lane)
+                visible += carry(lane) != (in.active[lane] && in.s2[lane] != 0 ? 1u : 0u);
+            ASSERT_GT(visible, 0u);
+            for (const uint32_t wave : {64u, 32u}) {
+                const auto run = run_vector_op_per_lane(program, in, wave);
+                ASSERT_TRUE(run.error.empty()) << "wave " << wave << ": " << run.error;
+                ASSERT_EQ(run.d.size(), in.lanes());
+                for (size_t lane = 0; lane < in.lanes(); ++lane)
+                    ASSERT_EQ(run.d[lane], carry(lane))
+                        << "wave " << wave << " lane " << lane << " active " << in.active[lane]
+                        << std::hex << " s0 " << in.s0[lane] << " s1 " << in.s1[lane] << " s2 "
+                        << in.s2[lane] << " s3 " << in.s3[lane];
+            }
+        }
+    }
+}
+
 // Synthetic witness corpus for the corpus gate (HOW_TO_ADD_A_FAMILY.md): every definition in every
 // form, reading D and reading the carry mask, in both wave sizes.
 TEST(IrVectorCarryExecution, ExportsReplayableWitnessPrograms) {
@@ -231,4 +391,21 @@ TEST(IrVectorCarryExecution, ExportsReplayableWitnessPrograms) {
                 programs.push_back(program);
             }
     EXPECT_EQ(export_mask_witness(programs, "vector-carry-witness", 0x5c41000000ull), 60u);
+}
+
+// The #5348 programs as a witness corpus of their own (Wave64 is the unchanged control): the
+// recorded corpus has no program that reaches them.
+TEST(IrVectorCarryExecution, ExportsVccLoLifetimeWitnessPrograms) {
+    std::vector<MaskWitness> programs;
+    for (const VectorCarryDef* def : vop2_carry_defs()) {
+        programs.push_back({e64_reader_program(*def)});
+        programs.push_back(
+            {carry_in_program(*find_vector_carry(Rdna2Format::VOP3, def->opcode + 0x100))});
+    }
+    for (const uint32_t opcode : {0x176u, 0x177u}) {
+        MaskWitness program{mad_program(opcode)};
+        program.fourth_source = true;
+        programs.push_back(program);
+    }
+    EXPECT_EQ(export_mask_witness(programs, "vcc-lo-lifetime-witness", 0x5348000000ull), 16u);
 }

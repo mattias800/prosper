@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/ir/lower/carry_mask_write.hpp"
 #include "gpu/recompiler/ir/lower/native_half_fma_lowering.hpp"
 #include "gpu/recompiler/ir/lower/half_fma_finite.hpp"
 #include "gpu/recompiler/ir/ops/vector_fma_float.hpp"
@@ -848,13 +849,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     vreg[in.dst.value] = result_lo;
                     vreg[hi_dst] = result_hi;
                     predicate_write(b, rs, hi_dst, old_hi);
-                    // ISA 3.9 carry-mask rule: an EXEC-inactive lane's bit is written 0, never the
-                    // raw carry (wave votes/spills must not see phantom bits from inactive lanes).
-                    const uint32_t carry_masked =
-                        rs.exec_narrowed ? b.land(rs.exec, carry_out) : carry_out;
-                    if (in.sdst.value == 106 || in.sdst.value == 107) rs.vcc = carry_masked;
-                    else if (in.sdst.kind == OperandKind::SGPR) rs.sreg_bool[in.sdst.value] = carry_masked;
-                    else ok = false;
+                    ir::write_mad64_carry_mask(b, rs, in, ok, carry_out);
                 }
             } else if (ir::lower_vop3_carry_out(b, rs, in, ok, allow_wave)) {
             } else if (ir::lower_vop3_multiply(b, rs, in, ok, allow_wave)) {

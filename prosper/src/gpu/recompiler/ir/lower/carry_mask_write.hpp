@@ -15,12 +15,18 @@ namespace prosper::gpu::ir {
 // definition's unmasked carry Bool; the result is what the mask destination receives.
 uint32_t exec_masked_carry(SpirvCompute& b, RegState& rs, uint32_t carry);
 
-// VOP2 (e32) v_add/sub/subrev_co_ci_u32: the masked carry replaces VCC.
+// VOP2 (e32) v_add/sub/subrev_co_ci_u32: the masked carry replaces VCC (in a Wave32 B32-mask
+// stage, VCC_LO: the B32 lifetime and `rs.vcc` together, like the VOP3B form's `sdst = vcc_lo`).
 void write_vop2_carry_mask(SpirvCompute& b, RegState& rs, uint32_t carry);
 
 // VOP3B: the masked carry goes to SDST (VCC, an SGPR pair, or in a Wave32 B32-mask stage one SGPR
 // word). Any other SDST refuses (`ok = false`).
 void write_vop3b_carry_mask(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok,
+                            uint32_t carry);
+
+// v_mad_u64_u32 / v_mad_i64_i32 (VOP3B 0x176/0x177): the masked carry goes to VCC (VCC_LO's B32
+// lifetime in a Wave32 B32-mask stage, as above) or an SGPR pair. Any other SDST refuses.
+void write_mad64_carry_mask(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok,
                             uint32_t carry);
 
 }   // namespace prosper::gpu::ir
