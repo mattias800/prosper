@@ -72,14 +72,15 @@ enum class Opcode : uint8_t {
     F32Mul,
     F32NMin,
     F32NMax,   // raw binary32 bits -> raw bits
-    F32AddNoContraction, // separate binary32 rounding; cannot contract with a product
+    F32AddNoContraction,   // separate binary32 rounding; cannot contract with a product
     F32MulNoContraction,
+    F32Fma,   // GLSL Fma intent; evaluation is a finite RTE reference, not a Vulkan accuracy promise
     BoolAnd,
     BoolOr,
     F32Clamp01,
     PackHalfLo,
-    FfbhU32, // leading zero count; all ones for a zero word
-    BitCount, // population count of one numeric word, without wave-mask state
+    FfbhU32,   // leading zero count; all ones for a zero word
+    BitCount,   // population count of one numeric word, without wave-mask state
     F32Fract,
     F32Trunc,
     F32Ceil,
@@ -98,14 +99,14 @@ enum class Opcode : uint8_t {
     F32ToU32Sat,
     F32ToI32Sat,
     BfeS,
-    UnpackHalf, // imm = component 0 or 1, raw binary16 -> binary32
+    UnpackHalf,   // imm = component 0 or 1, raw binary16 -> binary32
     F32Ge,
-    F32Abs, // absolute value of one raw binary32 word
-    F32Lt, // ordered less-than over raw binary32 words
-    F32UnordNe, // unordered-not-equal over raw binary32 words
-    F32Eq, // ordered equality over binary32 words, returning Bool
-    F32Ldexp, // binary32 word scaled by a signed integer exponent
-    PackNorm16, // raw binary32 to normalized low half; imm0 unsigned, imm1 signed
+    F32Abs,   // absolute value of one raw binary32 word
+    F32Lt,   // ordered less-than over raw binary32 words
+    F32UnordNe,   // unordered-not-equal over raw binary32 words
+    F32Eq,   // ordered equality over binary32 words, returning Bool
+    F32Ldexp,   // binary32 word scaled by a signed integer exponent
+    PackNorm16,   // raw binary32 to normalized low half; imm0 unsigned, imm1 signed
     // The rest of the binary32 relations over raw words, returning Bool (with F32Lt, F32Eq, F32Ge
     // and F32UnordNe above). Ordered relations are false when either word is a NaN; unordered
     // ones are true.

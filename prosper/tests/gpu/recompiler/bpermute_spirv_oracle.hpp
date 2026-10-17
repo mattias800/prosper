@@ -328,6 +328,28 @@ struct Interpreter {
       set(l, a[1], a[0], {std::bit_cast<uint32_t>(result)});
       return true;
   }
+  // Selected exact finite RTE Fma reference, NOT the minimum Vulkan precision contract:
+  // https://docs.vulkan.org/spec/latest/appendices/spirvenv.html (GLSL fma accuracy).
+  // Nonfinite/subnormal inputs or results remain outside this model; no guest MODE is inferred.
+  bool fma_reference_op(Lane& l, uint32_t op, const std::vector<uint32_t>& a) {
+      if (op != 12 || a.size() < 4 || !glsl || a[2] != glsl || a[3] != 50) return false;
+      if (a.size() != 7 || ty(a[0]).op != 22 || ty(a[0]).a != std::vector<uint32_t>{32})
+          fail("unsupported Fma reference type");
+      std::array<float, 3> values{};
+      for (size_t slot = 0; slot < values.size(); ++slot) {
+          const auto x = value(l, a[4 + slot]);
+          if (x.type != a[0] || !x.defined || x.words.size() != 1)
+              fail("undefined Fma reference input");
+          values[slot] = std::bit_cast<float>(x.words[0]);
+          if (!std::isfinite(values[slot]) || std::fpclassify(values[slot]) == FP_SUBNORMAL)
+              fail("outside finite normal-or-zero Fma reference");
+      }
+      const float result = std::fma(values[0], values[1], values[2]);
+      if (!std::isfinite(result) || std::fpclassify(result) == FP_SUBNORMAL)
+          fail("outside finite normal-or-zero Fma reference");
+      set(l, a[1], a[0], {std::bit_cast<uint32_t>(result)});
+      return true;
+  }
   bool float_alu_op(Lane& l, uint32_t op, const std::vector<uint32_t>& a) {
       const bool arithmetic = op == 129 || op == 131 || op == 133;
       const bool minmax =
@@ -675,7 +697,8 @@ struct Interpreter {
       ++l.pc;
       if (conversion_alu_op(l, op, a) || float_comparison_op(l, op, a) ||
           float_conversion_bound_op(l, op, a) || unary_float_alu_op(l, op, a) ||
-          half_alu_op(l, op, a) || float_alu_op(l, op, a) || scalar_alu_op(l, op, a))
+          half_alu_op(l, op, a) || fma_reference_op(l, op, a) || float_alu_op(l, op, a) ||
+          scalar_alu_op(l, op, a))
           continue;
       if (op == 248) {
         l.label = a.at(0);

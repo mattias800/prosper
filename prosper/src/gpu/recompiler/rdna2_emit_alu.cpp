@@ -2,6 +2,7 @@
 // rdna2_to_spirv.cpp. Shared state lives in gpu/recompiler/rdna2_to_spirv_internal.hpp.
 #include <atomic>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/ir/ops/vector_fma_float.hpp"
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -844,9 +845,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             } else if (ir::lower_vop3_mad_float(b, rs, in, ok, allow_wave, std::cref(fv),
                                                 std::cref(fresult))) {
             } else if (in.opcode == 0x14B) {
-                // Legacy fused-FMA separate rounding remains unchanged pending #5225.
-                uint32_t m = b.fbin(Op_FMul, fv(0), fv(1));
-                vreg[in.dst.value] = fresult(b.fbin(Op_FAdd, m, fv(2)));
+                // GLSL Fma intent; Vulkan precision remains implementation-dependent (#5225).
+                vreg[in.dst.value] = fresult(ir::emit_fused_mad_float(b, std::cref(fv)));
             } else if (in.opcode == 0x176 ||
                        in.opcode == 0x177) {   // v_mad_u64_u32 / v_mad_i64_i32
                 // {carry,D} = S0*S1 + S2 (rdna2_mad_64.cpp). A positive inline constant used as the

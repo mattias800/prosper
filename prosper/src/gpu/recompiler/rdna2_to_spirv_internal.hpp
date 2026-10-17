@@ -245,13 +245,33 @@ enum : uint32_t {
     Op_GroupNonUniformIAdd=349,
 };
 // GLSL.std.450 extended-instruction numbers.
-enum : uint32_t { Glsl_FAbs=4, Glsl_RoundEven=2, Glsl_Trunc=3, Glsl_Floor=8, Glsl_Ceil=9, Glsl_Fract=10, Glsl_Sin=13, Glsl_Cos=14,
-                  Glsl_Exp2=29, Glsl_Log2=30,
-                  Glsl_Sqrt=31, Glsl_InverseSqrt=32, Glsl_FMin=37, Glsl_UMin=38, Glsl_SMin=39, Glsl_FMax=40,
-                  Glsl_UMax=41, Glsl_SMax=42, Glsl_PackHalf2x16=58, Glsl_UnpackHalf2x16=62,
-                  Glsl_FindILsb=73,   // lowest set bit of a 32-bit word, all ones at zero
-                  Glsl_FindUMsb=75,   // bit index of the highest set bit (undefined at zero)
-                  Glsl_NMin=79, Glsl_NMax=80 };   // NaN-aware min/max: one-NaN operand -> the other operand
+enum : uint32_t {
+    Glsl_FAbs = 4,
+    Glsl_RoundEven = 2,
+    Glsl_Trunc = 3,
+    Glsl_Floor = 8,
+    Glsl_Ceil = 9,
+    Glsl_Fract = 10,
+    Glsl_Sin = 13,
+    Glsl_Cos = 14,
+    Glsl_Exp2 = 29,
+    Glsl_Log2 = 30,
+    Glsl_Sqrt = 31,
+    Glsl_InverseSqrt = 32,
+    Glsl_FMin = 37,
+    Glsl_UMin = 38,
+    Glsl_SMin = 39,
+    Glsl_FMax = 40,
+    Glsl_UMax = 41,
+    Glsl_SMax = 42,
+    Glsl_PackHalf2x16 = 58,
+    Glsl_UnpackHalf2x16 = 62,
+    Glsl_FindILsb = 73,   // lowest set bit of a 32-bit word, all ones at zero
+    Glsl_FindUMsb = 75,   // bit index of the highest set bit (undefined at zero)
+    Glsl_Fma = 50,
+    Glsl_NMin = 79,
+    Glsl_NMax = 80
+};   // NaN-aware min/max: one-NaN operand -> the other operand
 enum : uint32_t {
     Cap_Shader=1, Cap_Geometry=2, Cap_Int64=11, Cap_Int64Atomics=12,
     Cap_GroupNonUniform=61, Cap_GroupNonUniformVote=62,
@@ -850,6 +870,7 @@ struct SpirvCompute {
     // Float binary op on bit-operands -> bit-result.
     uint32_t fbin(uint32_t op, uint32_t a, uint32_t b) { uint32_t rf = id(); put(code, op, {t_f32, rf, bcf(a), bcf(b)}); return bcu(rf); }
     uint32_t fbin_no_contraction(uint32_t op, uint32_t a, uint32_t b);
+    uint32_t fma(uint32_t a, uint32_t b, uint32_t c);
     // Integer binary op on bit-operands -> bit-result.
     uint32_t ibin(uint32_t op, uint32_t a, uint32_t b) { uint32_t r = id(); put(code, op, {t_u32, r, a, b}); return r; }
     // Integer unary op on a bit-operand -> bit-result (e.g. OpNot).

@@ -7,6 +7,7 @@
 #include "gpu/recompiler/ir/lower/vector_lowering_internal.hpp"
 #include "gpu/recompiler/ir/ops/vector_float.hpp"
 #include "gpu/recompiler/ir/ops/vector_mad_float.hpp"
+#include "gpu/recompiler/ir/ops/vector_fma_float.hpp"
 
 namespace prosper::gpu::ir {
 
@@ -21,7 +22,7 @@ bool Vop2Lowering::compute_float(uint32_t& d) {
     }
     switch (in.opcode) {
         // v_mac_f32 (0x1f) / v_fmac_f32 (0x2b): dst = src0*src1 + dst (accumulate into the dest).
-        // The existing FMAC forms do not guarantee fused rounding; preserve their old bodies here.
+        // Fused forms express fusion through GLSL Fma, with MED Vulkan portability (#5225).
         // CONFIDENCE: HIGH: the 64-lane rounding witness in #5220 differs from AMD 70648.
         // NOTE(opcode ID): op 0x1f is v_mac_f32 on the PS5's ISA. v_mac_f32 was REMOVED on desktop
         // RDNA2/gfx1030 (where 0x1f is invalid and llvm-mc reads canonical v_dot2c at 0x02), but the
@@ -29,16 +30,16 @@ bool Vop2Lowering::compute_float(uint32_t& d) {
         // actual op-0x1f word 0x3e261221 through `llvm-mc -mcpu=gfx1010` → `v_mac_f32_e32`. The VOP3
         // (e64) form of this same op is 0x11f, handled in the VOP3 switch below.
         case 0x1F: d = emit_nonfused_mad_values(b, a, c, old_d); break;
-        case 0x2B: d = b.fbin(Op_FAdd, b.fbin(Op_FMul, a, c), old_d); break;
+        case 0x2B: d = emit_fused_mad_values(b, a, c, old_d); break;
         // The four mul-add-with-literal-K ops (K = in.literal). madmk/fmamk = src0*K + src1;
-        // madak/fmaak = src0*src1 + K. Fused forms retain the same unresolved rounding gap.
+        // madak/fmaak = src0*src1 + K. Only fused forms use GLSL Fma.
         case 0x20: d = emit_nonfused_mad_values(b, a, b.uconst(in.literal), c); break;
         case 0x2C:
-            d = b.fbin(Op_FAdd, b.fbin(Op_FMul, a, b.uconst(in.literal)), c);
+            d = emit_fused_mad_values(b, a, b.uconst(in.literal), c);
             break;   // v_madmk / v_fmamk
         case 0x21: d = emit_nonfused_mad_values(b, a, c, b.uconst(in.literal)); break;
         case 0x2D:
-            d = b.fbin(Op_FAdd, b.fbin(Op_FMul, a, c), b.uconst(in.literal));
+            d = emit_fused_mad_values(b, a, c, b.uconst(in.literal));
             break;   // v_madak / v_fmaak
         default: return false;
     }
