@@ -8,6 +8,7 @@
 #include "gpu/recompiler/ir/ir.hpp"
 #include "gpu/recompiler/ir/ops/vector_compare.hpp"
 #include "gpu/recompiler/ir/vector_compare_harness.hpp"
+#include "gpu/recompiler/ir/vector_lane_harness.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 
@@ -18,6 +19,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <ios>
 #include <iterator>
 #include <set>
 #include <string>
@@ -154,6 +156,7 @@ TEST(IrVectorCompareI16U16Execution, SdwaWordSelectionPrecedesTheSixteenBitRelat
                             eval_vector_compare(def, in.s0[lane] >> (16u * (sel0 - 4u)),
                                                 in.s1[lane] >> (16u * (sel1 - 4u)));
                         ASSERT_TRUE(test.has_value());
+                        if (!test.has_value()) return;
                         EXPECT_EQ(run.d[lane], expected_mask_read(form, in.active[lane], *test != 0,
                                                                   in.old_d[lane]))
                             << "op " << def.opcode << " lane " << lane;
@@ -277,6 +280,7 @@ TEST(IrVectorCompareI16U16Execution, ExportsEveryFormForTheCorpusGate) {
                 for (size_t lane = 0; lane < in.lanes(); ++lane) {
                     const Known test = eval_vector_compare(def, in.s0[lane], in.s1[lane]);
                     ASSERT_TRUE(test.has_value());
+                    if (!test.has_value()) return;
                     EXPECT_EQ(output[lane],
                               expected_mask_read(form, in.active[lane], *test != 0, in.old_d[lane]))
                         << "witness " << index << " lane " << lane;

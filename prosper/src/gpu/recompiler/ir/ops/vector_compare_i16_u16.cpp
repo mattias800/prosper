@@ -3,6 +3,11 @@
 // the old compare_integer16 emitter so the existing source and mask routes keep their bytes.
 #include "gpu/recompiler/ir/ops/vector_compare.hpp"
 
+#include "gpu/recompiler/ir/builder.hpp"
+#include "gpu/recompiler/ir/ir.hpp"
+
+#include <span>
+
 namespace prosper::gpu::ir {
 namespace {
 using In = VectorCompareIn;
