@@ -111,7 +111,7 @@ void check(const std::vector<uint32_t>& module, const LaneInputs& in, uint32_t f
     }
 }
 // Independent storage-buffer Floor control, without the conversion builder or prepass.
-std::vector<uint32_t> native_floor() {
+std::vector<uint32_t> native_unary(uint32_t operation = 8) {
     std::vector<uint32_t> module{0x07230203, 0x00010300, 0, 25, 0};
     const auto emit = [&](uint32_t op, std::initializer_list<uint32_t> operands) {
         module.push_back((uint32_t(operands.size() + 1) << 16) | op);
@@ -148,7 +148,7 @@ std::vector<uint32_t> native_floor() {
     emit(Op_AccessChain, {11, 20, 15, 12, 19});
     emit(Op_Load, {4, 21, 20});
     emit(Op_Bitcast, {5, 22, 21});
-    emit(Op_ExtInst, {5, 23, 1, 8, 22}); // GLSL.std.450 Floor
+    emit(Op_ExtInst, {5, 23, 1, operation, 22}); // Independent GLSL.std.450 opcode.
     emit(Op_Bitcast, {4, 24, 23});
     emit(Op_Store, {20, 24});
     emit(Op_Return, {});
@@ -158,7 +158,7 @@ std::vector<uint32_t> native_floor() {
 } // namespace
 
 TEST(IrCvtFlrDenormExecution, IndependentFloorControlProvesOnlyTheSelectedProfileFlushes) {
-    const auto module = native_floor();
+    const auto module = native_unary();
     const std::array cases{Example{0x80000001, 0xbf800000},
                            Example{0x807fffff, 0xbf800000},
                            Example{1, 0},
@@ -186,19 +186,18 @@ TEST(IrCvtFlrDenormExecution, PrepassChangesOnlyNonzeroSubnormalWords) {
     Block block;
     Builder ir(block);
     const auto prepared = prepare_cvt_flr_input(ir, ir.input(Type::U32));
-    for (const auto x : kExamples) {
+    // Literal endpoints and identities, independent of the implementation predicate.
+    for (const auto x :
+         std::array{Example{1, 0}, Example{0x80000001, 0xbf800000}, Example{0x007fffff, 0},
+                    Example{0x807fffff, 0xbf800000}, Example{0, 0}, Example{0x80000000, 0x80000000},
+                    Example{0x00800000, 0x00800000}, Example{0x80800000, 0x80800000},
+                    Example{0x40100000, 0x40100000}, Example{0xc0100000, 0xc0100000},
+                    Example{0x7f800000, 0x7f800000}, Example{0xff800000, 0xff800000},
+                    Example{0x7f800001, 0x7f800001}, Example{0xff812345, 0xff812345},
+                    Example{0x7fcabcde, 0x7fcabcde}, Example{0xffc12345, 0xffc12345},
+                    Example{0x7f7fffff, 0x7f7fffff}, Example{0xff7fffff, 0xff7fffff}}) {
         const Known operand[] = {x.bits};
-        const uint32_t magnitude = x.bits & 0x7fffffffu;
-        const uint32_t want = magnitude != 0 && magnitude < 0x00800000u
-                                  ? ((x.bits & 0x80000000u) ? 0xbf800000u : 0u)
-                                  : x.bits;
-        EXPECT_EQ(evaluate(block, operand)[prepared.index], Known(want));
-    }
-    // No claim about Floor's nonfinite result: only the raw input boundary is unchanged.
-    for (uint32_t bits : {0x7f800000u, 0xff800000u, 0x7f800001u, 0xff812345u, 0x7fcabcdeu,
-                          0xffc12345u, 0x7f7fffffu, 0xff7fffffu}) {
-        const Known operand[] = {bits};
-        EXPECT_EQ(evaluate(block, operand)[prepared.index], Known(bits));
+        EXPECT_EQ(evaluate(block, operand)[prepared.index], Known(x.want));
     }
     const Known missing[] = {std::nullopt};
     EXPECT_FALSE(evaluate(block, missing)[prepared.index]);
@@ -216,6 +215,42 @@ TEST(IrCvtFlrDenormExecution, ExistingConversionKeepsIndependentAnswersInBothHos
                     recompile_compute(p.code.data(), p.code.size(), &p.table, p.config);
                 for (uint32_t seed : {1u, 17u, 41u}) check(module, inputs(seed), form);
             }
+}
+TEST(IrCvtFlrDenormExecution, GeneratedSubnormalMantissasUseTheirConstructionSignInBothProfiles) {
+    for (uint32_t wave : {32u, 64u}) {
+        const auto p = lane_program(words(0), 64, wave);
+        const auto module = recompile_compute(p.code.data(), p.code.size(), &p.table, p.config);
+        ASSERT_FALSE(module.empty());
+        for (uint32_t seed : {1u, 17u, 5344u, 0xdeadbeefu}) {
+            auto in = lane_inputs(seed);
+            std::vector<uint32_t> wants;
+            for (size_t lane = 0; lane < in.lanes(); ++lane) {
+                seed = seed * 1664525u + 1013904223u;
+                const uint32_t mantissa = 1u + seed % 0x007fffffu;
+                const bool negative = (lane % 2) != 0;
+                in.s0[lane] = mantissa | (negative ? 0x80000000u : 0u);
+                wants.push_back(negative ? 0xffffffffu : 0u);
+            }
+            for (bool flush : {false, true}) {
+                const auto run = execute(module, in, flush);
+                ASSERT_TRUE(run.error.empty()) << run.error;
+                ASSERT_EQ(run.d.size(), in.lanes());
+                for (size_t lane = 0; lane < in.lanes(); ++lane)
+                    EXPECT_EQ(run.d[lane], in.active[lane] ? wants[lane] : in.old_d[lane])
+                        << "wave " << wave << " flush " << flush << " lane " << lane;
+            }
+        }
+    }
+}
+TEST(IrCvtFlrDenormExecution, FloorProfileDoesNotFlushTheIndependentCeilControl) {
+    for (bool flush : {false, true}) {
+        bpermute_oracle::Interpreter vm(native_unary(9));
+        vm.floor_flush_denorm_input = flush;
+        std::vector<uint32_t> data(64, 1);
+        const auto out = vm.run_buffers(64, {{3, data}}, 3);
+        ASSERT_TRUE(vm.error.empty()) << vm.error;
+        EXPECT_EQ(out, std::vector<uint32_t>(64, 0x3f800000u));
+    }
 }
 TEST(IrCvtFlrDenormExecution, UnknownAndNonfiniteConversionResultsRemainOutsideTheOracleDomain) {
     const auto* def = find_vector_conversion_op(Rdna2Format::VOP1, 0x0d);
@@ -286,7 +321,7 @@ TEST(IrCvtFlrDenormExecution, ExportsReplaysAndExecutesEachExactSavedModule) {
                 ++count;
             }
     std::ofstream control(root / "native-floor-control.spv", std::ios::binary);
-    const auto module = native_floor();
+    const auto module = native_unary();
     control.write(reinterpret_cast<const char*>(module.data()),
                   static_cast<std::streamsize>(module.size() * sizeof(uint32_t)));
     control.close();
