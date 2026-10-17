@@ -176,7 +176,7 @@ std::vector<uint32_t> prepared_module(const VectorCompareDef& def, uint32_t a, u
     b.begin(1, nullptr, 1, 1, 1, 64, 0, true, true);
     const uint32_t lhs = b.uconst(a), rhs = b.uconst(c);
     const uint32_t test = emit_vector_compare(b, def, lhs, rhs);
-    b.store_output(b.sel(test, b.uconst(1), b.uconst(0)));
+    b.store_output_word(b.sel(test, b.uconst(1), b.uconst(0)), 1, 0);
     return b.finish();
 }
 } // namespace
