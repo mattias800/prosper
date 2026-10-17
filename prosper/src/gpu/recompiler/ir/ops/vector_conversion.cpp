@@ -10,6 +10,17 @@
 #include "gpu/recompiler/ir/ops/vector_conversion.hpp"
 #include "gpu/recompiler/ir/emit/spirv_emitter.hpp"
 namespace prosper::gpu::ir {
+// AMD 70648 section 12.8, V_CVT_FLR_I32_F32: denormals are supported. Vulkan's
+// default GLSL Floor may flush its input, so replace only nonzero subnormals with
+// floor-equivalent normal/zero endpoints. All other words retain the old graph.
+Value prepare_cvt_flr_input(Builder& ir, Value bits) {
+    const Value magnitude = ir.and_(bits, ir.c32(0x7fffffffu));
+    const Value subnormal =
+        ir.booland_(ir.ult(magnitude, ir.c32(0x00800000u)), ir.ine(magnitude, ir.c32(0)));
+    const Value negative = ir.ine(ir.and_(bits, ir.c32(0x80000000u)), ir.c32(0));
+    const Value endpoint = ir.select(negative, ir.c32(0xbf800000u), ir.c32(0));
+    return ir.select(subnormal, endpoint, bits);
+}
 Value build_f32_to_u32_sat(Builder& ir, const ConversionIn& x) {
     return ir.f32_to_u32_sat(x.s0);
 }
@@ -59,7 +70,10 @@ constexpr ConversionDef kDefs[] = {
          const Value rounded = ir.f32add(lower, ir.select(round_up, ir.c32(0x3f800000), ir.c32(0)));
          return ir.f32_to_i32_sat(rounded);
      }},
-    {F::VOP1, 0x0d, [](Builder& ir, const In& x) { return ir.f32_to_i32_sat(ir.f32floor(x.s0)); }},
+    {F::VOP1, 0x0d,
+     [](Builder& ir, const In& x) {
+         return ir.f32_to_i32_sat(ir.f32floor(prepare_cvt_flr_input(ir, x.s0)));
+     }},
     {F::VOP1, 0x0e, build_conversion_off_f32_i4},
     {F::VOP1, 0x11, build_conversion_ubyte0_f32},
     {F::VOP1, 0x12, build_conversion_ubyte1_f32},

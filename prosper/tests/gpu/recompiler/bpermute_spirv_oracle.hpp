@@ -50,6 +50,9 @@ struct Lane {
 struct Interpreter {
   // Closed test profile for GLSL half conversions: RTE packing, preserved subnormals.
     bool half_rte_preserve_denorm = false;
+    // Closed host profile: Vulkan's spirvenv-precision-operation permits default
+    // GLSL Floor input flushing. This does not model guest MODE or other operations.
+    bool floor_flush_denorm_input = false;
     std::vector<Inst> ins;
     std::map<uint32_t, Type> types;
     std::map<uint32_t, Value> constants;
@@ -304,7 +307,15 @@ struct Interpreter {
                   break;
               }
               case 3: result = std::trunc(x); break;
-              case 8: result = std::floor(x); break;
+              case 8: {
+                  const uint32_t magnitude = input.words[0] & 0x7fffffffu;
+                  const float operand =
+                      floor_flush_denorm_input && magnitude != 0 && magnitude < 0x00800000u
+                          ? std::bit_cast<float>(input.words[0] & 0x80000000u)
+                          : x;
+                  result = std::floor(operand);
+                  break;
+              }
               case 9: result = std::ceil(x); break;
               case 10: result = x - std::floor(x); break;
               case 13: result = std::sin(x); break;
