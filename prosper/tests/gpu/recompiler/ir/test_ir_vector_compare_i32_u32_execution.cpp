@@ -141,7 +141,7 @@ size_t append_sdwa_witnesses() {
                         lane_program(sdwa_program(def.opcode, form, select0, select1), 64, wave);
                     const uint64_t address = 0x5330100000ull + count * 0x100;
                     const fs::path stem =
-                        dump / ("cs_" + std::to_string(address) + "_sdwa_" + std::to_string(count));
+                        dump / ("cs_" + std::to_string(address) + "_" + std::to_string(count));
                     std::ofstream bin(stem.string() + ".bin", std::ios::binary);
                     bin.write(reinterpret_cast<const char*>(lp.code.data()),
                               static_cast<std::streamsize>(lp.code.size() * sizeof(uint32_t)));
