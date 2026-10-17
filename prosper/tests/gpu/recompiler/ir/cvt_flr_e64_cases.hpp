@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <iterator>
 #include <vector>
 namespace prosper::test::ir::cvt_flr_e64 {
 struct Form {

@@ -3,6 +3,7 @@
 #include "gpu/recompiler/ir/cvt_flr_e64_cases.hpp"
 #include "gpu/recompiler/ir/ops/vector_float_integer_e64.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/diagnostics/refused_shader_inputs.hpp"
 #include "fixtures/test_scratch.h"
 #include <gtest/gtest.h>
@@ -50,6 +51,31 @@ std::vector<uint32_t> compile(const std::vector<uint32_t>& words, uint32_t wave 
                                     {RecompileDiagnosticStage::Compute, address});
     if (module.empty()) ADD_FAILURE() << last_terminal_reject_reason(address);
     return module;
+}
+// Pin the first actual fresh-mask consumer, so an unrelated later refusal cannot pass.
+void check_mask_source(const std::vector<uint32_t>& code, uint32_t wave, bool genuine,
+                       bool branch = false) {
+    auto p = lane_program(code, 64, wave);
+    if (branch) p.config.user_sgprs.resize(8);
+    std::vector<Rdna2Inst> decoded;
+    rdna2_walk(p.code.data(), p.code.size(), decoded);
+    std::optional<uint32_t> consumer;
+    for (const auto& in : decoded)
+        if (in.words[0] == 0x7d8a0280u) consumer = in.pc;
+    ASSERT_TRUE(consumer.has_value());
+    const auto address = lane_harness_address();
+    const auto module = recompile_compute(p.code.data(), p.code.size(), &p.table, p.config,
+                                          {RecompileDiagnosticStage::Compute, address});
+    const auto reason = last_terminal_reject_reason(address);
+    if (genuine)
+        ASSERT_FALSE(module.empty()) << reason;
+    else {
+        ASSERT_TRUE(module.empty());
+        EXPECT_NE(reason.find("fabricated-fresh-mask-source"), std::string::npos) << reason;
+        EXPECT_NE(reason.find("pc=" + std::to_string(consumer.value_or(UINT32_MAX)) + " "),
+                  std::string::npos)
+            << reason;
+    }
 }
 void export_witness(const std::filesystem::path& root, std::ofstream& manifest, size_t index,
                     uint32_t wave, uint32_t form, uint32_t mode, uint32_t encoding) {
@@ -175,52 +201,46 @@ TEST(IrVectorCvtFlrE64Execution, AllModifiersAndNoncanonicalFieldsRemainRefusedB
 }
 TEST(IrVectorCvtFlrE64Execution, MissingAndRelayedScalarSourcesCannotCreateFreshMasks) {
     for (uint32_t wave : {32u, 64u})
-        for (bool relay : {false, true})
-            for (bool initialize : {false, true}) {
+        for (bool relay : {false, true}) {
+            const auto words = [&](bool genuine) {
                 auto form = cases::form(2);
-                form.initialize = initialize;
-                std::vector<uint32_t> words;
+                form.initialize = false;
+                std::vector<uint32_t> code = genuine
+                                                 ? std::vector<uint32_t>{0xbeb203ff, form.scalar}
+                                                 : std::vector<uint32_t>{0xbf800000, 0xbf800000};
                 if (relay) {
-                    if (initialize) words.insert(words.end(), {0xbeb203ff, form.scalar});
-                    words.push_back(vop1(1, 254, 50));
-                    form.initialize = false;
+                    code.push_back(vop1(1, 254, 50));
                     form.source = 510;
                 }
                 const auto op = cases::words(form);
-                words.insert(words.end(), op.begin(), op.end());
-                words.insert(words.end(), {0xbefe04c1, 0x7d8a0280});
-                const auto run = run_vector_op_per_lane(words, cases::inputs(11), wave);
-                if (initialize)
-                    ASSERT_TRUE(run.error.empty()) << run.error;
-                else
-                    EXPECT_NE(run.error.find("fabricated-fresh-mask-source"), std::string::npos)
-                        << run.error;
-            }
+                code.insert(code.end(), op.begin(), op.end());
+                code.insert(code.end(), {0xbefe04c1, 0x7d8a0280});
+                return code;
+            };
+            const auto bad = words(false), good = words(true);
+            ASSERT_EQ(bad.size(), good.size());
+            check_mask_source(bad, wave, false);
+            check_mask_source(good, wave, true);
+        }
 }
 TEST(IrVectorCvtFlrE64Execution, OneArmScalarSourcesKeepTheirObligationWithBothEdgeControl) {
-    for (uint32_t wave : {32u, 64u})
-        for (bool initialize : {false, true}) {
-            std::vector<uint32_t> code;
-            if (initialize) code.insert(code.end(), {0xbeb203ff, 0x3fe00000});
+    for (uint32_t wave : {32u, 64u}) {
+        const auto words = [](bool genuine) {
+            std::vector<uint32_t> code = genuine ? std::vector<uint32_t>{0xbeb203ff, 0x3fe00000}
+                                                 : std::vector<uint32_t>{0xbf800000, 0xbf800000};
             code.insert(code.end(), {0xbf068004, 0xbf840002, 0xbeb203ff, 0x40000000});
             auto form = cases::form(2);
             form.initialize = false;
             const auto op = cases::words(form);
             code.insert(code.end(), op.begin(), op.end());
             code.insert(code.end(), {0xbefe04c1, 0x7d8a0280});
-            auto p = lane_program(code, 64, wave);
-            p.config.user_sgprs.resize(8);
-            const auto address = lane_harness_address();
-            const auto module = recompile_compute(p.code.data(), p.code.size(), &p.table, p.config,
-                                                  {RecompileDiagnosticStage::Compute, address});
-            const auto reason = last_terminal_reject_reason(address);
-            if (initialize)
-                ASSERT_FALSE(module.empty()) << reason;
-            else {
-                EXPECT_TRUE(module.empty());
-                EXPECT_NE(reason.find("fabricated-fresh-mask-source"), std::string::npos) << reason;
-            }
-        }
+            return code;
+        };
+        const auto bad = words(false), good = words(true);
+        ASSERT_EQ(bad.size(), good.size());
+        check_mask_source(bad, wave, false, true);
+        check_mask_source(good, wave, true, true);
+    }
 }
 TEST(IrVectorCvtFlrE64Execution, NonfiniteAndUnknownPolicyMatchesOldModelBoundaryExactly) {
     const auto* def = find_vector_cvt_flr_e64_op(Rdna2Format::VOP3, 0x18d);
