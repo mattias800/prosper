@@ -81,9 +81,11 @@ enum class Opcode : uint8_t {
     F32Fma,   // GLSL Fma intent; evaluation is a finite RTE reference, not a Vulkan accuracy promise
     BoolAnd,
     BoolOr,
+    BoolNot,
     F32Clamp01,
     PackHalfLo,
     FfbhU32,   // leading zero count; all ones for a zero word
+    FindUMsbU32,   // GLSL.std.450 FindUMsb: highest set-bit index, or all ones for zero
     BitCount,   // population count of one numeric word, without wave-mask state
     F32Fract,
     F32Trunc,
@@ -134,6 +136,10 @@ enum class Opcode : uint8_t {
     U64Le,
     U64Gt,
     U64Ge,   // u64 x u64 -> bool, unsigned order
+    U64Shl,
+    U64LShr,
+    U64AShr,   // (u64 raw word, u32 count) -> u64; unknown for count >= 64
+    U64Bfe,   // (U64 base, U32 offset <= 63, U32 count), clamped at the word end
 };
 
 struct OpcodeInfo {

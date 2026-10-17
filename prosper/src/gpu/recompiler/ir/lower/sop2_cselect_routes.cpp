@@ -3,6 +3,7 @@
 // These routes still emit SPIR-V directly; they are the mask-domain and proof-carrying shapes the
 // IR does not model yet. Each returns nullopt when the instruction is not its shape.
 #include "gpu/recompiler/ir/lower/scalar_lowering_internal.hpp"
+#include "gpu/recompiler/ir/ops/scalar_integer64_values.hpp"
 
 namespace prosper::gpu::ir {
 
@@ -204,9 +205,24 @@ std::optional<bool> Sop2Lowering::route_cselect_b64() {
             b.cselect_b64_low_only_pcs.contains(in.pc);
         if (!complete && !low_only) { ok = false; return true; }
 
-        const uint32_t selected_lo = b.sel(rs.scc, p0.lo, p1.lo);
-        const uint32_t selected_hi = complete
-            ? b.sel(rs.scc, p0.hi, p1.hi) : b.uconst(0);
+        const auto* value_def = find_scalar_integer64_value_op(in.fmt, in.opcode);
+        if (!value_def) {
+            ok = false;
+            return true;
+        }
+        const auto selected = emit_scalar_integer64_value(
+            b, *value_def,
+            [&](Scalar64Source source) {
+                switch (source) {
+                    case Scalar64Source::S0Lo: return p0.lo;
+                    case Scalar64Source::S0Hi: return p0.hi;
+                    case Scalar64Source::S1Lo: return p1.lo;
+                    case Scalar64Source::S1Hi: return p1.hi;
+                    default: return rs.scc;
+                }
+            },
+            complete);
+        const uint32_t selected_lo = selected.first, selected_hi = selected.second;
         rs.sreg[in.dst.value] = selected_lo;
         if (complete) rs.sreg[in.dst.value + 1] = selected_hi;
         else rs.sreg.erase(in.dst.value + 1);

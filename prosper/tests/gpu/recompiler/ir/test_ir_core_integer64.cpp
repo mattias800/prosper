@@ -1,6 +1,7 @@
 // The 64-bit word opcodes (PackU64, U64Lo, U64Hi, U64Eq..U64Ge): hand-worked evaluation, Block
 // type rules, the 32-bit view of a U64 value, and every opcode's SPIR-V run per lane in the integer
 // interpreter against its own evaluation.
+#include <optional>
 #include "gpu/recompiler/bpermute_spirv_oracle.hpp"
 #include "gpu/recompiler/ir/builder.hpp"
 #include "gpu/recompiler/ir/emit/spirv_emitter.hpp"
@@ -16,6 +17,7 @@
 #include <cstdint>
 #include <set>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -34,6 +36,59 @@ TEST(IrCoreInteger64, PackAndUnpackAreHandWorked) {
     EXPECT_EQ(evaluate_integer64(Opcode::U64Hi, 0x0123456789abcdefull, 0), Known64(0x01234567u));
     EXPECT_EQ(evaluate_integer64(Opcode::U64Hi, kMinI64, 0), Known64(0x80000000u))
         << "a logical, not arithmetic, shift";
+}
+
+TEST(IrCoreInteger64, ShiftsUseAllSixtyFourBitsAndRejectUnmaskedCounts) {
+    struct Row {
+        uint64_t word;
+        uint32_t count;
+        uint64_t left, logical, arithmetic;
+    };
+    for (const auto& r :
+         {Row{0x8000000000000001ull, 0, 0x8000000000000001ull, 0x8000000000000001ull,
+              0x8000000000000001ull},
+          Row{0x8000000000000001ull, 1, 2, 0x4000000000000000ull, 0xc000000000000000ull},
+          Row{0x8000000000000001ull, 31, 0x80000000ull, 0x100000000ull, 0xffffffff00000000ull},
+          Row{0x8000000000000001ull, 32, 0x100000000ull, 0x80000000ull, 0xffffffff80000000ull},
+          Row{0x8000000000000001ull, 33, 0x200000000ull, 0x40000000ull, 0xffffffffc0000000ull},
+          Row{0x8000000000000001ull, 63, 0x8000000000000000ull, 1, UINT64_MAX},
+          Row{0x7fffffffffffffffull, 63, 0x8000000000000000ull, 0, 0}}) {
+        EXPECT_EQ(evaluate_integer64(Opcode::U64Shl, r.word, r.count), Known64(r.left));
+        EXPECT_EQ(evaluate_integer64(Opcode::U64LShr, r.word, r.count), Known64(r.logical));
+        EXPECT_EQ(evaluate_integer64(Opcode::U64AShr, r.word, r.count), Known64(r.arithmetic));
+    }
+    for (const auto op : {Opcode::U64Shl, Opcode::U64LShr, Opcode::U64AShr})
+        for (const uint32_t count : {64u, 65u, UINT32_MAX})
+            EXPECT_FALSE(evaluate_integer64(op, UINT64_MAX, count));
+}
+
+TEST(IrCoreInteger64, ShiftsRequireWideDataAndNarrowCounts) {
+    for (const auto op : {Opcode::U64Shl, Opcode::U64LShr, Opcode::U64AShr}) {
+        EXPECT_DEATH(
+            {
+                prosper::test::suppress_coredump();
+                Block block;
+                Builder ir(block);
+                block.append({op, Type::U64, 0, {ir.c32(1), ir.c32(1)}});
+            },
+            "argument type mismatch");
+        EXPECT_DEATH(
+            {
+                prosper::test::suppress_coredump();
+                Block block;
+                Builder ir(block);
+                const Value wide = ir.pack_u64(ir.c32(1), ir.c32(2));
+                block.append({op, Type::U64, 0, {wide, wide}});
+            },
+            "argument type mismatch");
+        Block block;
+        Builder ir(block);
+        const Value word = ir.input(Type::U64), count = ir.input(Type::U32);
+        const Value result = block.append({op, Type::U64, 0, {word, count}});
+        for (const auto in :
+             {std::array<Known64, 2>{std::nullopt, 1}, std::array<Known64, 2>{1, std::nullopt}})
+            EXPECT_FALSE(evaluate_wide(block, in)[result.index]);
+    }
 }
 
 TEST(IrCoreInteger64, RelationsAreUnsignedOverAllSixtyFourBits) {
@@ -151,7 +206,7 @@ TEST(IrCoreInteger64, EveryOpcodeRunsLikeItsEvaluationPerLane) {
     const uint32_t words[] = {0u,          1u,          0x7fffffffu, 0x80000000u,
                               0xffffffffu, 0x12345678u, 0xffffffc0u, 0x0000003fu};
     std::set<Opcode> seen;
-    for (uint32_t op = uint32_t(Opcode::PackU64); op <= uint32_t(Opcode::U64Ge); ++op) {
+    for (uint32_t op = uint32_t(Opcode::PackU64); op <= uint32_t(Opcode::U64Bfe); ++op) {
         const Opcode opcode = static_cast<Opcode>(op);
         Block block;
         Builder ir(block);
@@ -161,13 +216,22 @@ TEST(IrCoreInteger64, EveryOpcodeRunsLikeItsEvaluationPerLane) {
         Value result = a;
         if (opcode == Opcode::U64Lo) result = ir.u64lo(a);
         if (opcode == Opcode::U64Hi) result = ir.u64hi(a);
-        if (opcode >= Opcode::U64Eq) {
+        if (opcode >= Opcode::U64Eq && opcode <= Opcode::U64Ge) {
             const Value c = ir.pack_u64(c_lo, c_hi);
             result = block.append({opcode, Type::Bool, 0, {a, c}});
         }
-        // A packed word leaves through both halves, so the store reads all 64 bits.
-        const Value lo = opcode == Opcode::PackU64 ? ir.u64lo(a) : result;
-        const Value hi = opcode == Opcode::PackU64 ? ir.u64hi(a) : result;
+        if (opcode >= Opcode::U64Shl && opcode <= Opcode::U64AShr)
+            result = block.append({opcode, Type::U64, 0, {a, ir.and_(c_lo, ir.c32(63))}});
+        if (opcode == Opcode::U64Bfe) {
+            const Value offset = ir.and_(c_lo, ir.c32(63));
+            const Value count = ir.iadd(ir.and_(c_hi, ir.c32(63)), ir.c32(1));
+            result = ir.u64bfe(a, offset, count);
+        }
+        // Positive widths keep both intermediate shifts defined in the unchanged BFE helper.
+        // Every wide result leaves through both halves, so the store reads all 64 bits.
+        const bool wide = block.at(result).type == Type::U64;
+        const Value lo = wide ? ir.u64lo(result) : result;
+        const Value hi = wide ? ir.u64hi(result) : result;
         for (const Inst& inst : block.insts()) seen.insert(inst.op);
         for (const uint32_t x : words)
             for (const uint32_t y : words) {
@@ -191,8 +255,33 @@ TEST(IrCoreInteger64, EveryOpcodeRunsLikeItsEvaluationPerLane) {
                 }
             }
     }
-    for (uint32_t op = uint32_t(Opcode::PackU64); op <= uint32_t(Opcode::U64Ge); ++op)
+    for (uint32_t op = uint32_t(Opcode::PackU64); op <= uint32_t(Opcode::U64Bfe); ++op)
         EXPECT_TRUE(seen.contains(static_cast<Opcode>(op))) << opcode_info(Opcode(op)).name;
 }
 
 }   // namespace
+
+TEST(IrCoreInteger64Oracle, ArithmeticShiftPropagatesUndefinedAndRejectsPoisonCounts) {
+    using bpermute_oracle::Interpreter;
+    SpirvCompute b;
+    b.begin(10, nullptr, 64, 1, 1, 64, 0, true, true);
+    const uint32_t word = b.u64_from_lohi(b.uconst(1), b.uconst(0x80000000));
+    const uint32_t count = b.u64_from_lohi(b.uconst(1), b.uconst(0));
+    b.store_output_word(b.uconst(0), 1, 0);
+    Interpreter vm(b.finish());
+    ASSERT_TRUE(vm.error.empty());
+    bpermute_oracle::Lane lane;
+    const uint32_t wide_type = b.t_u64();
+    lane.v[word] = {wide_type, {1, 0x80000000}, false};
+    lane.v[count] = {wide_type, {1, 0}, true};
+    const uint32_t result = 999;
+    ASSERT_TRUE(vm.scalar_alu_op(lane, Op_ShiftRightArithmetic, {wide_type, result, word, count}));
+    EXPECT_FALSE(lane.v.at(result).defined);
+    lane.v[word].defined = true;
+    lane.v[count].words = {64, 0};
+    EXPECT_THROW(vm.scalar_alu_op(lane, Op_ShiftRightArithmetic, {wide_type, result, word, count}),
+                 std::runtime_error);
+    lane.v[count].words = {1, 1};   // a wide count must not be silently truncated to its low word
+    EXPECT_THROW(vm.scalar_alu_op(lane, Op_ShiftRightArithmetic, {wide_type, result, word, count}),
+                 std::runtime_error);
+}

@@ -318,3 +318,47 @@ TEST(VectorScalarProvenance, CarryDestinationCannotCertifyItsOwnVectorSourceAtAn
                      .empty())
         << terminal_reason;
 }
+
+TEST(VectorScalarProvenance, Arithmetic64ShiftCannotAuthenticateFabricatedPairOrRelayedCount) {
+    // The new 0x301 admission must retain both source words and the B32 count's provenance.
+    // Observe both result words via readfirstlane, then consume the resulting pair as EXEC.
+    const Words read = {0x7e58050au, 0x7e5a050bu};   // s44=first(v10); s45=first(v11)
+    const Words pair_shift = {0xd701000au, 261u | (262u << 9u)};   // v[10:11]=v[6:7] >> v5
+    const Words count_shift = {0xd701000au, 262u | (268u << 9u)};   // v[10:11]=v[12:13] >> v6
+    const Words genuine_pair = {0x7e180280u, 0x7e1a02c1u};   // v12=0; v13=-1
+    struct Row {
+        Words fabricated;
+        Words genuine;
+        Words instruction;
+    };
+    const std::vector<Row> rows = {
+        {cat({prefix(), {0xbf800000u, 0x7e0c0280u, 0x7e0e0233u}}),
+         cat({prefix(), {0xbeb303c1u, 0x7e0c0280u, 0x7e0e0233u}}),
+         pair_shift},   // only high v7 is absent s51
+        {relay({0xbf800000u}), relay({0xbeb2047eu}),
+         pair_shift},   // pair through lane/scalar/vector hops
+        {cat({relay({0xbf800000u}), genuine_pair}), cat({relay({0xbeb2047eu}), genuine_pair}),
+         count_shift},
+    };
+    for (const auto& row : rows) {
+        ASSERT_EQ(row.fabricated.size(), row.genuine.size());
+        const auto decoded = rdna2_decode_one(row.instruction.data(), row.instruction.size());
+        ASSERT_EQ(decoded.opcode, 0x301u);
+        EXPECT_EQ(rdna2_vgpr_source_span(decoded, 0), 1u);
+        EXPECT_EQ(rdna2_vgpr_source_span(decoded, 1), 2u);
+        for (Stage stage : {Stage::Fragment, Stage::Compute}) {
+            SCOPED_TRACE(stage == Stage::Fragment ? "fragment" : "compute");
+            const auto rejected = cat({row.fabricated, row.instruction, read, restore(stage)});
+            expect_refused(stage, rejected);
+            // The numeric value may still be emitted. Authority is refused at the first EXEC
+            // consumer, retaining the source's fabricated mark through both shift outputs.
+            EXPECT_NE(
+                terminal_reason.find("pc=" + std::to_string(row.fabricated.size() + 4u) + " "),
+                std::string::npos)
+                << terminal_reason;
+            EXPECT_FALSE(
+                compile(stage, cat({row.genuine, row.instruction, read, restore(stage)})).empty())
+                << terminal_reason;
+        }
+    }
+}

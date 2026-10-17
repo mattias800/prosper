@@ -3,6 +3,8 @@
 // These routes still emit SPIR-V directly; they are the mask-domain and proof-carrying shapes the
 // IR does not model yet. Each returns nullopt when the instruction is not its shape.
 #include "gpu/recompiler/ir/lower/scalar_lowering_internal.hpp"
+#include "gpu/recompiler/ir/ops/integer64_shifts.hpp"
+#include "gpu/recompiler/ir/ops/scalar_integer64_values.hpp"
 
 namespace prosper::gpu::ir {
 
@@ -199,7 +201,23 @@ std::optional<bool> Sop2Lowering::route_lshr_b64_exec_pack() {
 }
 
 std::optional<bool> Sop2Lowering::route_shift_b64() {
-    if (in.opcode == 0x1f || in.opcode == 0x21) {
+    if (in.opcode == 0x23) {
+        // New ASHR is ordinary SGPR DATA only. It grants no special-register/mask write,
+        // and SGPR pairs use the ISA's even alignment. The existing source service and
+        // central effects/marks retain the current assignment obligations on all three words.
+        const bool ordinary_pair = in.src[0].kind == OperandKind::SGPR && in.src[0].value >= 0 &&
+                                   in.src[0].value <= 104 && !(in.src[0].value & 1);
+        const bool ordinary_count = (in.src[1].kind == OperandKind::SGPR && in.src[1].value >= 0 &&
+                                     in.src[1].value <= 105) ||
+                                    in.src[1].kind == OperandKind::InlineInt ||
+                                    (in.src[1].kind == OperandKind::Literal && in.has_literal);
+        if (in.dst.kind != OperandKind::SGPR || in.dst.value < 0 || in.dst.value > 104 ||
+            (in.dst.value & 1) || !ordinary_pair || !ordinary_count) {
+            ok = false;
+            return true;
+        }
+    }
+    if (in.opcode == 0x1f || in.opcode == 0x21 || in.opcode == 0x23) {
         // Ordinary s_lshl/lshr_b64 operates on a complete scalar-data pair. Generated
         // compute shaders frequently borrow VCC_LO/HI for 64-bit address arithmetic; that
         // lifetime coexists with VCC's per-lane predicate view, so retain both exactly.
@@ -228,13 +246,14 @@ std::optional<bool> Sop2Lowering::route_shift_b64() {
         } else {
             ok = false; return true;
         }
-        const uint32_t amount = b.ibin(
-            Op_BitwiseAnd, val(in.src[1]), b.uconst(63));
+        const uint32_t amount = emit_integer64_shift_count(b, [&] { return val(in.src[1]); });
         if (!ok) return true;
-        const uint32_t result = b.u64_shift(
-            in.opcode == 0x1f ? Op_ShiftLeftLogical : Op_ShiftRightLogical,
-            b.u64_from_lohi(source_lo, source_hi), amount);
-        const uint32_t lo = b.u64_lo(result), hi = b.u64_hi(result);
+        const auto& def = *find_integer64_shift(in.fmt, in.opcode);
+        const uint32_t result = emit_integer64_shift_result(b, def, [&](uint32_t source) {
+            return source == 2 ? amount : source == 0 ? source_lo : source_hi;
+        });
+        const auto words = emit_integer64_shift_words(b, result);
+        const uint32_t lo = words[0], hi = words[1];
         rs.scc = b.ucmp(
             Op_INotEqual, b.ibin(Op_BitwiseOr, lo, hi), b.uconst(0));
         const bool writes_exec = in.dst.value == 126 || in.dst.value == 127;
@@ -303,13 +322,17 @@ std::optional<bool> Sop2Lowering::route_bfe_u64() {
         const uint32_t source_hi = high();
         const uint32_t control = val(in.src[1]);
         if (!ok) return true;
-        const uint32_t offset = b.ibin(Op_BitwiseAnd, control, b.uconst(0x3f));
-        const uint32_t width = b.ibin(
-            Op_BitwiseAnd,
-            b.ibin(Op_ShiftRightLogical, control, b.uconst(16)),
-            b.uconst(0x7f));
-        const uint32_t result = b.bfe_u64(
-            b.u64_from_lohi(source_lo, source_hi), offset, width);
+        const auto* value_def = find_scalar_integer64_value_op(in.fmt, in.opcode);
+        if (!value_def) {
+            ok = false;
+            return true;
+        }
+        const uint32_t result =
+            emit_scalar_integer64_value(b, *value_def, [&](Scalar64Source source) {
+                if (source == Scalar64Source::S0Lo) return source_lo;
+                if (source == Scalar64Source::S0Hi) return source_hi;
+                return control;
+            }).first;
         const bool writes_exec = in.dst.value == 126 || in.dst.value == 127;
         const bool writes_vcc = in.dst.value == 106 || in.dst.value == 107;
         const auto has_scalar_word = [&](int reg) {
