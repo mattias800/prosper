@@ -48,6 +48,18 @@ TEST(IrLowerVop3CrossLane, NativeDynamicWriteKeepsMasksAndRetiresOnlyTheOldLaneS
         EXPECT_TRUE(t.rs.exec_narrowed);
     }
 }
+TEST(IrLowerVop3CrossLane, RetainedM0DataIsStillAValidDynamicSelector) {
+    for (uint32_t wave : {32u, 64u}) {
+        LoweringFixture t;
+        native(t, wave);
+        t.set_sgpr(124, 0x80000021u);
+        const uint32_t m0 = t.rs.sreg.at(124);
+        ASSERT_TRUE(lower_vop3_cross_lane(t.b, t.rs, instruction(124), t.ok, true).has_value());
+        ASSERT_TRUE(t.ok);
+        EXPECT_TRUE(t.rs.vreg.contains(1));
+        EXPECT_EQ(t.rs.sreg.at(124), m0);
+    }
+}
 TEST(IrLowerVop3CrossLane, OldDestinationIsResolvedAfterTheLaneComparison) {
     LoweringFixture t;
     native(t, 64);

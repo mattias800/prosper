@@ -22,13 +22,17 @@ inline LaneInputs inputs(uint32_t wave, uint32_t mask = 0) {
     return in;
 }
 inline LaneProgram program(uint32_t wave, uint32_t selector, Source source, uint32_t native,
-                           uint32_t mask = 0, bool following = false) {
+                           uint32_t mask = 0, bool following = false, bool compatibility = false,
+                           bool m0_selector = false) {
     // s20 is the source; s21 is a real SGPR selector (even when its value is constant).
-    std::vector<uint32_t> words{0xbe9403ffu, source_word(source), 0xbe9503ffu, selector};
+    const uint32_t selector_register = m0_selector ? 124u : 21u;
+    std::vector<uint32_t> words{0xbe9403ffu, source_word(source),
+                                0xbe8003ffu | (selector_register << 16), selector};
     const uint32_t src0 = source == Source::Scalar           ? 20u
                           : source == Source::InlineMinusOne ? 193u
                                                              : 255u;
-    words.insert(words.end(), {0xd7610001u, src0 | (21u << 9)});
+    words.insert(words.end(),
+                 {compatibility ? 0xd3610001u : 0xd7610001u, src0 | (selector_register << 9)});
     if (source == Source::Literal) words.push_back(source_word(source));
     if (following) words.push_back(vop1(0x37, kVdst, 256u + kVdst));
     auto p = lane_program(words, wave, wave);

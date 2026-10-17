@@ -5,11 +5,15 @@
 #include "gpu/diagnostics/refused_shader_inputs.hpp"
 #include "fixtures/test_scratch.h"
 #include <gtest/gtest.h>
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <system_error>
+#include <vector>
 using namespace prosper::gpu;
 using namespace prosper::gpu::ir;
 using namespace prosper::test::ir;
@@ -78,8 +82,9 @@ void save_words(const std::filesystem::path& path, const std::vector<uint32_t>& 
 }
 void export_form(const std::filesystem::path& root, std::ofstream& manifest, size_t index,
                  uint32_t wave, uint32_t native, uint32_t selector, cases::Source source,
-                 uint32_t mask) {
-    const auto p = cases::program(wave, selector, source, native, mask);
+                 uint32_t mask, bool compatibility, bool m0_selector) {
+    const auto p =
+        cases::program(wave, selector, source, native, mask, false, compatibility, m0_selector);
     const uint64_t address = 0x5370000000ull + index * 0x100;
     const auto stem = root / "refused_shaders_20000101-000000Z_synthetic" /
                       ("cs_" + std::to_string(address) + "_" + std::to_string(index));
@@ -103,16 +108,20 @@ void export_form(const std::filesystem::path& root, std::ofstream& manifest, siz
         expect_lanes(saved, cases::inputs(wave, mask), selector, source, wave);
     }
     manifest << stem.filename().string() << '\t' << wave << '\t' << native << '\t' << selector
-             << '\t' << static_cast<uint32_t>(source) << '\t' << mask << '\n';
+             << '\t' << static_cast<uint32_t>(source) << '\t' << mask << '\t' << compatibility
+             << '\t' << m0_selector << '\n';
 }
 } // namespace
 TEST(IrVectorWritelaneExecution, ScalarInlineAndLiteralDataSelectExactlyOneLane) {
     for (uint32_t wave : {32u, 64u})
         for (uint32_t selector : cases::selectors(wave))
-            for (auto source :
-                 {cases::Source::Scalar, cases::Source::InlineMinusOne, cases::Source::Literal})
-                expect_lanes(compile(cases::program(wave, selector, source, wave)),
-                             cases::inputs(wave), selector, source, wave);
+            for (bool compatibility : {false, true})
+                for (bool m0_selector : {false, true})
+                    for (auto source : {cases::Source::Scalar, cases::Source::InlineMinusOne,
+                                        cases::Source::Literal})
+                        expect_lanes(compile(cases::program(wave, selector, source, wave, 0, false,
+                                                            compatibility, m0_selector)),
+                                     cases::inputs(wave), selector, source, wave);
 }
 TEST(IrVectorWritelaneExecution, InactiveSelectedLaneIsWrittenEvenWhenExecIsEmpty) {
     for (uint32_t wave : {32u, 64u})
@@ -186,8 +195,11 @@ TEST(IrVectorWritelaneExecution, ExportsSavedReplayedAndExecutedWitnessPrograms)
                 for (auto source :
                      {cases::Source::Scalar, cases::Source::InlineMinusOne, cases::Source::Literal})
                     for (uint32_t mask : {0u, 1u, 2u})
-                        export_form(root, manifest, count++, wave, native, selector, source, mask);
+                        for (bool compatibility : {false, true})
+                            for (bool m0_selector : {false, true})
+                                export_form(root, manifest, count++, wave, native, selector, source,
+                                            mask, compatibility, m0_selector);
     manifest.close();
     EXPECT_TRUE(manifest.good());
-    EXPECT_EQ(count, 288u);
+    EXPECT_EQ(count, 1152u);
 }
