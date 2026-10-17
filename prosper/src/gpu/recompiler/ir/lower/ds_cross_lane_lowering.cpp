@@ -1,6 +1,7 @@
 // DS shuffle-only arms moved by tools/refactor/extract_case_routes.py. Their source reads,
 // destination writes and subgroup contracts retain the original ALU route order.
 #include "gpu/recompiler/ir/lower/ds_cross_lane_lowering.hpp"
+#include "gpu/recompiler/ir/ops/ds_shuffle.hpp"
 
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
@@ -30,8 +31,8 @@ std::optional<bool> DsCrossLaneLowering::route_bpermute() {
         const auto address = rs.vreg.find(in.src[0].value);
         const auto source = rs.vreg.find(in.src[1].value);
         const uint32_t old = vreg_old(b, rs, in.dst.value);
-        rs.vreg[in.dst.value] = b.ds_bpermute_b32(
-            address == rs.vreg.end() ? b.uconst(0) : address->second,
+        rs.vreg[in.dst.value] = emit_ds_bpermute_b32(
+            b, address == rs.vreg.end() ? b.uconst(0) : address->second,
             source == rs.vreg.end() ? b.uconst(0) : source->second, rs.exec, b.uconst(in.literal));
         predicate_write(b, rs, in.dst.value, old);
         return true;
@@ -45,18 +46,17 @@ std::optional<bool> DsCrossLaneLowering::route_swizzle() {
             ok = false;
             return true;
         }
-        uint32_t source_lane = 0;
-        if (!b.ds_swizzle_source_lane(in.literal, &source_lane)) {
+        if (in.literal >= 0xc000u) {
             ok = false;
             return true;
         }
-        auto source = rs.vreg.find(in.src[0].value);
-        const uint32_t source_value = source == rs.vreg.end() ? b.uconst(0) : source->second;
-        const uint32_t shuffled = b.subgroup_shuffle(source_value, source_lane);
-        const uint32_t active_word = b.sel(rs.exec, b.uconst(1), b.uconst(0));
-        const uint32_t fetched_active = b.subgroup_shuffle(active_word, source_lane);
-        const uint32_t result =
-            b.sel(b.ucmp(Op_INotEqual, fetched_active, b.uconst(0)), shuffled, b.uconst(0));
+        const uint32_t result = emit_ds_swizzle_b32(
+            b, in.literal,
+            [&] {
+                auto source = rs.vreg.find(in.src[0].value);
+                return source == rs.vreg.end() ? b.uconst(0) : source->second;
+            },
+            rs.exec);
         const uint32_t old = vreg_old(b, rs, in.dst.value);
         rs.vreg[in.dst.value] = result;
         predicate_write(b, rs, in.dst.value, old);

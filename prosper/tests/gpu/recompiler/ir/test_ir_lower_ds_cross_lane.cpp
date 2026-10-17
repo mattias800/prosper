@@ -114,4 +114,15 @@ TEST(IrLowerDsCrossLane, RotateAndFftSwizzlesRemainRefusedBeforePublication) {
         EXPECT_EQ(t.b.code.size(), before);
     }
 }
+TEST(IrLowerDsCrossLane, ComputeSubgroupContractsRetainTheirOriginalWidths) {
+    for (uint32_t control : {0x80e4u, 0x020fu}) {
+        LoweringFixture t;
+        t.rs.vreg[2] = t.b.uconst(0x11223344);
+        ASSERT_EQ(t.b.compute_min_subgroup_size, 0u);
+        ASSERT_EQ(lower_ds_cross_lane(t.b, t.rs, swizzle(control), t.ok),
+                  std::optional<bool>{true});
+        ASSERT_TRUE(t.ok);
+        EXPECT_EQ(t.b.compute_min_subgroup_size, control & 0x8000u ? 4u : 32u);
+    }
+}
 } // namespace
