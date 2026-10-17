@@ -80,8 +80,16 @@ constexpr OpcodeInfo kInfo[] = {
     {"f32.eq", 2, Type::Bool},
     {"f32.ldexp", 2, Type::U32},
     {"pack.norm16", 1, Type::U32},
+    {"f32.le", 2, Type::Bool},
+    {"f32.gt", 2, Type::Bool},
+    {"f32.lg", 2, Type::Bool},
+    {"f32.unord.lt", 2, Type::Bool},
+    {"f32.unord.eq", 2, Type::Bool},
+    {"f32.unord.le", 2, Type::Bool},
+    {"f32.unord.gt", 2, Type::Bool},
+    {"f32.unord.ge", 2, Type::Bool},
 };
-static_assert(std::size(kInfo) == static_cast<size_t>(Opcode::PackNorm16) + 1);
+static_assert(std::size(kInfo) == static_cast<size_t>(Opcode::F32UnordGe) + 1);
 
 // The type argument `slot` of `op` must have.
 Type argument_type(Opcode op, size_t slot) {

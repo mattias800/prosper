@@ -25,6 +25,14 @@ uint32_t emit_one(SpirvCompute& b, const Inst& inst, const uint32_t* x) {
         case Opcode::F32Abs: return b.fext1(Glsl_FAbs, x[0]);
         case Opcode::F32Lt: return b.fcmp(Op_FOrdLessThan, x[0], x[1]);
         case Opcode::F32UnordNe: return b.fcmp(Op_FUnordNotEqual, x[0], x[1]);
+        case Opcode::F32Le: return b.fcmp(Op_FOrdLessThanEqual, x[0], x[1]);
+        case Opcode::F32Gt: return b.fcmp(Op_FOrdGreaterThan, x[0], x[1]);
+        case Opcode::F32Lg: return b.fcmp(Op_FOrdNotEqual, x[0], x[1]);
+        case Opcode::F32UnordLt: return b.fcmp(Op_FUnordLessThan, x[0], x[1]);
+        case Opcode::F32UnordEq: return b.fcmp(Op_FUnordEqual, x[0], x[1]);
+        case Opcode::F32UnordLe: return b.fcmp(Op_FUnordLessThanEqual, x[0], x[1]);
+        case Opcode::F32UnordGt: return b.fcmp(Op_FUnordGreaterThan, x[0], x[1]);
+        case Opcode::F32UnordGe: return b.fcmp(Op_FUnordGreaterThanEqual, x[0], x[1]);
         case Opcode::F32Clamp01: return b.clamp01(x[0]);
         case Opcode::F32Ldexp: return b.ldexp_f32_bits(x[0], x[1]);
         case Opcode::PackNorm16:

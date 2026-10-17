@@ -2,7 +2,10 @@
 
 RDNA2 instructions are moving, one instruction family at a time, from direct SPIR-V emission in
 `emit_alu` (`../rdna2_emit_alu.cpp`) to a lowering through this IR. Done so far: the scalar ALU
-(SOP1, SOP2, SOPC, SOPK) and VOP2's integer and bitwise group. Everything here is private to `gpu/recompiler`.
+(SOP1, SOP2, SOPC, SOPK), VOP2's integer and bitwise group, and the later VALU groups the
+family table in `HOW_TO_ADD_A_FAMILY.md` lists. VOPC compares are two halves: the per-lane value
+(`ops/vector_compare*.cpp`) and the shared lane-mask write (`lower/vopc_mask_write.cpp`).
+Everything here is private to `gpu/recompiler`.
 
 | path | role |
 | --- | --- |

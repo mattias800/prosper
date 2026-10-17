@@ -4,6 +4,7 @@
 #include "gpu/recompiler/ir/eval_half.hpp"
 #include "gpu/recompiler/ir/eval_normalized_pack.hpp"
 #include "gpu/recompiler/ir/eval_float_unary.hpp"
+#include "gpu/recompiler/ir/eval_float_compare.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -51,6 +52,14 @@ Known evaluate_op(Opcode op, uint32_t imm, uint32_t a, uint32_t b, uint32_t c) {
             const float x = std::bit_cast<float>(a), y = std::bit_cast<float>(b);
             return uint32_t(std::isnan(x) || std::isnan(y) || x != y);
         }
+        case Opcode::F32Le:
+        case Opcode::F32Gt:
+        case Opcode::F32Lg:
+        case Opcode::F32UnordLt:
+        case Opcode::F32UnordEq:
+        case Opcode::F32UnordLe:
+        case Opcode::F32UnordGt:
+        case Opcode::F32UnordGe: return evaluate_float_compare(op, a, b);
         case Opcode::F32Clamp01:
             return std::bit_cast<uint32_t>(
                 std::fmin(std::fmax(std::bit_cast<float>(a), 0.0f), 1.0f));

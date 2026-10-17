@@ -212,20 +212,26 @@ struct Interpreter {
       return true;
   }
   bool float_comparison_op(Lane& l, uint32_t op, const std::vector<uint32_t>& a) {
-      if (op != 180 && op != 183 && op != 184 && op != 190) return false;
+      if (op < 180 || op > 191) return false;   // OpFOrdEqual .. OpFUnordGreaterThanEqual
       if (a.size() != 4 || ty(a[0]).op != 20) fail("malformed float comparison");
       const auto x = value(l, a[2]), y = value(l, a[3]);
       if (!x.defined || !y.defined || x.words.size() != 1 || y.words.size() != 1 ||
           x.type != y.type || ty(x.type).op != 22 || ty(x.type).a != std::vector<uint32_t>{32})
           fail("undefined or mistyped float comparison");
       const float f = std::bit_cast<float>(x.words[0]), g = std::bit_cast<float>(y.words[0]);
-      // FUnordNotEqual includes either NaN; ordered comparisons are false on NaN.
-      // SPIR-V OpFOrdEqual (180), ordered scalar equality; NaNs compare false.
+      // SPIR-V 3.52.15: the even opcodes 180-190 are the ordered relations (false when either
+      // operand is a NaN), the odd 181-191 the unordered ones (true when either is a NaN), in
+      // the order Equal, NotEqual, LessThan, GreaterThan, LessThanEqual, GreaterThanEqual.
       // https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html#OpFOrdEqual
-      const bool result = op == 180   ? f == g
-                          : op == 183 ? std::isnan(f) || std::isnan(g) || f != g
-                          : op == 184 ? f < g
-                                      : f >= g;
+      const bool unordered = std::isnan(f) || std::isnan(g);
+      const uint32_t relation = (op - 180) / 2;
+      const bool holds = relation == 0   ? f == g
+                         : relation == 1 ? f != g
+                         : relation == 2 ? f < g
+                         : relation == 3 ? f > g
+                         : relation == 4 ? f <= g
+                                         : f >= g;
+      const bool result = (op & 1u) ? unordered || holds : !unordered && holds;
       set(l, a[1], a[0], {uint32_t(result)});
       return true;
   }
