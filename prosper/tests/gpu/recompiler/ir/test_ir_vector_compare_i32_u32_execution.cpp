@@ -1,10 +1,16 @@
 // I32/U32 comparison values must keep the old EXEC-masked lane masks in every existing form.
 // Truth rows are hand-worked two's-complement/unsigned ordering from AMD 70648, 12.9 Table 61.
+#include "fixtures/test_scratch.h"
+#include "gpu/diagnostics/refused_shader_inputs.hpp"
 #include "gpu/recompiler/ir/builder.hpp"
+#include "gpu/recompiler/ir/eval.hpp"
 #include "gpu/recompiler/ir/ir.hpp"
 #include "gpu/recompiler/ir/ops/vector_compare.hpp"
 #include "gpu/recompiler/ir/vector_compare_harness.hpp"
+#include "gpu/recompiler/ir/vector_lane_harness.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 
 #include <gtest/gtest.h>
 
@@ -13,6 +19,8 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <ios>
+#include <iosfwd>
 #include <iterator>
 #include <set>
 #include <string>
@@ -60,7 +68,7 @@ void check_integer_run(const VectorCompareDef& def, Form form, uint32_t wave, co
         const Known test = eval_vector_compare(def, in.s0[lane], in.s1[lane]);
         ASSERT_TRUE(test.has_value());
         ASSERT_EQ(run.d[lane],
-                  expected_mask_read(form, in.active[lane], *test != 0, in.old_d[lane]))
+                  expected_mask_read(form, in.active[lane], test.value_or(0) != 0, in.old_d[lane]))
             << "op " << std::hex << def.opcode << " form " << int(form) << " wave " << wave
             << " lane " << lane << " s0 " << in.s0[lane] << " s1 " << in.s1[lane];
     }
@@ -119,7 +127,7 @@ void check_sdwa_run(const VectorCompareDef& def, Form form, uint32_t wave, uint3
                                                selected_bits(in.s1[lane], select1));
         ASSERT_TRUE(truth.has_value());
         ASSERT_EQ(run.d[lane],
-                  expected_mask_read(form, in.active[lane], *truth != 0, in.old_d[lane]))
+                  expected_mask_read(form, in.active[lane], truth.value_or(0) != 0, in.old_d[lane]))
             << "op " << def.opcode << " sels " << select0 << ',' << select1 << " lane " << lane;
     }
 }

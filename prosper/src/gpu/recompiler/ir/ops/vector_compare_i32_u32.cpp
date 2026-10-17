@@ -2,6 +2,9 @@
 // The existing lowering prepares sources; cmpx and e64 share these ordinary cmp definitions.
 // No definition reads EXEC, writes a mask, or changes source/proof bookkeeping.
 #include "gpu/recompiler/ir/ops/vector_compare.hpp"
+#include "gpu/recompiler/ir/ir.hpp"
+
+#include <span>
 
 namespace prosper::gpu::ir {
 namespace {
