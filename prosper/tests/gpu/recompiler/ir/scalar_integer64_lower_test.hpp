@@ -1,6 +1,8 @@
 #pragma once
 #include "gpu/recompiler/ir/lowering_fixture.hpp"
 #include "gpu/recompiler/bpermute_spirv_oracle.hpp"
+#include <cstdint>
+#include <vector>
 namespace prosper::test::ir {
 inline std::vector<uint32_t> scalar64_finish(LoweringFixture& t, uint32_t id) {
     t.b.store_output_word(id, 1u, 0u);

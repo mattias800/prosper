@@ -2,12 +2,33 @@
 // SALU programs. The latter execute with partial EXEC, then restore it before low/high/SCC reads.
 #include "gpu/recompiler/ir/scalar_integer64_value_harness.hpp"
 #include "gpu/recompiler/ir/emit/spirv_emitter.hpp"
-#include "gpu/recompiler/ir/vector_mask_harness.hpp"
+#include "gpu/recompiler/ir/vector_compare_harness.hpp"
+#include "gpu/recompiler/ir/vector_lane_harness.hpp"
+#include "gpu/recompiler/ir/ops/scalar_integer64_values.hpp"
+#include "gpu/recompiler/ir/builder.hpp"
+#include "gpu/recompiler/ir/eval.hpp"
+#include "gpu/recompiler/ir/ir.hpp"
+#include "gpu/recompiler/bpermute_spirv_oracle.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_instruction_effects.hpp"
+#include "gpu/diagnostics/refused_shader_inputs.hpp"
 #include "gpu/recompiler/ir/eval_integer64.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "support/death_test.hpp"
 #include <gtest/gtest.h>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <ios>
+#include <optional>
 #include <set>
+#include <string>
+#include <system_error>
+#include <utility>
+#include <vector>
 using namespace prosper::gpu;
 using namespace prosper::gpu::ir;
 using namespace prosper::test::ir;
@@ -21,6 +42,7 @@ uint32_t expected_word(const ScalarInteger64Def& def, const Scalar64Case& x, uin
 std::vector<uint32_t> outputs(const ScalarInteger64Def& def) {
     const auto& effects = rdna2_instruction_effects(def.fmt, def.opcode);
     std::vector<uint32_t> out;
+    out.reserve(effects.sdst_dwords + 1);
     for (uint32_t word = 0; word < effects.sdst_dwords; ++word) out.push_back(word);
     out.push_back(2);
     return out;
@@ -88,11 +110,12 @@ TEST(IrScalarInteger64ValuesExecution, EveryDefinitionRunsPerLaneLikeEvalAndInde
                 const auto eval = eval_scalar_integer64_value(def, scalar64_inputs(x));
                 ASSERT_TRUE(eval.first);
                 const uint64_t reference = scalar64_reference(def, x);
-                const uint64_t evaluated =
-                    shape.second.valid() ? (*eval.first | (*eval.second << 32)) : *eval.first;
+                if (shape.second.valid()) ASSERT_TRUE(eval.second);
+                const uint64_t evaluated = *eval.first | (eval.second.value_or(0) << 32);
                 ASSERT_EQ(evaluated, reference) << " lane " << lane;
-                ASSERT_EQ(out[2 * lane], (lane & 3) ? uint32_t(reference) : 0xdeadbeef);
-                ASSERT_EQ(out[2 * lane + 1], (lane & 3) ? uint32_t(reference >> 32) : 0xdeadbeef);
+                ASSERT_EQ(out[size_t(2) * lane], (lane & 3) ? uint32_t(reference) : 0xdeadbeef);
+                ASSERT_EQ(out[size_t(2) * lane + 1],
+                          (lane & 3) ? uint32_t(reference >> 32) : 0xdeadbeef);
             }
         }
 }
@@ -154,7 +177,7 @@ TEST(IrScalarInteger64ValuesExecution, HandWorkedIsaCasesAreIndependentOfEval) {
         ASSERT_NE(def, nullptr);
         const auto got = eval_scalar_integer64_value(*def, scalar64_inputs(r.x));
         ASSERT_TRUE(got.first);
-        ASSERT_EQ(got.second ? (*got.first | (*got.second << 32)) : *got.first, r.want);
+        ASSERT_EQ(*got.first | (got.second.value_or(0) << 32), r.want);
         ASSERT_EQ(scalar64_reference(*def, r.x), r.want);
         for (uint32_t output : outputs(*def)) check_real(*def, r.x, 64, output, 0);
     }

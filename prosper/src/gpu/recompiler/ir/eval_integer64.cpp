@@ -1,5 +1,7 @@
 // eval_integer64.cpp — the evaluation half of the 64-bit word opcodes (see ir.hpp).
 #include "gpu/recompiler/ir/eval_integer64.hpp"
+#include "gpu/recompiler/ir/eval.hpp"
+#include <cstdint>
 
 namespace prosper::gpu::ir {
 

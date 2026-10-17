@@ -2,6 +2,14 @@
 // Nesting, unused intermediates and lazy source resolution preserve the old emission order.
 #include "gpu/recompiler/ir/ops/scalar_integer64_values.hpp"
 #include "gpu/recompiler/ir/emit/spirv_emitter.hpp"
+#include "gpu/recompiler/ir/builder.hpp"
+#include "gpu/recompiler/ir/eval.hpp"
+#include "gpu/recompiler/ir/ir.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include <array>
+#include <cstdint>
+#include <span>
+#include <vector>
 #include <cstdio>
 #include <cstdlib>
 namespace prosper::gpu::ir {
@@ -86,6 +94,7 @@ Scalar64Known eval_scalar_integer64_value(const ScalarInteger64Def& def,
                                           bool high_available) {
     const Built out = build(def, high_available);
     std::vector<Known64> inputs;
+    inputs.reserve(out.slots.size());
     for (const auto source : out.slots) inputs.push_back(sources[static_cast<size_t>(source)]);
     const auto values = evaluate_wide(out.block, inputs);
     return {values[out.result.first.index],

@@ -3,10 +3,11 @@
 #include "gpu/recompiler/ir/ops/scalar_integer64_values.hpp"
 #include "gpu/recompiler/ir/scalar_encoding.hpp"
 #include "gpu/recompiler/ir/vector_lane_harness.hpp"
-#include "gpu/recompiler/ir/vector_compare_harness.hpp"
-#include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include <array>
-#include <bit>
+#include "gpu/recompiler/ir/eval.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include <cstdint>
+#include <vector>
 namespace prosper::test::ir {
 struct Scalar64Case {
     uint32_t lo, hi, other_lo, other_hi;

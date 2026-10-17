@@ -2,8 +2,10 @@
 #pragma once
 #include "gpu/recompiler/ir/builder.hpp"
 #include "gpu/recompiler/ir/eval.hpp"
+#include "gpu/recompiler/ir/ir.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include <array>
+#include <cstdint>
 #include <functional>
 #include <span>
 #include <vector>
