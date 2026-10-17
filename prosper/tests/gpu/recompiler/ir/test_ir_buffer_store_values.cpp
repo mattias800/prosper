@@ -12,9 +12,9 @@
 #include <array>
 #include <cstdint>
 #include <cstdlib>
-#include <limits>
-#include <optional>
 #include <vector>
+#include <utility>
+#include "gpu/recompiler/ir/ir.hpp"
 using namespace prosper::gpu;
 using namespace prosper::gpu::ir;
 namespace fixture = prosper::test::ir::buffer_store;
@@ -44,10 +44,12 @@ void check(BufferStoreBlock built, const std::vector<Row>& rows,
     SpirvCompute b;
     b.begin(built.block.input_count(), nullptr, lanes, 1, 1, lanes, 0, true, true);
     std::vector<uint32_t> inputs;
+    inputs.reserve(built.block.input_count());
     for (uint32_t i = 0; i < built.block.input_count(); ++i) inputs.push_back(b.load_input(i));
     const auto ids = emit_spirv(b, built.block, inputs);
     for (uint32_t i = 0; i < count; ++i) b.store_output_word(ids[built.outputs[i].index], count, i);
     std::vector<uint32_t> data;
+    data.reserve(rows.size() * built.inputs.size());
     for (const auto& row : rows)
         for (uint32_t slot : built.inputs) data.push_back(row[slot]);
     bpermute_oracle::Interpreter vm(b.finish());
@@ -58,6 +60,7 @@ void check(BufferStoreBlock built, const std::vector<Row>& rows,
     ASSERT_EQ(output.size(), rows.size() * count);
     for (uint32_t lane = 0; lane < lanes; ++lane) {
         std::vector<Known> known;
+        known.reserve(built.inputs.size());
         for (uint32_t slot : built.inputs) known.push_back(rows[lane][slot]);
         const auto values = evaluate(built.block, known);
         ASSERT_EQ(expected[lane].size(), count);
@@ -71,6 +74,7 @@ void check(BufferStoreBlock built, const std::vector<Row>& rows,
 }
 std::vector<Row> words(uint32_t wave) {
     std::vector<Row> out;
+    out.reserve(wave);
     for (uint32_t lane = 0; lane < wave; ++lane)
         out.push_back({0x8192a3b4u ^ lane * 1234567u, 0xc5d6e7f8u ^ lane * 173u,
                        0x397c892fu ^ lane * 371u, 0xabcdef17u ^ lane * 197u,
@@ -84,6 +88,7 @@ TEST(IrBufferStoreValues, AtomicFieldIndicesMasksAndPayloadsKeepEveryByteAndWrap
             for (uint32_t k = 0; k < 4; ++k) {
                 const auto rows = words(wave);
                 std::vector<std::vector<uint32_t>> expected;
+                expected.reserve(rows.size());
                 const uint32_t mask = bytes == 1 ? 255 : 65535;
                 for (const auto& row : rows) {
                     const uint32_t addr = row[4] + k * bytes, shift = (addr % 4) * 8;
@@ -97,6 +102,7 @@ TEST(IrBufferStoreValues, DwordComponentOffsetsAreModuloU32) {
         for (uint32_t k = 0; k < 4; ++k) {
             const auto rows = words(wave);
             std::vector<std::vector<uint32_t>> expected;
+            expected.reserve(rows.size());
             for (const auto& row : rows) expected.push_back({row[4] + k});
             check(build_buffer_store_index(k), rows, expected);
         }
@@ -108,6 +114,7 @@ TEST(IrBufferStoreValues, PackedWordsMatchIndependentFieldsWithPartialExec) {
             const auto& fmt = fixture::formats[f];
             auto rows = words(wave);
             std::vector<std::vector<uint32_t>> expected;
+            expected.reserve(rows.size());
             for (uint32_t lane = 0; lane < wave; ++lane) {
                 uint32_t value = 0;
                 for (uint32_t k = 0; k < 4; ++k) rows[lane][k] = fixture::input_word(c, lane, k);
@@ -128,6 +135,7 @@ TEST(IrBufferStoreValues, NormalizedAndHalfDwordsMatchIndependentTightPacking) {
                 for (uint32_t d = 0; d < (count * fmt.bytes + 3) / 4; ++d) {
                     auto rows = words(wave);
                     std::vector<std::vector<uint32_t>> expected;
+                    expected.reserve(rows.size());
                     for (uint32_t lane = 0; lane < wave; ++lane) {
                         uint32_t value = 0;
                         for (uint32_t k = 0; k < 4; ++k)
@@ -155,6 +163,31 @@ TEST(IrBufferStoreValues, MissingWordsAndExceptionalMiniFloatsStayUnknown) {
         for (uint32_t mantissa : {5u, 6u})
             EXPECT_FALSE(evaluate_op(Opcode::PackUnsignedFloat, mantissa, bits, 0, 0));
     EXPECT_FALSE(evaluate_op(Opcode::PackNormalizedField, 8, 0x7fc01234, 0, 0));
+}
+TEST(IrBufferStoreValues, UnsignedFloatNormalSubnormalAndEvenTiesAreHandWorked) {
+    // E5M6 and E5M5: one, minimum normal, minimum subnormal, half-minimum (even zero),
+    // 1.5 subnormals (even two), maximum subnormal and maximum finite.
+    const std::array<uint32_t, 7> e6{0x3f800000, 0x38800000, 0x35800000, 0x35000000,
+                                     0x35c00000, 0x387c0000, 0x477e0000};
+    const std::array<uint32_t, 7> e5{0x3f800000, 0x38800000, 0x36000000, 0x35800000,
+                                     0x36400000, 0x38780000, 0x477c0000};
+    const std::array<uint32_t, 7> r6{0x3c0, 0x40, 1, 0, 2, 63, 0x7bf};
+    const std::array<uint32_t, 7> r5{0x1e0, 0x20, 1, 0, 2, 31, 0x3df};
+    for (uint32_t wave : {32u, 64u})
+        for (uint32_t mantissa : {5u, 6u}) {
+            auto rows = words(wave);
+            std::vector<std::vector<uint32_t>> expected;
+            expected.reserve(rows.size());
+            for (uint32_t lane = 0; lane < wave; ++lane) {
+                rows[lane][0] = (mantissa == 6 ? e6 : e5)[lane % 7];
+                expected.push_back({(mantissa == 6 ? r6 : r5)[lane % 7]});
+            }
+            BufferStoreBlock built;
+            Builder ir(built.block);
+            built.inputs.push_back(0);
+            built.outputs.push_back(ir.pack_unsigned_float(ir.input(Type::U32), mantissa));
+            check(std::move(built), rows, expected);
+        }
 }
 TEST(IrBufferStoreValues, MalformedFieldMetadataAndTypesStopLoudly) {
     for (uint32_t width : {0u, 1u, 17u, 32u, 258u})

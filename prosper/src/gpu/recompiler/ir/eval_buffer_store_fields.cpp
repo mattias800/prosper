@@ -2,6 +2,7 @@
 // The unsigned mini-float reference knows finite results only: exceptional conversion/payload
 // authority is not inferred from the existing emitted helper. No shader folding domain is added.
 #include "gpu/recompiler/ir/eval_buffer_store_fields.hpp"
+#include "gpu/recompiler/ir/eval.hpp"
 #include <algorithm>
 #include <bit>
 #include <cmath>

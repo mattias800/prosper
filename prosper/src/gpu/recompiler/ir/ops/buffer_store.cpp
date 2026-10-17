@@ -2,6 +2,7 @@
 #include "gpu/recompiler/ir/ops/buffer_store.hpp"
 #include "gpu/recompiler/ir/builder.hpp"
 #include "gpu/recompiler/ir/emit/spirv_emitter.hpp"
+#include "gpu/recompiler/ir/ir.hpp"
 #include <cstdint>
 #include <functional>
 #include <vector>

@@ -3819,6 +3819,7 @@ if(TARGET prosper_core)
           ir_buffer_address_execution
           ir_lower_buffer_address
           ir_lower_buffer_format_values
+          ir_lower_buffer_store_values
           ir_buffer_format_values
           ir_buffer_format_execution
           ir_lower_vop3_half_float_exact

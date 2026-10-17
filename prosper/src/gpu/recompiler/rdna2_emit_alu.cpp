@@ -2514,9 +2514,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     }
                 } else if (packed_word) {
                     // #3575: every component shares ONE dword. This is the exact inverse of the
-                    // packed_word LOAD, which lives BELOW in this same function -- search
-                    // `packed_10_11_11 ? (sk == 0 ...` -- and the two field tables are RESTATED
-                    // independently rather than shared (#3600). They must be kept in step by hand:
+                    // packed_word LOAD in ir::lower_buffer_packed_field. Its field table and the
+                    // table in ir::build_buffer_store_word are RESTATED independently (#3600).
+                    // They must be kept in step by hand:
                     // a store whose layout disagreed with the load would round-trip wrongly through
                     // prosper's own reload, which is the cheapest way for this to be wrong and go
                     // unnoticed. If you edit either table, edit both.
@@ -2636,9 +2636,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // field to low field, so 2_10_10_10 is logical R/G/B in bits 0/10/20 and A in 30;
                     // 10_11_11 is R/G/B in bits 0/11/22 with widths 11/11/10.
                     //
-                    // This table is RESTATED, not shared, by the packed-word STORE above (#3600) --
-                    // search `packed_word_ncomp`. The two must agree or a store will not round-trip
-                    // through this load. If you edit this table, edit that one.
+                    // ir::lower_buffer_packed_field and ir::build_buffer_store_word keep separate
+                    // field tables (#3600). Both must agree for a store/load round-trip; if either
+                    // layout changes, update both.
                     uint32_t dw = load_dword(idx);
                     value = ir::lower_buffer_packed_field(b, dw, sk, packed_10_11_11, is_uint,
                                                           is_sint, is_snorm);

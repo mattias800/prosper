@@ -3,6 +3,7 @@
 #include "gpu/recompiler/ir/ops/buffer_store.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include <cstdint>
+#include <vector>
 namespace prosper::gpu::ir {
 namespace {
 std::vector<uint32_t> emit(SpirvCompute& b, const BufferStoreBlock& block, const Rdna2Inst& in,

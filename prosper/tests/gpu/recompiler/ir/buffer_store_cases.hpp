@@ -2,6 +2,7 @@
 // Expected storage is independent byte replacement, never a reload through prosper's decoder.
 #pragma once
 #include "gpu/recompiler/ir/vector_lane_harness.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include <array>
 #include <bit>
 #include <cstdint>
@@ -34,6 +35,7 @@ inline const std::array<Format, 14> formats{{
 struct Case {
     uint32_t format, wave, offset;
     bool typed;
+    uint32_t raw_opcode = 0;
 };
 inline std::vector<Case> cases() {
     std::vector<Case> out;
@@ -94,6 +96,7 @@ inline LaneProgram program(const Case& c, uint32_t opcode = 7) {
         p.code.push_back(0x80020000u | (regs[a] << 8));
     }
     p.code.insert(p.code.end(), {0xbf8c3f70u, 0x7daa0880u});
+    if (c.raw_opcode) opcode = c.raw_opcode;
     p.code.push_back((c.typed ? 0xe8000000u | (formats[c.format].encoding << 19) | (opcode << 16)
                               : 0xe0000000u | (opcode << 18)) |
                      0x2000u | c.offset);
@@ -102,8 +105,8 @@ inline LaneProgram program(const Case& c, uint32_t opcode = 7) {
     p.table.resources[0].size = c.wave * 6 * 4;
     ShaderResource r;
     r.cls = ResourceClass::VertexBuffer;
-    r.format = formats[c.format].format;
-    r.num_components = formats[c.format].components;
+    r.format = c.raw_opcode ? DataFormat::Uint32 : formats[c.format].format;
+    r.num_components = c.raw_opcode ? 1 : formats[c.format].components;
     r.binding = 3;
     r.sgpr_base = 12;
     r.stride = 16;
@@ -135,7 +138,16 @@ inline Data data(const Case& c) {
     for (uint32_t lane = 0; lane < c.wave; ++lane) {
         if (!active(lane, c.wave)) continue;
         const uint32_t address = ((lane * 7) % c.wave) * 16 + c.offset;
-        if (!f.bytes) {
+        if (c.raw_opcode) {
+            // RDNA2 BUFFER_STORE_DWORD, X2, X4, X3; full words, independent of FORMAT.
+            const uint32_t width = c.raw_opcode == 0x1c   ? 1
+                                   : c.raw_opcode == 0x1d ? 2
+                                   : c.raw_opcode == 0x1e ? 4
+                                                          : 3;
+            for (uint32_t k = 0; k < width; ++k)
+                for (uint32_t byte = 0; byte < 4; ++byte)
+                    put_byte(address + k * 4 + byte, input_word(c, lane, k) >> (byte * 8));
+        } else if (!f.bytes) {
             uint32_t packed = 0;
             for (uint32_t k = 0; k < f.components; ++k)
                 packed |= field(c, lane, k) << (f.kind == Kind::Ufloat ? k * 11 : k * 10);
