@@ -43,6 +43,7 @@ Known evaluate_op(Opcode op, uint32_t imm, uint32_t a, uint32_t b, uint32_t c) {
         case Opcode::ConstFalse: return 0u;
         case Opcode::BoolAnd: return uint32_t(bool(a) && bool(b));
         case Opcode::BoolOr: return uint32_t(bool(a) || bool(b));
+        case Opcode::BoolNot: return uint32_t(!a);
         case Opcode::F32Eq: return uint32_t(std::bit_cast<float>(a) == std::bit_cast<float>(b));
         case Opcode::F32Abs:
             // A NaN payload is unspecified by GLSL FAbs, so no payload is guessed.
@@ -139,6 +140,8 @@ Known evaluate_op(Opcode op, uint32_t imm, uint32_t a, uint32_t b, uint32_t c) {
         case Opcode::Xor: return a ^ b;
         case Opcode::Not: return ~a;
         case Opcode::BitReverse: return bit_reverse(a);
+        case Opcode::FindUMsbU32:
+            return a ? Known(31u - static_cast<uint32_t>(std::countl_zero(a))) : std::nullopt;
         case Opcode::BitCount: return static_cast<uint32_t>(std::popcount(a));
         case Opcode::Shl: return b < 32 ? Known(a << b) : std::nullopt;
         case Opcode::LShr: return b < 32 ? Known(a >> b) : std::nullopt;
@@ -173,7 +176,8 @@ Known evaluate_op(Opcode op, uint32_t imm, uint32_t a, uint32_t b, uint32_t c) {
         case Opcode::U64Ge:
         case Opcode::U64Shl:
         case Opcode::U64LShr:
-        case Opcode::U64AShr: return std::nullopt;
+        case Opcode::U64AShr:
+        case Opcode::U64Bfe: return std::nullopt;
     }
     return std::nullopt;
 }
@@ -198,7 +202,7 @@ std::vector<Known64> evaluate_wide(const Block& block, std::span<const Known64> 
         }
         if (!known) continue;
         if (is_integer64_opcode(inst.op)) {
-            values[i] = evaluate_integer64(inst.op, args[0], args[1]);
+            values[i] = evaluate_integer64(inst.op, args[0], args[1], args[2]);
             continue;
         }
         // Every other opcode's arguments are U32 or Bool, which fit in 32 bits.

@@ -3,6 +3,7 @@
 // These routes still emit SPIR-V directly; they are the mask-domain and proof-carrying shapes the
 // IR does not model yet. Each returns nullopt when the instruction is not its shape.
 #include "gpu/recompiler/ir/lower/scalar_lowering_internal.hpp"
+#include "gpu/recompiler/ir/ops/scalar_integer64_values.hpp"
 
 namespace prosper::gpu::ir {
 
@@ -98,7 +99,14 @@ std::optional<bool> Sop1Lowering::route_bcnt1_b64() {
             } else {
                 ok = false; return true;
             }
-            result = b.ibin(Op_IAdd, b.iun(Op_BitCount, lo), b.iun(Op_BitCount, hi));
+            const auto* value_def = find_scalar_integer64_value_op(in.fmt, in.opcode);
+            if (!value_def) {
+                ok = false;
+                return true;
+            }
+            result = emit_scalar_integer64_value(b, *value_def, [&](Scalar64Source source) {
+                         return source == Scalar64Source::S0Lo ? lo : hi;
+                     }).first;
         }
         // The result is ordinary scalar DATA regardless of whether its source was a wave
         // mask or a scalar pair.  A one-dword write can overlap either half of a saved B64

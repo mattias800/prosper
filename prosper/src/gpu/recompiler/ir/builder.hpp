@@ -31,6 +31,7 @@ public:
     Value xor_(Value a, Value b) { return u32(Opcode::Xor, a, b); }
     Value not_(Value a) { return block_.append({Opcode::Not, Type::U32, 0, {a}}); }
     Value ffbh_u32(Value a) { return block_.append({Opcode::FfbhU32, Type::U32, 0, {a}}); }
+    Value find_umsb_u32(Value a) { return block_.append({Opcode::FindUMsbU32, Type::U32, 0, {a}}); }
     Value bit_count(Value a) { return block_.append({Opcode::BitCount, Type::U32, 0, {a}}); }
     Value bitreverse(Value a) { return block_.append({Opcode::BitReverse, Type::U32, 0, {a}}); }
     Value shl(Value a, Value count) { return u32(Opcode::Shl, a, count); }
@@ -43,6 +44,7 @@ public:
     Value booland_(Value a, Value b) {
         return block_.append({Opcode::BoolAnd, Type::Bool, 0, {a, b}});
     }
+    Value boolnot_(Value a) { return block_.append({Opcode::BoolNot, Type::Bool, 0, {a}}); }
     Value boolor_(Value a, Value b) {
         return block_.append({Opcode::BoolOr, Type::Bool, 0, {a, b}});
     }
@@ -143,6 +145,9 @@ public:
     }
     Value u64lo(Value v) { return block_.append({Opcode::U64Lo, Type::U32, 0, {v}}); }
     Value u64hi(Value v) { return block_.append({Opcode::U64Hi, Type::U32, 0, {v}}); }
+    Value u64bfe(Value base, Value offset, Value count) {
+        return block_.append({Opcode::U64Bfe, Type::U64, 0, {base, offset, count}});
+    }
     Value u64eq(Value a, Value b) { return cmp(Opcode::U64Eq, a, b); }
     Value u64ne(Value a, Value b) { return cmp(Opcode::U64Ne, a, b); }
     Value u64lt(Value a, Value b) { return cmp(Opcode::U64Lt, a, b); }

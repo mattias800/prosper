@@ -3,6 +3,7 @@
 // These routes still emit SPIR-V directly; they are the mask-domain and proof-carrying shapes the
 // IR does not model yet. Each returns nullopt when the instruction is not its shape.
 #include "gpu/recompiler/ir/lower/scalar_lowering_internal.hpp"
+#include "gpu/recompiler/ir/ops/scalar_integer64_values.hpp"
 
 namespace prosper::gpu::ir {
 
@@ -142,10 +143,14 @@ std::optional<bool> Sop1Lowering::route_flbit() {
             result = b.sel(b.ucmp(Op_INotEqual, low, b.uconst(0)),
                            leading_zeros(low), none);
         } else {
-            result = b.sel(
-                b.ucmp(Op_INotEqual, high, b.uconst(0)), leading_zeros(high),
-                b.sel(b.ucmp(Op_INotEqual, low, b.uconst(0)),
-                      b.ibin(Op_IAdd, b.uconst(32), leading_zeros(low)), none));
+            const auto* value_def = find_scalar_integer64_value_op(in.fmt, in.opcode);
+            if (!value_def) {
+                ok = false;
+                return true;
+            }
+            result = emit_scalar_integer64_value(b, *value_def, [&](Scalar64Source source) {
+                         return source == Scalar64Source::S0Lo ? low : high;
+                     }).first;
         }
         rs.sreg[in.dst.value] = result;
         rs.sreg_srt.erase(in.dst.value);
@@ -244,23 +249,14 @@ std::optional<bool> Sop1Lowering::route_bitreplicate_b64_b32() {
         const uint32_t a = val(in.src[0]);
         if (!ok) return true;
         const int dst = in.dst.value;
-        auto replicate_16 = [&](uint32_t in_val) {
-            uint32_t out_val = b.uconst(0);
-            for (uint32_t i = 0; i < 16; ++i) {
-                const uint32_t bit = b.ibin(
-                    Op_BitwiseAnd,
-                    b.ibin(Op_ShiftRightLogical, in_val, b.uconst(i)),
-                    b.uconst(1u));
-                const uint32_t rep = b.ibin(
-                    Op_BitwiseOr,
-                    b.ibin(Op_ShiftLeftLogical, bit, b.uconst(2u * i)),
-                    b.ibin(Op_ShiftLeftLogical, bit, b.uconst(2u * i + 1u)));
-                out_val = b.ibin(Op_BitwiseOr, out_val, rep);
-            }
-            return out_val;
-        };
-        const uint32_t lo = replicate_16(a);
-        const uint32_t hi = replicate_16(b.ibin(Op_ShiftRightLogical, a, b.uconst(16u)));
+        const auto* value_def = find_scalar_integer64_value_op(in.fmt, in.opcode);
+        if (!value_def) {
+            ok = false;
+            return true;
+        }
+        const auto words =
+            emit_scalar_integer64_value(b, *value_def, [&](Scalar64Source) { return a; });
+        const uint32_t lo = words.first, hi = words.second;
         rs.sreg_written.insert(dst);
         rs.sreg_written.insert(dst + 1);
         rs.sreg_srt.erase(dst); rs.sreg_srt.erase(dst + 1);

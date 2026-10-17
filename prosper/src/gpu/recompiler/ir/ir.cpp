@@ -54,9 +54,11 @@ constexpr OpcodeInfo kInfo[] = {
     {"f32.fma", 3, Type::U32},
     {"bool.and", 2, Type::Bool},
     {"bool.or", 2, Type::Bool},
+    {"bool.not", 1, Type::Bool},
     {"f32.clamp01", 1, Type::U32},
     {"pack.half.lo", 1, Type::U32},
     {"ffbh.u32", 1, Type::U32},
+    {"findumsb.u32", 1, Type::U32},
     {"bitcount", 1, Type::U32},
     {"f32.fract", 1, Type::U32},
     {"f32.trunc", 1, Type::U32},
@@ -103,16 +105,18 @@ constexpr OpcodeInfo kInfo[] = {
     {"u64.shl", 2, Type::U64},
     {"u64.lshr", 2, Type::U64},
     {"u64.ashr", 2, Type::U64},
+    {"u64.bfe", 3, Type::U64},
 };
-static_assert(std::size(kInfo) == static_cast<size_t>(Opcode::U64AShr) + 1);
+static_assert(std::size(kInfo) == static_cast<size_t>(Opcode::U64Bfe) + 1);
 
 // The type argument `slot` of `op` must have.
 Type argument_type(Opcode op, size_t slot) {
-    if (op == Opcode::BoolAnd || op == Opcode::BoolOr) return Type::Bool;
+    if (op == Opcode::BoolAnd || op == Opcode::BoolOr || op == Opcode::BoolNot) return Type::Bool;
     if ((op == Opcode::Select || op == Opcode::BoolSelect) && slot == 0) return Type::Bool;
     if (op == Opcode::BoolSelect) return Type::Bool;
     if (op >= Opcode::U64Shl && op <= Opcode::U64AShr) return slot == 0 ? Type::U64 : Type::U32;
     if (op >= Opcode::U64Lo && op <= Opcode::U64Ge) return Type::U64;
+    if (op == Opcode::U64Bfe && slot == 0) return Type::U64;
     return Type::U32;
 }
 

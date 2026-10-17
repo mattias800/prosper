@@ -21,6 +21,7 @@ uint32_t emit_one(SpirvCompute& b, const Inst& inst, const uint32_t* x) {
         case Opcode::ConstFalse: return b.bfalse();
         case Opcode::BoolAnd: return b.land(x[0], x[1]);
         case Opcode::BoolOr: return b.lor(x[0], x[1]);
+        case Opcode::BoolNot: return b.logical_not(x[0]);
         case Opcode::F32Eq: return b.fcmp(Op_FOrdEqual, x[0], x[1]);
         case Opcode::F32Abs: return b.fext1(Glsl_FAbs, x[0]);
         case Opcode::F32Lt: return b.fcmp(Op_FOrdLessThan, x[0], x[1]);
@@ -47,6 +48,7 @@ uint32_t emit_one(SpirvCompute& b, const Inst& inst, const uint32_t* x) {
         case Opcode::F32NMin: return b.fext2(Glsl_NMin, x[0], x[1]);
         case Opcode::F32NMax: return b.fext2(Glsl_NMax, x[0], x[1]);
         case Opcode::FfbhU32: return b.ffbh_u32(x[0]);
+        case Opcode::FindUMsbU32: return b.find_umsb(x[0]);
         case Opcode::F32Fract: return b.fext1(Glsl_Fract, x[0]);
         case Opcode::F32Trunc: return b.fext1(Glsl_Trunc, x[0]);
         case Opcode::F32Ceil: return b.fext1(Glsl_Ceil, x[0]);
@@ -111,6 +113,7 @@ uint32_t emit_one(SpirvCompute& b, const Inst& inst, const uint32_t* x) {
         case Opcode::U64Shl: return b.u64_shift(Op_ShiftLeftLogical, x[0], x[1]);
         case Opcode::U64LShr: return b.u64_shift(Op_ShiftRightLogical, x[0], x[1]);
         case Opcode::U64AShr: return b.u64_shift(Op_ShiftRightArithmetic, x[0], x[1]);
+        case Opcode::U64Bfe: return b.bfe_u64(x[0], x[1], x[2]);
     }
     std::fprintf(stderr, "[ir] emit_one reached an input\n");   // emit_spirv binds inputs itself
     std::abort();

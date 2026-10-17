@@ -4,6 +4,7 @@
 // IR does not model yet. Each returns nullopt when the instruction is not its shape.
 #include "gpu/recompiler/ir/lower/scalar_lowering_internal.hpp"
 #include "gpu/recompiler/ir/ops/integer64_shifts.hpp"
+#include "gpu/recompiler/ir/ops/scalar_integer64_values.hpp"
 
 namespace prosper::gpu::ir {
 
@@ -321,13 +322,17 @@ std::optional<bool> Sop2Lowering::route_bfe_u64() {
         const uint32_t source_hi = high();
         const uint32_t control = val(in.src[1]);
         if (!ok) return true;
-        const uint32_t offset = b.ibin(Op_BitwiseAnd, control, b.uconst(0x3f));
-        const uint32_t width = b.ibin(
-            Op_BitwiseAnd,
-            b.ibin(Op_ShiftRightLogical, control, b.uconst(16)),
-            b.uconst(0x7f));
-        const uint32_t result = b.bfe_u64(
-            b.u64_from_lohi(source_lo, source_hi), offset, width);
+        const auto* value_def = find_scalar_integer64_value_op(in.fmt, in.opcode);
+        if (!value_def) {
+            ok = false;
+            return true;
+        }
+        const uint32_t result =
+            emit_scalar_integer64_value(b, *value_def, [&](Scalar64Source source) {
+                if (source == Scalar64Source::S0Lo) return source_lo;
+                if (source == Scalar64Source::S0Hi) return source_hi;
+                return control;
+            }).first;
         const bool writes_exec = in.dst.value == 126 || in.dst.value == 127;
         const bool writes_vcc = in.dst.value == 106 || in.dst.value == 107;
         const auto has_scalar_word = [&](int reg) {
