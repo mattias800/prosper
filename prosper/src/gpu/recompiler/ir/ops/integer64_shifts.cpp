@@ -1,4 +1,5 @@
 // AMD70648 12.12/13.2: numeric raw-word shifts with the guest count modulo 64.
+#include "gpu/recompiler/ir/builder.hpp"
 #include "gpu/recompiler/ir/ir.hpp"
 #include "gpu/recompiler/ir/eval.hpp"
 #include "gpu/recompiler/ir/ops/vector_ternary_integer.hpp"

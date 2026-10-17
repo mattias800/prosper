@@ -1,4 +1,4 @@
-// eval_integer64.hpp — the evaluation half of the 64-bit word opcodes (PackU64 .. U64Ge, ir.hpp).
+// eval_integer64.hpp — the evaluation half of the 64-bit word opcodes (PackU64 .. U64Bfe, ir.hpp).
 #pragma once
 
 #include "gpu/recompiler/ir/eval.hpp"

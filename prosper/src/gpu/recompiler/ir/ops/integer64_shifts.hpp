@@ -1,6 +1,7 @@
 // Numeric 64-bit shifts. Guest count masking is a separate Block so scalar lowering retains its
 // existing failed-source boundary, and result unpacking is a separate Block for old_hi ordering.
 #pragma once
+#include "gpu/recompiler/ir/builder.hpp"
 #include "gpu/recompiler/ir/ir.hpp"
 #include "gpu/recompiler/ir/eval.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"

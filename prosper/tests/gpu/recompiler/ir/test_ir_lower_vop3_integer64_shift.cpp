@@ -4,6 +4,7 @@
 #include "gpu/recompiler/ir/lowering_fixture.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include <gtest/gtest.h>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 using namespace prosper::gpu;
