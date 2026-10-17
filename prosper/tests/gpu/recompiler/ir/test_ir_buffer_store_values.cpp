@@ -8,6 +8,7 @@
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/bpermute_spirv_oracle.hpp"
 #include "support/death_test.hpp"
+#include "fixtures/buffer_store_ir.hpp"
 #include <gtest/gtest.h>
 #include <array>
 #include <cstdint>
@@ -216,5 +217,29 @@ TEST(IrBufferStoreValues, MalformedFieldMetadataAndTypesStopLoudly) {
             ir.pack_normalized_field(ir.ctrue(), 8, false);
         },
         "argument type mismatch");
+}
+TEST(IrBufferStoreValues, StrictValidationFixtureHasHandWorkedObservableValues) {
+    std::vector<uint32_t> input;
+    input.reserve(size_t{32} * 5);
+    for (uint32_t lane = 0; lane < 32; ++lane)
+        input.insert(input.end(), {0x3f800000, 0xbf800000, 0x3f000000, 0x3e800000, lane * 17 + 3});
+    bpermute_oracle::Interpreter vm(prosper::test::buffer_store_ir::module());
+    vm.half_rte_preserve_denorm = true;
+    const auto out =
+        vm.run_buffers(32, {{0, input}, {1, std::vector<uint32_t>(size_t{32} * 14)}}, 1);
+    ASSERT_TRUE(vm.error.empty()) << vm.error;
+    ASSERT_EQ(out.size(), 32u * 14);
+    for (uint32_t lane = 0; lane < 32; ++lane) {
+        const uint32_t index = lane * 17 + 3, addr = index + 6;
+        const std::array<uint32_t, 14> expected{addr / 4,   65535u << ((addr % 4) * 8),
+                                                0,          index + 3,
+                                                0,          0x600003ff,
+                                                0x100805ff, 0x700003c0,
+                                                index + 1,  0x34003800,
+                                                index,      0x408000ff,
+                                                index + 1,  0x20004000};
+        for (uint32_t k = 0; k < expected.size(); ++k)
+            EXPECT_EQ(out[size_t{lane} * 14 + k], expected[k]) << "lane=" << lane << " field=" << k;
+    }
 }
 } // namespace
