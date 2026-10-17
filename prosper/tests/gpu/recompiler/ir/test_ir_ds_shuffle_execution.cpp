@@ -4,6 +4,7 @@
 #include "gpu/recompiler/bpermute_spirv_oracle.hpp"
 #include "gpu/recompiler/ir/builder.hpp"
 #include "gpu/recompiler/ir/ds_shuffle_cases.hpp"
+#include "gpu/recompiler/ir/eval.hpp"
 #include "gpu/recompiler/ir/eval_lanes.hpp"
 #include "gpu/recompiler/ir/ir.hpp"
 #include "gpu/recompiler/ir/ops/ds_shuffle.hpp"

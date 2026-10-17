@@ -1,6 +1,7 @@
 // Pure shuffle values, appended in the native ALU helpers' original emission order.
 #include "gpu/recompiler/ir/ops/ds_shuffle.hpp"
 
+#include "gpu/recompiler/ir/builder.hpp"
 #include "gpu/recompiler/ir/emit/spirv_emitter.hpp"
 #include "gpu/recompiler/ir/ir.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
