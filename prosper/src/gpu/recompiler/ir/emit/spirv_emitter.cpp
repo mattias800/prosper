@@ -41,6 +41,8 @@ uint32_t emit_one(SpirvCompute& b, const Inst& inst, const uint32_t* x) {
         case Opcode::F32Add: return b.fbin(Op_FAdd, x[0], x[1]);
         case Opcode::F32Sub: return b.fbin(Op_FSub, x[0], x[1]);
         case Opcode::F32Mul: return b.fbin(Op_FMul, x[0], x[1]);
+        case Opcode::F32AddNoContraction: return b.fbin_no_contraction(Op_FAdd, x[0], x[1]);
+        case Opcode::F32MulNoContraction: return b.fbin_no_contraction(Op_FMul, x[0], x[1]);
         case Opcode::F32NMin: return b.fext2(Glsl_NMin, x[0], x[1]);
         case Opcode::F32NMax: return b.fext2(Glsl_NMax, x[0], x[1]);
         case Opcode::FfbhU32: return b.ffbh_u32(x[0]);

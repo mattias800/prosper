@@ -72,6 +72,8 @@ enum class Opcode : uint8_t {
     F32Mul,
     F32NMin,
     F32NMax,   // raw binary32 bits -> raw bits
+    F32AddNoContraction, // separate binary32 rounding; cannot contract with a product
+    F32MulNoContraction,
     BoolAnd,
     BoolOr,
     F32Clamp01,
@@ -109,7 +111,7 @@ enum class Opcode : uint8_t {
     // ones are true.
     F32Le,
     F32Gt,
-    F32Lg, // ordered not-equal
+    F32Lg,   // ordered not-equal
     F32UnordLt,
     F32UnordEq,
     F32UnordLe,

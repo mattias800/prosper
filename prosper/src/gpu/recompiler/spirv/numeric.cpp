@@ -6,6 +6,14 @@
 
 namespace prosper::gpu {
 
+uint32_t SpirvCompute::fbin_no_contraction(uint32_t op, uint32_t a, uint32_t b) {
+    const uint32_t result = id();
+    put(code, op, {t_f32, result, bcf(a), bcf(b)});
+    // The floating arithmetic result carries the rounding contract, not its U32 bitcast.
+    put(deco, Op_Decorate, {result, Dec_NoContraction});
+    return bcu(result);
+}
+
 uint32_t SpirvCompute::f32_nonzero_bits(uint32_t word) {
     if (!is_fragment || !fragment_float_mode.available) return 0;
     const uint32_t magnitude = ibin(Op_BitwiseAnd, word, uconst(0x7fffffffu));

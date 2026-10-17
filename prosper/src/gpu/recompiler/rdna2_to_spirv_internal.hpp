@@ -318,6 +318,9 @@ enum : uint32_t {
     GroupOp_Reduce=0, GroupOp_ExclusiveScan=2,
 };
 
+// Arithmetic contraction constraint (SPIR-V decoration).
+enum : uint32_t { Dec_NoContraction = 42 };
+
 inline uint32_t fbits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
 
 struct FlatAccessInfo {
@@ -846,6 +849,7 @@ struct SpirvCompute {
         uint32_t c = id(); put(types, Op_Constant, {t_f32, c, b}); fconst_cache[b] = c; return c; }
     // Float binary op on bit-operands -> bit-result.
     uint32_t fbin(uint32_t op, uint32_t a, uint32_t b) { uint32_t rf = id(); put(code, op, {t_f32, rf, bcf(a), bcf(b)}); return bcu(rf); }
+    uint32_t fbin_no_contraction(uint32_t op, uint32_t a, uint32_t b);
     // Integer binary op on bit-operands -> bit-result.
     uint32_t ibin(uint32_t op, uint32_t a, uint32_t b) { uint32_t r = id(); put(code, op, {t_u32, r, a, b}); return r; }
     // Integer unary op on a bit-operand -> bit-result (e.g. OpNot).
