@@ -1207,7 +1207,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 ok = false;
             } else if (ir::lower_vop3_rtz_pack(b, rs, in, ok, allow_wave, fv)) {
             } else if (ir::lower_vop3_float_integer(b, rs, in, ok)) {
-            } else if (ir::lower_vop3_binary_float(b, rs, in, ok, allow_wave, fv, fresult)) {
+            } else if (ir::lower_vop3_float_values(b, rs, in, ok, allow_wave, fv, fresult)) {
             } else if (ir::lower_vop3_legacy_mul(b, rs, in, ok, allow_wave, fv, fresult)) {
             } else if (in.opcode == 0x101) {   // v_cndmask_b32_e64: src2_mask ? src1 : src0
                 const Operand& s2 = in.src[2]; uint32_t m = 0;        // src2 is an SGPR-pair (or VCC) wave mask
