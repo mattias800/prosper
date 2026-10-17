@@ -5,6 +5,7 @@
 // differs only in the low word. The interpreter tests (test_ir_vector_compare_f64_execution) say
 // the SPIR-V means this; this test says a real driver executes it so, with DenormPreserve 64.
 #include "fixtures/compute_runner.h"
+#include "gpu/execute/float_controls_probe.hpp"
 #include "gpu/recompiler/float64_support.hpp"
 #include "gpu/recompiler/ir/ops/vector_compare.hpp"
 #include "gpu/recompiler/ir/vector_compare_harness.hpp"
@@ -63,7 +64,8 @@ constexpr TruthRow kRows[] = {
 };
 
 struct Device {
-    bool float64 = false, float_controls = false, denorm_preserve = false;
+    bool float64 = false, float_controls = false, float_controls2 = false,
+         compatible_controls = false;
     std::string receipt;
 };
 // run_compute's device: the first physical device on a Vulkan 1.1 instance.
@@ -91,8 +93,18 @@ Device query_device() {
         for (const auto& e : extensions) {
             d.float_controls |=
                 !std::strcmp(e.extensionName, VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME);
+            d.float_controls2 |=
+                !std::strcmp(e.extensionName, VK_KHR_SHADER_FLOAT_CONTROLS_2_EXTENSION_NAME);
             driver_properties |=
                 !std::strcmp(e.extensionName, VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME);
+        }
+        if (d.float_controls2) {
+            VkPhysicalDeviceShaderFloatControls2Features controls2{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT_CONTROLS_2_FEATURES};
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            query.pNext = &controls2;
+            vkGetPhysicalDeviceFeatures2(devices[0], &query);
+            d.float_controls2 = controls2.shaderFloatControls2 == VK_TRUE;
         }
         VkPhysicalDeviceFloatControlsProperties controls{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
@@ -102,7 +114,8 @@ Device query_device() {
         VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
         properties.pNext = &controls;
         vkGetPhysicalDeviceProperties2(devices[0], &properties);
-        d.denorm_preserve = d.float_controls && controls.shaderDenormPreserveFloat64 == VK_TRUE;
+        d.compatible_controls =
+            d.float_controls && d.float_controls2 && float64_controls_compatible(controls);
         d.receipt = std::string("device=") + properties.properties.deviceName +
                     " api=" + std::to_string(properties.properties.apiVersion) +
                     " driver_version=" + std::to_string(properties.properties.driverVersion) +
@@ -125,13 +138,58 @@ std::vector<uint32_t> buffer(const LaneInputs& in) {
 }
 } // namespace
 
+// The emitter declares DenormPreserve only for 64 bits. Restricted independence would require
+// matching modes for other widths (Vulkan runtime SPIR-V rules 06289/06290), which it does not emit.
+// These synthetic properties exercise the production publication without creating a Vulkan device.
+TEST(Float64DeviceGate, RestrictedIndependenceRefusesAndCannotBeRaisedByAnotherPublisher) {
+    VkPhysicalDeviceFloatControlsProperties properties{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
+    properties.shaderDenormPreserveFloat64 = VK_TRUE;
+    properties.shaderSignedZeroInfNanPreserveFloat64 = VK_TRUE;
+    for (const auto independence : {VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE,
+                                    VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_32_BIT_ONLY}) {
+        reset_float64_support_for_test();
+        properties.denormBehaviorIndependence = independence;
+        EXPECT_FALSE(publish_float64_device_support(true, properties, true, true));
+        EXPECT_FALSE(float64_admitted());
+        properties.denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL;
+        EXPECT_TRUE(publish_float64_device_support(true, properties, true, true));
+        EXPECT_FALSE(float64_admitted()) << "the weaker earlier publisher remains authoritative";
+    }
+    reset_float64_support_for_test();
+}
+
+TEST(Float64DeviceGate, IndependentPreservationStillRequiresEveryEnabledCapability) {
+    VkPhysicalDeviceFloatControlsProperties properties{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
+    properties.denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL;
+    for (const bool feature : {false, true})
+        for (const bool preserve : {false, true})
+            for (const bool nonfinite : {false, true})
+                for (const bool controls2 : {false, true})
+                    for (const bool permitted : {false, true}) {
+                        reset_float64_support_for_test();
+                        properties.shaderDenormPreserveFloat64 = preserve ? VK_TRUE : VK_FALSE;
+                        properties.shaderSignedZeroInfNanPreserveFloat64 =
+                            nonfinite ? VK_TRUE : VK_FALSE;
+                        const bool want =
+                            feature && preserve && nonfinite && controls2 && permitted;
+                        EXPECT_EQ(publish_float64_device_support(feature, properties, permitted,
+                                                                 controls2),
+                                  want);
+                        EXPECT_EQ(float64_admitted(), want);
+                    }
+    reset_float64_support_for_test();
+}
+
 TEST(ComputeF64Compare, EveryDefinitionAndFormMatchesTheHandWorkedTruthOnTheDevice) {
     const Device device = query_device();
     ASSERT_FALSE(device.receipt.empty()) << "real Vulkan execution is required";
     RecordProperty("executing_driver", device.receipt);
     std::printf("F64_COMPARE_EXECUTING_DRIVER %s\n", device.receipt.c_str());
-    if (!device.float64 || !device.denorm_preserve)
-        GTEST_SKIP() << "device lacks shaderFloat64 or shaderDenormPreserveFloat64: F64 refuses";
+    if (!device.float64 || !device.compatible_controls)
+        GTEST_SKIP()
+            << "device lacks Float64 or compatible nonfinite/denormal controls: F64 refuses";
     reset_float64_support_for_test();
     publish_float64_support(true, true, true);
     size_t lanes_checked = 0;

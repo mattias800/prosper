@@ -32,6 +32,18 @@ uint32_t SpirvCompute::t_f64() {
     put(caps, Op_Capability, {kCapDenormPreserve});
     declare_float_controls_extension();
     put(exec, Op_ExecutionMode, {f_main, kModeDenormPreserve, 64});
+    // Comparisons need nonfinite semantics; their U64 -> F64 Bitcasts additionally need
+    // per-instruction None because Bitcast is outside Vulkan's implicit SZI operation list.
+    // The device verdict requires both SZI64 and enabled shaderFloatControls2.
+    if (!float_controls_declared) put(caps, Op_Capability, {Cap_SignedZeroInfNanPreserve});
+    put(exec, Op_ExecutionMode, {f_main, EM_SignedZeroInfNanPreserve, 64});
+    if (!float_transport_declared) {
+        float_transport_declared = true;
+        put(caps, Op_Capability, {Cap_FloatControls2});
+        std::vector<uint32_t> extension;
+        pstr(extension, "SPV_KHR_float_controls2");
+        putv(exts, Op_Extension, extension);
+    }
     t_f64_cache = id();
     put(types, Op_TypeFloat, {t_f64_cache, 64});
     return t_f64_cache;
@@ -41,8 +53,10 @@ uint32_t SpirvCompute::fcmp64(uint32_t cmpop, uint32_t a64, uint32_t b64) {
     const uint32_t type = t_f64();
     const uint32_t x = id();
     put(code, Op_Bitcast, {type, x, a64});
+    put(deco, Op_Decorate, {x, Dec_FPFastMathMode, 0});
     const uint32_t y = id();
     put(code, Op_Bitcast, {type, y, b64});
+    put(deco, Op_Decorate, {y, Dec_FPFastMathMode, 0});
     const uint32_t r = id();
     put(code, cmpop, {t_bool, r, x, y});
     return r;

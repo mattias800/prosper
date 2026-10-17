@@ -277,6 +277,23 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
             required_subgroup_features.pNext = &atomic_int64_features;
         dci.pNext = &required_subgroup_features;
     }
+    // F64 operand Bitcasts use FPFastMathMode None. Enable its actual feature when this
+    // Vulkan 1.1 fixture can enable the float-controls2 extension, retaining every earlier link.
+    VkPhysicalDeviceShaderFloatControls2Features float_controls2_features{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT_CONTROLS_2_FEATURES};
+    for (const auto& extension : available_extensions) {
+        if (std::strcmp(extension.extensionName, VK_KHR_SHADER_FLOAT_CONTROLS_2_EXTENSION_NAME))
+            continue;
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        features.pNext = &float_controls2_features;
+        vkGetPhysicalDeviceFeatures2(phys, &features);
+        if (float_controls2_features.shaderFloatControls2) {
+            float_controls2_features.pNext = const_cast<void*>(dci.pNext);
+            dci.pNext = &float_controls2_features;
+            device_extensions.push_back(VK_KHR_SHADER_FLOAT_CONTROLS_2_EXTENSION_NAME);
+        }
+        break;
+    }
     dci.enabledExtensionCount = static_cast<uint32_t>(device_extensions.size());
     dci.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
     VkDevice dev = VK_NULL_HANDLE;

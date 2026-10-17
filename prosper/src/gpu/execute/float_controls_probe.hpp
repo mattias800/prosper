@@ -84,30 +84,56 @@ inline bool publish_device_float_controls(const char* owner, VkPhysicalDevice ph
     return usable;
 }
 
+// Property half of the binary64 verdict, also used by synthetic CPU tests and device fixtures.
+inline bool float64_controls_compatible(const VkPhysicalDeviceFloatControlsProperties& properties) {
+    // The module requests only DenormPreserve 64. Vulkan runtime SPIR-V rules 06289/06290
+    // require matching modes at other widths on devices with restricted independence.
+    return properties.shaderDenormPreserveFloat64 == VK_TRUE &&
+           properties.shaderSignedZeroInfNanPreserveFloat64 == VK_TRUE &&
+           properties.denormBehaviorIndependence == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL;
+}
+
+inline bool
+publish_float64_device_support(bool shader_float64_enabled,
+                               const VkPhysicalDeviceFloatControlsProperties& properties,
+                               bool float_controls_permitted, bool shader_float_controls2_enabled) {
+    const bool compatible_controls =
+        shader_float_controls2_enabled && float64_controls_compatible(properties);
+    publish_float64_support(shader_float64_enabled, compatible_controls, float_controls_permitted);
+    return shader_float64_enabled && compatible_controls && float_controls_permitted;
+}
+
 // The binary64 half of the same measurement (float64_support.hpp, #5325). `shader_float64_enabled`
 // is what vkCreateDevice ENABLED, never what the device advertises. Returns what was published.
 inline bool publish_device_float64(const char* owner, VkPhysicalDevice physical,
                                    uint32_t instance_api_version, bool shader_float64_enabled,
+                                   bool shader_float_controls2_enabled,
                                    bool float_controls_extension_enabled) {
     if (!physical) return false;
     VkPhysicalDeviceProperties base{};
     vkGetPhysicalDeviceProperties(physical, &base);
     const uint32_t effective = std::min(instance_api_version, base.apiVersion);
     const bool permitted = effective >= VK_API_VERSION_1_2 || float_controls_extension_enabled;
-    bool denorm_preserve = false;
+    VkPhysicalDeviceFloatControlsProperties float_controls{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
     if (permitted) {
-        VkPhysicalDeviceFloatControlsProperties float_controls{
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
         VkPhysicalDeviceProperties2 properties2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
         properties2.pNext = &float_controls;
         vkGetPhysicalDeviceProperties2(physical, &properties2);
-        denorm_preserve = float_controls.shaderDenormPreserveFloat64 == VK_TRUE;
     }
-    publish_float64_support(shader_float64_enabled, denorm_preserve, permitted);
-    const bool usable = shader_float64_enabled && denorm_preserve && permitted;
-    std::fprintf(stderr, "[%s] F64 %s (shaderFloat64 %s, shaderDenormPreserveFloat64 %s)\n", owner,
-                 usable ? "ENABLED" : "unavailable", shader_float64_enabled ? "enabled" : "off",
-                 permitted ? (denorm_preserve ? "VK_TRUE" : "VK_FALSE") : "not queryable");
+    const bool usable = publish_float64_device_support(shader_float64_enabled, float_controls,
+                                                       permitted, shader_float_controls2_enabled);
+    std::fprintf(
+        stderr,
+        "[%s] F64 %s (shaderFloat64 %s, shaderDenormPreserveFloat64 %s, "
+        "shaderSignedZeroInfNanPreserveFloat64 %s, shaderFloatControls2 %s, "
+        "denormBehaviorIndependence %u)\n",
+        owner, usable ? "ENABLED" : "unavailable", shader_float64_enabled ? "enabled" : "off",
+        permitted ? (float_controls.shaderDenormPreserveFloat64 == VK_TRUE ? "VK_TRUE" : "VK_FALSE")
+                  : "not queryable",
+        float_controls.shaderSignedZeroInfNanPreserveFloat64 == VK_TRUE ? "VK_TRUE" : "VK_FALSE",
+        shader_float_controls2_enabled ? "enabled" : "off",
+        static_cast<unsigned>(float_controls.denormBehaviorIndependence));
     return usable;
 }
 

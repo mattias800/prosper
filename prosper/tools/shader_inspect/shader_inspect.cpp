@@ -345,8 +345,8 @@ int replay_recorded_inputs(const std::string& code_path, const std::string& inpu
 } // namespace
 
 int main(int argc, char** argv) {
-    // The corpus models a device that enabled shaderFloat64 with DenormPreserve 64 (RADV does), so
-    // the gate measures the binary64 instructions a live run would execute (float64_support.hpp).
+    // The corpus models a synthetic target with the complete F64 controls contract.
+    // This is an offline target assumption, not a measured executing-device verdict.
     prosper::gpu::publish_float64_support(true, true, true);
     // Flags are parsed rather than positionally matched, so a mode can be added without the arity
     // of the previous one becoming load-bearing. `--mimg-sites` is exclusive: it replaces the

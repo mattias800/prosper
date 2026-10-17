@@ -12,22 +12,23 @@ std::atomic<bool> g_float64_published{false};
 std::atomic<bool> g_float64_supported{true};
 } // namespace
 
-void publish_float64_support(bool shader_float64_enabled, bool denorm_preserve_float64,
+void publish_float64_support(bool shader_float64_enabled, bool compatible_float_controls,
                              bool float_controls_permitted) {
     const bool usable =
-        shader_float64_enabled && denorm_preserve_float64 && float_controls_permitted;
+        shader_float64_enabled && compatible_float_controls && float_controls_permitted;
     if (!usable) {
         static std::atomic<unsigned> said{0};
         g_float64_supported.store(false, std::memory_order_relaxed);
         if (said.fetch_add(1) == 0)
-            std::fprintf(stderr,
-                         "[recompile] F64 DISABLED: shaderFloat64 %s, shaderDenormPreserveFloat64 "
-                         "%s, float controls %s. Guest binary64 instructions refuse "
-                         "(f64-device-unavailable) instead of running unflushed-input semantics "
-                         "this device cannot promise.\n",
-                         shader_float64_enabled ? "enabled" : "not enabled",
-                         denorm_preserve_float64 ? "VK_TRUE" : "VK_FALSE",
-                         float_controls_permitted ? "permitted" : "not permitted");
+            std::fprintf(
+                stderr,
+                "[recompile] F64 DISABLED: shaderFloat64 %s, compatible F64 float controls "
+                "%s, float controls %s. Guest binary64 instructions refuse "
+                "(f64-device-unavailable) instead of running unflushed-input semantics "
+                "this device cannot promise.\n",
+                shader_float64_enabled ? "enabled" : "not enabled",
+                compatible_float_controls ? "supported" : "unavailable",
+                float_controls_permitted ? "permitted" : "not permitted");
     }
     // Published LAST, so a reader that observes `published` also observes this verdict.
     g_float64_published.store(true, std::memory_order_release);

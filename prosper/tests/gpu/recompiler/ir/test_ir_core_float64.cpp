@@ -186,19 +186,38 @@ TEST(IrCoreFloat64, Float64AndDenormPreserveAreDeclaredOnlyWhenUsed) {
     EXPECT_TRUE(has_instruction(with, 17u, float64_cap));
     EXPECT_TRUE(has_instruction(with, 17u, denorm_cap));
     EXPECT_TRUE(has_instruction(with, 17u, int64_cap));
+    const uint32_t nonfinite_cap[] = {4466u}, controls2_cap[] = {6029u};
+    EXPECT_TRUE(has_instruction(with, 17u, nonfinite_cap));
+    EXPECT_TRUE(has_instruction(with, 17u, controls2_cap));
+    EXPECT_FALSE(has_instruction(without, 17u, controls2_cap));
     EXPECT_FALSE(has_instruction(without, 17u, float64_cap));
     EXPECT_FALSE(has_instruction(without, 17u, denorm_cap));
     EXPECT_TRUE(has_instruction(without, 17u, int64_cap));
-    bool mode = false;
-    size_t extensions = 0;
+    bool mode = false, nonfinite_mode = false;
+    uint32_t float64_type = 0;
+    size_t extensions = 0, guarded_bitcasts = 0;
     for (size_t at = 5; at < with.size(); at += with[at] >> 16) {
         if ((with[at] & 0xffffu) == 16u && (with[at] >> 16) == 4u && with[at + 2] == 4459u &&
             with[at + 3] == 64u)
             mode = true;   // OpExecutionMode %main DenormPreserve 64
+        if ((with[at] & 0xffffu) == 16u && (with[at] >> 16) == 4u && with[at + 2] == 4461u &&
+            with[at + 3] == 64u)
+            nonfinite_mode = true;
+        if ((with[at] & 0xffffu) == 22u && (with[at] >> 16) == 3u && with[at + 2] == 64u)
+            float64_type = with[at + 1];
+        if ((with[at] & 0xffffu) == 124u && (with[at] >> 16) == 4u &&
+            with[at + 1] == float64_type) {
+            const uint32_t none[] = {with[at + 2], 40u, 0u};
+            EXPECT_TRUE(has_instruction(with, 71u, none))
+                << "binary64 Bitcast needs FPFastMathMode None";
+            ++guarded_bitcasts;
+        }
         extensions += (with[at] & 0xffffu) == 10u;
     }
     EXPECT_TRUE(mode);
-    EXPECT_EQ(extensions, 1u);
+    EXPECT_TRUE(nonfinite_mode);
+    EXPECT_EQ(guarded_bitcasts, 2u);
+    EXPECT_EQ(extensions, 2u);
 }
 
 // The interpreter refuses a binary64 subnormal when the module did not ask Vulkan to keep it, so
