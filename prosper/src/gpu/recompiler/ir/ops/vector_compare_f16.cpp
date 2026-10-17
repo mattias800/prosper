@@ -3,6 +3,9 @@
 // binary32, so the relation uses prepared F32 bits; no conversion belongs here.
 #include "gpu/recompiler/ir/ops/vector_compare.hpp"
 
+#include "gpu/recompiler/ir/builder.hpp"
+#include "gpu/recompiler/ir/ir.hpp"
+
 #include <span>
 
 namespace prosper::gpu::ir {
