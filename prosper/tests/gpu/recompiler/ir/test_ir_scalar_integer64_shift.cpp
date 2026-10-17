@@ -29,6 +29,17 @@ std::vector<uint32_t> words(uint32_t op, uint64_t word, uint32_t count, uint32_t
         out.push_back(vop1(1, 1, destination + observation));
     return out;
 }
+std::vector<uint32_t> constant_source_words(uint32_t op, uint32_t source_form,
+                                            uint32_t observation) {
+    auto out = words(op, kWord, 33, 1, observation);
+    const uint32_t selector = source_form == 0 ? 129 : source_form == 1 ? 193 : 255;
+    out[4] = (out[4] & ~255u) | selector;
+    if (source_form == 2) out.insert(out.begin() + 5, 0x89abcdef);
+    return out;
+}
+uint64_t constant_source(uint32_t form) {
+    return form == 0 ? uint64_t{1} : form == 1 ? UINT64_MAX : uint64_t{0x89abcdef};
+}
 uint64_t expected(uint32_t op, uint64_t word, uint32_t count) {
     const uint32_t n = count & 63;
     if (op == 0x1f) return word << n;
@@ -80,6 +91,79 @@ TEST(IrScalarInteger64Shift, InlineLiteralCountsAndAliasingDestinationsReadOldWo
             for (uint32_t wave : {32u, 64u})
                 for (uint32_t observation : {0u, 1u, 2u})
                     check(op, kWord, 33, form, wave, observation, 50);
+}
+TEST(IrScalarInteger64Shift, ExistingSourceConstantsKeepSignAndLiteralZeroExtension) {
+    for (uint32_t op : {0x1fu, 0x21u})
+        for (uint32_t form : {0u, 1u, 2u})
+            for (uint32_t wave : {32u, 64u})
+                for (uint32_t observation : {0u, 1u, 2u}) {
+                    const auto in = lane_inputs(173);
+                    const auto run = run_vector_op_per_lane(
+                        constant_source_words(op, form, observation), in, wave);
+                    ASSERT_TRUE(run.error.empty()) << run.error;
+                    ASSERT_EQ(run.d.size(), in.lanes());
+                    const uint64_t result = expected(op, constant_source(form), 33);
+                    const uint32_t want =
+                        observation == 2 ? result != 0 : uint32_t(result >> (observation * 32));
+                    for (size_t lane = 0; lane < in.lanes(); ++lane)
+                        EXPECT_EQ(run.d[lane], in.active[lane] ? want : in.old_d[lane]);
+                }
+}
+TEST(IrScalarInteger64Shift, ExistingPairServiceRetainsSpecialWordsAndInputFallback) {
+    for (uint32_t op : {0x1fu, 0x21u})
+        for (int source : {50, 106, 108, 122})
+            for (bool input : {false, true}) {
+                LoweringFixture t;
+                auto& map = input ? t.rs.sreg_input : t.rs.sreg;
+                map[source] = t.b.uconst(3);
+                map[source + 1] = t.b.uconst(0x80000001);
+                t.set_sgpr(52, 33);
+                const auto in = decoded(op, 20, source);
+                const auto old_scc = t.rs.scc;
+                ASSERT_TRUE(ir::lower_sop2(t.b, t.rs, in, t.ok, false));
+                ASSERT_TRUE(t.ok) << source << " input " << input;
+                EXPECT_TRUE(t.rs.sreg.contains(20));
+                EXPECT_TRUE(t.rs.sreg.contains(21));
+                EXPECT_NE(t.rs.scc, old_scc);
+            }
+}
+TEST(IrScalarInteger64Shift, ArithmeticRightKeepsSourceConstantsOutsideItsNewAdmission) {
+    for (const auto source :
+         {Operand{OperandKind::InlineInt, 1}, Operand{OperandKind::InlineInt, -1},
+          Operand{OperandKind::Literal, 0}}) {
+        LoweringFixture t;
+        t.set_sgpr(52, 33);
+        auto in = decoded(0x23);
+        in.src[0] = source;
+        in.has_literal = true;
+        in.literal = 0x89abcdef;
+        const auto old = t.rs.sreg;
+        const auto before = t.code_words();
+        EXPECT_TRUE(ir::lower_sop2(t.b, t.rs, in, t.ok, false));
+        EXPECT_FALSE(t.ok);
+        EXPECT_EQ(t.rs.sreg, old);
+        EXPECT_EQ(t.code_words(), before);
+    }
+}
+TEST(IrScalarInteger64Shift, CountDestinationAliasAndEarlierRefusalKeepTheirBoundaries) {
+    for (uint32_t op : {0x1fu, 0x21u, 0x23u}) {
+        for (uint32_t wave : {32u, 64u})
+            for (uint32_t observation : {0u, 1u, 2u})
+                check(op, kWord, 33, 0, wave, observation, 52);
+        LoweringFixture t;
+        t.set_sgpr(50, 3);
+        t.set_sgpr(51, 0x80000001);
+        t.set_sgpr(52, 33);
+        t.set_sgpr(20, 0xaabbccdd);
+        t.set_sgpr(21, 0x11223344);
+        const auto old = t.rs.sreg;
+        const auto scc = t.rs.scc;
+        t.ok = false;
+        ASSERT_TRUE(ir::lower_sop2(t.b, t.rs, decoded(op), t.ok, false));
+        EXPECT_FALSE(t.ok);
+        EXPECT_EQ(t.rs.sreg, old);
+        EXPECT_EQ(t.rs.scc, scc);
+    }
 }
 TEST(IrScalarInteger64Shift, ArithmeticRightRefusesNonordinaryAndMisalignedShapesBeforeReading) {
     for (uint32_t arm = 0; arm < 9; ++arm) {
@@ -171,5 +255,24 @@ TEST(IrScalarInteger64Shift, ExportsUniformScalarFormsForTheCorpusGate) {
                         EXPECT_EQ(run.d[lane], in.active[lane] ? want : in.old_d[lane]);
                     ++count;
                 }
-    EXPECT_EQ(count, 54u);
+    for (uint32_t op : {0x1fu, 0x21u})
+        for (uint32_t wave : {32u, 64u})
+            for (uint32_t form : {0u, 1u, 2u})
+                for (uint32_t observation : {0u, 1u, 2u}) {
+                    const auto lp =
+                        lane_program(constant_source_words(op, form, observation), 64, wave);
+                    const auto module = saved_integer64_shift_witness(
+                        dump, 0x6460000000ull + count * 0x100, count, lp);
+                    const auto in = lane_inputs(173);
+                    const auto run = execute_integer64_shift_module(module, in);
+                    ASSERT_TRUE(run.error.empty()) << run.error;
+                    ASSERT_EQ(run.d.size(), in.lanes());
+                    const uint64_t result = expected(op, constant_source(form), 33);
+                    const uint32_t want =
+                        observation == 2 ? result != 0 : uint32_t(result >> (observation * 32));
+                    for (size_t lane = 0; lane < in.lanes(); ++lane)
+                        EXPECT_EQ(run.d[lane], in.active[lane] ? want : in.old_d[lane]);
+                    ++count;
+                }
+    EXPECT_EQ(count, 90u);
 }
