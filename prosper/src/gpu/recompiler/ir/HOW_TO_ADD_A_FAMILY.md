@@ -610,7 +610,8 @@ evaluated in `eval_integer64.cpp`, which `evaluate_wide` reaches through `is_int
 
 A new 64-bit opcode goes in the usual five places, with three more things to get right:
 
-- keep it inside the `PackU64` .. last-64-bit-opcode range, so `is_integer64_opcode` routes it;
+- keep it inside the `PackU64` .. last-integer-64-bit-opcode range, so `is_integer64_opcode`
+  routes it; the binary64 relations follow that range (`F64Lt` ..), see "F64 values";
 - say in `ir.cpp`'s `argument_type` which of its argument slots are U64 (today the range
   `U64Lo` .. `U64Ge` takes U64 in every slot, and `PackU64` takes two U32 words). A shift is
   `(U64 value, U32 count)`, so it needs a per-slot rule;
@@ -717,7 +718,7 @@ with `_F64` before the last `S_ENDPGM`), and report what it says.
 
 | piece | where | what it does |
 | --- | --- | --- |
-| opcodes | `ir.hpp` `F64Lt` .. `F64UnordGe` | the twelve binary64 relations, `(U64, U64) -> Bool`, after the U64 block. `argument_type` gives U64 to every slot from `U64Lo` to `F64UnordGe` |
+| opcodes | `ir.hpp` `F64Lt` .. `F64UnordGe` | the twelve binary64 relations, `(U64, U64) -> Bool`, after the U64 block (after `U64Bfe`). `argument_type` has its own rule giving U64 to both slots of `F64Lt` .. `F64UnordGe`; a new F64 opcode extends that range or adds a per-slot rule |
 | evaluation | `eval_float64.cpp` | `is_float64_opcode` routes them from `evaluate_wide`; the host evaluates in `double` with unflushed subnormals. The constant folder never sees an F64 opcode: keep it that way (no F64 folds) |
 | emission | `SpirvCompute::t_f64`, `fcmp64` (`spirv/float64.cpp`) | bitcasts both U64 words to `OpTypeFloat 64`. `t_f64()` declares `Float64`, `DenormPreserve`, one `SPV_KHR_float_controls` and `OpExecutionMode DenormPreserve 64` on first use, so a module without F64 declares none of them |
 | device gate | `float64_support.hpp` | `float64_admitted()` is true only after a device owner published shaderFloat64 ENABLED + shaderDenormPreserveFloat64 + float controls permitted. Publishers are ANDed (the renderer, `tests/fixtures/render_runner.h`, and the private compute device, `frontends/shared/live/live_compute.cpp`, through `publish_device_float64` in `gpu/execute/float_controls_probe.hpp`). `shader_inspect` publishes a capable device, so the corpus gate measures what RADV runs |
