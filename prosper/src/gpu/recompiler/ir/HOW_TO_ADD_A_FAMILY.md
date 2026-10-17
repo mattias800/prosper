@@ -458,6 +458,122 @@ The F32 group's results:
 So the witness corpus is required. The recorded corpus alone could not show that the constant
 compares still work.
 
+## Mask-reading and mask-writing VALU
+
+`v_cndmask_b32` and the carry ops are done, and they are the worked example. They read a lane mask
+(the cndmask selector, a carry-in), write one (a carry-out), or both. They split the way the VOPC
+compares do, into a per-lane **value** that is yours and the **mask** around it that is not.
+`write_vopc_mask` could not be reused: a compare masks its result with `exec_masked_predicate`
+(a `bsel`), while a carry op uses `land`. Changing either is a byte change and a poison-semantics
+change, so the carry ops have their own shared write.
+
+| file | holds |
+| --- | --- |
+| `ops/vector_carry.hpp`, `ops/vector_carry.cpp` | `VectorCarryDef {fmt, opcode, reads_carry_in, build}`: D and the carry Bool, from S0, S1 and the lane's carry-in **bit** |
+| `ops/vector_cndmask.hpp`, `ops/vector_cndmask.cpp` | `VectorCndmaskDef`: D = bit ? S1 : S0 |
+| `lower/carry_mask_write.cpp` | the shared mask write: `exec_masked_carry` (ISA 3.9), `write_vop2_carry_mask` (VCC) and `write_vop3b_carry_mask` (SDST: VCC, an SGPR pair, or one Wave32 B32 word; emit_alu's old `write_vop3b_carry_output`, verbatim) |
+| `lower/vop3_carry.cpp`, `lower/vop3_cndmask.cpp` | the VOP3 routes: the mask READ (verbatim), then the definition, then the write |
+| `lower/vop2_mask.cpp` | the VOP2 forms: VCC is the selector, the carry-in and the carry-out |
+| `tests/gpu/recompiler/ir/vector_mask_harness.hpp` | the per-lane harness and the witness exporter |
+
+### The rules this example follows
+
+- **A definition never sees a mask register.** It gets the lane's bit as a `Type::Bool` input. The
+  mask read stays in the lowering, verbatim, because each read carries its own rules. VCC_HI never
+  falls back to `rs.vcc`. A tracked B32 lifetime is preferred over `rs.vcc`. The NGG one-lane
+  projection reads scalar DATA as a mask. An untracked source refuses (`ok = false`). None of that is
+  per-opcode semantics.
+- **One build function per operation, one table row per encoding.** VOP2 `0x28` and VOP3B `0x128`
+  are the same `add_co_ci` function. `DefinitionsAgreeWithTheEffectsTable` checks that each VOP2 row
+  has its VOP3B twin at +0x100 with the same `build`.
+- **Two outputs are fine.** A carry definition returns `{d, carry}` from one Block, and the lowering
+  writes D first and the mask second, as the old code did.
+- **Append order.** `Select(cin, 1, 0)` comes first, then the partial sums, and the partial carries
+  join as `BoolSelect(c1, true, c2)`. That is the old code's `b.bsel(c1, b.btrue(), c2)`, not a
+  `BoolOr`.
+- **An emit function's argument order is part of the bytes.** `emit_vector_cndmask(b, def, mask, s1,
+  s0)` takes its arguments in `SpirvCompute::sel`'s order. The old `b.sel(m, fv(1), fv(0))` becomes
+  `emit_vector_cndmask(b, *def, m, fv(1), fv(0))` with the same argument expressions, so the
+  compiler evaluates `fv(0)` and `fv(1)` in the same order. This was measured. Hoisting `fv(1)` into
+  a local first changed 2 recorded modules and both modifier witnesses. The same applies to the VOP2
+  SDWA path's `word(c, ..)`, `word(a, ..)`.
+- **Keep the chain position.** Each VOP3 lowering returns `false` when the opcode has no definition
+  of its kind, and emit_alu calls it at the old `else if` position. `route_carry_out` takes only
+  definitions without a carry-in, and `route_carry_in_out` only those with one.
+
+### What you must never touch
+
+These are consulted around the lowering, never from inside it. Before migrating, grep the case body
+to confirm that it does not call them:
+
+- the fresh-mask proof `refuse_mask_write` / `fresh_mask_sources_defined` (emit_alu's prologue);
+- the destination-width facts `vop3b_fresh_carry_output` and `vop3_writes_mask_sdst`, which the CFG,
+  Wave32 dispatch-word and fragment-loop passes read;
+- `write_vop3b_carry_mask`, `write_vop2_carry_mask` and `exec_masked_carry`, and each route's mask
+  read. A known defect lives there: a VOP2 carry leaves a stale Wave32 VCC_LO B32 lifetime (#5348).
+  Fixing it is a separate, corpus-gated PR.
+
+### Testing the mask
+
+Copy `test_ir_vector_carry_execution.cpp` or `test_ir_vector_cndmask_execution.cpp`. Each program
+first writes the mask the op reads from S2 (v5, `mask_lane_inputs`), then runs the op, then
+optionally reads the written mask back into v1 for every lane. So one definition gets two programs:
+one reads D (an inactive lane keeps its old VDST), and one reads the carry mask (an inactive lane
+reads 0). Run every form in both wave sizes: VOP2, VOP3B to VCC and to an SGPR pair, and a carry-in
+from VCC and from an SGPR pair.
+
+The carry-in is produced the way guest code produces one, by an earlier carry op (`carry_from_s2`,
+`v_add_co_u32 v7, <mask>, v5, -1`); the cndmask selector by `v_cmp_ne_u32_e64` (`mask_from_s2`).
+Two harness traps, each found the hard way:
+
+- **In Wave32, the VOP3B `_co_ci` forms are refused** (`fabricated-fresh-mask-source`): the proof
+  reads SRC2 as the Wave64 pair the effects table charges it, and the second word is never written
+  (CONFIDENCE: MED, from reading the code; not A/B-tested). The refusal comes from emit_alu's
+  prologue (`refuse_mask_write`), which this migration does not touch, so it is the pre-IR verdict.
+  `Wave32RefusalsStay` pins it, and the witness exporter leaves those programs out of Wave32.
+- **Read VCC back with `v_cndmask_b32_e32`** (`read_mask`), not the e64 form, because of #5348.
+
+The four tests per family: every definition in every form and both waves against eval; a
+hand-worked ISA table (it must include rows that separate `<` from `<=`, such as a zero addend: the
+`ULt -> ULe` mutation survived until it did); the harness's positive control (an inactive lane with
+a raw carry of 1, and active lanes seeing both carry values and both carry-in values); and effects
+agreement. `test_ir_lower_vector_mask.cpp` pins the write's destinations, the B32 domain, the EXEC
+`land`, the mask reads and every refusal.
+
+Mutations that went red: carry `ULt -> ULe` (after the zero-addend rows were added), the EXEC mask
+dropped, the VOP3 operands swapped, the cndmask arms swapped, the B32 insert dropped, and the VOP2
+carry-in ignored.
+
+### Gate and controls
+
+Witness: `PROSPER_IR_WITNESS_DIR=~/<slug>-witness/carry ./test_ir_vector_carry_execution
+--gtest_filter='*Exports*'` (likewise `cndmask`), then `recompile_corpus.py harvest` on each. Each
+control is a neutral byte change in one definition: swapped IAdd operands for add, and a mirrored
+borrow `UGt(y, x)` for the subtractions.
+
+| control | recorded corpus (1,442 modules) | carry witness (60) | cndmask witness (12) |
+| --- | --- | --- | --- |
+| the migration | none | none | none |
+| `v_add_co_u32` | **none** | output-changed 44 (its 8, plus every carry-in producer) | none |
+| `v_sub_co_u32` | **none** | output-changed 8 | none |
+| `v_subrev_co_u32` | output-changed 2 | output-changed 8 | none |
+| `v_add_co_ci_u32` | output-changed 10 | output-changed 12 | none |
+| `v_sub_co_ci_u32` | **none** | output-changed 12 | none |
+| `v_subrev_co_ci_u32` | **none** | output-changed 12 | none |
+| `v_cndmask_b32` (`Select` on `BoolSelect(m, true, false)`) | output-changed 1,338 | output-changed 30 (the mask reads) | output-changed 12 |
+
+The recorded corpus never reaches four of the seven definitions, so the witness corpus is required.
+
+### The remaining mask-family members
+
+| instruction | status | why |
+| --- | --- | --- |
+| `v_div_scale_f32` (VOP3B 0x16D) | Codex with this recipe, as an **admission** in its own explained PR | emit_alu has no case for it today. The value is an F32 definition, and the flag goes through `write_vop3b_carry_mask`. |
+| `v_div_scale_f64` (0x16E) | stop at the F64 point | no F64 type |
+| `v_mad_u64_u32` / `v_mad_i64_i32` (0x176 / 0x177) | **stop and report (lead)** | Its carry write is not `write_vop3b_carry_mask`: it has no Wave32 B32 branch and does not erase the old SGPR word, and `for_each_scalar_write` charges it a pair. Sharing the write is a behaviour change in Wave32. Its 64-bit result also needs the two-Block order (see "64-bit values"). |
+| `v_mbcnt_lo/hi` | lead | cross-lane |
+| the VOPC mask write | lead | unchanged |
+
 ## 64-bit values
 
 The IR has one 64-bit type, `Type::U64`: a raw 64-bit word, as `U32` is a raw 32-bit word. The
@@ -606,8 +722,9 @@ and leave the reserved ones in the `switch`.
 | 13 | VOPC F64 compares (`v_cmp/cmpx_*_f64`) | Codex, using the 64-bit recipe; an admission that stops at the F64 point until the lead adds an F64 type |
 | 14 | VOP3 F64 arithmetic (`v_add/mul/fma_f64`, `v_min/max_f64`, `v_ldexp_f64`, `v_div_*_f64`, ...) | Codex, using the 64-bit recipe; same F64 stop point |
 | 15 | 64-bit conversions (`v_cvt_f64_*`, `v_cvt_*_f64`, `v_frexp_*_f64`) | Codex, using the 64-bit recipe; same F64 stop point |
+| 16 | VOP3B `v_div_scale_f32`: an admission (emit_alu has no case for it) | Codex, using the mask recipe ("Mask-reading and mask-writing VALU"), in its own explained PR; `v_div_scale_f64` stops at the F64 point |
 | - | Admitting any compare the switch refuses today | lead, then Codex |
-| - | VOP2 `v_cndmask_b32`, carry ops `v_add/sub/subrev_co_ci_u32` (VCC), the VOPC mask write (`lower/vopc_mask_write.cpp`), VOP3B (`v_add_co_u32`, `v_div_scale`, `v_mad_u64_u32`: SGPR carry masks), `v_mbcnt` | lead (wave masks) |
+| - | `v_mad_u64_u32` / `v_mad_i64_i32` (their carry write differs from the shared one in Wave32), the VOPC mask write (`lower/vopc_mask_write.cpp`), the carry mask write (`lower/carry_mask_write.cpp`), `v_mbcnt` | lead (wave masks) |
 | - | DPP (the VOP1/VOP2 DPP routes and SRC0 stage), `v_permlane*`, `v_readlane/writelane/readfirstlane`, `ds_bpermute/permute`, quad and swizzle ops | lead (cross-lane) |
 | - | `v_movrel*`, `s_movrel*`, and the memory families SMEM, MUBUF/MTBUF, FLAT, MIMG, DS (descriptor provenance, raw windows, active-word marks) | lead (proof and definedness) |
 | - | SOPP, `rdna2_emit_cfg.cpp`, the SOP `*_routes.cpp` | lead (control flow, mask routes) |
