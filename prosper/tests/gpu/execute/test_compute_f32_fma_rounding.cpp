@@ -162,7 +162,8 @@ std::vector<uint32_t> gpu_run(const Encoding& e, uint32_t wave,
     const auto module = recompile_compute(p.code.data(), p.code.size(), &p.table, p.config);
     EXPECT_FALSE(module.empty());
     if (module.empty()) return {};
-    const auto stem = std::string(e.name) + "_wave" + std::to_string(wave);
+    const auto stem = std::string(e.name) + "_wave" + std::to_string(wave) +
+                      (independent_inputs ? "_distinct" : "");
     const auto root = artifact_root();
     std::ofstream spv(root / (stem + ".spv"), std::ios::binary);
     spv.write(reinterpret_cast<const char*>(module.data()),
