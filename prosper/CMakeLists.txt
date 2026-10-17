@@ -3814,6 +3814,8 @@ if(TARGET prosper_core)
           ir_vector_writelane_execution
           ir_lower_ds_cross_lane
           ir_ds_shuffle_values
+          ir_ds_address_values
+          ir_lower_ds_address
           ir_ds_shuffle_execution
           ir_buffer_address
           ir_buffer_address_execution
