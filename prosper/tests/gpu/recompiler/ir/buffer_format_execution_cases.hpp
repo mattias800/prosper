@@ -133,7 +133,7 @@ inline Data data(const Case& c) {
     for (uint32_t lane = 0; lane < c.wave; ++lane) {
         d.lanes.s0[lane] = c.dynamic ? lane * 16 + lane % 4 : lane;
         d.lanes.s1[lane] = 0x72000000u + lane;
-        d.lanes.active[lane] = lane != 0 && lane != c.wave - 1 && lane % 4 != 2;
+        d.lanes.active[lane] = lane != 0 && lane != c.wave - 1 && lane % 5 != 2;
         const uint32_t base = lane * 16 + (c.dynamic ? lane % 4 + c.offset : 0);
         const bool packed = !c.raw_opcode && kFormats[c.format].packed;
         const uint32_t components = c.raw_opcode                                         ? 1

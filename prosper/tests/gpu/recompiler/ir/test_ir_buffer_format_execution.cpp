@@ -134,11 +134,13 @@ TEST(IrBufferFormatExecution, TheFixtureHasDistinctDataAndInactiveOldDestination
         if (!c.admitted() || c.component || c.wave != 64) continue;
         const auto data = fixture::data(c);
         std::set<uint32_t> active;
+        std::set<uint32_t> active_byte_positions;
         size_t inactive = 0;
         for (uint32_t lane = 0; lane < c.wave; ++lane) {
-            if (data.lanes.active[lane])
+            if (data.lanes.active[lane]) {
                 active.insert(data.expected[lane]);
-            else {
+                active_byte_positions.insert((data.lanes.s0[lane] + c.offset) & 3u);
+            } else {
                 ++inactive;
                 EXPECT_EQ(data.expected[lane], data.lanes.old_d[lane]);
             }
@@ -148,6 +150,8 @@ TEST(IrBufferFormatExecution, TheFixtureHasDistinctDataAndInactiveOldDestination
                                      ? 2u
                                      : 8u);
         EXPECT_GE(inactive, 2u);
+        // The modulo-five EXEC pattern must leave every modulo-four address residue active.
+        if (c.dynamic) EXPECT_EQ(active_byte_positions, (std::set<uint32_t>{0, 1, 2, 3}));
     }
 }
 }   // namespace
