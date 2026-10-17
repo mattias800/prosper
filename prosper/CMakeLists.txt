@@ -6235,6 +6235,10 @@ endif()
         INCLUDES tests
         LIBRARIES prosper_core Vulkan::Vulkan)
 
+      prosper_add_gtest(test_ir_smem_index_execution
+        SOURCES tests/gpu/recompiler/ir/test_ir_smem_index_execution.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
       prosper_add_gtest(test_ir_ds_address_execution
         SOURCES tests/gpu/recompiler/ir/test_ir_ds_address_execution.cpp
         INCLUDES tests
