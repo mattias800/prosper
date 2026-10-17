@@ -4,6 +4,7 @@
 #include <atomic>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/ir/lower/buffer_address_lowering.hpp"
+#include "gpu/recompiler/ir/lower/smem_index_lowering.hpp"
 #include "gpu/recompiler/ir/lower/ds_address_lowering.hpp"
 #include "gpu/recompiler/ir/lower/buffer_format_values.hpp"
 #include "gpu/recompiler/ir/lower/buffer_store_values.hpp"
@@ -794,14 +795,10 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 } else {
                     ok = false; return true;
                 }
-                uint32_t idx = b.ibin(Op_ShiftRightLogical,
-                    b.ibin(Op_IAdd, soff, b.uconst(in.literal)), b.uconst(2));
+                uint32_t idx = ir::lower_smem_pcrel_index(b, soff, in);
                 for (uint32_t k = 0; k < n; ++k) {
-                    uint32_t kidx = k ? b.ibin(Op_IAdd, idx, b.uconst(k)) : idx;
-                    uint32_t value = b.uconst(0); // bounded V# OOB contract
-                    for (uint32_t t = 0; t < pcrel->second.size(); ++t)
-                        value = b.sel(b.ucmp(Op_IEqual, kidx, b.uconst(t)),
-                                      b.uconst(pcrel->second[t]), value);
+                    uint32_t kidx = ir::lower_smem_pcrel_component(b, idx, k);
+                    uint32_t value = ir::lower_smem_constant_word(b, kidx, pcrel->second);
                     rs.sreg[in.dst.value + static_cast<int>(k)] = value;
                     rs.sreg_srt.erase(in.dst.value + static_cast<int>(k));
                 }
@@ -1263,7 +1260,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         resource.table_entry_stride == 0u)
                         continue;
                     b.cbuf_table_selector_value[resource.binding] =
-                        b.ibin(Op_UDiv, soff_bits, b.uconst(resource.table_entry_stride));
+                        ir::lower_smem_table_selector(b, soff_bits, resource.table_entry_stride);
                     b.cbuf_table_selector_block[resource.binding] = b.cur_block;
                     if (getenv("PROSPER_DBG"))
                         fprintf(stderr,
@@ -1274,10 +1271,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             }
             if (soff_dyn) {
                 // Dynamic dword index: (soffset + signed imm) >> 2 (uint add == two's-complement add).
-                uint32_t idx0 = b.ibin(Op_ShiftRightLogical,
-                                       b.ibin(Op_IAdd, soff_bits, b.uconst(in.literal)), b.uconst(2));
+                uint32_t idx0 = ir::lower_smem_dynamic_index(b, soff_bits, in);
                 for (uint32_t k = 0; k < n; k++) {
-                    uint32_t kidx = k ? b.ibin(Op_IAdd, idx0, b.uconst(k)) : idx0;
+                    uint32_t kidx = ir::lower_smem_dynamic_component(b, idx0, k);
                     rs.sreg[in.dst.value + (int)k] = bounded_cbuf_load(kidx);
                     rs.sreg_srt.erase(in.dst.value + (int)k);   // data load: drop any stale descriptor tag
                 }

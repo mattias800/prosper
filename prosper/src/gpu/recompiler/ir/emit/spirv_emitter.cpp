@@ -86,6 +86,7 @@ uint32_t emit_one(SpirvCompute& b, const Inst& inst, const uint32_t* x) {
         case Opcode::IAdd: return b.ibin(Op_IAdd, x[0], x[1]);
         case Opcode::ISub: return b.ibin(Op_ISub, x[0], x[1]);
         case Opcode::IMul: return b.ibin(Op_IMul, x[0], x[1]);
+        case Opcode::UDiv: return b.ibin(Op_UDiv, x[0], x[1]);
         case Opcode::UMulHi: return b.umul_hi(x[0], x[1]);
         case Opcode::SMulHi: return b.smul_hi(x[0], x[1]);
         case Opcode::And: return b.ibin(Op_BitwiseAnd, x[0], x[1]);

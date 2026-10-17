@@ -71,6 +71,8 @@ enum class Opcode : uint8_t {
     SLe,
     SGt,
     SGe,   // u32 x u32 -> bool
+    // Memory value arithmetic, outside the guest scalar-ALU opcode range above.
+    UDiv,   // unsigned quotient; a zero divisor evaluates to unknown
     F32Add,
     F32Sub,
     F32Mul,

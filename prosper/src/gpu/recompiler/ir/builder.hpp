@@ -26,6 +26,7 @@ public:
     Value iadd(Value a, Value b) { return u32(Opcode::IAdd, a, b); }
     Value isub(Value a, Value b) { return u32(Opcode::ISub, a, b); }
     Value imul(Value a, Value b) { return u32(Opcode::IMul, a, b); }
+    Value udiv(Value a, Value b) { return u32(Opcode::UDiv, a, b); }
     Value umulhi(Value a, Value b) { return u32(Opcode::UMulHi, a, b); }
     Value smulhi(Value a, Value b) { return u32(Opcode::SMulHi, a, b); }
     Value and_(Value a, Value b) { return u32(Opcode::And, a, b); }

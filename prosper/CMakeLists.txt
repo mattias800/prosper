@@ -3816,6 +3816,8 @@ if(TARGET prosper_core)
           ir_ds_shuffle_values
           ir_ds_address_values
           ir_lower_ds_address
+          ir_smem_index_values
+          ir_lower_smem_index
           ir_ds_shuffle_execution
           ir_buffer_address
           ir_buffer_address_execution
@@ -6233,6 +6235,10 @@ endif()
         INCLUDES tests
         LIBRARIES prosper_core Vulkan::Vulkan)
 
+      prosper_add_gtest(test_ir_smem_index_execution
+        SOURCES tests/gpu/recompiler/ir/test_ir_smem_index_execution.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
       prosper_add_gtest(test_ir_ds_address_execution
         SOURCES tests/gpu/recompiler/ir/test_ir_ds_address_execution.cpp
         INCLUDES tests

@@ -44,6 +44,8 @@ Known evaluate_op(Opcode op, uint32_t imm, uint32_t a, uint32_t b, uint32_t c) {
         case Opcode::ConstU32: return imm;
         case Opcode::ConstTrue: return 1u;
         case Opcode::ConstFalse: return 0u;
+        // SPIR-V OpUDiv is undefined for a zero divisor; do not invent a value.
+        case Opcode::UDiv: return b ? Known(a / b) : std::nullopt;
         case Opcode::BoolAnd: return uint32_t(bool(a) && bool(b));
         case Opcode::BoolOr: return uint32_t(bool(a) || bool(b));
         case Opcode::BoolNot: return uint32_t(!a);

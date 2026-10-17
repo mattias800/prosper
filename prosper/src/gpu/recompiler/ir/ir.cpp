@@ -44,6 +44,7 @@ constexpr OpcodeInfo kInfo[] = {
     {"sle", 2, Type::Bool},
     {"sgt", 2, Type::Bool},
     {"sge", 2, Type::Bool},
+    {"udiv", 2, Type::U32},
     {"f32.add", 2, Type::U32},
     {"f32.sub", 2, Type::U32},
     {"f32.mul", 2, Type::U32},
