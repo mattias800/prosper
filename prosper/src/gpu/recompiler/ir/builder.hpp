@@ -54,6 +54,14 @@ public:
     Value f32eq(Value a, Value b) { return cmp(Opcode::F32Eq, a, b); }
     Value f32clamp01(Value a) { return block_.append({Opcode::F32Clamp01, Type::U32, 0, {a}}); }
     Value pack_half_lo(Value a) { return block_.append({Opcode::PackHalfLo, Type::U32, 0, {a}}); }
+    Value pack_normalized_field(Value a, uint32_t width, bool is_signed) {
+        const uint32_t mode =
+            width >= 2 && width <= 16 ? width | (uint32_t(is_signed) << 8) : 0xffffffffu;
+        return block_.append({Opcode::PackNormalizedField, Type::U32, mode, {a}});
+    }
+    Value pack_unsigned_float(Value a, uint32_t mantissa) {
+        return block_.append({Opcode::PackUnsignedFloat, Type::U32, mantissa, {a}});
+    }
     Value f32add(Value a, Value b) { return u32(Opcode::F32Add, a, b); }
     Value f32sub(Value a, Value b) { return u32(Opcode::F32Sub, a, b); }
     Value f32mul(Value a, Value b) { return u32(Opcode::F32Mul, a, b); }

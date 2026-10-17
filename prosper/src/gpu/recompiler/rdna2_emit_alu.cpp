@@ -5,6 +5,7 @@
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/ir/lower/buffer_address_lowering.hpp"
 #include "gpu/recompiler/ir/lower/buffer_format_values.hpp"
+#include "gpu/recompiler/ir/lower/buffer_store_values.hpp"
 #include "gpu/recompiler/ir/lower/ds_cross_lane_lowering.hpp"
 #include "gpu/recompiler/ir/lower/carry_mask_write.hpp"
 #include "gpu/recompiler/ir/lower/native_half_fma_lowering.hpp"
@@ -2483,14 +2484,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // one shape this can't express and stays deferred.
                     const uint32_t field_mask = comp_bytes == 2 ? 0xffffu : 0xffu;
                     for (uint32_t k = 0; k < store_n; k++) {
-                        const uint32_t caddr = k ? b.ibin(Op_IAdd, addr, b.uconst(k * comp_bytes)) : addr;
-                        const uint32_t cidx  = b.ibin(Op_ShiftRightLogical, caddr, b.uconst(2));
-                        const uint32_t bitpos = b.ibin(Op_ShiftLeftLogical,
-                                                       b.ibin(Op_BitwiseAnd, caddr, b.uconst(3)), b.uconst(3));
-                        const uint32_t mask = b.ibin(Op_ShiftLeftLogical, b.uconst(field_mask), bitpos);
-                        const uint32_t v = b.ibin(Op_ShiftLeftLogical,
-                                                  b.ibin(Op_BitwiseAnd, vread(in.dst.value + (int)k),
-                                                         b.uconst(field_mask)), bitpos);
+                        const auto fields = ir::lower_buffer_store_fields(
+                            b, in, addr, k, comp_bytes, field_mask, std::cref(vread));
+                        const uint32_t cidx = fields.index, mask = fields.mask, v = fields.value;
                         b.cbuf_atomic_rtn(Op_AtomicAnd, cidx, b.iun(Op_Not, mask), binding,
                                           rs.exec_narrowed, rs.exec, b.uconst(0));
                         b.cbuf_atomic_rtn(Op_AtomicOr, cidx, v, binding,
@@ -2513,14 +2509,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (!packed) {
                     // Raw/Float32/Uint32: one dword per component.
                     for (uint32_t k = 0; k < store_n; k++) {
-                        uint32_t kidx = k ? b.ibin(Op_IAdd, idx, b.uconst(k)) : idx;
+                        const uint32_t kidx = ir::lower_buffer_store_index(b, idx, k);
                         store_dword(kidx, vread(in.dst.value + (int)k));
                     }
                 } else if (packed_word) {
                     // #3575: every component shares ONE dword. This is the exact inverse of the
-                    // packed_word LOAD, which lives BELOW in this same function -- search
-                    // `packed_10_11_11 ? (sk == 0 ...` -- and the two field tables are RESTATED
-                    // independently rather than shared (#3600). They must be kept in step by hand:
+                    // packed_word LOAD in ir::lower_buffer_packed_field. Its field table and the
+                    // table in ir::build_buffer_store_word are RESTATED independently (#3600).
+                    // They must be kept in step by hand:
                     // a store whose layout disagreed with the load would round-trip wrongly through
                     // prosper's own reload, which is the cheapest way for this to be wrong and go
                     // unnoticed. If you edit either table, edit both.
@@ -2557,52 +2553,19 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         buf_op.how = "reject-packed-word-partial-store";
                         ok = false; return true;
                     }
-                    uint32_t acc = b.uconst(0);
-                    for (uint32_t k = 0; k < store_n && k < packed_word_ncomp; k++) {
-                        const uint32_t boff = packed_10_11_11
-                            ? (k == 0 ? 0u : k == 1 ? 11u : 22u)
-                            : (k == 0 ? 0u : k == 1 ? 10u : k == 2 ? 20u : 30u);
-                        const uint32_t bits = packed_10_11_11 ? (k < 2 ? 11u : 10u)
-                                                              : (k < 3 ? 10u : 2u);
-                        uint32_t field;
-                        if (packed_10_11_11) {
-                            // pack_ufloat's argument is MANTISSA bits, not the field width: an 11-bit
-                            // field is 5 exponent + 6 mantissa, a 10-bit field 5 + 5. The same
-                            // routine already packs an R11G11B10 texel on the storage-image write
-                            // path (image_write), so this is the established conversion reached
-                            // through the buffer descriptor instead of the image one.
-                            field = b.pack_ufloat(vread(in.dst.value + (int)k), bits - 5u);
-                        } else if (is_uint || is_sint) {
-                            // The raw integer field, truncated to its width. Signed values keep
-                            // two's complement in `bits` bits, which is what bfe_s reads back.
-                            field = b.ibin(Op_BitwiseAnd, vread(in.dst.value + (int)k),
-                                           b.uconst((1u << bits) - 1u));
-                        } else {
-                            const float field_norm = is_snorm ? (bits == 2 ? 1.0f : 511.0f)
-                                                              : (bits == 2 ? 3.0f : 1023.0f);
-                            field = b.pack_norm(vread(in.dst.value + (int)k), bits, is_snorm,
-                                                field_norm);
-                        }
-                        if (boff) field = b.ibin(Op_ShiftLeftLogical, field, b.uconst(boff));
-                        acc = b.ibin(Op_BitwiseOr, acc, field);
-                    }
+                    const uint32_t acc = ir::lower_buffer_store_packed_word(
+                        b, in, store_n, packed_word_ncomp, packed_10_11_11, is_uint, is_sint,
+                        is_snorm, std::cref(vread));
                     store_dword(idx, acc);
                 } else {
                     // Packed UNORM/SNORM/Float16: pack the components tightly into ceil(n*bytes/4) dwords
                     // (inverse of the packed load). Each dword ORs together the fields that land in it.
                     const uint32_t dwords = (store_n * comp_bytes + 3) / 4;
                     for (uint32_t d = 0; d < dwords; d++) {
-                        uint32_t acc = b.uconst(0);
-                        for (uint32_t k = 0; k < store_n; k++) {
-                            uint32_t byte_off = k * comp_bytes;
-                            if (byte_off / 4 != d) continue;
-                            uint32_t field = is_half ? b.pack_half_lo(vread(in.dst.value + (int)k))
-                                                     : b.pack_norm(vread(in.dst.value + (int)k), comp_bytes * 8, is_snorm, norm);
-                            uint32_t sh = (byte_off % 4) * 8;
-                            if (sh) field = b.ibin(Op_ShiftLeftLogical, field, b.uconst(sh));
-                            acc = b.ibin(Op_BitwiseOr, acc, field);
-                        }
-                        uint32_t did = d ? b.ibin(Op_IAdd, idx, b.uconst(d)) : idx;
+                        const auto packed_dword = ir::lower_buffer_store_packed_dword(
+                            b, in, idx, d, store_n, comp_bytes, is_half, is_snorm, norm,
+                            std::cref(vread));
+                        const uint32_t did = packed_dword.index, acc = packed_dword.value;
                         store_dword(did, acc);
                     }
                 }
@@ -2673,9 +2636,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // field to low field, so 2_10_10_10 is logical R/G/B in bits 0/10/20 and A in 30;
                     // 10_11_11 is R/G/B in bits 0/11/22 with widths 11/11/10.
                     //
-                    // This table is RESTATED, not shared, by the packed-word STORE above (#3600) --
-                    // search `packed_word_ncomp`. The two must agree or a store will not round-trip
-                    // through this load. If you edit this table, edit that one.
+                    // ir::lower_buffer_packed_field and ir::build_buffer_store_word keep separate
+                    // field tables (#3600). Both must agree for a store/load round-trip; if either
+                    // layout changes, update both.
                     uint32_t dw = load_dword(idx);
                     value = ir::lower_buffer_packed_field(b, dw, sk, packed_10_11_11, is_uint,
                                                           is_sint, is_snorm);

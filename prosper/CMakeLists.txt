@@ -3672,6 +3672,7 @@ if(TARGET prosper_core)
   # test_ir_scalar_alu_execution runs each scalar-op definition's SPIR-V in the integer interpreter
   # against its own constant evaluation (#2514).
   foreach(ir_test
+          ir_buffer_store_values
           ir_core
           ir_half_fma_finite
           ir_half_fma_finite_execution
@@ -3818,6 +3819,7 @@ if(TARGET prosper_core)
           ir_buffer_address_execution
           ir_lower_buffer_address
           ir_lower_buffer_format_values
+          ir_lower_buffer_store_values
           ir_buffer_format_values
           ir_buffer_format_execution
           ir_lower_vop3_half_float_exact
@@ -6221,6 +6223,11 @@ endif()
       # address past the bound range reads 0 through robustBufferAccess.
       prosper_add_gtest(test_ir_buffer_address_robustness
         SOURCES tests/gpu/recompiler/ir/test_ir_buffer_address_robustness.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan)
+
+      prosper_add_gtest(test_ir_buffer_store_execution
+        SOURCES tests/gpu/recompiler/ir/test_ir_buffer_store_execution.cpp
         INCLUDES tests
         LIBRARIES prosper_core Vulkan::Vulkan)
 

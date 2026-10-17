@@ -68,6 +68,7 @@
 #include "../../tests/fixtures/portable_entry_exec.hpp"
 #include "../../tests/fixtures/native_mask_participation.hpp"
 #include "../../tests/fixtures/checked_compute_launch.hpp"
+#include "../../tests/fixtures/buffer_store_ir.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #if defined(PROSPER_SPV_VALIDATE_SCALAR_BANK)
 #include "../../tests/fixtures/fragment_scalar_bank_fixture.hpp"
@@ -1068,6 +1069,8 @@ int main(int argc, char** argv) {
              recompile_compute(c, std::size(c), nullptr, ComputeShaderConfig{}),
              "emit_spirv_resolving_inputs");
     }
+    dump(dir, "ir_buffer_store_values", prosper::test::buffer_store_ir::module(),
+         "emit_buffer_store_values");
     dump_numeric_mbcnt(dir);
     dump_numeric_wqm(dir);
     dump_numeric_wqm_sources(dir);

@@ -57,6 +57,8 @@ constexpr OpcodeInfo kInfo[] = {
     {"bool.not", 1, Type::Bool},
     {"f32.clamp01", 1, Type::U32},
     {"pack.half.lo", 1, Type::U32},
+    {"pack.normalized.field", 1, Type::U32},
+    {"pack.unsigned.float", 1, Type::U32},
     {"ffbh.u32", 1, Type::U32},
     {"findumsb.u32", 1, Type::U32},
     {"bitcount", 1, Type::U32},
@@ -176,6 +178,11 @@ Value Block::append(const Inst& inst) {
     if (inst.op == Opcode::NormalizeField &&
         (!(inst.imm & 0x7fffffffu) || (inst.imm & 0x7fffffffu) >= 0x7f800000u))
         malformed("normalized-field divisor must be finite and positive", info);
+    if (inst.op == Opcode::PackNormalizedField &&
+        ((inst.imm & ~0x11fu) || (inst.imm & 31u) < 2 || (inst.imm & 31u) > 16))
+        malformed("normalized pack width or mode out of range", info);
+    if (inst.op == Opcode::PackUnsignedFloat && inst.imm != 5 && inst.imm != 6)
+        malformed("unsigned float mantissa out of range", info);
     insts_.push_back(inst);
     return Value{static_cast<uint32_t>(insts_.size() - 1)};
 }
