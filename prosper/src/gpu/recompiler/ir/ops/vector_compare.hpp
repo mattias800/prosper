@@ -35,6 +35,7 @@ struct VectorCompareDef {
 // One table per type group, each in its own ops/vector_compare_<group>.cpp.
 std::span<const VectorCompareDef> vector_compare_f32_defs();
 std::span<const VectorCompareDef> vector_compare_i32_u32_defs();
+std::span<const VectorCompareDef> vector_compare_i16_u16_defs();
 
 // Every group's definitions, and the one for a V_CMP_* opcode (nullptr when it has none yet).
 std::span<const std::span<const VectorCompareDef>> vector_compare_groups();

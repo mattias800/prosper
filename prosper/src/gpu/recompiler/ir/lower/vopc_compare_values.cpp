@@ -17,10 +17,6 @@ uint32_t VopcLowering::compare_value() {
         return emit_vector_compare(b, *def, a, c);
     uint32_t cmp = 0;
     switch (eff) {
-        case 0x89: case 0x8A: case 0x8B: case 0x8C: case 0x8D: case 0x8E:
-        case 0xA9: case 0xAA: case 0xAB: case 0xAC: case 0xAD: case 0xAE:
-            cmp = compare_integer16();
-            break;
         case 0xA1: case 0xA2: case 0xA3: case 0xA4: case 0xA5: case 0xA6:
             cmp = compare_integer64_signed();
             break;
@@ -32,35 +28,6 @@ uint32_t VopcLowering::compare_value() {
             cmp = compare_f16();
             break;
         default: ok = false;
-    }
-    return cmp;
-}
-
-// 16-bit integer compares (i16 0x89-0x8e, u16 0xa9-0xae) read bits [15:0] of each
-// source; the i16 window sign-extends and the u16 window zero-extends, after which
-// the ordinary 32-bit relational operators give the exact 16-bit answer. Both
-// windows carry the same six operations in the same order (lt/eq/le/gt/ne/ge), so
-// one shared body indexes them by the low three bits.
-// VERIFIED(round-trip llvm-mc gfx1030): 0x89 is v_cmp_lt_i16 and 0xab is
-// v_cmp_le_u16 — the encoding Sonic Racing: CrossWorlds emits (#2013).
-uint32_t VopcLowering::compare_integer16() {
-    uint32_t cmp = 0;
-    const bool narrow_signed = eff <= 0x8Eu;
-    const uint32_t x = narrow_signed ? b.bfe_s(a, b.uconst(0), b.uconst(16))
-                                     : b.bfe_u(a, b.uconst(0), b.uconst(16));
-    const uint32_t y = narrow_signed ? b.bfe_s(c, b.uconst(0), b.uconst(16))
-                                     : b.bfe_u(c, b.uconst(0), b.uconst(16));
-    switch (eff & 7u) {
-        case 1: cmp = narrow_signed ? b.scmp(Op_SLessThan, x, y)
-                                    : b.ucmp(Op_ULessThan, x, y); break;
-        case 2: cmp = b.ucmp(Op_IEqual, x, y); break;
-        case 3: cmp = narrow_signed ? b.scmp(Op_SLessThanEqual, x, y)
-                                    : b.ucmp(Op_ULessThanEqual, x, y); break;
-        case 4: cmp = narrow_signed ? b.scmp(Op_SGreaterThan, x, y)
-                                    : b.ucmp(Op_UGreaterThan, x, y); break;
-        case 5: cmp = b.ucmp(Op_INotEqual, x, y); break;
-        default: cmp = narrow_signed ? b.scmp(Op_SGreaterThanEqual, x, y)
-                                     : b.ucmp(Op_UGreaterThanEqual, x, y); break;
     }
     return cmp;
 }
