@@ -100,8 +100,10 @@ TEST(IrCoreFloat64, AFloat64RelationEvaluatesThroughTheWideView) {
 
 // One module per case, as test_ir_core_integer64: lane l computes `block` on inputs base[i] ^ l.
 std::vector<uint32_t> run_per_lane(const Block& block, Value result, std::span<const uint32_t> base,
-                                   std::vector<uint32_t>* words) {
+                                   std::vector<uint32_t>* words,
+                                   FloatTransportConfig transport = {}) {
     SpirvCompute b;
+    b.float_transport = transport;
     static uint64_t next_address = 0x64f40000u;
     b.diagnostic = {RecompileDiagnosticStage::Compute, next_address++};
     b.begin(10u, nullptr, 64u, 1u, 1u, 64u, 0u, true, true);
@@ -218,6 +220,36 @@ TEST(IrCoreFloat64, Float64AndDenormPreserveAreDeclaredOnlyWhenUsed) {
     EXPECT_TRUE(nonfinite_mode);
     EXPECT_EQ(guarded_bitcasts, 2u);
     EXPECT_EQ(extensions, 2u);
+}
+
+TEST(IrCoreFloat64, ExplicitF32TransportSharesCapabilitiesAndKeepsBothNonfiniteModes) {
+    Block block;
+    Builder ir(block);
+    const Value a = ir.pack_u64(ir.input(Type::U32), ir.input(Type::U32));
+    const Value c = ir.pack_u64(ir.input(Type::U32), ir.input(Type::U32));
+    const Value result = ir.f64eq(a, c);
+    const std::array<uint32_t, 4> base = {0u, 0x7ff80000u, 0u, 0x3ff00000u};
+    std::vector<uint32_t> words;
+    const auto out =
+        run_per_lane(block, result, base, &words, {FloatTransportProfile::ExplicitNonFinite32});
+    ASSERT_EQ(out.size(), 64u);
+    EXPECT_EQ(out[0], 0u) << "ordered equality with a NaN remains false";
+    size_t nonfinite_caps = 0, controls2_caps = 0, extensions = 0;
+    std::set<uint32_t> nonfinite_widths;
+    for (size_t at = 5; at < words.size(); at += words[at] >> 16) {
+        const uint32_t opcode = words[at] & 0xffffu, length = words[at] >> 16;
+        if (opcode == 17u && length == 2u) {
+            nonfinite_caps += words[at + 1] == 4466u;
+            controls2_caps += words[at + 1] == 6029u;
+        }
+        if (opcode == 16u && length == 4u && words[at + 2] == 4461u)
+            nonfinite_widths.insert(words[at + 3]);
+        extensions += opcode == 10u;
+    }
+    EXPECT_EQ(nonfinite_caps, 1u);
+    EXPECT_EQ(controls2_caps, 1u);
+    EXPECT_EQ(extensions, 2u);
+    EXPECT_EQ(nonfinite_widths, (std::set<uint32_t>{32u, 64u}));
 }
 
 // The interpreter refuses a binary64 subnormal when the module did not ask Vulkan to keep it, so

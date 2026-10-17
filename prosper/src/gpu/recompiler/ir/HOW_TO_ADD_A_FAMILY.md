@@ -720,7 +720,7 @@ with `_F64` before the last `S_ENDPGM`), and report what it says.
 | --- | --- | --- |
 | opcodes | `ir.hpp` `F64Lt` .. `F64UnordGe` | the twelve binary64 relations, `(U64, U64) -> Bool`, after the U64 block (after `U64Bfe`). `argument_type` has its own rule giving U64 to both slots of `F64Lt` .. `F64UnordGe`; a new F64 opcode extends that range or adds a per-slot rule |
 | evaluation | `eval_float64.cpp` | `is_float64_opcode` routes them from `evaluate_wide`; the host evaluates in `double` with unflushed subnormals. The constant folder never sees an F64 opcode: keep it that way (no F64 folds) |
-| emission | `SpirvCompute::t_f64`, `fcmp64` (`spirv/float64.cpp`) | bitcasts both U64 words to `OpTypeFloat 64`. `t_f64()` declares `Float64`, `DenormPreserve`, `SPV_KHR_float_controls`, `SPV_KHR_float_controls2`, and 64-bit DenormPreserve/SignedZeroInfNanPreserve modes on first use; both operand Bitcasts carry `FPFastMathMode None`, so a module without F64 declares none of them |
+| emission | `SpirvCompute::t_f64`, `fcmp64` (`spirv/float64.cpp`) | bitcasts both U64 words to `OpTypeFloat 64`. `t_f64()` declares `Float64`, `DenormPreserve`, `SPV_KHR_float_controls`, `SPV_KHR_float_controls2`, and 64-bit DenormPreserve/SignedZeroInfNanPreserve modes on first use; both operand Bitcasts carry `FPFastMathMode None`. F64 declarations are lazy; existing F32 profile declarations are unchanged |
 | device gate | `float64_support.hpp` | `float64_admitted()` is true only after a device owner published shaderFloat64 ENABLED + shaderDenormPreserveFloat64 + independent denormal modes (`denormBehaviorIndependence = ALL`) + SZI64 + enabled shaderFloatControls2 + float controls permitted. Publishers are ANDed (the renderer, `tests/fixtures/render_runner.h`, and the private compute device, `frontends/shared/live/live_compute.cpp`, through `publish_device_float64` in `gpu/execute/float_controls_probe.hpp`). `shader_inspect` publishes a synthetic capable target for offline corpus checks, not a measured device verdict |
 | launch MODE | `lower/launch_float_mode.hpp` | the producing launch's FLOAT_MODE for fragment, compute and vertex stages; MODE cannot change inside an admitted program (`s_setreg` of MODE, `s_round_mode` and `s_denorm_mode` refuse) |
 
@@ -733,7 +733,8 @@ Every F64 lowering checks these before it emits an F64 opcode, and refuses **by 
   that a device cannot execute is invalid, not slow. Since the module requests only the 64-bit
   denormal mode, the device gate requires `denormBehaviorIndependence = ALL`; restricted
   independence refuses even when `shaderDenormPreserveFloat64` is true. Nonfinite comparison
-  inputs additionally require SZI64 and enabled shaderFloatControls2 for explicit Bitcast transport. An instruction that reads no F64 value
+  inputs additionally require SZI64 and enabled shaderFloatControls2 for explicit Bitcast transport.
+  An instruction that reads no F64 value
   (`v_cmp_f_f64`, `v_cmp_tru_f64`) needs no gate.
 - **MODE unknown:** a missing launch FLOAT_MODE refuses `f64-float-mode-unavailable`.
 - **Input denormals:** FP_DENORM[7:6] (AMD 70648 6.4, Table 24) is shared by F64 and F16. Bit 6
@@ -786,7 +787,8 @@ Copy the compare group's three tests:
 - `test_ir_core_float64.cpp`: hand-worked binary64 truth for each opcode (NaN on each side, quiet
   and signalling, +0 against -0, the infinities against `DBL_MAX`, subnormals against zero and at
   the normal boundary, a pair differing only in the low word); the U64 argument types; Float64 and
-  DenormPreserve, SZI64 and explicit transport declared only by a module that uses them; every opcode's SPIR-V per lane against
+  DenormPreserve, SZI64 and explicit transport declared only by a module that uses them; every
+  opcode's SPIR-V per lane against
   `evaluate`; and the interpreter's own control, which must refuse a subnormal once the module's
   mode is rewritten to `DenormFlushToZero`.
 - `test_ir_vector_compare_f64_execution.cpp`: the harness in both FLOAT_MODE input modes
@@ -800,7 +802,11 @@ Copy the compare group's three tests:
   `VK_KHR_shader_float_controls` when the device has them, and the test skips (with the reason)
   on a device without the complete F64 controls contract.
 
-The compare group's mutations, each of which turned at least one test red:
+The following mutation and gate receipts describe the original admission, before the complete
+float-controls correction (#5364). That correction changes F64 module bytes and requires its own
+validation; these receipts do not qualify the corrected device profile.
+
+The compare group's original mutations, each of which turned at least one test red:
 
 - `F64Le` evaluated as `<`; `F64UnordLt` emitted as `OpFOrdLessThan`;
 - LG defined as NEQ; O reading S0 twice;
