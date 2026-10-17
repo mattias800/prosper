@@ -34,4 +34,10 @@ bool lower_vop3_round_float(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, 
     rs.vreg[in.dst.value] = fresult(result);
     return true;
 }
+bool lower_vop3_float_values_erased(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok,
+                                    bool allow_wave, const BinaryFloatSource& fv,
+                                    const BinaryFloatResult& fresult) {
+    if (lower_vop3_round_float(b, rs, in, ok, fv, fresult)) return true;
+    return lower_vop3_binary_float_erased(b, rs, in, ok, allow_wave, fv, fresult);
+}
 }   // namespace prosper::gpu::ir
