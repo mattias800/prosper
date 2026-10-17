@@ -12,7 +12,7 @@ uint32_t VopcLowering::compare_value() {
     // (zero_compare, magnitude_compare). Only the f32 EQ/NEQ and LE/GE compares produce one.
     if (zero_cmp) return zero_cmp;
     if (magnitude_cmp) return magnitude_cmp;
-    // F16 definitions consume the existing unpacked sources, after the overrides.
+    // Definitions with prepared sources consume them after the value overrides.
     switch (eff) {
         case 0xC9:
         case 0xCA:
@@ -20,6 +20,7 @@ uint32_t VopcLowering::compare_value() {
         case 0xCC:
         case 0xCD:
         case 0xCE: return compare_f16();
+        case 0x88: return compare_class_f32();
         default: break;
     }
     // Opcodes with an ir/ops definition (ops/vector_compare_*.cpp).
@@ -30,7 +31,6 @@ uint32_t VopcLowering::compare_value() {
         case 0xA1: case 0xA2: case 0xA3: case 0xA4: case 0xA5: case 0xA6:
             cmp = compare_integer64_signed();
             break;
-        case 0x88: cmp = compare_class_f32(); break;                   // v_cmp_class_f32
         case 0xE1: case 0xE2: case 0xE3: case 0xE4: case 0xE5: case 0xE6:
             cmp = compare_integer64_unsigned();
             break;
@@ -70,35 +70,10 @@ uint32_t VopcLowering::compare_class_f32() {
         class_raw = b.ibin(Op_BitwiseAnd, class_raw, b.uconst(0x7fffffffu));
     if (in.src_neg[0])
         class_raw = b.ibin(Op_BitwiseXor, class_raw, b.uconst(0x80000000u));
-    const uint32_t sign = b.ucmp(
-        Op_INotEqual,
-        b.ibin(Op_BitwiseAnd, class_raw, b.uconst(0x80000000u)), b.uconst(0));
-    const uint32_t exponent =
-        b.ibin(Op_BitwiseAnd, class_raw, b.uconst(0x7f800000u));
-    const uint32_t mantissa =
-        b.ibin(Op_BitwiseAnd, class_raw, b.uconst(0x007fffffu));
-    const uint32_t exponent_zero = b.ucmp(Op_IEqual, exponent, b.uconst(0));
-    const uint32_t exponent_all = b.ucmp(Op_IEqual, exponent, b.uconst(0x7f800000u));
-    const uint32_t mantissa_zero = b.ucmp(Op_IEqual, mantissa, b.uconst(0));
-    const uint32_t quiet_nan = b.ucmp(
-        Op_INotEqual,
-        b.ibin(Op_BitwiseAnd, mantissa, b.uconst(0x00400000u)), b.uconst(0));
-
-    // AMD's mask order is sNaN, qNaN, -Inf, -normal, -subnormal, -zero,
-    // +zero, +subnormal, +normal, +Inf. Select the input's one-hot class bit,
-    // then test it against SRC1 (Astro's live packet uses 3 = either NaN).
-    const uint32_t nan_class = b.sel(quiet_nan, b.uconst(2), b.uconst(1));
-    const uint32_t inf_class = b.sel(sign, b.uconst(4), b.uconst(512));
-    const uint32_t exp_all_class = b.sel(mantissa_zero, inf_class, nan_class);
-    const uint32_t zero_class = b.sel(sign, b.uconst(32), b.uconst(64));
-    const uint32_t subnormal_class = b.sel(sign, b.uconst(16), b.uconst(128));
-    const uint32_t exp_zero_class = b.sel(mantissa_zero, zero_class, subnormal_class);
-    const uint32_t normal_class = b.sel(sign, b.uconst(8), b.uconst(256));
-    const uint32_t class_bit = b.sel(
-        exponent_all, exp_all_class,
-        b.sel(exponent_zero, exp_zero_class, normal_class));
-    return b.ucmp(Op_INotEqual,
-                  b.ibin(Op_BitwiseAnd, rc, class_bit), b.uconst(0));
+    if (const VectorCompareDef* def = find_vector_compare(eff))
+        return emit_vector_compare(b, *def, class_raw, rc);
+    ok = false;
+    return 0;
 }
 
 uint32_t VopcLowering::compare_integer64_unsigned() {
