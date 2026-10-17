@@ -2661,8 +2661,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     const uint32_t shift = raw_shift.shift;
                     uint32_t joined = raw_shift.joined;
                     if (raw_bits == 16) {
-                        const uint32_t dw1 = load_dword(
-                            b.ibin(Op_IAdd, idx, b.uconst(1)));
+                        const uint32_t dw1 = load_dword(ir::lower_buffer_next_dword(b, idx));
                         joined = ir::lower_buffer_raw_join(b, joined, dw1, shift);
                     }
                     value = ir::lower_buffer_raw_field(b, joined, raw_bits, raw_signed);
@@ -2686,10 +2685,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // shift-by-32 case, and the select discards that word when shift==0.
                     const auto location = ir::lower_buffer_half_location(b, addr, sk);
                     const uint32_t cidx = location.index, shift = location.shift;
-                    uint32_t joined = b.ibin(
-                        Op_ShiftRightLogical, load_dword(cidx), shift);
-                    const uint32_t dw1 = load_dword(
-                        b.ibin(Op_IAdd, cidx, b.uconst(1)));
+                    uint32_t joined = ir::lower_buffer_low_shift(b, load_dword(cidx), shift);
+                    const uint32_t dw1 = load_dword(ir::lower_buffer_next_dword(b, cidx));
                     joined = ir::lower_buffer_half_join(b, joined, dw1, shift);
                     value = ir::lower_buffer_half_field(b, joined);
                 } else if (dyn_int || dyn_norm) {
@@ -2701,11 +2698,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     const auto location =
                         ir::lower_buffer_dynamic_location(b, addr, sk, comp_bytes);
                     const uint32_t cidx = location.index, shift = location.shift;
-                    uint32_t joined = b.ibin(
-                        Op_ShiftRightLogical, load_dword(cidx), shift);
+                    uint32_t joined = ir::lower_buffer_low_shift(b, load_dword(cidx), shift);
                     if (comp_bytes == 2) {
-                        const uint32_t dw1 = load_dword(
-                            b.ibin(Op_IAdd, cidx, b.uconst(1)));
+                        const uint32_t dw1 = load_dword(ir::lower_buffer_next_dword(b, cidx));
                         joined = ir::lower_buffer_dynamic_join(b, joined, dw1, shift);
                     }
                     value = ir::lower_buffer_dynamic_field(b, joined, comp_bytes, dyn_norm,

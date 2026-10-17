@@ -8,6 +8,8 @@
 
 #include "gpu/recompiler/ir/ir.hpp"
 
+#include <bit>
+
 namespace prosper::gpu::ir {
 
 class Builder {
@@ -93,6 +95,12 @@ public:
     Value f32ldexp(Value a, Value exponent) { return u32(Opcode::F32Ldexp, a, exponent); }
     Value pack_norm16(Value a, bool is_signed) {
         return block_.append({Opcode::PackNorm16, Type::U32, uint32_t(is_signed), {a}});
+    }
+    Value normalize_field(Value a, float divisor, bool is_signed) {
+        const uint32_t bits = std::bit_cast<uint32_t>(divisor);
+        // Reserve the sign bit for the mode; a negative divisor is malformed metadata.
+        const uint32_t mode = bits >> 31 ? 0x7fc00000u : bits | (uint32_t(is_signed) << 31);
+        return block_.append({Opcode::NormalizeField, Type::U32, mode, {a}});
     }
     Value f32abs(Value a) { return block_.append({Opcode::F32Abs, Type::U32, 0, {a}}); }
     Value f32lt(Value a, Value b) { return cmp(Opcode::F32Lt, a, b); }

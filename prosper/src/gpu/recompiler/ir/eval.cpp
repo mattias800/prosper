@@ -3,6 +3,7 @@
 #include "gpu/recompiler/ir/eval_conversion.hpp"
 #include "gpu/recompiler/ir/eval_half.hpp"
 #include "gpu/recompiler/ir/eval_normalized_pack.hpp"
+#include "gpu/recompiler/ir/eval_normalized_field.hpp"
 #include "gpu/recompiler/ir/eval_float_unary.hpp"
 #include "gpu/recompiler/ir/eval_float_compare.hpp"
 #include "gpu/recompiler/ir/eval_integer64.hpp"
@@ -74,6 +75,7 @@ Known evaluate_op(Opcode op, uint32_t imm, uint32_t a, uint32_t b, uint32_t c) {
             return std::bit_cast<uint32_t>(
                 std::scalbn(std::bit_cast<float>(a), std::clamp(s(b), -512, 512)));
         case Opcode::PackNorm16: return evaluate_pack_norm16(a, imm);
+        case Opcode::NormalizeField: return evaluate_normalized_field(imm, a);
         case Opcode::PackHalfLo: return pack_half_rte(a);
         case Opcode::F32Fma: {
             // Selected finite, normal-or-zero binary32 RTE reference. GLSL.std.450 Fma's

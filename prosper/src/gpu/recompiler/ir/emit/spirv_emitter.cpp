@@ -5,6 +5,7 @@
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
 #include <span>
+#include <bit>
 #include <vector>
 #include <cstdio>
 #include <cstdlib>
@@ -38,6 +39,13 @@ uint32_t emit_one(SpirvCompute& b, const Inst& inst, const uint32_t* x) {
         case Opcode::F32Ldexp: return b.ldexp_f32_bits(x[0], x[1]);
         case Opcode::PackNorm16:
             return b.pack_norm(x[0], 16, inst.imm == 1, inst.imm == 1 ? 32767.0f : 65535.0f);
+        case Opcode::NormalizeField: {
+            const bool is_signed = inst.imm >> 31;
+            const float norm = std::bit_cast<float>(inst.imm & 0x7fffffffu);
+            const uint32_t converted = is_signed ? b.cvt_i2f(x[0]) : b.cvt_u2f(x[0]);
+            const uint32_t value = b.fbin(Op_FDiv, converted, b.bcu(b.fconstf(norm)));
+            return is_signed ? b.fext2(Glsl_FMax, value, b.bcu(b.fconstf(-1.0f))) : value;
+        }
         case Opcode::PackHalfLo: return b.pack_half_lo(x[0]);
         case Opcode::F32Add: return b.fbin(Op_FAdd, x[0], x[1]);
         case Opcode::F32Sub: return b.fbin(Op_FSub, x[0], x[1]);

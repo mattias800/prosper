@@ -39,4 +39,7 @@ uint32_t lower_buffer_static_field(SpirvCompute& b, uint32_t dw, uint32_t boff, 
                                    bool is_half, bool is_uint, bool is_sint, bool is_snorm,
                                    float norm);
 
+uint32_t lower_buffer_low_shift(SpirvCompute& b, uint32_t word, uint32_t shift);
+uint32_t lower_buffer_next_dword(SpirvCompute& b, uint32_t index);
+
 } // namespace prosper::gpu::ir
