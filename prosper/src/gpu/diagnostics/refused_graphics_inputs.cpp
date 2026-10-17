@@ -124,10 +124,13 @@ void read_arguments(In& in, RefusedGraphicsInputs& g) {
 std::vector<uint8_t> encode(const std::string& stage, const RefusedGraphicsInputs& g) {
     Out o;
     o.bytes.insert(o.bytes.end(), std::begin(kMagic), std::end(kMagic));
-    const uint32_t schema = g.vertex_float_mode != GraphicsFloatMode{} ||
+    const bool has_overflow = g.vertex_float_mode.fp16_overflow != Fp16OverflowMode{} ||
+                              g.shell.float_mode.fp16_overflow != Fp16OverflowMode{};
+    const uint32_t schema = has_overflow ? kRefusedGraphicsInputsSchema
+                            : g.vertex_float_mode != GraphicsFloatMode{} ||
                                     g.shell.float_mode != GraphicsFloatMode{} ||
                                     g.launch.rsrc1_available != 0
-                                ? kRefusedGraphicsInputsSchema
+                                ? 5u
                                 : 3u;
     o.num<uint32_t>(schema);
     o.text(stage);
@@ -154,6 +157,14 @@ std::vector<uint8_t> encode(const std::string& stage, const RefusedGraphicsInput
         };
         write_mode(g.vertex_float_mode);
         write_mode(g.shell.float_mode);
+    }
+    if (schema >= 6) {
+        for (const auto mode :
+             {g.vertex_float_mode.fp16_overflow, g.shell.float_mode.fp16_overflow}) {
+            require(mode.canonical(), "graphics-input half overflow mode");
+            o.num<uint8_t>(mode.available);
+            o.num<uint8_t>(mode.saturate);
+        }
     }
     require(o.bytes.size() <= kMaxFile - 8, "graphics-input file budget");
     o.num(hash(o.bytes));
@@ -214,7 +225,7 @@ RefusedShaderInputs decode_refused_graphics_inputs(const std::vector<uint8_t>& b
             "graphics-input checksum");
     In in{std::span(bytes).first(bytes.size() - 8), sizeof kMagic};
     const auto schema = in.num<uint32_t>();
-    require(schema == 2 || schema == 3 || schema == kRefusedGraphicsInputsSchema,
+    require(schema == 2 || schema == 3 || schema == 5 || schema == kRefusedGraphicsInputsSchema,
             "graphics-input schema");
     RefusedShaderInputs result;
     result.stage = in.text();
@@ -246,6 +257,14 @@ RefusedShaderInputs decode_refused_graphics_inputs(const std::vector<uint8_t>& b
         // its physical bank; native-vertex sidecars lack that association and stay unknown.
         g->shell.float_mode = graphics_float_mode_from_rsrc1(g->launch.rsrc1[0]);
     }
+    if (schema >= 6) {
+        for (auto* mode :
+             {&g->vertex_float_mode.fp16_overflow, &g->shell.float_mode.fp16_overflow}) {
+            mode->available = in.flag();
+            mode->saturate = in.flag();
+            require(mode->canonical(), "graphics-input half overflow mode");
+        }
+    }
     require(in.at == in.bytes.size() && !g->invocation.complete,
             "graphics-input trailing data or complete carrier");
     require(g->invocation.program_address == result.program_address &&
@@ -266,6 +285,8 @@ uint64_t refused_graphics_inputs_identity(const RefusedGraphicsInputs& g) {
         o.num<uint8_t>(mode.available);
         o.num(mode.value);
         o.num<uint8_t>(mode.ieee_mode);
+        o.num<uint8_t>(mode.fp16_overflow.available);
+        o.num<uint8_t>(mode.fp16_overflow.saturate);
     }
     // Code/chain and semantic choices participate. Buffer bytes and host pointer values do not.
     const auto& actual = g.invocation;

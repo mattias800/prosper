@@ -23,7 +23,7 @@ namespace P = prosper::agc::Pm4;
 namespace {
 constexpr FragmentFloatFlags kUnknownFlags{};
 constexpr FragmentLaunchRsrc1 kUnavailableWord{};
-constexpr FragmentFloatFlags kKnownFlagsClear{true, false, false};
+constexpr FragmentFloatFlags kKnownFlagsClear{true, false, false, {true, false}};
 constexpr FragmentFloatMode kUnknownMode{};
 constexpr FragmentFloatMode kKnownModeZero{true, 0};
 constexpr FragmentLaunchRsrc1 kRawEvidenceZero{true, 0};
@@ -52,7 +52,8 @@ TEST(FragmentFloatFlags, EveryLaunchRegisterExtractionDecodesItsThreeAuthorities
             launch.sh[P::SPI_SHADER_PGM_RSRC1_PS] =
                 (mode << 12) | ((flags & 1u) << 21) | ((flags & 2u) << 22) | (1u << 22) | 0x3fu;
             const auto decoded = extract_render_state(launch);
-            const FragmentFloatFlags expected{true, (flags & 2u) != 0, (flags & 1u) != 0};
+            const FragmentFloatFlags expected{
+                true, (flags & 2u) != 0, (flags & 1u) != 0, {true, false}};
             const FragmentFloatMode expected_mode{true, static_cast<uint8_t>(mode)};
             const FragmentLaunchRsrc1 expected_word{true, launch.sh.at(P::SPI_SHADER_PGM_RSRC1_PS)};
             SCOPED_TRACE(::testing::Message() << "FLOAT_MODE=" << mode << " flags=" << flags);

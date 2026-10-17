@@ -8862,7 +8862,7 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
         ComputeShaderConfig config;
         config.dispatch_launch = compute_dispatch_launch_state(dispatch);
         config.float_transport = published_float_transport_config();
-        config.compute_pgm_rsrc1 = rd(ds.sh, P::COMPUTE_PGM_RSRC1);
+        populate_compute_launch_rsrc1(config, ds.sh);
         config.user_sgprs.assign(sgprs, sgprs + std::min(user_count, kUserSgprs));
         config.local_x = launch.local_x;
         config.local_y = launch.local_y;

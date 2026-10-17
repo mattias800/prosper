@@ -256,7 +256,7 @@ static void codec_tests(const FragmentCompileCase& produced) {
         CHECK(error([&] { decode_fragment_compile_case(bad); }).find("checksum") != std::string::npos);
     }
     auto schema = wire;
-    schema[8] = 8;
+    schema[8] = 9;
     rechecksum(schema);
     CHECK(error([&] { decode_fragment_compile_case(schema); }).find("schema") != std::string::npos);
     auto boolean = wire; boolean[12] = 2; rechecksum(boolean);

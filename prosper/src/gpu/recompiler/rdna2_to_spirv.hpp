@@ -19,6 +19,7 @@
 #include <vector>
 #include <span>
 #include "gpu/recompiler/fragment_float_mode.hpp"
+#include "gpu/recompiler/fp16_overflow_mode.hpp"
 #include "gpu/recompiler/fragment_float_flags.hpp"
 #include "gpu/recompiler/graphics_float_mode.hpp"
 #include "gpu/recompiler/fragment_export_formats.hpp"
@@ -866,6 +867,8 @@ struct ComputeShaderConfig {
     // ADR 0006: values for the switch-type compiler choices this module's emitters read. Unset
     // entries still read the environment until every stage has migrated.
     CompilerChoiceSet choices{};
+    // Independent producing observation: a legacy/default raw RSRC1 word grants no authority.
+    Fp16OverflowMode fp16_overflow{};
 };
 
 // Translate a game compute program without the synthetic binding-0 input / binding-1 output used by

@@ -226,7 +226,9 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // leave it unavailable; an observed raw raster register is not retrospectively a compiler argument.
 // v77 adds the vertex/NGG producing FLOAT_MODE and IEEE_MODE, with explicit unavailable state.
 // It is appended only when needed; captures without these compiler inputs retain their old bytes.
-constexpr uint32_t kVersion = 77;
+// v78 appends independent producing FP16_OVFL facts for graphics; legacy captures stay unknown.
+constexpr uint32_t kVersion = 78;
+constexpr uint32_t kVersionWithFp16OverflowMode = 78;
 constexpr uint32_t kVersionWithGraphicsFloatMode = 77;
 constexpr uint32_t kVersionWithFrontFaceEncoding = 76;
 constexpr uint32_t kVersionWithComputeDispatchLaunch = 75;
@@ -246,6 +248,21 @@ inline bool gpu_capture_has_unavailable_source(const GpuCaptureFile& c) {
 }
 // The lowest version whose tails can hold everything this capture carries.
 inline uint32_t gpu_capture_version_for(const GpuCaptureFile& c) {
+    for (const auto& compute : c.computes)
+        if (compute.recompile_config.fp16_overflow != Fp16OverflowMode{})
+            return kVersionWithFp16OverflowMode;
+    for (const auto& diagnostic : c.failure_diagnostics)
+        for (const auto& stage : diagnostic.stages)
+            if (stage.recompile_config.fp16_overflow != Fp16OverflowMode{})
+                return kVersionWithFp16OverflowMode;
+    for (const auto& draw : c.draws)
+        if (draw.vertex_float_mode.fp16_overflow != Fp16OverflowMode{} ||
+            draw.ps_float_flags.fp16_overflow != Fp16OverflowMode{})
+            return kVersionWithFp16OverflowMode;
+    for (const auto& diagnostic : c.failure_diagnostics)
+        if (diagnostic.vertex_float_mode.fp16_overflow != Fp16OverflowMode{} ||
+            diagnostic.ps_float_flags.fp16_overflow != Fp16OverflowMode{})
+            return kVersionWithFp16OverflowMode;
     for (const auto& draw : c.draws)
         if (draw.vertex_float_mode != GraphicsFloatMode{}) return kVersionWithGraphicsFloatMode;
     for (const auto& diagnostic : c.failure_diagnostics)
@@ -900,6 +917,10 @@ inline bool validate_compute_config(const ComputeShaderConfig& config,
                              uint32_t required_subgroup_size,
                              const char* state_error,
                              std::string& error) {
+    if (!config.fp16_overflow.canonical()) {
+        error = "invalid compute half overflow mode";
+        return false;
+    }
     if (!config.float_transport.canonical()) {
         error = "invalid compute float transport config";
         return false;
@@ -930,6 +951,12 @@ inline bool validate_compute_config(const ComputeShaderConfig& config,
 
 inline bool validate_compute_recompile_state(const GpuCapturedCompute& compute,
                                       std::string& error) {
+    if (!compute.recompile_config.fp16_overflow.canonical() ||
+        (!compute.recompile_config_available &&
+         compute.recompile_config.fp16_overflow != Fp16OverflowMode{})) {
+        error = "invalid compute half overflow presence";
+        return false;
+    }
     if (!compute.recompile_config.float_transport.canonical()) {
         error = "invalid compute float transport config";
         return false;
@@ -1414,13 +1441,14 @@ inline bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::str
             return false;
         }
         if (!diagnostic.ps_float_flags.canonical() ||
-            (diagnostic.kind != SubmitOperationKind::Draw && diagnostic.ps_float_flags.available)) {
+            (diagnostic.kind != SubmitOperationKind::Draw &&
+             diagnostic.ps_float_flags != FragmentFloatFlags{})) {
             error = "invalid failed-draw fragment float flags";
             return false;
         }
         if (!diagnostic.vertex_float_mode.canonical() ||
             (diagnostic.kind != SubmitOperationKind::Draw &&
-             diagnostic.vertex_float_mode.available)) {
+             diagnostic.vertex_float_mode != GraphicsFloatMode{})) {
             error = "invalid failed-draw graphics float mode";
             return false;
         }
@@ -1491,6 +1519,12 @@ inline bool validate_failure_diagnostics(const GpuCaptureFile& capture, std::str
                 (stage.resource_table.present != stage.resource_table_present ||
                  stage.resource_table.resources.size() != stage.resource_count)) {
                 error = "failed-stage resource table disagrees with its diagnostic summary";
+                return false;
+            }
+            if (!stage.recompile_config.fp16_overflow.canonical() ||
+                (!stage.recompile_config_available &&
+                 stage.recompile_config.fp16_overflow != Fp16OverflowMode{})) {
+                error = "invalid failed-compute half overflow presence";
                 return false;
             }
             if (stage.recompile_config_available &&

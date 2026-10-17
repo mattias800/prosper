@@ -1436,6 +1436,43 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
                 return false;
             }
     }
+    if (gpu_capture_version_for(c) >= kVersionWithFp16OverflowMode) {
+        const auto write_overflow = [&](Fp16OverflowMode mode) {
+            if (!mode.canonical()) return false;
+            w.u8(mode.available);
+            w.u8(mode.saturate);
+            return true;
+        };
+        w.u32(static_cast<uint32_t>(c.draws.size()));
+        for (const auto& draw : c.draws)
+            if (!write_overflow(draw.vertex_float_mode.fp16_overflow) ||
+                !write_overflow(draw.ps_float_flags.fp16_overflow)) {
+                error = "invalid draw half overflow mode";
+                return false;
+            }
+        w.u32(static_cast<uint32_t>(c.failure_diagnostics.size()));
+        for (const auto& diagnostic : c.failure_diagnostics)
+            if (!write_overflow(diagnostic.vertex_float_mode.fp16_overflow) ||
+                !write_overflow(diagnostic.ps_float_flags.fp16_overflow)) {
+                error = "invalid failed draw half overflow mode";
+                return false;
+            }
+        w.u32(static_cast<uint32_t>(c.computes.size()));
+        for (const auto& compute : c.computes)
+            if (!write_overflow(compute.recompile_config.fp16_overflow)) {
+                error = "invalid compute half overflow mode";
+                return false;
+            }
+        w.u32(static_cast<uint32_t>(c.failure_diagnostics.size()));
+        for (const auto& diagnostic : c.failure_diagnostics) {
+            w.u32(static_cast<uint32_t>(diagnostic.stages.size()));
+            for (const auto& stage : diagnostic.stages)
+                if (!write_overflow(stage.recompile_config.fp16_overflow)) {
+                    error = "invalid failed-compute half overflow mode";
+                    return false;
+                }
+        }
+    }
     // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail
     // existed, so a capture sitting just under the maximum could serialize successfully into a file
     // that read_gpu_capture then rejects as oversized -- a write that reports success and produces

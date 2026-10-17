@@ -24,6 +24,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstring>
 #include <cstddef>
 #include <cstdint>
@@ -580,4 +581,124 @@ TEST(RefusedShaderInputs, InvalidRawLaunchPresenceIsNotAValidArtifact) {
     c.dispatch_launch.known = 255;
     EXPECT_FALSE(
         write_refused_compute_inputs(root / "invalid.inputs", 0x4930, nullptr, c, "refusal"));
+}
+
+// #4096: producing overflow authority is separate from a legacy raw word or cleared bit.
+TEST(RefusedShaderInputs, ComputeOverflowRoundTripKeepsThreeIndependentStates) {
+    const auto root = fresh_root("refused_inputs_compute_overflow");
+    constexpr std::array<Fp16OverflowMode, 3> modes{{{}, {true, false}, {true, true}}};
+    for (size_t i = 0; i < modes.size(); ++i) {
+        auto c = prosper::test::portable_entry_exec::config();
+        c.compute_pgm_rsrc1 = 0;   // all three facts deliberately share the same legacy raw word
+        c.fp16_overflow = modes[i];
+        const auto path = root / (std::to_string(i) + ".inputs");
+        ASSERT_TRUE(write_refused_compute_inputs(path, 0x4096, nullptr, c, "refusal"));
+        const auto bytes = sidecar_bytes(path);
+        ASSERT_GE(bytes.size(), 12u);
+        EXPECT_EQ(bytes[8], i == 0 ? 4u : 7u);
+        EXPECT_EQ(bytes[9] | bytes[10] | bytes[11], 0u);
+        const auto decoded = decode_refused_shader_inputs(bytes);
+        EXPECT_EQ(decoded.stage, "cs");
+        EXPECT_EQ(decoded.compute.compute_pgm_rsrc1, 0u);
+        EXPECT_EQ(decoded.compute.dispatch_launch, c.dispatch_launch);
+        EXPECT_EQ(decoded.compute.fp16_overflow, modes[i]);
+    }
+}
+
+TEST(RefusedShaderInputs, LegacyComputeWordsCannotInventOverflowAuthority) {
+    const auto root = fresh_root("refused_inputs_old_compute_overflow");
+    for (const uint32_t raw : {0u, 1u << 26}) {
+        auto c = prosper::test::portable_entry_exec::config();
+        c.compute_pgm_rsrc1 = raw;
+        const auto path = root / (std::to_string(raw) + ".inputs");
+        ASSERT_TRUE(write_refused_compute_inputs(path, 0x4096, nullptr, c, "refusal"));
+        auto bytes = sidecar_bytes(path);
+        ASSERT_GT(bytes.size(), 44u);
+        ASSERT_EQ(bytes[8], 4u);
+        const auto schema4 = decode_refused_shader_inputs(bytes);
+        EXPECT_EQ(schema4.compute.compute_pgm_rsrc1, raw);
+        EXPECT_EQ(schema4.compute.dispatch_launch, c.dispatch_launch);
+        EXPECT_EQ(schema4.compute.fp16_overflow, Fp16OverflowMode{});
+        bytes.erase(bytes.end() - 44, bytes.end() - 8);   // remove only schema4 launch appendix
+        bytes[8] = 1;
+        checksum_sidecar(bytes);
+        const auto schema1 = decode_refused_shader_inputs(bytes);
+        EXPECT_EQ(schema1.compute.compute_pgm_rsrc1, raw);
+        EXPECT_EQ(schema1.compute.dispatch_launch, ComputeDispatchLaunchState{});
+        EXPECT_EQ(schema1.compute.fp16_overflow, Fp16OverflowMode{});
+    }
+}
+
+TEST(RefusedShaderInputs, OverflowAppendixCannotBeMisreadAsAnOlderComputeSchema) {
+    const auto root = fresh_root("refused_inputs_overflow_appendix");
+    auto c = prosper::test::portable_entry_exec::config();
+    c.fp16_overflow = {true, true};
+    const auto path = root / "overflow.inputs";
+    ASSERT_TRUE(write_refused_compute_inputs(path, 0x4096, nullptr, c, "refusal"));
+    auto bytes = sidecar_bytes(path);
+    ASSERT_GT(bytes.size(), 46u);
+    ASSERT_EQ(bytes[8], 7u);
+    ASSERT_EQ(bytes[bytes.size() - 10], 1u);
+    ASSERT_EQ(bytes[bytes.size() - 9], 1u);
+    auto wrong_schema = bytes;
+    wrong_schema[8] = 4;
+    checksum_sidecar(wrong_schema);
+    EXPECT_THROW(decode_refused_shader_inputs(wrong_schema), std::runtime_error);
+    bytes.erase(bytes.end() - 10, bytes.end() - 8);   // real schema4, not a retagged schema7
+    bytes[8] = 4;
+    checksum_sidecar(bytes);
+    const auto old = decode_refused_shader_inputs(bytes);
+    EXPECT_EQ(old.compute.dispatch_launch, c.dispatch_launch);
+    EXPECT_EQ(old.compute.fp16_overflow, Fp16OverflowMode{});
+}
+
+TEST(RefusedShaderInputs, InvalidOverflowBooleanAndCrossStageKindsAreRejected) {
+    const auto root = fresh_root("refused_inputs_invalid_overflow");
+    auto c = prosper::test::portable_entry_exec::config();
+    c.fp16_overflow = {true, true};
+    const auto path = root / "overflow.inputs";
+    ASSERT_TRUE(write_refused_compute_inputs(path, 0x4096, nullptr, c, "refusal"));
+    const auto bytes = sidecar_bytes(path);
+    ASSERT_GT(bytes.size(), 18u);
+    for (const size_t offset : {bytes.size() - 10, bytes.size() - 9}) {
+        auto invalid = bytes;
+        invalid[offset] = 2;
+        checksum_sidecar(invalid);
+        EXPECT_THROW(decode_refused_shader_inputs(invalid), std::runtime_error);
+    }
+    auto unavailable_set = bytes;
+    unavailable_set[bytes.size() - 10] = 0;
+    checksum_sidecar(unavailable_set);
+    EXPECT_THROW(decode_refused_shader_inputs(unavailable_set), std::runtime_error);
+    auto cross_stage = bytes;
+    ASSERT_EQ(cross_stage[16], 'c');   // magic, schema, length, then the two stage bytes
+    cross_stage[16] = 'v';
+    checksum_sidecar(cross_stage);
+    EXPECT_THROW(decode_refused_shader_inputs(cross_stage), std::runtime_error);
+    auto cross_schema = bytes;
+    cross_schema[8] = 6;   // graphics schema6 must never be accepted as compute schema7
+    checksum_sidecar(cross_schema);
+    EXPECT_THROW(decode_refused_shader_inputs(cross_schema), std::runtime_error);
+    c.fp16_overflow = {false, true};
+    EXPECT_FALSE(write_refused_compute_inputs(root / "bad.inputs", 0x4096, nullptr, c, "refusal"));
+    EXPECT_FALSE(fs::exists(root / "bad.inputs"));
+}
+
+TEST(RefusedShaderInputs, OverflowIdentityAndDedupKeepUnknownClearAndSetDistinct) {
+    fresh_root("refused_inputs_overflow_identity");
+    const auto code = fixture_code();
+    constexpr std::array<Fp16OverflowMode, 3> modes{{{}, {true, false}, {true, true}}};
+    std::array<uint64_t, modes.size()> identities{};
+    auto inputs = live_inputs();
+    inputs.config.compute_pgm_rsrc1 = 0;
+    for (size_t i = 0; i < modes.size(); ++i) {
+        inputs.config.fp16_overflow = modes[i];
+        identities[i] = refused_compute_inputs_identity(&inputs.table, inputs.config);
+        for (size_t previous = 0; previous < i; ++previous)
+            EXPECT_NE(identities[previous], identities[i]);
+        refuse_live(code, 0x4096, inputs);
+        EXPECT_EQ(only_input_set_count(), i + 1);
+        refuse_live(code, 0x4096, inputs);
+        EXPECT_EQ(only_input_set_count(), i + 1) << "equal observation reuses its own input set";
+    }
 }

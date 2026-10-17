@@ -1,4 +1,5 @@
 #pragma once
+#include "gpu/recompiler/fp16_overflow_mode.hpp"
 #include <cstdint>
 
 namespace prosper::gpu {
@@ -10,8 +11,11 @@ struct FragmentFloatFlags {
     bool ieee_mode = false;
     bool dx10_clamp = false;
 
+    Fp16OverflowMode
+        fp16_overflow{}; // independently observed; old flags do not imply known clear
+
     constexpr bool canonical() const {
-        return available || (!ieee_mode && !dx10_clamp);
+        return (available || (!ieee_mode && !dx10_clamp)) && fp16_overflow.canonical();
     }
     bool operator==(const FragmentFloatFlags&) const = default;
 };

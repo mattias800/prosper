@@ -220,6 +220,7 @@ struct ShaderCompileKey {
     uint32_t compute_threads_x = 0, compute_threads_y = 0, compute_threads_z = 0;
     uint32_t compute_wave_size = 64;
     uint32_t compute_pgm_rsrc1 = kDefaultComputePgmRsrc1;
+    Fp16OverflowMode compute_fp16_overflow{};
     uint32_t compute_tidig_comp_cnt = 0;
     bool compute_tgid_x_en = false, compute_tgid_y_en = false, compute_tgid_z_en = false;
     bool compute_tg_size_en = false;
@@ -294,6 +295,7 @@ struct ShaderCompileKey {
                compute_threads_z == other.compute_threads_z &&
                compute_wave_size == other.compute_wave_size &&
                compute_pgm_rsrc1 == other.compute_pgm_rsrc1 &&
+               compute_fp16_overflow == other.compute_fp16_overflow &&
                compute_tidig_comp_cnt == other.compute_tidig_comp_cnt &&
                compute_tgid_x_en == other.compute_tgid_x_en &&
                compute_tgid_y_en == other.compute_tgid_y_en &&
@@ -374,10 +376,14 @@ struct ShaderCompileKeyHash {
         hash = hash_mix(hash, key.vertex_float_mode.available);
         hash = hash_mix(hash, key.vertex_float_mode.value);
         hash = hash_mix(hash, key.vertex_float_mode.ieee_mode);
+        hash = hash_mix(hash, key.vertex_float_mode.fp16_overflow.available);
+        hash = hash_mix(hash, key.vertex_float_mode.fp16_overflow.saturate);
         hash = hash_mix(hash, static_cast<uint8_t>(key.float_transport.profile));
         hash = hash_mix(hash, key.fragment_float_flags.available);
         hash = hash_mix(hash, key.fragment_float_flags.ieee_mode);
         hash = hash_mix(hash, key.fragment_float_flags.dx10_clamp);
+        hash = hash_mix(hash, key.fragment_float_flags.fp16_overflow.available);
+        hash = hash_mix(hash, key.fragment_float_flags.fp16_overflow.saturate);
         hash = hash_mix(hash, key.fragment_launch_rsrc1.available);
         hash = hash_mix(hash, key.fragment_launch_rsrc1.value);
         hash = hash_mix(hash, key.fragment_export_formats.compressed_formats);
@@ -403,6 +409,8 @@ struct ShaderCompileKeyHash {
             hash = hash_mix(hash, key.compute_threads_z);
             hash = hash_mix(hash, key.compute_wave_size);
             hash = hash_mix(hash, key.compute_pgm_rsrc1);
+            hash = hash_mix(hash, key.compute_fp16_overflow.available);
+            hash = hash_mix(hash, key.compute_fp16_overflow.saturate);
             hash = hash_mix(hash, key.compute_tidig_comp_cnt);
             hash = hash_mix(hash, key.compute_tgid_x_en);
             hash = hash_mix(hash, key.compute_tgid_y_en);

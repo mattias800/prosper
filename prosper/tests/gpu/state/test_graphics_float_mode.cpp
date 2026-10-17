@@ -31,7 +31,7 @@ TEST(GraphicsFloatMode, AbsentAndObservedZeroAreDifferent) {
     EXPECT_EQ(graphics_float_mode(state, GraphicsHardwareStage::Geometry), GraphicsFloatMode{});
     state.sh[0x8a] = 0;
     EXPECT_EQ(graphics_float_mode(state, GraphicsHardwareStage::Geometry),
-              (GraphicsFloatMode{true, 0, false}));
+              (GraphicsFloatMode{true, 0, false, {true, false}}));
     EXPECT_TRUE(GraphicsFloatMode{}.canonical());
     EXPECT_FALSE((GraphicsFloatMode{false, 1, false}.canonical()));
     EXPECT_FALSE((GraphicsFloatMode{false, 0, true}.canonical()));
@@ -46,7 +46,8 @@ TEST(GraphicsFloatMode, NggAndMergedEsGsUseGsWhileLegacyVertexUsesVs) {
     for (uint32_t stages : {0u, 0x20u, 0x2000u, 0x2020u}) {
         state.cx[0x2d5] = stages;   // VGT_SHADER_STAGES_EN
         const GraphicsFloatMode expected =
-            stages ? GraphicsFloatMode{true, 0x82, true} : GraphicsFloatMode{true, 0x31, false};
+            stages ? GraphicsFloatMode{true, 0x82, true, {true, false}}
+                   : GraphicsFloatMode{true, 0x31, false, {true, false}};
         EXPECT_EQ(vertex_graphics_float_mode(state), expected);
         EXPECT_EQ(extract_render_state_uncached(state).vertex_float_mode, expected);
     }

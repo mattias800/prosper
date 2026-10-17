@@ -207,6 +207,11 @@ uint64_t refused_compute_inputs_identity(const ShaderResourceTable* table,
     HashOut encoded;
     write_config(encoded, c);
     write_launch(encoded, c.dispatch_launch);
+    // Unknown retains the legacy identity; an observed clear bit is a distinct producing input.
+    if (c.fp16_overflow.available) {
+        encoded.num<uint8_t>(c.fp16_overflow.available);
+        encoded.num<uint8_t>(c.fp16_overflow.saturate);
+    }
     uint64_t hash = encoded.hash;
     mix(hash, compile_case_resource_metadata_identity(table));
     return hash;
@@ -220,9 +225,11 @@ std::vector<uint8_t> encode(const std::string& stage, uint64_t address,
     require(config.user_sgprs.size() <= 64, "refused-shader inputs user-SGPR bound");
     require(!(config.dispatch_launch.known & ~ComputeDispatchLaunchState::kAll),
             "refused-shader inputs launch presence");
+    require(config.fp16_overflow.canonical(), "refused-shader inputs FP16 overflow");
+    const uint32_t schema = config.fp16_overflow.available ? kRefusedShaderInputsSchema : 4;
     Out o;
     o.bytes.insert(o.bytes.end(), std::begin(kMagic), std::end(kMagic));
-    o.num<uint32_t>(kRefusedShaderInputsSchema);
+    o.num<uint32_t>(schema);
     o.text(stage);
     o.num<uint64_t>(address);
     o.text(live_reject);
@@ -231,6 +238,10 @@ std::vector<uint8_t> encode(const std::string& stage, uint64_t address,
     write_config(o, config);
     o.blob(carrier);
     write_launch(o, config.dispatch_launch);
+    if (schema >= 7) {
+        o.num<uint8_t>(config.fp16_overflow.available);
+        o.num<uint8_t>(config.fp16_overflow.saturate);
+    }
     o.num<uint64_t>(fnv(o.bytes.data(), o.bytes.size()));
     return std::move(o.bytes);
 }
@@ -246,18 +257,24 @@ RefusedShaderInputs decode_refused_shader_inputs(const std::vector<uint8_t>& byt
             "not a refused-shader inputs file");
     In in{bytes, bytes.size() - 8, sizeof kMagic};
     const uint32_t schema = in.num<uint32_t>();
-    if (schema == 2 || schema == 3 || schema == kRefusedGraphicsInputsSchema)
+    if (schema == 2 || schema == 3 || schema == 5 || schema == kRefusedGraphicsInputsSchema)
         return decode_refused_graphics_inputs(bytes);
-    require(schema == 1 || schema == kRefusedShaderInputsSchema, "refused-shader inputs schema");
+    require(schema == 1 || schema == 4 || schema == kRefusedShaderInputsSchema,
+            "refused-shader inputs schema");
     RefusedShaderInputs inputs;
     inputs.stage = in.text();
+    require(inputs.stage == "cs", "refused-shader inputs compute stage");
     inputs.program_address = in.num<uint64_t>();
     inputs.live_reject = in.text();
     inputs.incomplete = in.text();
     inputs.payload_omitted = in.flag();
     inputs.compute = read_config(in);
     const std::vector<uint8_t> carrier = in.blob();
-    if (schema == kRefusedShaderInputsSchema) inputs.compute.dispatch_launch = read_launch(in);
+    if (schema >= 4) inputs.compute.dispatch_launch = read_launch(in);
+    if (schema >= 7) {
+        inputs.compute.fp16_overflow = {in.flag(), in.flag()};
+        require(inputs.compute.fp16_overflow.canonical(), "refused-shader inputs FP16 overflow");
+    }
     require(in.at == in.end, "refused-shader inputs trailing data");
     if (!carrier.empty()) {
         FragmentCompileCase c = decode_fragment_compile_case(carrier);
