@@ -156,7 +156,7 @@ TEST(IrHalfFmaFiniteExecution, ExportsReplayedWitnessesAndExecutesThoseExactModu
         fs::remove_all(root, error);
         ASSERT_FALSE(error);
     }
-    ASSERT_FALSE(fs::exists(root));
+    ASSERT_FALSE(fs::exists(root)) << root << " must not exist; the export refuses to overwrite";
     const auto dump = root / "refused_shaders_20000101-000000Z_synthetic";
     ASSERT_TRUE(fs::create_directories(dump));
     std::ofstream manifest(root / "manifest.tsv");
