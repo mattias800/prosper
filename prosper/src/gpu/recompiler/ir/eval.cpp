@@ -72,6 +72,8 @@ Known evaluate_op(Opcode op, uint32_t imm, uint32_t a, uint32_t b, uint32_t c) {
                 std::scalbn(std::bit_cast<float>(a), std::clamp(s(b), -512, 512)));
         case Opcode::PackNorm16: return evaluate_pack_norm16(a, imm);
         case Opcode::PackHalfLo: return pack_half_rte(a);
+        case Opcode::F32AddNoContraction: return evaluate_op(Opcode::F32Add, imm, a, b, c);
+        case Opcode::F32MulNoContraction: return evaluate_op(Opcode::F32Mul, imm, a, b, c);
         case Opcode::F32Add:
         case Opcode::F32Sub:
         case Opcode::F32Mul:

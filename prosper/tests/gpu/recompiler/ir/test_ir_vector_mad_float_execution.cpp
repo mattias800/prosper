@@ -239,8 +239,8 @@ TEST(IrVectorMadFloatExecution, DefinitionFactsRequiredSourcesAndNonfusedScopeAr
         EXPECT_EQ(eval_mad_float_op(def, {0x3f800000u, 0x40000000u, 0x40400000u}),
                   Known(0x40a00000));
     }
-    EXPECT_TRUE(seen.contains(Opcode::F32Mul));
-    EXPECT_TRUE(seen.contains(Opcode::F32Add));
+    EXPECT_TRUE(seen.contains(Opcode::F32MulNoContraction));
+    EXPECT_TRUE(seen.contains(Opcode::F32AddNoContraction));
     EXPECT_EQ(find_vector_mad_float_op(Rdna2Format::VOP3, 0x14b), nullptr);
     EXPECT_EQ(find_vector_mad_float_op(Rdna2Format::VOP3, 0x34b), nullptr);
     EXPECT_EQ(find_vector_mad_float_op(Rdna2Format::VOP2, 0x141), nullptr);
