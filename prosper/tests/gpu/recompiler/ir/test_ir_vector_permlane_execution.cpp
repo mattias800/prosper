@@ -2,6 +2,7 @@
 // FI=0/BC=0 expectations explicitly retain the old implementation's compatibility contract.
 #include "gpu/recompiler/ir/permlane_cases.hpp"
 #include "gpu/diagnostics/refused_shader_inputs.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "fixtures/test_scratch.h"
 #include <gtest/gtest.h>
 #include <cstdlib>
