@@ -1068,7 +1068,8 @@ int main(int argc, char** argv) {
         SpirvCompute builder;
         builder.begin(1, nullptr, 32, 1, 1, 32, 0, true, true);
         prosper::test::ir::smem_index::emit_fixture(builder);
-        dump(dir, "ir_smem_index_values", builder.finish(), "emit_smem_index_value");
+        // The helper appends IDs to this builder; it is not a separate module producer.
+        dump(dir, "ir_smem_index_values", builder.finish());
     }
     // This VOP3 LSHL_ADD route calls the ordered IR input resolver; validate its containing module.
     {
