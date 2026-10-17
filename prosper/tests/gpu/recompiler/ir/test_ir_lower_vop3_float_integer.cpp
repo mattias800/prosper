@@ -1,4 +1,5 @@
 // Numeric stage contracts, independently of the caller's source proofs and final EXEC write.
+#include <vector>
 #include "gpu/recompiler/ir/lower/vop3_float_integer_lowering.hpp"
 #include "gpu/recompiler/ir/lowering_fixture.hpp"
 #include "gpu/recompiler/ir/ops/vector_float_integer_e64.hpp"

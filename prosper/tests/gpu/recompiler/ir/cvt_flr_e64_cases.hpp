@@ -1,5 +1,6 @@
 // Test-owned FLR encodings and finite bit reference; no host floating-point arithmetic.
 #pragma once
+#include "gpu/recompiler/bpermute_spirv_oracle.hpp"
 #include "gpu/recompiler/ir/vector_lane_harness.hpp"
 #include <cstddef>
 #include <cstdint>

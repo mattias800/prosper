@@ -1,5 +1,7 @@
 // Canonical e64 FLR reuses corrected e32 semantics; finite independent answers,
 // both permitted Floor input profiles, and source ownership must survive admission.
+#include "gpu/recompiler/ir/vector_lane_harness.hpp"
+#include "gpu/recompiler/ir/ops/vector_conversion.hpp"
 #include "gpu/recompiler/ir/cvt_flr_e64_cases.hpp"
 #include "gpu/recompiler/ir/ops/vector_float_integer_e64.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"

@@ -1,4 +1,5 @@
 // AMD 70648 12.8: truncate, saturate out-of-range values, and convert NaN to zero.
+#include "gpu/recompiler/ir/ops/vector_conversion.hpp"
 #include "gpu/recompiler/ir/ops/vector_float_integer_e64.hpp"
 namespace prosper::gpu::ir {
 namespace {
