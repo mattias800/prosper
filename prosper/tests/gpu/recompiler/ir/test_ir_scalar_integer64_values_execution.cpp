@@ -111,7 +111,7 @@ TEST(IrScalarInteger64ValuesExecution, EveryDefinitionRunsPerLaneLikeEvalAndInde
                 ASSERT_TRUE(eval.first);
                 const uint64_t reference = scalar64_reference(def, x);
                 if (shape.second.valid()) ASSERT_TRUE(eval.second);
-                const uint64_t evaluated = *eval.first | (eval.second.value_or(0) << 32);
+                const uint64_t evaluated = eval.first.value_or(0) | (eval.second.value_or(0) << 32);
                 ASSERT_EQ(evaluated, reference) << " lane " << lane;
                 ASSERT_EQ(out[size_t(2) * lane], (lane & 3) ? uint32_t(reference) : 0xdeadbeef);
                 ASSERT_EQ(out[size_t(2) * lane + 1],
@@ -177,7 +177,7 @@ TEST(IrScalarInteger64ValuesExecution, HandWorkedIsaCasesAreIndependentOfEval) {
         ASSERT_NE(def, nullptr);
         const auto got = eval_scalar_integer64_value(*def, scalar64_inputs(r.x));
         ASSERT_TRUE(got.first);
-        ASSERT_EQ(*got.first | (got.second.value_or(0) << 32), r.want);
+        ASSERT_EQ(got.first.value_or(0) | (got.second.value_or(0) << 32), r.want);
         ASSERT_EQ(scalar64_reference(*def, r.x), r.want);
         for (uint32_t output : outputs(*def)) check_real(*def, r.x, 64, output, 0);
     }

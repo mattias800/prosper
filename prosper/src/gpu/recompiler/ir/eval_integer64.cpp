@@ -2,6 +2,7 @@
 #include "gpu/recompiler/ir/eval_integer64.hpp"
 #include "gpu/recompiler/ir/eval.hpp"
 #include <cstdint>
+#include <optional>
 
 namespace prosper::gpu::ir {
 

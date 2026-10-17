@@ -1,10 +1,9 @@
 // Scalar-pair numeric results, unchanged publication and the pre-existing source refusals.
 #include "gpu/recompiler/ir/scalar_integer64_lower_test.hpp"
 #include "gpu/recompiler/ir/lowering_fixture.hpp"
+#include "gpu/recompiler/ir/scalar_encoding.hpp"
 #include "gpu/recompiler/ir/lower/scalar_alu_lowering.hpp"
-#include "gpu/recompiler/rdna2_decode.hpp"
 #include <gtest/gtest.h>
-#include <cstdint>
 using namespace prosper::gpu;
 using namespace prosper::test::ir;
 
