@@ -167,4 +167,38 @@ TEST(IrCoreCrossLane, SpirvRunsLikeTheSubgroupEvaluation) {
     EXPECT_TRUE(seen.contains(Opcode::Shuffle));
 }
 
+// WRITELANE's migrated arm requires an exact native subgroup. Unlike READLANE, this
+// definition is never selected for a Wave32 guest in a 64-invocation subgroup.
+TEST(IrCoreCrossLane, WritelaneMatchesHandSelectedLanesInBothExactNativeWidths) {
+    for (uint32_t wave : {32u, 64u}) {
+        Block block;
+        Builder ir(block);
+        const Value source = ir.input(Type::U32), selector = ir.input(Type::U32);
+        const Value d =
+            writelane_b32(ir, source, selector, wave, [&] { return ir.input(Type::U32); });
+        EXPECT_EQ(block.input_count(), 3u);
+        for (uint32_t selected : {0u, 1u, 31u, 32u, 63u, 64u, 69u, 0xffffffffu}) {
+            std::vector<InvocationInputs> inputs;
+            for (uint32_t lane = 0; lane < wave; ++lane)
+                inputs.push_back({0x5370abcd, selected, data(lane)});
+            const auto evaluated = evaluate_lanes(block, inputs);
+            const auto executed = run_subgroup(block, d, inputs);
+            for (uint32_t lane = 0; lane < wave; ++lane) {
+                const uint32_t expected = lane == selected % wave ? 0x5370abcd : data(lane);
+                EXPECT_EQ(evaluated[lane][d.index], expected) << wave << " / " << lane;
+                EXPECT_EQ(executed[lane], expected) << wave << " / " << lane;
+            }
+        }
+        // The old destination is read AFTER the comparison, not while binding S0/S1.
+        size_t old_position = 0, compare_position = 0;
+        for (size_t i = 0; i < block.size(); ++i) {
+            const Inst& inst = block.insts()[i];
+            if (inst.op == Opcode::Input && inst.imm == 2u) old_position = i;
+            if (inst.op == Opcode::IEq) compare_position = i;
+        }
+        EXPECT_GT(old_position, compare_position);
+        EXPECT_EQ(block.insts().back().op, Opcode::Select);
+    }
+}
+
 }   // namespace

@@ -42,12 +42,8 @@ std::optional<bool> Vop3CrossLaneLowering::route_writelane() {
             const uint32_t value = val(in.src[0]);
             const uint32_t selector = val(in.src[1]);
             if (!ok) return true;
-            const uint32_t lane = b.subgroup_local_id();
-            const uint32_t selected = b.ucmp(
-                Op_IEqual, lane,
-                b.ibin(Op_BitwiseAnd, selector, b.uconst(b.wave_size - 1u)));
-            rs.vreg[in.dst.value] = b.sel(
-                selected, value, vreg_old(b, rs, in.dst.value));
+            rs.vreg[in.dst.value] = emit_writelane_b32(
+                b, value, selector, b.wave_size, [&] { return vreg_old(b, rs, in.dst.value); });
             rs.invalidated_vgpr_lane_slots.erase(in.dst.value);
             rs.vgpr_lane_slots.erase(in.dst.value);
             rs.vgpr_lane_mask_slots.erase(in.dst.value);

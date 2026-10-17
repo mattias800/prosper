@@ -11,6 +11,7 @@
 #include "gpu/recompiler/ir/builder.hpp"
 
 #include <cstdint>
+#include <functional>
 
 namespace prosper::gpu {
 struct SpirvCompute;
@@ -27,5 +28,17 @@ Value readlane_b32(Builder& ir, Value source, Value selector, uint32_t wave_size
 
 // The SPIR-V of readlane_b32 for bound ids, in the pre-IR emitter's order.
 uint32_t emit_readlane_b32(SpirvCompute& b, uint32_t source, uint32_t selector, uint32_t wave_size);
+
+// v_writelane_b32 (VOP3 0x361), exact-native compute arm only: replace S1 % W with S0,
+// ignoring EXEC (AMD 70648, V_WRITELANE_B32). The host subgroup MUST have W invocations;
+// the lowering already enforces that contract. Resolve the old destination after the lane
+// comparison, where the pre-IR sel read it. A caller building a Block supplies a late Input.
+Value writelane_b32(Builder& ir, Value source, Value selector, uint32_t wave_size,
+                    const std::function<Value()>& old_destination);
+
+// Bound source/selector ids have already been read. The old destination may allocate a
+// constant, so resolve its id at the Input's position rather than before the Block.
+uint32_t emit_writelane_b32(SpirvCompute& b, uint32_t source, uint32_t selector, uint32_t wave_size,
+                            const std::function<uint32_t()>& old_destination);
 
 }   // namespace prosper::gpu::ir
