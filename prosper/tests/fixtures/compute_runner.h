@@ -248,9 +248,12 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     std::vector<VkExtensionProperties> available_extensions(extension_count);
     vkEnumerateDeviceExtensionProperties(
         phys, nullptr, &extension_count, available_extensions.data());
+    bool float_controls_extension_enabled = false;
     for (const auto& extension : available_extensions)
-        if (!std::strcmp(extension.extensionName, VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME))
+        if (!std::strcmp(extension.extensionName, VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME)) {
             device_extensions.push_back(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME);
+            float_controls_extension_enabled = true;
+        }
     for (const auto& extension : available_extensions) {
         if (std::strcmp(extension.extensionName,
                         VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME))
@@ -285,6 +288,8 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
         if (std::strcmp(extension.extensionName, VK_KHR_SHADER_FLOAT_CONTROLS_2_EXTENSION_NAME) !=
             0)
             continue;
+        // On this 1.1 instance, float-controls2 also requires the float-controls extension.
+        if (!float_controls_extension_enabled) break;
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         features.pNext = &float_controls2_features;
         vkGetPhysicalDeviceFeatures2(phys, &features);
