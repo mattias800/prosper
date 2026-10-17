@@ -47,6 +47,13 @@ uint32_t emit_one(SpirvCompute& b, const Inst& inst, const uint32_t* x) {
             return is_signed ? b.fext2(Glsl_FMax, value, b.bcu(b.fconstf(-1.0f))) : value;
         }
         case Opcode::PackHalfLo: return b.pack_half_lo(x[0]);
+        case Opcode::PackNormalizedField: {
+            const uint32_t width = inst.imm & 31u;
+            const bool is_signed = (inst.imm & 0x100u) != 0;
+            const float norm = static_cast<float>((1u << (width - is_signed)) - 1);
+            return b.pack_norm(x[0], width, is_signed, norm);
+        }
+        case Opcode::PackUnsignedFloat: return b.pack_ufloat(x[0], inst.imm);
         case Opcode::F32Add: return b.fbin(Op_FAdd, x[0], x[1]);
         case Opcode::F32Sub: return b.fbin(Op_FSub, x[0], x[1]);
         case Opcode::F32Mul: return b.fbin(Op_FMul, x[0], x[1]);

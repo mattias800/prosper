@@ -4,6 +4,7 @@
 #include "gpu/recompiler/ir/eval_half.hpp"
 #include "gpu/recompiler/ir/eval_normalized_pack.hpp"
 #include "gpu/recompiler/ir/eval_normalized_field.hpp"
+#include "gpu/recompiler/ir/eval_buffer_store_fields.hpp"
 #include "gpu/recompiler/ir/eval_float_unary.hpp"
 #include "gpu/recompiler/ir/eval_float_compare.hpp"
 #include "gpu/recompiler/ir/eval_integer64.hpp"
@@ -77,6 +78,8 @@ Known evaluate_op(Opcode op, uint32_t imm, uint32_t a, uint32_t b, uint32_t c) {
         case Opcode::PackNorm16: return evaluate_pack_norm16(a, imm);
         case Opcode::NormalizeField: return evaluate_normalized_field(imm, a);
         case Opcode::PackHalfLo: return pack_half_rte(a);
+        case Opcode::PackNormalizedField: return evaluate_pack_normalized_field(a, imm);
+        case Opcode::PackUnsignedFloat: return evaluate_pack_unsigned_float(a, imm);
         case Opcode::F32Fma: {
             // Selected finite, normal-or-zero binary32 RTE reference. GLSL.std.450 Fma's
             // Vulkan accuracy is inherited from Mul+Add, so this is not a portable device

@@ -84,6 +84,8 @@ enum class Opcode : uint8_t {
     BoolNot,
     F32Clamp01,
     PackHalfLo,
+    PackNormalizedField,   // raw f32 -> normalized low field; imm[4:0] width, imm8 signed
+    PackUnsignedFloat,   // raw f32 -> unsigned E5M5/E5M6 field; imm is mantissa width
     FfbhU32,   // leading zero count; all ones for a zero word
     FindUMsbU32,   // GLSL.std.450 FindUMsb: highest set-bit index, or all ones for zero
     BitCount,   // population count of one numeric word, without wave-mask state

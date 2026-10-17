@@ -3672,6 +3672,7 @@ if(TARGET prosper_core)
   # test_ir_scalar_alu_execution runs each scalar-op definition's SPIR-V in the integer interpreter
   # against its own constant evaluation (#2514).
   foreach(ir_test
+          ir_buffer_store_values
           ir_core
           ir_half_fma_finite
           ir_half_fma_finite_execution

@@ -1,0 +1,187 @@
+// Pure store fields/indices execute per lane against eval and independently worked bytes.
+// Masked lanes keep distinct old values; unknown/exceptional inputs never invent a known word.
+#include "gpu/recompiler/ir/ops/buffer_store.hpp"
+#include "gpu/recompiler/ir/buffer_store_cases.hpp"
+#include "gpu/recompiler/ir/builder.hpp"
+#include "gpu/recompiler/ir/eval.hpp"
+#include "gpu/recompiler/ir/emit/spirv_emitter.hpp"
+#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include "gpu/recompiler/bpermute_spirv_oracle.hpp"
+#include "support/death_test.hpp"
+#include <gtest/gtest.h>
+#include <array>
+#include <cstdint>
+#include <cstdlib>
+#include <limits>
+#include <optional>
+#include <vector>
+using namespace prosper::gpu;
+using namespace prosper::gpu::ir;
+namespace fixture = prosper::test::ir::buffer_store;
+namespace {
+BufferStoreKind kind(fixture::Kind k) {
+    switch (k) {
+        case fixture::Kind::Integer: return BufferStoreKind::Integer;
+        case fixture::Kind::Half: return BufferStoreKind::Half;
+        case fixture::Kind::Unorm: return BufferStoreKind::Unorm;
+        case fixture::Kind::Snorm: return BufferStoreKind::Snorm;
+        case fixture::Kind::Ufloat: return BufferStoreKind::Ufloat;
+    }
+    std::abort();
+}
+using Row = std::array<uint32_t, 7>;
+void check(BufferStoreBlock built, const std::vector<Row>& rows,
+           const std::vector<std::vector<uint32_t>>& expected) {
+    Builder ir(built.block);
+    const auto append_input = [&](uint32_t what) {
+        built.inputs.push_back(what);
+        return ir.input(Type::U32);
+    };
+    const Value active = append_input(5), old = append_input(6);
+    for (Value& output : built.outputs) output = ir.select(ir.ine(active, ir.c32(0)), output, old);
+    const auto count = static_cast<uint32_t>(built.outputs.size());
+    const auto lanes = static_cast<uint32_t>(rows.size());
+    SpirvCompute b;
+    b.begin(built.block.input_count(), nullptr, lanes, 1, 1, lanes, 0, true, true);
+    std::vector<uint32_t> inputs;
+    for (uint32_t i = 0; i < built.block.input_count(); ++i) inputs.push_back(b.load_input(i));
+    const auto ids = emit_spirv(b, built.block, inputs);
+    for (uint32_t i = 0; i < count; ++i) b.store_output_word(ids[built.outputs[i].index], count, i);
+    std::vector<uint32_t> data;
+    for (const auto& row : rows)
+        for (uint32_t slot : built.inputs) data.push_back(row[slot]);
+    bpermute_oracle::Interpreter vm(b.finish());
+    vm.half_rte_preserve_denorm = true;
+    const auto output =
+        vm.run_buffers(lanes, {{0, data}, {1, std::vector<uint32_t>(rows.size() * count)}}, 1);
+    ASSERT_TRUE(vm.error.empty()) << vm.error;
+    ASSERT_EQ(output.size(), rows.size() * count);
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+        std::vector<Known> known;
+        for (uint32_t slot : built.inputs) known.push_back(rows[lane][slot]);
+        const auto values = evaluate(built.block, known);
+        ASSERT_EQ(expected[lane].size(), count);
+        for (uint32_t k = 0; k < count; ++k) {
+            const uint32_t want = rows[lane][5] ? expected[lane][k] : rows[lane][6];
+            EXPECT_EQ(values[built.outputs[k].index], Known(want))
+                << "lane=" << lane << " output=" << k;
+            EXPECT_EQ(output[lane * count + k], want) << "lane=" << lane << " output=" << k;
+        }
+    }
+}
+std::vector<Row> words(uint32_t wave) {
+    std::vector<Row> out;
+    for (uint32_t lane = 0; lane < wave; ++lane)
+        out.push_back({0x8192a3b4u ^ lane * 1234567u, 0xc5d6e7f8u ^ lane * 173u,
+                       0x397c892fu ^ lane * 371u, 0xabcdef17u ^ lane * 197u,
+                       lane < 4 ? 0xfffffffcu + lane : lane * 17u + 3u, fixture::active(lane, wave),
+                       0xd0000000u + lane});
+    return out;
+}
+TEST(IrBufferStoreValues, AtomicFieldIndicesMasksAndPayloadsKeepEveryByteAndWrap) {
+    for (uint32_t wave : {32u, 64u})
+        for (uint32_t bytes : {1u, 2u})
+            for (uint32_t k = 0; k < 4; ++k) {
+                const auto rows = words(wave);
+                std::vector<std::vector<uint32_t>> expected;
+                const uint32_t mask = bytes == 1 ? 255 : 65535;
+                for (const auto& row : rows) {
+                    const uint32_t addr = row[4] + k * bytes, shift = (addr % 4) * 8;
+                    expected.push_back({addr / 4, mask << shift, (row[k] & mask) << shift});
+                }
+                check(build_buffer_store_fields(k, bytes, mask), rows, expected);
+            }
+}
+TEST(IrBufferStoreValues, DwordComponentOffsetsAreModuloU32) {
+    for (uint32_t wave : {32u, 64u})
+        for (uint32_t k = 0; k < 4; ++k) {
+            const auto rows = words(wave);
+            std::vector<std::vector<uint32_t>> expected;
+            for (const auto& row : rows) expected.push_back({row[4] + k});
+            check(build_buffer_store_index(k), rows, expected);
+        }
+}
+TEST(IrBufferStoreValues, PackedWordsMatchIndependentFieldsWithPartialExec) {
+    for (uint32_t wave : {32u, 64u})
+        for (uint32_t f = 9; f < fixture::formats.size(); ++f) {
+            const fixture::Case c{f, wave, 0, false};
+            const auto& fmt = fixture::formats[f];
+            auto rows = words(wave);
+            std::vector<std::vector<uint32_t>> expected;
+            for (uint32_t lane = 0; lane < wave; ++lane) {
+                uint32_t value = 0;
+                for (uint32_t k = 0; k < 4; ++k) rows[lane][k] = fixture::input_word(c, lane, k);
+                for (uint32_t k = 0; k < fmt.components; ++k)
+                    value |= fixture::field(c, lane, k)
+                             << (fmt.kind == fixture::Kind::Ufloat ? k * 11 : k * 10);
+                expected.push_back({value});
+            }
+            check(build_buffer_store_word({kind(fmt.kind), 4, fmt.components, 0}), rows, expected);
+        }
+}
+TEST(IrBufferStoreValues, NormalizedAndHalfDwordsMatchIndependentTightPacking) {
+    for (uint32_t wave : {32u, 64u})
+        for (uint32_t f : {4u, 5u, 6u, 7u, 8u}) {
+            const fixture::Case c{f, wave, 0, false};
+            const auto& fmt = fixture::formats[f];
+            for (uint32_t count = 1; count <= 4; ++count)
+                for (uint32_t d = 0; d < (count * fmt.bytes + 3) / 4; ++d) {
+                    auto rows = words(wave);
+                    std::vector<std::vector<uint32_t>> expected;
+                    for (uint32_t lane = 0; lane < wave; ++lane) {
+                        uint32_t value = 0;
+                        for (uint32_t k = 0; k < 4; ++k)
+                            rows[lane][k] = fixture::input_word(c, lane, k);
+                        for (uint32_t k = 0; k < count; ++k)
+                            if (k * fmt.bytes / 4 == d)
+                                value |= fixture::field(c, lane, k) << ((k * fmt.bytes % 4) * 8);
+                        expected.push_back({rows[lane][4] + d, value});
+                    }
+                    check(build_buffer_store_dword({kind(fmt.kind), count, 4, fmt.bytes}, d), rows,
+                          expected);
+                }
+        }
+}
+TEST(IrBufferStoreValues, MissingWordsAndExceptionalMiniFloatsStayUnknown) {
+    for (auto kind : {BufferStoreKind::Integer, BufferStoreKind::Half, BufferStoreKind::Unorm,
+                      BufferStoreKind::Snorm, BufferStoreKind::Ufloat}) {
+        const auto built =
+            kind == BufferStoreKind::Half
+                ? build_buffer_store_dword({kind, 4, 4, 2}, 0)
+                : build_buffer_store_word({kind, 4, kind == BufferStoreKind::Ufloat ? 3u : 4u, 0});
+        for (Value output : built.outputs) EXPECT_FALSE(evaluate(built.block, {})[output.index]);
+    }
+    for (uint32_t bits : {0x7f800000u, 0xff800000u, 0x7fc01234u, 0x7f7fffffu})
+        for (uint32_t mantissa : {5u, 6u})
+            EXPECT_FALSE(evaluate_op(Opcode::PackUnsignedFloat, mantissa, bits, 0, 0));
+    EXPECT_FALSE(evaluate_op(Opcode::PackNormalizedField, 8, 0x7fc01234, 0, 0));
+}
+TEST(IrBufferStoreValues, MalformedFieldMetadataAndTypesStopLoudly) {
+    for (uint32_t width : {0u, 1u, 17u, 32u, 258u})
+        EXPECT_DEATH_IF_SUPPORTED(
+            {
+                prosper::test::suppress_coredump();
+                Block b;
+                Builder ir(b);
+                ir.pack_normalized_field(ir.c32(0), width, false);
+            },
+            "normalized pack width or mode out of range");
+    for (uint32_t mantissa : {0u, 4u, 7u, 32u})
+        EXPECT_DEATH_IF_SUPPORTED(
+            {
+                prosper::test::suppress_coredump();
+                Block b;
+                Builder ir(b);
+                ir.pack_unsigned_float(ir.c32(0), mantissa);
+            },
+            "unsigned float mantissa out of range");
+    EXPECT_DEATH_IF_SUPPORTED(
+        {
+            prosper::test::suppress_coredump();
+            Block b;
+            Builder ir(b);
+            ir.pack_normalized_field(ir.ctrue(), 8, false);
+        },
+        "argument type mismatch");
+}
+} // namespace
