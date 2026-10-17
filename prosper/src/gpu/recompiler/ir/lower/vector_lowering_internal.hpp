@@ -13,6 +13,8 @@
 #include "gpu/recompiler/ir/lower/lowering_context.hpp"
 #include "gpu/recompiler/ir/lower/vector_alu_lowering.hpp"
 #include "gpu/recompiler/ir/ops/vector_alu.hpp"
+#include "gpu/recompiler/ir/ops/vector_carry.hpp"
+#include "gpu/recompiler/ir/ops/vector_cndmask.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_dpp_row_shr.hpp"
 #include "gpu/recompiler/rdna2_dpp_row_ror8.hpp"
@@ -44,6 +46,8 @@ private:
     std::optional<bool> stage_dpp_source();
     std::optional<bool> stage_source_modifiers();
     std::optional<bool> compute(uint32_t& d);
+    std::optional<bool> compute_cndmask(const VectorCndmaskDef& def, uint32_t& d);
+    std::optional<bool> compute_carry(const VectorCarryDef& def, uint32_t& d);
     bool compute_float(uint32_t& d);
     bool compute_f16(uint32_t& d);
     uint32_t half_source(uint32_t raw, const Operand& operand, uint8_t sel, int k);

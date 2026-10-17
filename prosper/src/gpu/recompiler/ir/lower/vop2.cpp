@@ -44,46 +44,13 @@ std::optional<bool> Vop2Lowering::compute(uint32_t& d) {
     }
     if (compute_float(d)) return std::nullopt;
     if (compute_f16(d)) return std::nullopt;
-    switch (in.opcode) {
-        case 0x01: {                                         // v_cndmask_b32: dst = vcc ? src1 : src0
-            if (!vcc) { ok = false; return true; }
-            if (in.sdwa_dst_sel == 6) { d = b.sel(vcc, c, a); break; }
-            auto word = [&](uint32_t raw, uint8_t sel) {
-                if (sel == 5) raw = b.ibin(Op_ShiftRightLogical, raw, b.uconst(16));
-                return b.ibin(Op_BitwiseAnd, raw, b.uconst(0xFFFFu));
-            };
-            uint32_t selected = b.sel(vcc, word(c, in.sdwa_src1_sel), word(a, in.sdwa_src0_sel));
-            d = in.sdwa_dst_sel == 5
-                ? b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0x0000FFFFu)),
-                         b.ibin(Op_ShiftLeftLogical, selected, b.uconst(16)))
-                : b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)), selected);
-            break;
-        }
-
-        // Carry ops (VOP2 e32 form): carry-in + carry-out are VCC. v_add_co_ci(0x28)/
-        // v_sub_co_ci(0x29)/v_subrev_co_ci(0x2a). Mirrors the VOP3B 0x128/129/12A logic with VCC.
-        case 0x28: case 0x29: case 0x2A: {
-            if (!vcc) { ok = false; return true; }
-            uint32_t cin = b.sel(vcc, b.uconst(1), b.uconst(0));
-            uint32_t carry;
-            if (in.opcode == 0x28) {                          // (a + c) + cin
-                uint32_t s1 = b.ibin(Op_IAdd, a, c); uint32_t k1 = b.ucmp(Op_ULessThan, s1, a);
-                d = b.ibin(Op_IAdd, s1, cin); uint32_t k2 = b.ucmp(Op_ULessThan, d, s1);
-                carry = b.bsel(k1, b.btrue(), k2);
-            } else {                                          // (x - y) - cin  (subrev swaps)
-                uint32_t x = in.opcode == 0x29 ? a : c, y = in.opcode == 0x29 ? c : a;
-                uint32_t s1 = b.ibin(Op_ISub, x, y); uint32_t k1 = b.ucmp(Op_ULessThan, x, y);
-                d = b.ibin(Op_ISub, s1, cin); uint32_t k2 = b.ucmp(Op_ULessThan, s1, cin);
-                carry = b.bsel(k1, b.btrue(), k2);
-            }
-            // Carry-out masks follow ISA 3.9 like compare results: an EXEC-inactive lane's
-            // VCC bit is written 0, not its raw carry (wave votes must not see phantom bits).
-            vcc = rs.exec_narrowed ? b.land(rs.exec, carry) : carry;
-            break;
-        }
-
-        default: ok = false;
-    }
+    // The lane-mask readers and writers: the value is an IR definition, the VCC read and write
+    // are this lowering's (vop2_mask.cpp).
+    if (const VectorCndmaskDef* def = find_vector_cndmask(in.fmt, in.opcode))
+        return compute_cndmask(*def, d);
+    if (const VectorCarryDef* def = find_vector_carry(in.fmt, in.opcode))
+        return compute_carry(*def, d);
+    ok = false;
     return std::nullopt;
 }
 
