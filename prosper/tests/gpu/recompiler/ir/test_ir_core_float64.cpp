@@ -2,6 +2,7 @@
 // Block type rules, the lazy Float64/DenormPreserve declaration, and every opcode's SPIR-V run per
 // lane in the interpreter against its own evaluation.
 #include "gpu/recompiler/bpermute_spirv_oracle.hpp"
+#include "gpu/recompiler/float_transport_config.hpp"
 #include "gpu/recompiler/ir/builder.hpp"
 #include "gpu/recompiler/ir/emit/spirv_emitter.hpp"
 #include "gpu/recompiler/ir/eval.hpp"

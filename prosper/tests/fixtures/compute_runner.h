@@ -282,7 +282,8 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     VkPhysicalDeviceShaderFloatControls2Features float_controls2_features{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT_CONTROLS_2_FEATURES};
     for (const auto& extension : available_extensions) {
-        if (std::strcmp(extension.extensionName, VK_KHR_SHADER_FLOAT_CONTROLS_2_EXTENSION_NAME))
+        if (std::strcmp(extension.extensionName, VK_KHR_SHADER_FLOAT_CONTROLS_2_EXTENSION_NAME) !=
+            0)
             continue;
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         features.pNext = &float_controls2_features;
