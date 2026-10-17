@@ -1946,10 +1946,10 @@ inline const RenderVkCtx& render_vk_ctx() {
         prosper::gpu::publish_device_float_controls(
             "render", r.phys, prosper::frontend::kVulkanRuntimeVersion,
             /*float_controls_extension_enabled=*/false);
-        prosper::gpu::publish_device_float64("render", r.phys,
-                                             prosper::frontend::kVulkanRuntimeVersion,
-                                             feats.shaderFloat64 == VK_TRUE,
-                                             /*float_controls_extension_enabled=*/false);
+        prosper::gpu::publish_device_float64(
+            "render", r.phys, prosper::frontend::kVulkanRuntimeVersion,
+            feats.shaderFloat64 == VK_TRUE, transport_features.shaderFloatControls2 == VK_TRUE,
+            /*float_controls_extension_enabled=*/false);
         prosper::gpu::publish_float_transport_config(r.float_transport);
         VkPipelineCacheCreateInfo cache_info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
         std::vector<uint8_t> initial_cache;

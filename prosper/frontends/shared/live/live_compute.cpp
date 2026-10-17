@@ -3564,8 +3564,9 @@ struct VulkanComputeContext {
         prosper::gpu::publish_device_float_controls(
             "compute", physical, kVulkanRuntimeVersion,
             /*float_controls_extension_enabled=*/false);
-        prosper::gpu::publish_device_float64("compute", physical, kVulkanRuntimeVersion,
-                                             enabled.shaderFloat64 == VK_TRUE, false);
+        prosper::gpu::publish_device_float64(
+            "compute", physical, kVulkanRuntimeVersion, enabled.shaderFloat64 == VK_TRUE,
+            transport_features.shaderFloatControls2 == VK_TRUE, false);
         prosper::gpu::publish_float_transport_config(float_transport);
         vkGetDeviceQueue(device, queue_family, 0, &queue);
         if (!create_pipeline_cache())

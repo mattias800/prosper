@@ -248,9 +248,12 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
     std::vector<VkExtensionProperties> available_extensions(extension_count);
     vkEnumerateDeviceExtensionProperties(
         phys, nullptr, &extension_count, available_extensions.data());
+    bool float_controls_extension_enabled = false;
     for (const auto& extension : available_extensions)
-        if (!std::strcmp(extension.extensionName, VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME))
+        if (!std::strcmp(extension.extensionName, VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME)) {
             device_extensions.push_back(VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME);
+            float_controls_extension_enabled = true;
+        }
     for (const auto& extension : available_extensions) {
         if (std::strcmp(extension.extensionName,
                         VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME))
@@ -276,6 +279,26 @@ inline std::vector<float> run_compute(const std::vector<uint32_t>& spirv, const 
         if (dci.pNext == &atomic_int64_features)
             required_subgroup_features.pNext = &atomic_int64_features;
         dci.pNext = &required_subgroup_features;
+    }
+    // F64 operand Bitcasts use FPFastMathMode None. Enable its actual feature when this
+    // Vulkan 1.1 fixture can enable the float-controls2 extension, retaining every earlier link.
+    VkPhysicalDeviceShaderFloatControls2Features float_controls2_features{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT_CONTROLS_2_FEATURES};
+    for (const auto& extension : available_extensions) {
+        if (std::strcmp(extension.extensionName, VK_KHR_SHADER_FLOAT_CONTROLS_2_EXTENSION_NAME) !=
+            0)
+            continue;
+        // On this 1.1 instance, float-controls2 also requires the float-controls extension.
+        if (!float_controls_extension_enabled) break;
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        features.pNext = &float_controls2_features;
+        vkGetPhysicalDeviceFeatures2(phys, &features);
+        if (float_controls2_features.shaderFloatControls2) {
+            float_controls2_features.pNext = const_cast<void*>(dci.pNext);
+            dci.pNext = &float_controls2_features;
+            device_extensions.push_back(VK_KHR_SHADER_FLOAT_CONTROLS_2_EXTENSION_NAME);
+        }
+        break;
     }
     dci.enabledExtensionCount = static_cast<uint32_t>(device_extensions.size());
     dci.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
