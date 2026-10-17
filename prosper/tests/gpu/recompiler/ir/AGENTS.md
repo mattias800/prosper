@@ -7,6 +7,9 @@ One focused test per piece: `test_ir_core` (Block rules, evaluation edges, emiss
 `recompile_compute`, runs the module in `../bpermute_spirv_oracle.hpp`'s integer interpreter and
 compares against the definition's own evaluation. `vector_lane_harness.hpp` is the per-lane
 counterpart every vector family's execution test calls (`test_ir_vector_alu_execution`): own
-operands per lane, a partial EXEC, and inactive lanes checked for their old VDST. A new family adds its tests here and to the
+operands per lane, a partial EXEC, and inactive lanes checked for their old VDST.
+`vector_compare_harness.hpp` wraps it for VOPC compares, which write a lane mask instead of a VGPR:
+it reads the mask back into v1 for every lane (inactive lanes must read 0) or, for V_CMPX, writes
+v1 under the narrowed EXEC. A new family adds its tests here and to the
 `foreach(ir_test ...)` list in `prosper/CMakeLists.txt`; the recipe is
 `src/gpu/recompiler/ir/HOW_TO_ADD_A_FAMILY.md`.

@@ -104,6 +104,17 @@ enum class Opcode : uint8_t {
     F32Eq, // ordered equality over binary32 words, returning Bool
     F32Ldexp, // binary32 word scaled by a signed integer exponent
     PackNorm16, // raw binary32 to normalized low half; imm0 unsigned, imm1 signed
+    // The rest of the binary32 relations over raw words, returning Bool (with F32Lt, F32Eq, F32Ge
+    // and F32UnordNe above). Ordered relations are false when either word is a NaN; unordered
+    // ones are true.
+    F32Le,
+    F32Gt,
+    F32Lg, // ordered not-equal
+    F32UnordLt,
+    F32UnordEq,
+    F32UnordLe,
+    F32UnordGt,
+    F32UnordGe,
 };
 
 struct OpcodeInfo {

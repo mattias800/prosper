@@ -3,43 +3,20 @@
 // moves onto an ir/ops definition is deleted from here (HOW_TO_ADD_A_FAMILY.md, "Mask-writing
 // compares").
 #include "gpu/recompiler/ir/lower/vopc_lowering_internal.hpp"
+#include "gpu/recompiler/ir/ops/vector_compare.hpp"
 
 namespace prosper::gpu::ir {
 
 uint32_t VopcLowering::compare_value() {
+    // A value override is a guest fact the proof passes read, emitted INSTEAD of the relation
+    // (zero_compare, magnitude_compare). Only the f32 EQ/NEQ and LE/GE compares produce one.
+    if (zero_cmp) return zero_cmp;
+    if (magnitude_cmp) return magnitude_cmp;
+    // Opcodes with an ir/ops definition (ops/vector_compare_*.cpp).
+    if (const VectorCompareDef* def = find_vector_compare(eff))
+        return emit_vector_compare(b, *def, a, c);
     uint32_t cmp = 0;
     switch (eff) {
-        case 0x00: cmp = b.bfalse(); break;                              // v_cmp_f_f32
-        case 0x01: cmp = b.fcmp(Op_FOrdLessThan, a, c); break;         // v_cmp_lt_f32
-        case 0x02: cmp = zero_cmp ? zero_cmp :
-            b.fcmp(Op_FOrdEqual, a, c); break;                      // v_cmp_eq_f32
-        case 0x03: cmp = magnitude_cmp ? magnitude_cmp :
-            b.fcmp(Op_FOrdLessThanEqual, a, c); break;               // v_cmp_le_f32
-        case 0x04: cmp = b.fcmp(Op_FOrdGreaterThan, a, c); break;      // v_cmp_gt_f32
-        case 0x05: cmp = b.fcmp(Op_FOrdNotEqual, a, c); break;         // v_cmp_lg_f32
-        case 0x06: cmp = magnitude_cmp ? magnitude_cmp :
-            b.fcmp(Op_FOrdGreaterThanEqual, a, c); break;            // v_cmp_ge_f32
-        case 0x07: {                                                    // v_cmp_o_f32
-            const uint32_t a_ordered = b.fcmp(Op_FOrdEqual, a, a);
-            const uint32_t c_ordered = b.fcmp(Op_FOrdEqual, c, c);
-            cmp = b.land(a_ordered, c_ordered);
-            break;
-        }
-        case 0x08: {                                                    // v_cmp_u_f32
-            const uint32_t a_nan = b.fcmp(Op_FUnordNotEqual, a, a);
-            const uint32_t c_nan = b.fcmp(Op_FUnordNotEqual, c, c);
-            cmp = b.lor(a_nan, c_nan);
-            break;
-        }
-        // NaN-inclusive f32 compares (the "n"-prefix set is the unordered negation of 0x1-0x6):
-        case 0x09: cmp = b.fcmp(Op_FUnordLessThan, a, c); break;       // v_cmp_nge_f32 = !(a>=b)
-        case 0x0A: cmp = b.fcmp(Op_FUnordEqual, a, c); break;          // v_cmp_nlg_f32 = !(a!=b)
-        case 0x0B: cmp = b.fcmp(Op_FUnordLessThanEqual, a, c); break;  // v_cmp_ngt_f32 = !(a>b)
-        case 0x0C: cmp = b.fcmp(Op_FUnordGreaterThan, a, c); break;    // v_cmp_nle_f32 = !(a<=b)
-        case 0x0D: cmp = zero_cmp ? zero_cmp :
-            b.fcmp(Op_FUnordNotEqual, a, c); break;                 // v_cmp_neq_f32 = !(a==b)
-        case 0x0E: cmp = b.fcmp(Op_FUnordGreaterThanEqual, a, c); break;// v_cmp_nlt_f32 = !(a<b)
-        case 0x0F: cmp = b.btrue(); break;                              // v_cmp_tru_f32
         case 0x81: cmp = b.scmp(Op_SLessThan, a, c); break;            // v_cmp_lt_i32
         case 0x82: cmp = b.ucmp(Op_IEqual, a, c); break;               // v_cmp_eq_i32
         case 0x83: cmp = b.scmp(Op_SLessThanEqual, a, c); break;       // v_cmp_le_i32
