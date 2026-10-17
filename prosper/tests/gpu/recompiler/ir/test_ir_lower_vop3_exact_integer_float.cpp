@@ -66,6 +66,23 @@ TEST(IrLowerVop3ExactIntegerFloat, EveryInlineIntegerSelectorHasAnExplicitDomain
         EXPECT_EQ(accepted, def.opcode == 0x185 ? 80u : 64u);
     }
 }
+TEST(IrLowerVop3ExactIntegerFloat, BothDecodedVop3PrefixesHaveIdenticalValueGraphs) {
+    for (const auto& def : vector_exact_integer_float_e64_defs())
+        for (uint32_t selector : {129u, 255u}) {
+            std::vector<uint32_t> reference;
+            for (bool legacy : {false, true}) {
+                LoweringFixture t;
+                const auto in = LoweringFixture::decode(
+                    cases::words(def.opcode, selector, 0x80000000, false, legacy));
+                ASSERT_EQ(in.fmt, Rdna2Format::VOP3);
+                ASSERT_EQ(in.opcode, def.opcode);
+                ASSERT_TRUE(lower_vop3_float_integer(t.b, t.rs, in, t.ok));
+                ASSERT_TRUE(t.ok);
+                if (reference.empty()) reference = t.b.code;
+                EXPECT_EQ(t.b.code, reference);
+            }
+        }
+}
 TEST(IrLowerVop3ExactIntegerFloat, KnownRegistersAndInlineFloatsRemainUnmatched) {
     for (const auto& def : vector_exact_integer_float_e64_defs())
         for (uint32_t selector : {0u, 50u, 106u, 124u, 125u, 126u, 242u, 256u, 258u, 511u}) {

@@ -34,8 +34,9 @@ LaneInputs inputs(uint32_t prefix = 0) {
     return in;
 }
 LaneProgram program_for(uint32_t opcode, uint32_t selector, uint32_t literal, uint32_t wave,
-                        uint32_t mode = UINT32_MAX, uint32_t prefix = 0, bool old = false) {
-    auto words = cases::words(opcode, selector, literal, old);
+                        uint32_t mode = UINT32_MAX, uint32_t prefix = 0, bool old = false,
+                        bool legacy_prefix = false) {
+    auto words = cases::words(opcode, selector, literal, old, legacy_prefix);
     // A live following instruction makes the literal's stream length observable in the result.
     if (prefix == 3) words.push_back(vop1(0x37, kVdst, 256 + kVdst));
     auto p = lane_program(words, 64, wave);
@@ -103,8 +104,9 @@ void save_words(const std::filesystem::path& file, const std::vector<uint32_t>& 
 }
 void export_form(const std::filesystem::path& root, std::ofstream& manifest, size_t index,
                  const ConversionDef& def, uint32_t selector, uint32_t literal, uint32_t wave,
-                 uint32_t prefix, uint32_t mode, bool old = false) {
-    const auto program = program_for(def.opcode, selector, literal, wave, mode, prefix, old);
+                 uint32_t prefix, uint32_t mode, bool old = false, bool legacy_prefix = false) {
+    const auto program =
+        program_for(def.opcode, selector, literal, wave, mode, prefix, old, legacy_prefix);
     const uint64_t address = 0x5356000000ull + index * 0x100;
     const auto stem = root / "refused_shaders_20000101-000000Z_synthetic" /
                       ("cs_" + std::to_string(address) + "_" + std::to_string(index));
@@ -131,7 +133,7 @@ void export_form(const std::filesystem::path& root, std::ofstream& manifest, siz
     }
     manifest << stem.filename().string() << '\t' << def.opcode << '\t' << selector << '\t' << raw
              << '\t' << wave << '\t' << prefix << '\t' << mode << '\t' << old << '\t'
-             << (accepted ? "accepted" : "refused") << '\n';
+             << legacy_prefix << '\t' << (accepted ? "accepted" : "refused") << '\n';
 }
 } // namespace
 
@@ -163,6 +165,33 @@ TEST(IrVectorExactIntegerFloatE64Execution, FullZeroAndPartialExecKeepTheOldLane
                 const auto in = inputs(prefix);
                 expect_lanes(def, execute(module, in), in, 0x80000000, prefix);
             }
+}
+TEST(IrVectorExactIntegerFloatE64Execution, D1PrefixExecutesInlineLiteralAndExecForms) {
+    for (const auto& def : vector_exact_integer_float_e64_defs())
+        for (uint32_t wave : {32u, 64u}) {
+            for (uint32_t selector = 128; selector <= 208; ++selector) {
+                const auto raw = cases::inline_word(selector);
+                const auto want = cases::reference_bits(raw, def.opcode == 0x185);
+                const auto module =
+                    compile(program_for(def.opcode, selector, 0, wave, UINT32_MAX, 0, false, true));
+                ASSERT_EQ(!module.empty(), want.has_value()) << selector;
+                if (want) expect_lanes(def, execute(module, inputs()), inputs(), raw);
+            }
+            for (uint32_t raw : cases::literals()) {
+                const auto want = cases::reference_bits(raw, def.opcode == 0x185);
+                const auto module =
+                    compile(program_for(def.opcode, 255, raw, wave, UINT32_MAX, 0, false, true));
+                ASSERT_EQ(!module.empty(), want.has_value()) << raw;
+                if (want) expect_lanes(def, execute(module, inputs()), inputs(), raw);
+            }
+            for (uint32_t prefix = 0; prefix < 4; ++prefix) {
+                const auto module = compile(program_for(def.opcode, 255, 0x80000000, wave,
+                                                        UINT32_MAX, prefix, false, true));
+                ASSERT_FALSE(module.empty());
+                expect_lanes(def, execute(module, inputs(prefix)), inputs(prefix), 0x80000000,
+                             prefix);
+            }
+        }
 }
 TEST(IrVectorExactIntegerFloatE64Execution, HandUnpredicatedProgramExposesInactiveCanaryLoss) {
     for (const auto& def : vector_exact_integer_float_e64_defs())
@@ -234,6 +263,9 @@ TEST(IrVectorExactIntegerFloatE64Execution, EncodingsAndLiteralConsumptionArePin
     EXPECT_EQ(cases::words(0x185, 129), (std::vector<uint32_t>{0xd5850001, 129}));
     EXPECT_EQ(cases::words(0x186, 255, 0xffffff00),
               (std::vector<uint32_t>{0xd5860001, 255, 0xffffff00}));
+    EXPECT_EQ(cases::words(0x185, 129, 0, false, true), (std::vector<uint32_t>{0xd1850001, 129}));
+    EXPECT_EQ(cases::words(0x186, 255, 0xffffff00, false, true),
+              (std::vector<uint32_t>{0xd1860001, 255, 0xffffff00}));
     for (const auto& def : vector_exact_integer_float_e64_defs()) {
         const auto words = cases::words(def.opcode, 255, 0x80000000);
         auto code = words;
@@ -266,20 +298,25 @@ TEST(IrVectorExactIntegerFloatE64Execution, ExportsActualSavedReplaysAndRefusedD
     const auto literal_vector = cases::literals();
     const std::set<uint32_t> literals(literal_vector.begin(), literal_vector.end());
     for (const auto& def : vector_exact_integer_float_e64_defs())
-        for (uint32_t wave : {32u, 64u}) {
-            for (uint32_t selector = 128; selector <= 208; ++selector)
-                export_form(root, manifest, index++, def, selector, 0, wave, 0, UINT32_MAX);
-            for (uint32_t raw : literals)
-                export_form(root, manifest, index++, def, 255, raw, wave, 0, UINT32_MAX);
-            for (uint32_t prefix = 0; prefix < 4; ++prefix)
-                for (bool old : {false, true})
-                    export_form(root, manifest, index++, def, 255, 0x80000000, wave, prefix,
-                                UINT32_MAX, old);
-            for (uint32_t mode = 0; mode < 256; ++mode)
-                for (uint32_t ieee : {0u, 1u})
-                    export_form(root, manifest, index++, def, 255, 0xffffff00, wave, 0,
-                                (mode << 12) | (ieee << 23));
-        }
+        for (uint32_t wave : {32u, 64u})
+            for (bool legacy : {false, true}) {
+                for (uint32_t selector = 128; selector <= 208; ++selector)
+                    export_form(root, manifest, index++, def, selector, 0, wave, 0, UINT32_MAX,
+                                false, legacy);
+                for (uint32_t raw : literals)
+                    export_form(root, manifest, index++, def, 255, raw, wave, 0, UINT32_MAX, false,
+                                legacy);
+                for (uint32_t prefix = 0; prefix < 4; ++prefix)
+                    for (bool old : {false, true}) {
+                        if (legacy && old) continue;   // The e32 control has no VOP3 prefix.
+                        export_form(root, manifest, index++, def, 255, 0x80000000, wave, prefix,
+                                    UINT32_MAX, old, legacy);
+                    }
+                for (uint32_t mode = 0; mode < 256; ++mode)
+                    for (uint32_t ieee : {0u, 1u})
+                        export_form(root, manifest, index++, def, 255, 0xffffff00, wave, 0,
+                                    (mode << 12) | (ieee << 23), false, legacy);
+            }
     manifest.close();
     EXPECT_TRUE(manifest.good());
     EXPECT_GT(index, 0u);

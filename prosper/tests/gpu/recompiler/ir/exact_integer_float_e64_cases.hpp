@@ -49,12 +49,13 @@ inline std::optional<uint32_t> reference_bits(uint32_t raw, bool is_signed) {
            static_cast<uint32_t>(significand & 0x7fffffu);
 }
 inline std::vector<uint32_t> words(uint32_t opcode, uint32_t selector, uint32_t literal = 0,
-                                   bool old = false) {
+                                   bool old = false, bool legacy_prefix = false) {
     std::vector<uint32_t> out;
     if (old)
         out.push_back(vop1(opcode - 0x180, kVdst, selector));
     else
-        out.insert(out.end(), {0xd4000001u | (opcode << 16), selector});
+        out.insert(out.end(),
+                   {(legacy_prefix ? 0xd0000001u : 0xd4000001u) | (opcode << 16), selector});
     if (selector == 255) out.push_back(literal);
     return out;
 }
