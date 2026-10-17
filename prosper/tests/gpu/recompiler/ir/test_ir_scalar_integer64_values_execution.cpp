@@ -212,7 +212,7 @@ TEST(IrScalarInteger64ValuesExecution, BfePrimitiveBoundsTypesAndRawMsbZeroStayE
     EXPECT_EQ(evaluate_integer64(Opcode::U64Bfe, 1, 0, 0), Known64(0));
     EXPECT_FALSE(evaluate_integer64(Opcode::U64Bfe, 1, 64, 1));
     EXPECT_FALSE(evaluate_integer64(Opcode::U64Bfe, 1, 0, 0x100000000ull));
-    EXPECT_FALSE(evaluate_op(Opcode::FindUMsbU32, 0, 0, 0, 0));
+    EXPECT_EQ(evaluate_op(Opcode::FindUMsbU32, 0, 0, 0, 0), Known(UINT32_MAX));
     EXPECT_EQ(evaluate_op(Opcode::FindUMsbU32, 0, 1, 0, 0), Known(0));
     EXPECT_EQ(evaluate_op(Opcode::FindUMsbU32, 0, 0x80000000, 0, 0), Known(31));
     EXPECT_EQ(evaluate_op(Opcode::BoolNot, 0, 0, 0, 0), Known(1));
@@ -241,6 +241,29 @@ TEST(IrScalarInteger64ValuesExecution, InlineAndLiteralSourcesKeepExistingExtens
             if (form >= 3)
                 for (uint32_t wave : {64u, 32u})
                     for (uint32_t output : outputs(def)) check_real(def, x, wave, output, form);
+}
+// GLSL.std.450 instruction75 explicitly returns all bits set for zero. The scalar
+// FLBIT route keeps its old OR1 safeguard; the raw IR primitive still models the builtin itself.
+TEST(IrScalarInteger64ValuesExecution, RawFindUMsbZeroOneAndHighBitRunAsSpecified) {
+    struct Row {
+        uint32_t input, expected;
+    };
+    for (const auto row : {Row{0, UINT32_MAX}, Row{1, 0}, Row{0x80000000u, 31},
+                           Row{0xffffffffu, 31}, Row{0x01000000u, 24}}) {
+        Block block;
+        Builder ir(block);
+        const auto value = ir.find_umsb_u32(ir.input(Type::U32));
+        SpirvCompute b;
+        b.begin(10, nullptr, 64, 1, 1, 64, 0, true, true);
+        const uint32_t input[] = {b.uconst(row.input)};
+        const auto ids = emit_spirv(b, block, input);
+        b.store_output_word(ids[value.index], 1, 0);
+        bpermute_oracle::Interpreter vm(b.finish());
+        const auto out = vm.run_buffers(64, {{1, std::vector<uint32_t>(64, 0xdeadbeef)}}, 1);
+        ASSERT_TRUE(vm.error.empty()) << vm.error;
+        ASSERT_EQ(out.size(), 64u);
+        for (const auto word : out) ASSERT_EQ(word, row.expected);
+    }
 }
 TEST(IrScalarInteger64ValuesExecution, ExportsAllNumericReadbackAndAliasForms) {
     namespace fs = std::filesystem;

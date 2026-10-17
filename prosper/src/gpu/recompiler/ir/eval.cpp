@@ -141,7 +141,7 @@ Known evaluate_op(Opcode op, uint32_t imm, uint32_t a, uint32_t b, uint32_t c) {
         case Opcode::Not: return ~a;
         case Opcode::BitReverse: return bit_reverse(a);
         case Opcode::FindUMsbU32:
-            return a ? Known(31u - static_cast<uint32_t>(std::countl_zero(a))) : std::nullopt;
+            return a ? Known(31u - static_cast<uint32_t>(std::countl_zero(a))) : Known(UINT32_MAX);
         case Opcode::BitCount: return static_cast<uint32_t>(std::popcount(a));
         case Opcode::Shl: return b < 32 ? Known(a << b) : std::nullopt;
         case Opcode::LShr: return b < 32 ? Known(a >> b) : std::nullopt;
