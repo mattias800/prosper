@@ -64,13 +64,15 @@ LaneRun execute(const std::vector<uint32_t>& module, const LaneInputs& in) {
     result.resize(in.lanes());
     return {std::move(result), {}};
 }
-void expect_lanes(const LaneRun& run, const LaneInputs& in, uint32_t raw, bool is_signed,
+void expect_lanes(const ConversionDef& def, const LaneRun& run, const LaneInputs& in, uint32_t raw,
                   uint32_t prefix = 0, bool varying = false) {
     ASSERT_TRUE(run.error.empty()) << run.error;
     ASSERT_EQ(run.d.size(), in.lanes());
     for (size_t lane = 0; lane < in.lanes(); ++lane) {
-        const auto bits = cases::reference_bits(varying ? in.s0[lane] : raw, is_signed);
+        const uint32_t source = varying ? in.s0[lane] : raw;
+        const auto bits = cases::reference_bits(source, def.opcode == 0x185);
         ASSERT_TRUE(bits.has_value()) << raw << " lane " << lane;
+        ASSERT_EQ(eval_conversion_op(def, source), bits) << "eval lane " << lane;
         const uint32_t value = prefix == 3 ? ~bits.value_or(0) : bits.value_or(0);
         ASSERT_EQ(run.d[lane], in.active[lane] ? value : in.old_d[lane]) << "lane " << lane;
     }
@@ -125,8 +127,7 @@ void export_form(const std::filesystem::path& root, std::ofstream& manifest, siz
         save_words(file, replay.spirv);
         const auto saved_module = load_words(file);
         ASSERT_EQ(saved_module, replay.spirv);
-        expect_lanes(execute(saved_module, inputs(prefix)), inputs(prefix), raw,
-                     def.opcode == 0x185, prefix);
+        expect_lanes(def, execute(saved_module, inputs(prefix)), inputs(prefix), raw, prefix);
     }
     manifest << stem.filename().string() << '\t' << def.opcode << '\t' << selector << '\t' << raw
              << '\t' << wave << '\t' << prefix << '\t' << mode << '\t' << old << '\t'
@@ -142,15 +143,13 @@ TEST(IrVectorExactIntegerFloatE64Execution, EveryInlineIntegerAndLiteralBoundary
                 const auto want = cases::reference_bits(raw, def.opcode == 0x185);
                 const auto module = compile(program_for(def.opcode, selector, 0, wave));
                 ASSERT_EQ(!module.empty(), want.has_value()) << selector << ' ' << def.opcode;
-                if (want)
-                    expect_lanes(execute(module, inputs()), inputs(), raw, def.opcode == 0x185);
+                if (want) expect_lanes(def, execute(module, inputs()), inputs(), raw);
             }
             for (uint32_t raw : cases::literals()) {
                 const auto want = cases::reference_bits(raw, def.opcode == 0x185);
                 const auto module = compile(program_for(def.opcode, 255, raw, wave));
                 ASSERT_EQ(!module.empty(), want.has_value()) << raw << ' ' << def.opcode;
-                if (want)
-                    expect_lanes(execute(module, inputs()), inputs(), raw, def.opcode == 0x185);
+                if (want) expect_lanes(def, execute(module, inputs()), inputs(), raw);
             }
         }
 }
@@ -162,8 +161,32 @@ TEST(IrVectorExactIntegerFloatE64Execution, FullZeroAndPartialExecKeepTheOldLane
                     compile(program_for(def.opcode, 255, 0x80000000, wave, UINT32_MAX, prefix));
                 ASSERT_FALSE(module.empty());
                 const auto in = inputs(prefix);
-                expect_lanes(execute(module, in), in, 0x80000000, def.opcode == 0x185, prefix);
+                expect_lanes(def, execute(module, in), in, 0x80000000, prefix);
             }
+}
+TEST(IrVectorExactIntegerFloatE64Execution, HandUnpredicatedProgramExposesInactiveCanaryLoss) {
+    for (const auto& def : vector_exact_integer_float_e64_defs())
+        for (uint32_t wave : {32u, 64u}) {
+            // Deliberately omit the guest CMPX. Use the partial lane-input mask only as the
+            // independently wrong expectation whose lost canaries this control must expose.
+            const auto module =
+                compile(program_for(def.opcode, 255, 0x80000000, wave, UINT32_MAX, 1));
+            ASSERT_FALSE(module.empty());
+            const auto in = inputs();
+            const auto run = execute(module, in);
+            ASSERT_TRUE(run.error.empty()) << run.error;
+            ASSERT_EQ(run.d.size(), in.lanes());
+            const auto bits = def.opcode == 0x185 ? 0xcf000000u : 0x4f000000u;
+            uint32_t exposed = 0;
+            for (size_t lane = 0; lane < in.lanes(); ++lane) {
+                ASSERT_EQ(run.d[lane], bits);
+                if (!in.active[lane]) {
+                    EXPECT_NE(run.d[lane], in.old_d[lane]);
+                    ++exposed;
+                }
+            }
+            EXPECT_GT(exposed, 0u);
+        }
 }
 TEST(IrVectorExactIntegerFloatE64Execution,
      AllProducingModeBytesAndIeeeArmsExecuteTheSameExactBits) {
@@ -174,8 +197,7 @@ TEST(IrVectorExactIntegerFloatE64Execution,
                     const auto module = compile(program_for(def.opcode, 255, 0xffffff00, wave,
                                                             (mode << 12) | (ieee << 23)));
                     ASSERT_FALSE(module.empty()) << mode << ' ' << ieee;
-                    expect_lanes(execute(module, inputs()), inputs(), 0xffffff00,
-                                 def.opcode == 0x185);
+                    expect_lanes(def, execute(module, inputs()), inputs(), 0xffffff00);
                 }
 }
 TEST(IrVectorExactIntegerFloatE64Execution, OldE32PathExecutesVaryingExactLaneInputsHonestly) {
@@ -193,7 +215,7 @@ TEST(IrVectorExactIntegerFloatE64Execution, OldE32PathExecutesVaryingExactLaneIn
                 const auto module =
                     compile(program_for(def.opcode, 258, 0, wave, UINT32_MAX, 0, true));
                 ASSERT_FALSE(module.empty());
-                expect_lanes(execute(module, in), in, 0, def.opcode == 0x185, 0, true);
+                expect_lanes(def, execute(module, in), in, 0, 0, true);
             }
 }
 TEST(IrVectorExactIntegerFloatE64Execution, InitializedRegisterAndInlineFloatSourcesStayRefused) {
@@ -205,7 +227,7 @@ TEST(IrVectorExactIntegerFloatE64Execution, InitializedRegisterAndInlineFloatSou
                 EXPECT_TRUE(compile(p).empty()) << selector;
                 const auto good = compile(program_for(def.opcode, 255, 0x3f800000, wave));
                 ASSERT_FALSE(good.empty());
-                expect_lanes(execute(good, inputs()), inputs(), 0x3f800000, def.opcode == 0x185);
+                expect_lanes(def, execute(good, inputs()), inputs(), 0x3f800000);
             }
 }
 TEST(IrVectorExactIntegerFloatE64Execution, EncodingsAndLiteralConsumptionArePinned) {
