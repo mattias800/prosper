@@ -1,10 +1,12 @@
 // AMD 70648 6.2, 12.8: ABS then NEG on the float source; OMOD ignores integer results.
 #include "gpu/recompiler/ir/lower/vop3_float_integer_lowering.hpp"
+#include "gpu/recompiler/ir/lower/vop3_exact_integer_float_lowering.hpp"
 #include "gpu/recompiler/ir/ops/vector_float_integer_e64.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 namespace prosper::gpu::ir {
 bool lower_vop3_float_integer(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok) {
+    if (lower_vop3_exact_integer_float(b, rs, in, ok)) return true;
     const auto* def = find_vector_float_integer_e64_op(in.fmt, in.opcode);
     const bool plain_flr = !def;
     if (!def) def = find_vector_cvt_flr_e64_op(in.fmt, in.opcode);
