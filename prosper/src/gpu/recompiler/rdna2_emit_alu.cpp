@@ -421,7 +421,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             if (auto routed = ir::lower_vop1_conversion_routes(b, rs, in, a, d, old_d, ok))
                 return *routed;
             const bool integer_handled = ir::lower_vop1_integer(b, in, a, d, ok);
-            const bool float_handled = ir::lower_vop1_unary_float(b, in, a, d);
+            const bool float_handled = ir::lower_vop1_unary_float(b, in, a, d, ok);
             const bool conversion_handled =
                 ir::lower_vop1_conversion_values(b, rs, in, a, d, old_d, ok);
             switch (in.opcode) {

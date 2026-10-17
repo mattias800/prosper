@@ -123,6 +123,10 @@ struct Rdna2InstructionEffects {
     bool accumulates = false;
     // SRC0's VGPR is written too, with the old VDST (v_swap_b32, v_swaprel_b32).
     bool writes_src0 = false;
+    // An integer-valued F32 rounding instruction whose result can differ when an input
+    // subnormal is flushed (CEIL/FLOOR). TRUNC/RNDNE yield the same signed zero either
+    // way; FRACT has its own denormal-input contract. Not a general FP classification.
+    bool f32_rounding_input_sensitive = false;
     // ---- Scalar memory (SMEM rows; status Known). sdst_dwords is what SDATA receives -- for an
     // atomic, the returned old value, written only when GLC is set; ssrc_dwords[0] is SBASE (a
     // pair, or a V# quad for the buffer forms) and ssrc_dwords[1] the SOFFSET register.
