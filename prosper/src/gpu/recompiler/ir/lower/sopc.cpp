@@ -1,5 +1,6 @@
 // sopc.cpp — SOPC lowering: the wave-mask compare routes, then scalar-data compares.
 #include "gpu/recompiler/ir/lower/scalar_lowering_internal.hpp"
+#include "gpu/recompiler/ir/ops/scalar_integer64_values.hpp"
 
 namespace prosper::gpu::ir {
 
@@ -27,7 +28,7 @@ bool SopcLowering::lower_data() {
     return true;
 }
 
-// s_cmp_eq/lg_u64 on scalar data pairs. Not in the IR yet: it reads each source's high word.
+// s_cmp_eq/lg_u64: value math is IR; the existing high-word source reads stay here.
 bool SopcLowering::lower_compare_u64(uint32_t a, uint32_t c) {
     // AMD RDNA2 ISA 12.4: each encoded source names the low half of an SGPR pair.
     // Inline integer/literal sources are extended to 64 bits; Astro compares
@@ -53,10 +54,20 @@ bool SopcLowering::lower_compare_u64(uint32_t a, uint32_t c) {
         ok = false;
         return b.uconst(0);
     };
-    const uint32_t equal = b.land(
-        b.ucmp(Op_IEqual, a, c),
-        b.ucmp(Op_IEqual, high(in.src[0]), high(in.src[1])));
-    rs.scc = in.opcode == 0x12 ? equal : b.logical_not(equal);
+    const auto* value_def = find_scalar_integer64_value_op(in.fmt, in.opcode);
+    if (!value_def) {
+        ok = false;
+        return true;
+    }
+    rs.scc = emit_scalar_integer64_value(b, *value_def, [&](Scalar64Source source) {
+                 switch (source) {
+                     case Scalar64Source::S0Lo: return a;
+                     case Scalar64Source::S0Hi: return high(in.src[0]);
+                     case Scalar64Source::S1Lo: return c;
+                     case Scalar64Source::S1Hi: return high(in.src[1]);
+                     default: return rs.scc;
+                 }
+             }).first;
     return true;
 }
 
