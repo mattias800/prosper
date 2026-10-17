@@ -4,6 +4,7 @@
 #include "gpu/recompiler/ir/lower/vop3_binary_float_lowering.hpp"
 #include "gpu/recompiler/ir/ops/vector_alu.hpp"
 #include "gpu/recompiler/ir/lower/vop3_round_float_lowering.hpp"
+#include "gpu/recompiler/ir/lower/f32_round_input.hpp"
 #include "gpu/recompiler/ir/ops/vector_round_float.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <cstdio>
@@ -28,7 +29,9 @@ bool lower_vop3_round_float(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, 
     }
     const auto source = fv(0);
     if (!ok) return true;
-    rs.vreg[in.dst.value] = fresult(emit_vector_op(b, *def, source, 0));
+    const auto result = emit_f32_rounding_op(b, in, *def, source, ok);
+    if (!ok) return true;
+    rs.vreg[in.dst.value] = fresult(result);
     return true;
 }
 }   // namespace prosper::gpu::ir

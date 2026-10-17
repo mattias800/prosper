@@ -57,6 +57,9 @@ LaneInputs inputs(uint32_t seed) {
 Known expected(const VectorOpDef& def, uint32_t source, Form f, uint32_t rsrc1) {
     if (f.abs) source &= 0x7fffffffu;
     if (f.neg) source ^= 0x80000000u;
+    if (rdna2_instruction_effects(def.fmt, def.opcode).f32_rounding_input_sensitive &&
+        !(rsrc1 & (0x10u << 12)) && (source & 0x7fffffffu) < 0x00800000u)
+        source &= 0x80000000u;
     auto result = eval_vector_op(def, source, std::nullopt);
     if (!result) return {};
     float x = std::bit_cast<float>(*result);
@@ -177,18 +180,81 @@ TEST(IrVectorRoundFloatExecution, HandWorkedOutputModesDistinguishScalingSuppres
                         << " PGM_RSRC1 " << rsrc1;
             }
 }
-TEST(IrVectorRoundFloatExecution, MissingLaunchModeRefusesOnlyAnActiveOutputScale) {
+TEST(IrVectorRoundFloatExecution, EveryProducingModeKeepsInputPolicyAndInactiveWords) {
+    // Independent bit arithmetic for CEIL/FLOOR: zero keeps its sign; magnitudes
+    // below one round to zero or one according to sign/direction. Larger finite
+    // values clear fractional mantissa bits and increment one integer unit if needed.
+    const auto rounded = [](uint32_t bits, bool ceil, bool flush) {
+        const uint32_t magnitude = bits & 0x7fffffffu, sign = bits & 0x80000000u;
+        if (flush && magnitude < 0x00800000u) return sign;
+        if (!magnitude) return bits;
+        const int exponent = int(magnitude >> 23) - 127;
+        if (exponent < 0) return (ceil != bool(sign)) ? sign | 0x3f800000u : sign;
+        if (exponent >= 23) return bits;
+        const uint32_t unit = 1u << (23 - exponent), mask = unit - 1;
+        return (bits & ~mask) + ((bits & mask) && (ceil != bool(sign)) ? unit : 0);
+    };
+    const uint32_t edges[] = {1,          0x80000001, 0x007fffff, 0x807fffff, 0,
+                              0x80000000, 0x00800000, 0x80800000, 0x3fa00000, 0xbfa00000,
+                              0x3f000000, 0xbf000000, 0x7f7fffff, 0xff7fffff};
+    for (const auto& def : vector_round_float_defs())
+        for (uint32_t wave : {32u, 64u})
+            for (uint32_t mode = 0; mode < 256; ++mode) {
+                auto in = inputs(5322);
+                for (size_t lane = 0; lane < in.lanes(); ++lane) {
+                    in.s0[lane] = edges[lane % std::size(edges)];
+                    // FRACT's separate denormal-result contract is outside this input fix.
+                    // Its controls use finite normal values with normal fractional results.
+                    if (def.opcode == 0x1a0) in.s0[lane] = lane & 1 ? 0xbfa00000 : 0x3fa00000;
+                }
+                Form f;
+                f.abs = mode & 1;
+                f.neg = mode & 2;
+                const uint32_t rsrc1 = (mode << 12) | ((mode & 4) ? 1u << 23 : 0);
+                const auto run =
+                    run_vector_op_per_lane(words(def.opcode, f), in, wave, false, rsrc1);
+                ASSERT_TRUE(run.error.empty()) << run.error;
+                ASSERT_EQ(run.d.size(), in.lanes());
+                const bool sensitive =
+                    rdna2_instruction_effects(def.fmt, def.opcode).f32_rounding_input_sensitive;
+                for (size_t lane = 0; lane < in.lanes(); ++lane) {
+                    uint32_t source = in.s0[lane];
+                    if (f.abs) source &= 0x7fffffffu;
+                    if (f.neg) source ^= 0x80000000u;
+                    const auto want =
+                        !in.active[lane] ? Known(in.old_d[lane])
+                        : sensitive ? Known(rounded(source, def.opcode == 0x1a2, !(mode & 0x10)))
+                                    : expected(def, in.s0[lane], f, rsrc1);
+                    ASSERT_TRUE(want);
+                    EXPECT_EQ(run.d[lane], *want) << "opcode " << def.opcode << " wave " << wave
+                                                  << " mode " << mode << " lane " << lane;
+                }
+            }
+}
+TEST(IrVectorRoundFloatExecution, MissingModeKeepsInputAndOutputObligationsDistinct) {
     for (const auto& def : vector_round_float_defs())
         for (uint32_t wave : {64u, 32u}) {
             Form f;
             f.scale = 1;
             const auto scaled =
                 run_vector_op_per_lane(words(def.opcode, f), inputs(7), wave, false, UINT32_MAX);
-            EXPECT_NE(scaled.error.find("float-omod-launch-mode-unavailable"), std::string::npos)
+            const bool sensitive =
+                rdna2_instruction_effects(def.fmt, def.opcode).f32_rounding_input_sensitive;
+            EXPECT_NE(scaled.error.find(sensitive ? "f32-round-input-mode-unavailable"
+                                                  : "float-omod-launch-mode-unavailable"),
+                      std::string::npos)
                 << scaled.error;
             const auto plain =
                 run_vector_op_per_lane(words(def.opcode), inputs(7), wave, false, UINT32_MAX);
-            EXPECT_TRUE(plain.error.empty()) << plain.error;
+            if (sensitive)
+                EXPECT_NE(plain.error.find("f32-round-input-mode-unavailable"), std::string::npos)
+                    << plain.error;
+            else
+                EXPECT_TRUE(plain.error.empty()) << plain.error;
+            EXPECT_TRUE(
+                run_vector_op_per_lane(words(def.opcode), inputs(7), wave, false, 0).error.empty());
+            EXPECT_TRUE(run_vector_op_per_lane(words(def.opcode), inputs(7), wave, false, 0x30000)
+                            .error.empty());
         }
 }
 TEST(IrVectorRoundFloatExecution, HarnessAndEffectsRetainOneOwnedWordPerLane) {

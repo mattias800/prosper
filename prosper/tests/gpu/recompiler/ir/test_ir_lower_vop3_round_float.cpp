@@ -106,6 +106,27 @@ TEST(IrLowerVop3RoundFloat, SourceFailureDoesNotPublishAnInventedResult) {
     EXPECT_TRUE(t.modified.empty());
     EXPECT_TRUE(t.rs.vreg.empty());
 }
+TEST(IrLowerVop3RoundFloat, MissingInputModeKeepsTheOldDestinationAndSkipsOutputModifiers) {
+    for (const auto& def : ir::vector_round_float_defs()) {
+        if (!rdna2_instruction_effects(def.fmt, def.opcode).f32_rounding_input_sensitive) continue;
+        Round t;
+        t.b.compute_pgm_rsrc1 = UINT32_MAX;
+        const auto old = t.b.uconst(0xd00d);
+        t.rs.vreg[1] = old;
+        t.source = [&](int slot) {
+            t.reads.push_back(slot);
+            return t.b.id();
+        };
+        const auto before = t.code_words();
+        EXPECT_TRUE(t.lower(instruction(def.opcode)));
+        EXPECT_FALSE(t.ok);
+        EXPECT_EQ(t.reads, (std::vector<int>{0}));
+        EXPECT_TRUE(t.modified.empty());
+        EXPECT_EQ(t.rs.vreg.at(1), old);
+        EXPECT_EQ(t.code_words(), before);
+        EXPECT_EQ(t.b.stage_reject_reason, "f32-round-input-mode-unavailable");
+    }
+}
 TEST(IrLowerVop3RoundFloat, ResultAndMaskBookkeepingRemainWithTheCaller) {
     Round t;
     t.rs.exec = t.b.bfalse();
