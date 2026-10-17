@@ -1,4 +1,5 @@
 // Pin native row/nibble math independently, and label inherited FI/BC compatibility separately.
+#include "gpu/recompiler/ir/vector_lane_harness.hpp"
 #include "gpu/recompiler/bpermute_spirv_oracle.hpp"
 #include "gpu/recompiler/ir/builder.hpp"
 #include "gpu/recompiler/ir/ir.hpp"

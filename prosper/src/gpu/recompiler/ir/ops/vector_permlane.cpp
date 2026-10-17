@@ -1,5 +1,6 @@
 // AMD70648 12.12: sixteen selector nibbles gather within a row, or from its paired row.
 // Expressions retain the old helper/lowering order, including late old-destination reads.
+#include "gpu/recompiler/ir/builder.hpp"
 #include "gpu/recompiler/ir/ir.hpp"
 #include <cstdint>
 #include "gpu/recompiler/ir/ops/vector_permlane.hpp"
