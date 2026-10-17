@@ -808,9 +808,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             } else if (in.opcode == 0x14B) {
                 // GLSL Fma intent; Vulkan precision remains implementation-dependent (#5225).
                 vreg[in.dst.value] = fresult(ir::emit_fused_mad_float(b, std::cref(fv)));
-            } else if (in.opcode == 0x176 ||
-                       in.opcode == 0x177) {   // v_mad_u64_u32 / v_mad_i64_i32
-                ir::lower_vop3_mad64(b, rs, in, ok, allow_wave);
+            } else if (ir::lower_vop3_mad64(b, rs, in, ok, allow_wave)) {
             } else if (ir::lower_vop3_carry_out(b, rs, in, ok, allow_wave)) {
             } else if (ir::lower_vop3_multiply(b, rs, in, ok, allow_wave)) {
             } else if (in.opcode == 0x157 &&

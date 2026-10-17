@@ -1,11 +1,15 @@
 // MAD64 bookkeeping relocated with extract_case_routes.py; arithmetic is unchanged.
+#include "gpu/recompiler/rdna2_alu_support.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include <cstdint>
+#include <optional>
 #include "gpu/recompiler/ir/lower/vop3_mad64_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_mad64_lowering_internal.hpp"
 #include "gpu/recompiler/ir/lower/carry_mask_write.hpp"
-#include "gpu/recompiler/rdna2_mad_64.hpp"
+#include "gpu/recompiler/ir/ops/vector_mad64.hpp"
 namespace prosper::gpu::ir {
 std::optional<bool> Vop3Mad64Lowering::route_value() {
-    // {carry,D} = S0*S1 + S2 (rdna2_mad_64.cpp). A positive inline constant used as the
+    // {carry,D} = S0*S1 + S2 (ops/vector_mad64.cpp). A positive inline constant used as the
     // 64-bit addend is zero-extended, a negative integer inline sign-extended; register
     // addends consume the consecutive high register. A literal addend is zero-extended
     // for 0x176 and refused for 0x177 until its extension is proved.
@@ -43,7 +47,8 @@ std::optional<bool> Vop3Mad64Lowering::route_value() {
 
         const uint32_t a = val(in.src[0]), c = val(in.src[1]);
         const uint32_t add_lo = val(in.src[2]), add_hi = high_half(in.src[2]);
-        const Mad64Result mad = emit_mad_64_32(b, a, c, add_lo, add_hi, is_signed);
+        const auto& def = *find_vector_mad64(in.fmt, in.opcode);
+        const Mad64Ids mad = emit_vector_mad64(b, def, a, c, add_lo, add_hi);
         const uint32_t result_lo = mad.lo, result_hi = mad.hi, carry_out = mad.carry;
 
         const int hi_dst = in.dst.value + 1;
@@ -58,7 +63,7 @@ std::optional<bool> Vop3Mad64Lowering::route_value() {
 
 bool lower_vop3_mad64(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok,
                       bool allow_wave) {
-    if (in.fmt != Rdna2Format::VOP3 || (in.opcode != 0x176 && in.opcode != 0x177)) return false;
+    if (!find_vector_mad64(in.fmt, in.opcode)) return false;
     Vop3Mad64Lowering lower({b, rs, in, ok, allow_wave});
     lower.route_value();
     return true;
