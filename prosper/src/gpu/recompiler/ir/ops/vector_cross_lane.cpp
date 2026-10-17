@@ -4,6 +4,7 @@
 #include "gpu/recompiler/ir/emit/spirv_emitter.hpp"
 
 #include <array>
+#include <functional>
 
 namespace prosper::gpu::ir {
 

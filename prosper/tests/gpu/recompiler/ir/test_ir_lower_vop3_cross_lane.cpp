@@ -3,8 +3,12 @@
 #include "gpu/recompiler/ir/lowering_fixture.hpp"
 #include "gpu/recompiler/ir/ops/vector_cross_lane.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <gtest/gtest.h>
+#include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <vector>
 using namespace prosper::gpu;
 using namespace prosper::gpu::ir;
@@ -34,8 +38,7 @@ TEST(IrLowerVop3CrossLane, NativeDynamicWriteKeepsMasksAndRetiresOnlyTheOldLaneS
         t.rs.invalidated_vgpr_lane_slots.insert(7);
         const auto exec = t.rs.exec, vcc = t.rs.vcc, scc = t.rs.scc;
         const auto routed = lower_vop3_cross_lane(t.b, t.rs, instruction(), t.ok, true);
-        ASSERT_TRUE(routed.has_value());
-        EXPECT_TRUE(*routed);
+        ASSERT_EQ(routed, std::optional<bool>{true});
         ASSERT_TRUE(t.ok);
         EXPECT_TRUE(t.rs.vreg.contains(1));
         EXPECT_FALSE(t.rs.invalidated_vgpr_lane_slots.contains(1));

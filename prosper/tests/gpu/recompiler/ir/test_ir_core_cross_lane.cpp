@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <set>
@@ -179,6 +180,7 @@ TEST(IrCoreCrossLane, WritelaneMatchesHandSelectedLanesInBothExactNativeWidths) 
         EXPECT_EQ(block.input_count(), 3u);
         for (uint32_t selected : {0u, 1u, 31u, 32u, 63u, 64u, 69u, 0xffffffffu}) {
             std::vector<InvocationInputs> inputs;
+            inputs.reserve(wave);
             for (uint32_t lane = 0; lane < wave; ++lane)
                 inputs.push_back({0x5370abcd, selected, data(lane)});
             const auto evaluated = evaluate_lanes(block, inputs);

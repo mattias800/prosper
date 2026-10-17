@@ -2,6 +2,11 @@
 #include "gpu/recompiler/ir/native_writelane_cases.hpp"
 #include "gpu/recompiler/ir/eval_lanes.hpp"
 #include "gpu/recompiler/ir/ops/vector_cross_lane.hpp"
+#include "gpu/recompiler/ir/vector_lane_harness.hpp"
+#include "gpu/recompiler/ir/builder.hpp"
+#include "gpu/recompiler/ir/ir.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/bpermute_spirv_oracle.hpp"
 #include "gpu/diagnostics/refused_shader_inputs.hpp"
 #include "fixtures/test_scratch.h"
 #include <gtest/gtest.h>
@@ -11,6 +16,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <ios>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -47,6 +53,7 @@ void expect_lanes(const std::vector<uint32_t>& module, const LaneInputs& in, uin
     const Value s0 = ir.input(Type::U32), s1 = ir.input(Type::U32);
     const Value d = writelane_b32(ir, s0, s1, wave, [&] { return ir.input(Type::U32); });
     std::vector<InvocationInputs> inputs;
+    inputs.reserve(wave);
     for (uint32_t lane = 0; lane < wave; ++lane)
         inputs.push_back({cases::source_word(source), selector, in.old_d[lane]});
     const auto evaluated = evaluate_lanes(block, inputs);
