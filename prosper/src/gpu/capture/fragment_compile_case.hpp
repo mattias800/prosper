@@ -55,6 +55,7 @@ struct FragmentCompileCase {
     // Schema 4 retains independent observed launch flags. A legacy schema cannot derive these
     // inputs from FLOAT_MODE, SOURCE, width or a host device and stays inspectable INCOMPLETE.
     FragmentFloatFlags float_flags{};
+    // Schema 8 appends float_flags.fp16_overflow independently; older cases keep it unknown.
     FragmentLaunchRsrc1 launch_rsrc1{}; // schema 4 evidence; not an unused compiler argument
     // Schema 6 (#4703). Older schemas predate the input, and their compiler built exactly what
     // the all-zero value builds, so they replay with {} and stay complete.

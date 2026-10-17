@@ -18,6 +18,7 @@ void populate_compute_shader_key(ShaderCompileKey& key, const ComputeShaderConfi
     key.compute_threads_z = config.threads_z;
     key.compute_wave_size = config.wave_size;
     key.compute_pgm_rsrc1 = config.compute_pgm_rsrc1;
+    key.compute_fp16_overflow = config.fp16_overflow;
     key.compute_tidig_comp_cnt = config.tidig_comp_cnt;
     key.compute_tgid_x_en = config.tgid_x_en;
     key.compute_tgid_y_en = config.tgid_y_en;

@@ -116,6 +116,8 @@ struct StageKeyHash {
         hash = mix(hash, key.float_mode.available);
         hash = mix(hash, key.float_mode.value);
         hash = mix(hash, key.float_mode.ieee_mode);
+        hash = mix(hash, key.float_mode.fp16_overflow.available);
+        hash = mix(hash, key.float_mode.fp16_overflow.saturate);
         hash = mix(hash, key.interpolation_layout);
         hash = mix(
             hash,

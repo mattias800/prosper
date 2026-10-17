@@ -13,7 +13,7 @@
 namespace prosper::gpu {
 // Schema 5 adds explicit native/NGG graphics modes after the resource carrier. Schema 3 keeps
 // terminal text outside that bounded carrier. Both legacy graphics schemas remain readable.
-inline constexpr uint32_t kRefusedGraphicsInputsSchema = 5;
+inline constexpr uint32_t kRefusedGraphicsInputsSchema = 6;
 inline constexpr size_t kRefusedGraphicsRejectMaxBytes = 512;
 struct GpuState;
 struct RefusedShaderInputs;

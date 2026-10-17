@@ -1996,6 +1996,59 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                 return false;
             }
     }
+    if (version >= kVersionWithFp16OverflowMode) {
+        const auto read_overflow = [&](Fp16OverflowMode& mode) {
+            uint8_t available = 0, saturate = 0;
+            if (!r.u8(available) || !r.u8(saturate) || available > 1 || saturate > 1) return false;
+            mode = {available != 0, saturate != 0};
+            return mode.canonical();
+        };
+        uint32_t count = 0;
+        if (!r.u32(count) || count != c.draws.size()) {
+            error = "invalid draw half overflow count";
+            return false;
+        }
+        for (auto& draw : c.draws)
+            if (!read_overflow(draw.vertex_float_mode.fp16_overflow) ||
+                !read_overflow(draw.ps_float_flags.fp16_overflow)) {
+                error = "invalid draw half overflow mode";
+                return false;
+            }
+        if (!r.u32(count) || count != c.failure_diagnostics.size()) {
+            error = "invalid failed draw half overflow count";
+            return false;
+        }
+        for (auto& diagnostic : c.failure_diagnostics)
+            if (!read_overflow(diagnostic.vertex_float_mode.fp16_overflow) ||
+                !read_overflow(diagnostic.ps_float_flags.fp16_overflow)) {
+                error = "invalid failed draw half overflow mode";
+                return false;
+            }
+        if (!r.u32(count) || count != c.computes.size()) {
+            error = "invalid compute half overflow count";
+            return false;
+        }
+        for (auto& compute : c.computes)
+            if (!read_overflow(compute.recompile_config.fp16_overflow)) {
+                error = "invalid compute half overflow mode";
+                return false;
+            }
+        if (!r.u32(count) || count != c.failure_diagnostics.size()) {
+            error = "invalid failed-compute half overflow count";
+            return false;
+        }
+        for (auto& diagnostic : c.failure_diagnostics) {
+            if (!r.u32(count) || count != diagnostic.stages.size()) {
+                error = "invalid failed-stage half overflow count";
+                return false;
+            }
+            for (auto& stage : diagnostic.stages)
+                if (!read_overflow(stage.recompile_config.fp16_overflow)) {
+                    error = "invalid failed-compute half overflow mode";
+                    return false;
+                }
+        }
+    }
     // DS seed identity is checked HERE, not in the record loop, because the slice arrives in the
     // tail above: a per-record check would compare incomplete identities and reject two faces of one
     // cube that differ only in slice -- which is exactly the capture this version exists to allow.

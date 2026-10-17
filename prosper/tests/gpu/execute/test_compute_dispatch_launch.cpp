@@ -1,6 +1,7 @@
 // Raw dispatch controls are part of physical entry-mask provenance. Normalized extents lose the
 // independent partial-TG flag and register halves, so they cannot grant original guest EXEC words.
 #include "fixtures/portable_entry_exec.hpp"
+#include "gpu/capture/gpu_capture.hpp"
 #include "gpu/agc/agc_shader_layout.hpp"
 #include "gpu/execute/compute_dispatch_launch.hpp"
 #include "gpu/execute/gpu_execute.hpp"
@@ -12,9 +13,12 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <string>
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iterator>
 #include <memory>
 #include <vector>
@@ -211,5 +215,71 @@ TEST(ComputeDispatchLaunch, WarmCacheCannotReuseFullMaskForChangedRawControl) {
     stats = shader_recompile_cache_stats();
     EXPECT_EQ(stats.misses, 3u);
     EXPECT_EQ(stats.hits, 1u);
+    clear_shader_recompile_cache();
+}
+
+// The producer helper must remain wired at the real register-file realization boundary.
+TEST(ComputeDispatchLaunch, ActualExecutorRetainsIndependentFp16OverflowKnownness) {
+    alignas(256) static const uint32_t code[] = {0x7e000280u, 0xbf810000u};
+    static ComputeShaderBlob blob;
+    ASSERT_TRUE(register_compute(code, std::size(code), blob));
+    clear_shader_recompile_cache();
+    for (const auto expected :
+         {Fp16OverflowMode{}, Fp16OverflowMode{true, false}, Fp16OverflowMode{true, true}}) {
+        auto dispatch = packet();
+        auto producing = std::make_shared<GpuState>(*dispatch.state);
+        for (const auto& reg : blob.registers) producing->sh.set(reg.offset, reg.value);
+        if (expected.available)
+            producing->sh.set(prosper::agc::Pm4::COMPUTE_PGM_RSRC1,
+                              expected.saturate ? 1u << 26 : 0u);
+        dispatch.state = producing;
+        GpuState state;
+        state.dispatches.push_back(dispatch);
+        std::vector<OperationRealizationFailure> failures;
+        const auto items = realize_compute_dispatches(state, 4096, &failures);
+        ASSERT_TRUE(failures.empty());
+        ASSERT_EQ(items.size(), 1u);
+        ASSERT_TRUE(items[0].recompile_config_available);
+        EXPECT_EQ(items[0].recompile_config.fp16_overflow, expected);
+        EXPECT_EQ(items[0].recompile_config.compute_pgm_rsrc1, expected.saturate ? 1u << 26 : 0u);
+        auto captured_items = items;
+        captured_items[0].command_order = 1;
+        captured_items[0].dispatch_index = 0;
+        GpuCaptureMetadata metadata;
+        metadata.width = metadata.height = 1;
+        GpuCaptureFile capture, decoded;
+        std::string error;
+        const auto reader = [&](uint64_t address, uint8_t* out, size_t count) {
+            const uint64_t base = reinterpret_cast<uint64_t>(code);
+            if (address < base || address - base >= sizeof(code)) return size_t{0};
+            const size_t offset = size_t(address - base);
+            const size_t size = std::min(count, sizeof(code) - offset);
+            std::memcpy(out, reinterpret_cast<const uint8_t*>(code) + offset, size);
+            return size;
+        };
+        ASSERT_TRUE(capture_submit_items({}, captured_items,
+                                         {{SubmitOperationKind::Dispatch, 0, 1}}, metadata, reader,
+                                         capture, error))
+            << error;
+        std::vector<uint8_t> bytes;
+        ASSERT_TRUE(serialize_gpu_capture(capture, bytes, error)) << error;
+        ASSERT_TRUE(deserialize_gpu_capture(bytes, decoded, error)) << error;
+        ASSERT_EQ(decoded.computes.size(), 1u);
+        EXPECT_EQ(decoded.computes[0].recompile_config.fp16_overflow, expected);
+        GpuReplayFrame replay;
+        ASSERT_TRUE(materialize_gpu_replay(decoded, replay, error)) << error;
+        ASSERT_EQ(replay.computes.size(), 1u);
+        EXPECT_EQ(replay.computes[0].recompile_config.fp16_overflow, expected);
+        if (expected.available) {
+            ASSERT_EQ(decoded.format_version, 78u);
+            // v78: empty graphics counts, one compute fact, then empty failure count.
+            bytes.resize(bytes.size() - 18);
+            for (unsigned i = 0; i < 4; ++i) bytes.at(8 + i) = uint8_t(77u >> (8 * i));
+            ASSERT_TRUE(deserialize_gpu_capture(bytes, decoded, error)) << error;
+            EXPECT_EQ(decoded.computes[0].recompile_config.fp16_overflow, Fp16OverflowMode{});
+            EXPECT_EQ(decoded.computes[0].recompile_config.compute_pgm_rsrc1,
+                      expected.saturate ? 1u << 26 : 0u);
+        }
+    }
     clear_shader_recompile_cache();
 }

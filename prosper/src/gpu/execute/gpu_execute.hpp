@@ -1800,6 +1800,9 @@ using LiveTargetByteRangeReaderFn = std::function<LiveTargetByteReadResult(
 void set_live_target_byte_range_reader(LiveTargetByteRangeReaderFn fn);
 LiveTargetByteReadResult read_live_render_target_bytes(uint64_t gpu_addr, uint32_t bytes,
                                                        std::vector<uint8_t>& output);
+// Preserve the historical missing-register raw zero while recording whether CS RSRC1 was observed.
+void populate_compute_launch_rsrc1(ComputeShaderConfig& config, const RegisterFile& registers);
+
 std::vector<ComputeItem>
 realize_compute_dispatches(const GpuState& st, uint64_t submit_no = 0,
                            std::vector<OperationRealizationFailure>* failures = nullptr,

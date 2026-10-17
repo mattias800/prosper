@@ -31,6 +31,20 @@ alignas(256) constexpr uint32_t failed_fragment[] = {
     0x7e000280u,0xf800180fu,0u,0xbf810000u,
 };
 alignas(256) constexpr uint32_t utility[] = {0x7e000280u,0xf8001803u,0u,0xbf810000u};
+// Legacy profile/byte-offset controls need a genuine historical writer payload, not a relabel.
+GpuCaptureFile without_half_overflow(GpuCaptureFile historical) {
+    for (auto& draw : historical.draws) {
+        draw.vertex_float_mode.fp16_overflow = {};
+        draw.ps_float_flags.fp16_overflow = {};
+    }
+    for (auto& compute : historical.computes) compute.recompile_config.fp16_overflow = {};
+    for (auto& failure : historical.failure_diagnostics) {
+        failure.vertex_float_mode.fp16_overflow = {};
+        failure.ps_float_flags.fp16_overflow = {};
+        for (auto& stage : failure.stages) stage.recompile_config.fp16_overflow = {};
+    }
+    return historical;
+}
 void program(GpuState& state, uint32_t lo, uint32_t hi, const uint32_t* words) {
     const auto address = reinterpret_cast<uint64_t>(words);
     state.sh[lo] = static_cast<uint32_t>(address >> 8);
@@ -90,23 +104,30 @@ int main(int argc, char** argv) {
     }
     for (bool shared : {false,true}) for (bool wave32 : {false,true})
         for (bool ieee : {false,true}) for (bool dx10 : {false,true}) {
-            const FragmentFloatFlags expected{true,ieee,dx10};
-            const uint32_t bits = (ieee ? 1u << P::SPI_SHADER_PGM_RSRC1_PS_IEEE_MODE_SHIFT : 0u) |
-                                  (dx10 ? 1u << P::SPI_SHADER_PGM_RSRC1_PS_DX10_CLAMP_SHIFT : 0u);
-            DrawItem cold,warm;
-            const auto state = state_for({true,0xab},fragment,wave32,bits);
-            CHECK(realize_draw_item(state,nullptr,3,std::size(vertex),false,cold,nullptr,shared) &&
-                      realize_draw_item(state,nullptr,3,std::size(vertex),false,warm,nullptr,shared) &&
-                      cold.ps_float_flags==expected && warm.ps_float_flags==expected &&
-                      cold.ps_float_mode==FragmentFloatMode({true,0xab}) &&
-                      cold.ps_launch_rsrc1==FragmentLaunchRsrc1({true,(0xabu<<12)|bits}) &&
-                      warm.ps_launch_rsrc1==cold.ps_launch_rsrc1 &&
-                      warm.fs_words()==cold.fs_words() && cold.fs_words()==direct({true,0xab},wave32),
-                  "actual copied/shared cold/warm producer retains all four known flag states");
-            for (auto* item : {&cold,&warm}) {
-                item->draw_index=realized.size(); item->command_order=realized.size()+1;
-                realized.push_back(std::move(*item));
-            }
+                const FragmentFloatFlags expected{true, ieee, dx10, {true, false}};
+                const uint32_t bits =
+                    (ieee ? 1u << P::SPI_SHADER_PGM_RSRC1_PS_IEEE_MODE_SHIFT : 0u) |
+                    (dx10 ? 1u << P::SPI_SHADER_PGM_RSRC1_PS_DX10_CLAMP_SHIFT : 0u);
+                DrawItem cold, warm;
+                const auto state = state_for({true, 0xab}, fragment, wave32, bits);
+                CHECK(realize_draw_item(state, nullptr, 3, std::size(vertex), false, cold, nullptr,
+                                        shared) &&
+                          realize_draw_item(state, nullptr, 3, std::size(vertex), false, warm,
+                                            nullptr, shared) &&
+                          cold.ps_float_flags == expected && warm.ps_float_flags == expected &&
+                          cold.ps_float_mode == FragmentFloatMode({true, 0xab}) &&
+                          cold.ps_launch_rsrc1 ==
+                              FragmentLaunchRsrc1({true, (0xabu << 12) | bits}) &&
+                          warm.ps_launch_rsrc1 == cold.ps_launch_rsrc1 &&
+                          warm.fs_words() == cold.fs_words() &&
+                          cold.fs_words() == direct({true, 0xab}, wave32),
+                      "actual copied/shared cold/warm producer retains all four known flag "
+                      "states");
+                for (auto* item : {&cold, &warm}) {
+                    item->draw_index = realized.size();
+                    item->command_order = realized.size() + 1;
+                    realized.push_back(std::move(*item));
+                }
         }
     for (bool shared : {false,true}) {
         uint64_t identities[2]{};
@@ -115,14 +136,18 @@ int main(int argc, char** argv) {
             const uint32_t word=(0xabu<<12)|(1u<<29)|(i ? 1u<<22 : 0u);
             DrawItem cold,warm;
             const auto launch=state_for({true,0xab},fragment,false,(1u<<29)|(i ? 1u<<22 : 0u));
-            CHECK(realize_draw_item(launch,nullptr,3,std::size(vertex),false,cold,nullptr,shared) &&
-                  realize_draw_item(launch,nullptr,3,std::size(vertex),false,warm,nullptr,shared) &&
-                  cold.ps_launch_rsrc1==FragmentLaunchRsrc1({true,word}) &&
-                  warm.ps_launch_rsrc1==cold.ps_launch_rsrc1 &&
-                  cold.ps_float_flags==FragmentFloatFlags({true,false,false}) &&
-                  cold.ps_float_mode==FragmentFloatMode({true,0xab}) &&
-                  cold.fs_identity && warm.fs_identity==cold.fs_identity,
-                  "non-IEEE/DX10 raw bits partition copied/shared producing context without policy inference");
+            CHECK(realize_draw_item(launch, nullptr, 3, std::size(vertex), false, cold, nullptr,
+                                    shared) &&
+                      realize_draw_item(launch, nullptr, 3, std::size(vertex), false, warm, nullptr,
+                                        shared) &&
+                      cold.ps_launch_rsrc1 == FragmentLaunchRsrc1({true, word}) &&
+                      warm.ps_launch_rsrc1 == cold.ps_launch_rsrc1 &&
+                      cold.ps_float_flags ==
+                          FragmentFloatFlags({true, false, false, {true, true}}) &&
+                      cold.ps_float_mode == FragmentFloatMode({true, 0xab}) && cold.fs_identity &&
+                      warm.fs_identity == cold.fs_identity,
+                  "non-IEEE/DX10 raw bits partition copied/shared producing context without policy "
+                  "inference");
             identities[i]=cold.fs_identity;
             if (i==0) unchanged=cold.fs_words();
             CHECK(cold.fs_words()==unchanged && warm.fs_words()==unchanged,
@@ -171,29 +196,32 @@ int main(int argc, char** argv) {
         mixed.draws.push_back(std::move(draw));
     }
     const auto per_draw = realize_gpustate_draws(mixed,std::size(vertex),1,1,nullptr,true,false);
-    CHECK(per_draw.size()==2 && per_draw[0].ps_float_mode==FragmentFloatMode({true,0}) &&
-              per_draw[1].ps_float_mode==FragmentFloatMode({true,16}) &&
-              per_draw[0].ps_float_flags==FragmentFloatFlags({true,false,false}) &&
-              per_draw[1].ps_float_flags==FragmentFloatFlags({true,true,true}) &&
-              per_draw[0].ps_launch_rsrc1==FragmentLaunchRsrc1({true,0}) &&
-              per_draw[1].ps_launch_rsrc1==FragmentLaunchRsrc1({true,(16u<<12)|(1u<<23)|(1u<<21)}) &&
-              per_draw[0].fs_words()==flush && per_draw[1].fs_words()==preserve,
+    CHECK(per_draw.size() == 2 && per_draw[0].ps_float_mode == FragmentFloatMode({true, 0}) &&
+              per_draw[1].ps_float_mode == FragmentFloatMode({true, 16}) &&
+              per_draw[0].ps_float_flags ==
+                  FragmentFloatFlags({true, false, false, {true, false}}) &&
+              per_draw[1].ps_float_flags == FragmentFloatFlags({true, true, true, {true, false}}) &&
+              per_draw[0].ps_launch_rsrc1 == FragmentLaunchRsrc1({true, 0}) &&
+              per_draw[1].ps_launch_rsrc1 ==
+                  FragmentLaunchRsrc1({true, (16u << 12) | (1u << 23) | (1u << 21)}) &&
+              per_draw[0].fs_words() == flush && per_draw[1].fs_words() == preserve,
           "per-draw snapshots beat conflicting submit-end mode/flags and warm cache");
     auto util = state_for({true,0xab},utility,true,1u<<23);
     util.cx[P::CB_COLOR_CONTROL]=P::CB_COLOR_CONTROL_MODE_DCC_DECOMPRESS << P::CB_COLOR_CONTROL_MODE_SHIFT;
     DrawItem replaced;
-    CHECK(realize_draw_item(util,nullptr,3,std::size(vertex),false,replaced) &&
-              replaced.ps_float_mode==FragmentFloatMode({true,0xab}) &&
-              replaced.ps_float_flags==FragmentFloatFlags({true,true,false}) &&
-              fragment_spirv_required_subgroup_size(replaced.fs_words())==0,
-          "utility replacement retains launch mode rather than inferring authority from effective SPIR-V");
+    CHECK(realize_draw_item(util, nullptr, 3, std::size(vertex), false, replaced) &&
+              replaced.ps_float_mode == FragmentFloatMode({true, 0xab}) &&
+              replaced.ps_float_flags == FragmentFloatFlags({true, true, false, {true, false}}) &&
+              fragment_spirv_required_subgroup_size(replaced.fs_words()) == 0,
+          "utility replacement retains launch mode rather than inferring authority from effective "
+          "SPIR-V");
     GpuCaptureMetadata metadata; metadata.width=metadata.height=1;
     GpuCaptureFile capture, loaded;
     std::string error;
     std::vector<uint8_t> bytes;
     CHECK(capture_draw_items(realized, metadata, reader, capture, error) &&
               serialize_gpu_capture(capture, bytes, error) &&
-              deserialize_gpu_capture(bytes, loaded, error) && loaded.format_version == 71 &&
+              deserialize_gpu_capture(bytes, loaded, error) && loaded.format_version == 78 &&
               loaded.draws.size() == realized.size(),
           "actual collector and current production codecs round trip realized mode");
     GpuReplayFrame replay;
@@ -221,6 +249,35 @@ int main(int argc, char** argv) {
     for (const auto* result : {&full,&manifest}) for (size_t i=0;i<realized.size();++i)
         CHECK(i<result->draws.size() && result->draws[i].ps_launch_rsrc1==realized[i].ps_launch_rsrc1,
               "bundle paths preserve unknown, explicitly programmed zero and full-byte values");
+    // Keep every established legacy control on a genuine v71 fixture. Clearing only the new
+    // independent fact selects the historical writer; today's higher-version tails stay separate.
+    const auto legacy71 = [&](std::vector<uint8_t> modern) {
+        auto historical = capture;
+        for (auto& draw : historical.draws) {
+            draw.ps_float_flags.fp16_overflow = {};
+            draw.vertex_float_mode.fp16_overflow = {};
+        }
+        std::vector<uint8_t> result;
+        CHECK(serialize_gpu_capture(historical, result, error),
+              "historical producing inputs serialize");
+        CHECK(result.size() > 12 && result[8] == 71,
+              "historical inputs select the genuine v71 wire");
+        // Resource-free/no-NGG/no-failure fixture: v72(4+n), v73(4+9n), v74(4),
+        // v75(4), v76(8+n), v77(8+3n), v78(16+4n), in their official append order.
+        const size_t suffix = 48u + 18u * capture.draws.size();
+        CHECK(modern.size() >= suffix, "all newer tails fit the modern fixture");
+        if (modern.size() < suffix) return result;
+        modern.resize(modern.size() - suffix);
+        set32(modern, 8, 71);
+        CHECK(modern == result,
+              "stripped modern prefix is byte-exactly the genuine v71 writer payload");
+        return modern;
+    };
+    bytes = legacy71(std::move(bytes));
+    CHECK(deserialize_gpu_capture(bytes, loaded, error), "genuine v71 prefix loads");
+    for (const auto& draw : loaded.draws)
+        CHECK(draw.ps_float_flags.fp16_overflow == Fp16OverflowMode{},
+              "known historical MODE/flags/raw evidence do not invent half overflow authority");
     const size_t entry_tail=4u+kGpuCaptureFragmentEntryRecordBytes*capture.draws.size();
     const size_t wave_tail = 4u + capture.draws.size();
     const size_t launch_tail = 4u + 25u * capture.draws.size();
@@ -237,6 +294,7 @@ int main(int argc, char** argv) {
     for (const auto& draw : loaded.draws) CHECK(draw.ps_float_flags==FragmentFloatFlags{} &&
           draw.ps_launch_rsrc1==FragmentLaunchRsrc1{},"rewritten flags/raw evidence stay unknown");
     CHECK(serialize_gpu_capture(capture,bytes,error),"restore exact producing flag bytes for hostile controls");
+    bytes = legacy71(std::move(bytes));
     for (size_t field : {flags_tail, bytes.size() - launch_tail - wave_tail - entry_tail - 8u}) {
         auto corrupt=bytes; set32(corrupt,field,UINT32_MAX);
         CHECK(!deserialize_gpu_capture(corrupt,loaded,error),"hostile v67 counts refuse before second allocations");
@@ -319,11 +377,12 @@ int main(int argc, char** argv) {
     CHECK(!capture_draw_items(bad_draws,metadata,reader,bad,error),"collector rejects noncanonical mode");
     OperationRealizationFailure failure;
     DrawItem rejected;
-    CHECK(!realize_draw_item(state_for({true,0x9b},failed_fragment,false,
-                             1u<<P::SPI_SHADER_PGM_RSRC1_PS_IEEE_MODE_SHIFT),nullptr,3,std::size(vertex),false,
-                             rejected,&failure) && failure.reason==RealizationFailureReason::ShaderRecompile &&
-              failure.ps_float_mode==FragmentFloatMode({true,0x9b}) &&
-              failure.ps_float_flags==FragmentFloatFlags({true,true,false}),
+    CHECK(!realize_draw_item(state_for({true, 0x9b}, failed_fragment, false,
+                                       1u << P::SPI_SHADER_PGM_RSRC1_PS_IEEE_MODE_SHIFT),
+                             nullptr, 3, std::size(vertex), false, rejected, &failure) &&
+              failure.reason == RealizationFailureReason::ShaderRecompile &&
+              failure.ps_float_mode == FragmentFloatMode({true, 0x9b}) &&
+              failure.ps_float_flags == FragmentFloatFlags({true, true, false, {true, false}}),
           "actual failed-stage compiler retains known launch mode");
     CHECK(failure.ps_launch_rsrc1==FragmentLaunchRsrc1({true,(0x9bu<<12)|(1u<<23)}),
           "actual failed-stage compiler retains known launch mode");
@@ -371,7 +430,9 @@ int main(int argc, char** argv) {
             CHECK(capture_draw_items({draw},metadata,reader,single,error),"CLI fixture captures exact producing input");
             // Wrong stored pixels must not pass for regenerated source. Oppose the known mode.
             single.draws[0].fs=entry.mode.available && entry.mode.value==0 ? preserve : flush;
-            CHECK(write_gpu_capture((directory/(std::string(entry.name)+".prgcap")).string(),single,error),"CLI fixture writes");
+            CHECK(write_gpu_capture((directory / (std::string(entry.name) + ".prgcap")).string(),
+                                    without_half_overflow(single), error),
+                  "CLI fixture writes");
             auto retry=single; retry.draws.clear(); retry.operations={{SubmitOperationKind::Draw,7,1,false}};
             retry.failure_diagnostics_available=true;
             GpuCapturedOperationFailure f; f.source_index=7; f.command_order=1;
@@ -384,7 +445,10 @@ int main(int argc, char** argv) {
             // Remove the otherwise unreferenced vertex raw version and remap fragment index.
             const auto raw=retry.raw_shader_versions[stage.raw_shader_index]; retry.raw_shader_versions={raw};
             retry.failure_diagnostics[0].stages[0].raw_shader_index=0;
-            CHECK(write_gpu_capture((directory/(std::string(entry.name)+"-failed.prgcap")).string(),retry,error),"retry CLI fixture writes");
+            CHECK(write_gpu_capture(
+                      (directory / (std::string(entry.name) + "-failed.prgcap")).string(),
+                      without_half_overflow(retry), error),
+                  "retry CLI fixture writes");
         }
     }
     std::printf("== %s (%d failures) ==\n",failures?"FAIL":"PASS",failures);

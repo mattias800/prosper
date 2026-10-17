@@ -13,8 +13,12 @@ GraphicsFloatMode graphics_float_mode(const GpuState& state, GraphicsHardwareSta
     if (stage == GraphicsHardwareStage::Geometry) reg = P::SPI_SHADER_PGM_RSRC1_GS;
     if (stage == GraphicsHardwareStage::Hull) reg = P::SPI_SHADER_PGM_RSRC1_HS;
     const auto found = state.sh.find(reg);
-    return found == state.sh.end() ? GraphicsFloatMode{}
-                                   : graphics_float_mode_from_rsrc1(found->second);
+    if (found == state.sh.end()) return {};
+    auto result = graphics_float_mode_from_rsrc1(found->second);
+    // FP16_OVFL is HS[30], VS/GS[31]; FLOAT_MODE and IEEE happen to share positions.
+    const auto shift = stage == GraphicsHardwareStage::Hull ? 30u : 31u;
+    result.fp16_overflow = {true, (found->second & (1u << shift)) != 0};
+    return result;
 }
 GraphicsFloatMode vertex_graphics_float_mode(const GpuState& state) {
     const auto found = state.cx.find(prosper::agc::Pm4::VGT_SHADER_STAGES_EN);

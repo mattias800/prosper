@@ -22,6 +22,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -441,6 +442,29 @@ TEST_F(NggLiveDraw, LinkedChainIsTheHardwareOrderAndStable) {
     auto in = kena_input();
     in.linked.reset();
     EXPECT_STREQ(realize_ngg_live_draw(in, radv()).refusal, "ngg-program-unavailable");
+}
+
+TEST_F(NggLiveDraw, IndependentHalfOverflowFactPartitionsStagesWithIdenticalShells) {
+    std::set<const NggSubgroupStages*> owners;
+    std::vector<uint32_t> expected;
+    for (const auto mode :
+         {Fp16OverflowMode{}, Fp16OverflowMode{true, false}, Fp16OverflowMode{true, true}}) {
+        auto input = kena_input();
+        input.registers.float_mode = {true, 0x30, false, mode};
+        const auto cold = realize_ngg_live_draw(input, radv());
+        ASSERT_TRUE(cold.draw) << cold.detail;
+        const auto warm = realize_ngg_live_draw(input, radv());
+        ASSERT_TRUE(warm.draw) << warm.detail;
+        ASSERT_FALSE(cold.draw->groups.empty());
+        const auto& stages = cold.draw->groups[0].stages;
+        EXPECT_EQ(stages, warm.draw->groups[0].stages);
+        ASSERT_TRUE(stages && stages->shell);
+        if (expected.empty()) expected = *stages->shell;
+        EXPECT_EQ(*stages->shell, expected);
+        owners.insert(stages.get());
+    }
+    EXPECT_EQ(owners.size(), 3u);
+    EXPECT_EQ(ngg_live_draw_cache_stats().stage_compiles, 3u);
 }
 
 TEST_F(NggLiveDraw, NothingCompilesOnceWarm) {

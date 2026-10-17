@@ -1028,6 +1028,7 @@ recompile_compute_once(const uint32_t* code, size_t dwords, const ShaderResource
     b.storage_buffer_int64_atomics = config.storage_buffer_int64_atomics;
     b.packed_r11_storage = config.packed_r11_storage;
     b.compute_pgm_rsrc1 = config.compute_pgm_rsrc1;
+    b.compute_fp16_overflow = config.fp16_overflow;
     b.begin(1, rt, local_x, local_y, local_z, wave_size,
             static_cast<uint32_t>(config.user_sgprs.size()));
     b.allow_b32_masks = wave_size == 32;

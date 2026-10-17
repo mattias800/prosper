@@ -31,9 +31,10 @@ alignas(256) constexpr uint32_t vertex[] = {0x36020081u, 0x2c040081u, 0x7e020d01
 alignas(256) constexpr uint32_t pixel[] = {0x7e000280u, 0xf800180fu, 0u, 0xbf810000u};
 alignas(256) constexpr uint32_t rejected_vertex[] = {0x7e000280u, 0xf80008c1u, 0u,
                                                      0xbf810000u}; // unsupported partial POS0
-constexpr std::array modes{
-    GraphicsFloatMode{}, GraphicsFloatMode{true, 0, false}, GraphicsFloatMode{true, 0x30, false},
-    GraphicsFloatMode{true, 0x30, true}, GraphicsFloatMode{true, 0xff, true}};
+constexpr std::array modes{GraphicsFloatMode{}, GraphicsFloatMode{true, 0, false, {true, false}},
+                           GraphicsFloatMode{true, 0x30, false, {true, false}},
+                           GraphicsFloatMode{true, 0x30, true, {true, false}},
+                           GraphicsFloatMode{true, 0xff, true, {true, false}}};
 GpuState launch(GraphicsFloatMode mode, bool ngg) {
     GpuState state;
     for (const auto entry :
@@ -196,7 +197,7 @@ TEST(GraphicsFloatLaunch, CaptureBundleAndReplayRetainModeWithoutUpgradingLegacy
     GpuCaptureFile loaded;
     ASSERT_TRUE(serialize_gpu_capture(source, bytes, error)) << error;
     ASSERT_TRUE(deserialize_gpu_capture(bytes, loaded, error)) << error;
-    EXPECT_EQ(loaded.format_version, 77u);
+    EXPECT_EQ(loaded.format_version, 78u);
     GpuReplayFrame frame;
     ASSERT_TRUE(materialize_gpu_replay(loaded, frame, error)) << error;
     GpuCaptureBundle bundle;
@@ -211,6 +212,12 @@ TEST(GraphicsFloatLaunch, CaptureBundleAndReplayRetainModeWithoutUpgradingLegacy
         EXPECT_EQ(full.draws.at(i).vertex_float_mode, modes[i]);
         EXPECT_EQ(manifest.draws.at(i).vertex_float_mode, modes[i]);
     }
+    // Remove v78 first: old MODE/IEEE authority does not imply observed half overflow.
+    bytes.resize(bytes.size() - 16 - 4 * modes.size());
+    set32(bytes, 8, 77);
+    ASSERT_TRUE(deserialize_gpu_capture(bytes, loaded, error)) << error;
+    for (const auto& draw : loaded.draws)
+        EXPECT_EQ(draw.vertex_float_mode.fp16_overflow, Fp16OverflowMode{});
     // Remove the genuine append-only v77 tail: historical captures cannot invent an observed zero.
     bytes.resize(bytes.size() - 8 - 3 * modes.size());
     set32(bytes, 8, 76);
@@ -226,6 +233,9 @@ TEST(GraphicsFloatLaunch, MalformedAndTruncatedCaptureModesRefuse) {
     std::vector<uint8_t> bytes;
     std::string error;
     ASSERT_TRUE(serialize_gpu_capture(source, bytes, error)) << error;
+    // Keep the existing v77 hostile-input controls on their exact historical prefix.
+    bytes.resize(bytes.size() - 16 - 4 * modes.size());
+    set32(bytes, 8, 77);
     const size_t tail = bytes.size() - 8 - 3 * modes.size();
     GpuCaptureFile loaded;
     for (size_t end = tail; end < bytes.size(); ++end) {
@@ -253,7 +263,7 @@ TEST(GraphicsFloatLaunch, MalformedAndTruncatedCaptureModesRefuse) {
 }
 
 TEST(GraphicsFloatLaunch, RefusedProducerRetainsModeAndCannotBecomeComputeAuthority) {
-    const GraphicsFloatMode mode{true, 0xa5, true};
+    const GraphicsFloatMode mode{true, 0xa5, true, {true, false}};
     auto state = launch(mode, true);
     const uint64_t address = reinterpret_cast<uint64_t>(rejected_vertex);
     state.sh[P::SPI_SHADER_PGM_LO_ES] = uint32_t(address >> 8);
