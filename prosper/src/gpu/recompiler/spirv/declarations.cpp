@@ -38,8 +38,7 @@ void SpirvCompute::declare_float_controls(uint32_t entry) {
             putv(exts, Op_Extension, extension);
         }
         put(caps, Op_Capability, {Cap_SignedZeroInfNanPreserve});
-        std::vector<uint32_t> o; pstr(o, "SPV_KHR_float_controls");
-        putv(exts, Op_Extension, o);
+        declare_float_controls_extension();
         put(exec, Op_ExecutionMode, {entry, EM_SignedZeroInfNanPreserve, 32});
     }
 

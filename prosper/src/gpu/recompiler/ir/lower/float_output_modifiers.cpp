@@ -1,28 +1,18 @@
 // Launch state selects OMOD policy; no register/mark/CFG authority is changed here.
 #include "gpu/recompiler/ir/lower/float_output_modifiers.hpp"
+#include "gpu/recompiler/ir/lower/launch_float_mode.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include <cstdint>
 namespace prosper::gpu::ir {
 FloatOutputModifier float_output_modifier(SpirvCompute& b, const Rdna2Inst& in,
                                           FloatResultWidth width, bool& ok) {
     FloatOutputModifier result{0, 0, width};
     if (!in.omod) return result;
-    bool mode_available = false, flags_available = false, ieee = false;
-    uint8_t mode = 0;
-    if (b.is_fragment || b.is_fragment_packet()) {
-        mode_available = b.fragment_float_mode.available;
-        mode = b.fragment_float_mode.value;
-        flags_available = b.fragment_float_flags.available;
-        ieee = b.fragment_float_flags.ieee_mode;
-    } else if (b.is_compute && !b.ngg_workgroup_shell) {
-        mode_available = flags_available = b.compute_pgm_rsrc1 != UINT32_MAX;
-        mode = (b.compute_pgm_rsrc1 >> 12) & 0xff;
-        ieee = (b.compute_pgm_rsrc1 & (1u << 23)) != 0;
-    } else {
-        mode_available = flags_available = b.vertex_float_mode.available;
-        mode = b.vertex_float_mode.value;
-        ieee = b.vertex_float_mode.ieee_mode;
-    }
+    const LaunchFloatMode launch = launch_float_mode(b);
+    const bool mode_available = launch.mode_available, flags_available = launch.flags_available;
+    const bool ieee = launch.ieee;
+    const uint8_t mode = launch.mode;
     const uint8_t output_bit = width == FloatResultWidth::F32 ? 0x20 : 0x80;
     if ((mode_available && (mode & output_bit)) || (flags_available && ieee)) return result;
     if (!mode_available || !flags_available || width == FloatResultWidth::F64) {

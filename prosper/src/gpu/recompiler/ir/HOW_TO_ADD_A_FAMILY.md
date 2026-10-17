@@ -384,14 +384,14 @@ Changing any of them is a lead change, even when it looks mechanical:
 2. In `lower/vopc_compare_values.cpp`, delete the group's `case` labels and its function. The
    definition lookup runs first, so they are dead once the definitions exist.
 3. **Admit nothing new.** Only the opcodes the old switch handled get definitions. The switch
-   handles the F16 group only at 0xC9-0xCE (LT, EQ, LE, GT, LG, GE), and it has no F64, no
-   `class_f16` and no `v_cmp_f/t` for the integer types. Adding any of those is a behaviour change:
+   handles the F16 group only at 0xC9-0xCE (LT, EQ, LE, GT, LG, GE), and it had no F64 (now
+   admitted, see "F64 values"), no `class_f16` and no `v_cmp_f/t` for the integer types. Adding any of those is a behaviour change:
    do it in a separate, explained PR, as in Group 5.
 4. Run the corpus gate, a witness corpus and the controls (below).
 
 **64-bit groups.** I64 and U64 are done (`ops/vector_compare_i64_u64.cpp`), and they are the
-worked example of "64-bit values" below. F64 is not a migration: the switch never handled it, so it
-is an admission, and the IR has no F64 type for it (see the F64 stop point below).
+worked example of "64-bit values" below. F64 is done too (`ops/vector_compare_f64.cpp`), as an
+admission rather than a migration, and it is the worked example of "F64 values" below.
 
 ### How to test the mask
 
@@ -573,7 +573,7 @@ The recorded corpus never reaches four of the seven definitions, so the witness 
 | instruction | status | why |
 | --- | --- | --- |
 | `v_div_scale_f32` (VOP3B 0x16D) | Codex with this recipe, as an **admission** in its own explained PR | emit_alu has no case for it today. The value is an F32 definition, and the flag goes through `write_vop3b_carry_mask`. |
-| `v_div_scale_f64` (0x16E) | stop at the F64 point | no F64 type |
+| `v_div_scale_f64` (0x16E) | Codex, after `v_div_scale_f32`, using the F64 recipe | an F64 result with a flag; it needs F64 arithmetic first (family 14) and the result-mode rules in "F64 values" |
 | `v_mad_u64_u32` / `v_mad_i64_i32` (0x176 / 0x177) | values in `ops/vector_mad64.cpp`; carry write remains **lead** | The existing 32-bit graph computes U32 low, U32 high and Bool carry in one Block, all before the old-high lookup. Keep that order. `write_mad64_carry_mask` remains protected: Wave32 `sdst = vcc_lo` writes VCC_LO, while an SGPR SDST still writes a pair, with no B32 branch or erase of the old SGPR word. Do not share or change that write. |
 | `v_mbcnt_lo/hi` | lead | cross-lane |
 | the VOPC mask write | lead | unchanged |
@@ -610,7 +610,8 @@ evaluated in `eval_integer64.cpp`, which `evaluate_wide` reaches through `is_int
 
 A new 64-bit opcode goes in the usual five places, with three more things to get right:
 
-- keep it inside the `PackU64` .. last-64-bit-opcode range, so `is_integer64_opcode` routes it;
+- keep it inside the `PackU64` .. last-integer-64-bit-opcode range, so `is_integer64_opcode`
+  routes it; the binary64 relations follow that range (`F64Lt` ..), see "F64 values";
 - say in `ir.cpp`'s `argument_type` which of its argument slots are U64 (today the range
   `U64Lo` .. `U64Ge` takes U64 in every slot, and `PackU64` takes two U32 words). A shift is
   `(U64 value, U32 count)`, so it needs a per-slot rule;
@@ -687,19 +688,139 @@ The witness is 12 definitions in five forms and two wave sizes, plus four consta
 per definition. So a 64-bit family needs the witness corpus: the recorded one reaches one of
 twelve definitions.
 
-### Stop and report: F64
+### Stop and report: 64-bit words
 
-**The IR has no F64, and nothing in the recompiler declares the `Float64` capability.** The old
-emitter admits no F64 instruction at all (no F64 compare, arithmetic or conversion), so every F64
-family is an **admission**, a behaviour change, not a migration. Do not build it on `U64` bits with
-integer arithmetic, and do not add `Float64` yourself. Stop and report when a family needs any of:
+Stop and report when a family needs:
 
-- an F64 value type or the `Float64` capability (any F64 arithmetic, compare or conversion);
-- F64 rounding modes or denormal handling (`MODE` FP_ROUND / FP_DENORM for 64-bit), or the F64
-  NaN and signed-zero rules beyond what the F32 compares pin;
 - a 64-bit literal: `uconst64` emits a two-word constant only for values above 32 bits, and its
   comment records a driver that misparses that form;
 - a signed 64-bit relation that cannot be written with `pack_u64_signed_order`.
+
+Binary64 (F64) values have their own section next.
+
+## F64 values
+
+The IR reads binary64 the way it reads binary32: there is **no F64 Type**. An F64 opcode takes
+`U64` words and says they are IEEE binary64 values, as an F32 opcode takes `U32` words. The VOPC
+F64 compares (`ops/vector_compare_f64.cpp`, `lower/vopc_float64.cpp`) are the worked example. They
+were an **admission**: the old emitter refused every F64 instruction, so there are no old bytes to
+match, and the gate is "every newly accepted program is attributed to an F64 site, passes
+spirv-val, and nothing else changes".
+
+**Measure first.** When the compares were admitted (2026-10-17), no F64 instruction occurred in
+reachable code anywhere we had: 0 of the 4,000 recorded corpus programs (two `v_cmpx_*_f64` words
+sat after `s_endpgm`, in data) and 0 of 4,777 distinct programs across 359 `refused_shaders_*`
+dumps. So an F64 family un-refuses nothing measurable today, and its gate is the witness corpus.
+Re-run the census before you start (`tools/rdna2_ref/decode.py` over the corpus, counting names
+with `_F64` before the last `S_ENDPGM`), and report what it says.
+
+### The pieces
+
+| piece | where | what it does |
+| --- | --- | --- |
+| opcodes | `ir.hpp` `F64Lt` .. `F64UnordGe` | the twelve binary64 relations, `(U64, U64) -> Bool`, after the U64 block (after `U64Bfe`). `argument_type` has its own rule giving U64 to both slots of `F64Lt` .. `F64UnordGe`; a new F64 opcode extends that range or adds a per-slot rule |
+| evaluation | `eval_float64.cpp` | `is_float64_opcode` routes them from `evaluate_wide`; the host evaluates in `double` with unflushed subnormals. The constant folder never sees an F64 opcode: keep it that way (no F64 folds) |
+| emission | `SpirvCompute::t_f64`, `fcmp64` (`spirv/float64.cpp`) | bitcasts both U64 words to `OpTypeFloat 64`. `t_f64()` declares `Float64`, `DenormPreserve`, one `SPV_KHR_float_controls` and `OpExecutionMode DenormPreserve 64` on first use, so a module without F64 declares none of them |
+| device gate | `float64_support.hpp` | `float64_admitted()` is true only after a device owner published shaderFloat64 ENABLED + shaderDenormPreserveFloat64 + float controls permitted. Publishers are ANDed (the renderer, `tests/fixtures/render_runner.h`, and the private compute device, `frontends/shared/live/live_compute.cpp`, through `publish_device_float64` in `gpu/execute/float_controls_probe.hpp`). `shader_inspect` publishes a capable device, so the corpus gate measures what RADV runs |
+| launch MODE | `lower/launch_float_mode.hpp` | the producing launch's FLOAT_MODE for fragment, compute and vertex stages; MODE cannot change inside an admitted program (`s_setreg` of MODE, `s_round_mode` and `s_denorm_mode` refuse) |
+
+### Admission rules a lowering must apply
+
+Every F64 lowering checks these before it emits an F64 opcode, and refuses **by name**
+(`b.stage_reject_pc`, `b.stage_reject_reason`, `ok = false`; see `VopcLowering::refuse`):
+
+- **Device:** `!float64_admitted()` refuses `f64-device-unavailable`. A module declaring Float64
+  that a device cannot execute is invalid, not slow. An instruction that reads no F64 value
+  (`v_cmp_f_f64`, `v_cmp_tru_f64`) needs no gate.
+- **MODE unknown:** a missing launch FLOAT_MODE refuses `f64-float-mode-unavailable`.
+- **Input denormals:** FP_DENORM[7:6] (AMD 70648 6.4, Table 24) is shared by F64 and F16. Bit 6
+  set (modes 1, 3) keeps input subnormals; `DenormPreserve 64` then keeps the host from flushing
+  them. Bit 6 clear (modes 0, 2) flushes them: the lowering does it on the source halves, before
+  the definition (a zero exponent field leaves only the sign bit), so the host never sees one.
+  `kDefaultComputePgmRsrc1` is mode 0, so test both modes. CONFIDENCE: MED that V_CMP applies the
+  input flush; the F32 EQ/NEQ zero relation assumes the same.
+- **SDWA and DPP** refuse `f64-compare-sdwa-dpp`: neither describes a register pair.
+
+Source halves (`VopcLowering::float64_source`; reuse it, do not re-derive it):
+
+| operand | low word | high word | evidence |
+| --- | --- | --- | --- |
+| VGPR, SGPR, VCC/TTMP pair | `val(src)` | `val(src + 1)` | as `integer64_halves` |
+| inline float 240-248 | the double's low word | its high word | Table 20: "single, double, or half-precision inline floats"; 1/(2*pi) is `0x3fc45f306dc9c882` |
+| 32-bit literal | 0 | the literal | 6.2.1 "Literal Expansion to 64 bits": "64 bit float: the lower 32-bit are padded with zero" |
+| inline integer 0, `SGPR_NULL` | 0 | 0 | +0.0 under every reading |
+| any other inline integer | refuse `f64-inline-integer-unspecified` | | the ISA does not say whether it is the sign-extended bit pattern or the converted value |
+| ABS, NEG | unchanged | `& 0x7fffffff`, then `^ 0x80000000` | the sign bit; hardware order ABS then NEG |
+
+### What the compares did not need, and an arithmetic family will
+
+These are **stop points**: an F64 arithmetic or conversion family (14, 15) must settle each one,
+with evidence, or refuse the case by name. Do not guess.
+
+- **Rounding.** FP_ROUND[3:2] is the F64/F16 round mode. A compare has no result to round. An
+  arithmetic result is correctly rounded to nearest-even by Vulkan's `OpFAdd/FSub/FMul` on
+  doubles; any other mode (1, 2, 3) needs `RoundingModeRTZ`-style float controls that do not cover
+  +/-inf rounding, so refuse a non-zero FP_ROUND[3:2] until someone cites how to honour it.
+- **Output denormals.** FP_DENORM bit 7 clear (modes 0, 1) flushes F64 *results*. Flush the result
+  halves after the operation, the same way the inputs are flushed, or refuse.
+- **NaN payloads.** A compare only classifies NaNs. An arithmetic result's NaN bits are not pinned
+  by the interpreter (`bpermute_spirv_oracle.hpp` fails rather than invent them for F32) or by
+  Vulkan; decide what the test asserts before writing it.
+- **OMOD** on an F64 result already refuses (`float-omod-f64-representation-unavailable`).
+- **The interpreter.** `bpermute_spirv_oracle.hpp` executes binary64 only in the twelve
+  relations, and fails on a binary64 subnormal unless the module declares `DenormPreserve 64`.
+  Each new F64 instruction needs its SPIR-V semantics added there, with the citation.
+- **Graphics stages and captures.** The gate is process-global, so fragment and vertex modules are
+  admitted on the same verdict as compute. A replayed capture or refused-shader sidecar records no
+  F64 verdict; the replaying process publishes its own.
+
+### Testing it
+
+Copy the compare group's three tests:
+
+- `test_ir_core_float64.cpp`: hand-worked binary64 truth for each opcode (NaN on each side, quiet
+  and signalling, +0 against -0, the infinities against `DBL_MAX`, subnormals against zero and at
+  the normal boundary, a pair differing only in the low word); the U64 argument types; Float64 and
+  DenormPreserve declared only by a module that uses them; every opcode's SPIR-V per lane against
+  `evaluate`; and the interpreter's own control, which must refuse a subnormal once the module's
+  mode is rewritten to `DenormFlushToZero`.
+- `test_ir_vector_compare_f64_execution.cpp`: the harness in both FLOAT_MODE input modes
+  (`kFlush` is the default RSRC1, `kPreserve` sets [7:6] = 3), a hand-worked truth string per
+  definition and mode (derive it independently, never from eval), constant operands, ABS/NEG, the
+  named refusals (publish nothing, publish a device without the feature, RSRC1 `UINT32_MAX`), and
+  the witness exporter. The device gate is process-global: publish in `SetUp`, reset in `TearDown`.
+- `tests/gpu/execute/test_compute_f64_compare.cpp`: the same hand-worked rows on the real device,
+  every form, both waves, both modes, recording the driver. Run it under
+  `flock ~/.prosper-gpu.lock`. `tests/fixtures/compute_runner.h` enables `shaderFloat64` and
+  `VK_KHR_shader_float_controls` when the device has them, and the test skips (with the reason)
+  on a device without `shaderDenormPreserveFloat64`.
+
+The compare group's mutations, each of which turned at least one test red:
+
+- `F64Le` evaluated as `<`; `F64UnordLt` emitted as `OpFOrdLessThan`;
+- LG defined as NEQ; O reading S0 twice;
+- the source's high word not read; a literal placed in the low word; an inline float read as its
+  f32 bits; ABS clearing the low word's bit 31;
+- the input flush never applied, always applied, or leaving the low word;
+- the device gate removed;
+- `t_f64()` without `OpExecutionMode DenormPreserve 64` (the interpreter then refuses the
+  subnormal lanes).
+
+### Gate and controls
+
+An admission's gate is three questions: is every newly accepted program an F64 site, does each
+pass spirv-val, and does anything else change. The witness carries it (16 definitions x 5 forms x 2
+waves x 2 input modes, plus 6 constant SRC0 operands per definition). One positive control per
+definition, each a byte-changing neutral edit (the relation mirrored with swapped operands, O/U's
+arguments swapped, F/TRU rewritten as `F64Lg(s0, s0)` / `F64UnordEq(s0, s0)`), run against the
+uncontrolled candidate:
+
+| | recorded corpus (4,000 programs) | witness (416 programs) |
+| --- | --- | --- |
+| the admission (base = `main`) | `changes: none` | `newly-accepted 416`, every one refused by base at a `V_CMP(X)_*_F64`; 416 of 416 pass `spirv-val`; 364 declare Float64, the 52 F/TRU programs none |
+| each of the 16 controls | not run: no F64 site exists there | `output-changed 26` each, exactly its own 20 forms and 6 constants; every execution arm stays green (the opcode-coverage arm goes red for the eight mirrored relations, as it must) |
+
+The recorded corpus cannot see this family at all, so the witness is the whole gate.
 
 ## Family list and order
 
@@ -723,10 +844,11 @@ and leave the reserved ones in the `switch`.
 | 10 | VOPC F16 (`v_cmp/cmpx_{lt,eq,le,gt,lg,ge}_f16`: only the six the switch admits) | Codex, using the compare recipe |
 | 11 | VOPC `v_cmp/cmpx_class_f32` | Codex, using the compare recipe |
 | 12 | VOP3 64-bit shifts: `v_lshlrev_b64`, `v_lshrrev_b64` (the two the old code admits, with their exact SRC admission), using a new `(U64, U32)` shift opcode on `u64_shift`; `v_ashrrev_i64` is an admission | Codex, using the 64-bit recipe |
-| 13 | VOPC F64 compares (`v_cmp/cmpx_*_f64`) | Codex, using the 64-bit recipe; an admission that stops at the F64 point until the lead adds an F64 type |
-| 14 | VOP3 F64 arithmetic (`v_add/mul/fma_f64`, `v_min/max_f64`, `v_ldexp_f64`, `v_div_*_f64`, ...) | Codex, using the 64-bit recipe; same F64 stop point |
-| 15 | 64-bit conversions (`v_cvt_f64_*`, `v_cvt_*_f64`, `v_frexp_*_f64`) | Codex, using the 64-bit recipe; same F64 stop point |
-| 16 | VOP3B `v_div_scale_f32`: an admission (emit_alu has no case for it) | Codex, using the mask recipe ("Mask-reading and mask-writing VALU"), in its own explained PR; `v_div_scale_f64` stops at the F64 point |
+| 13 | VOPC F64 compares (`v_cmp/cmpx_*_f64`) | **done** (admission, `ops/vector_compare_f64.cpp`); the worked example of "F64 values" |
+| 13a | VOPC `v_cmp/cmpx_class_f64` (0xA8) | Codex, using the F64 recipe and the `class_f32` model: an admission PR (integer-domain classification of the two halves) |
+| 14 | VOP3 F64 arithmetic (`v_add/mul/fma_f64`, `v_min/max_f64`, `v_ldexp_f64`, `v_div_*_f64`, ...) | Codex, using the F64 recipe: one admission PR per coherent group (add/mul/fma first). Stop points: non-RTE FP_ROUND[3:2], the output-denormal flush, NaN payloads |
+| 15 | 64-bit conversions (`v_cvt_f64_*`, `v_cvt_*_f64`, `v_frexp_*_f64`, `v_trunc/ceil/rndne/floor/fract_f64`) | Codex, using the F64 recipe: admission PRs. A 64-bit result is written as two VGPRs ("Writing a 64-bit result"); `v_cvt_f32_f64` rounds by FP_ROUND[1:0], the F32 field |
+| 16 | VOP3B `v_div_scale_f32`: an admission (emit_alu has no case for it) | Codex, using the mask recipe ("Mask-reading and mask-writing VALU"), in its own explained PR; `v_div_scale_f64` follows family 14 with the F64 recipe |
 | 17 | VOP3B `v_mad_u64_u32` / `v_mad_i64_i32`: values in `ops/vector_mad64.cpp` | Codex, value-only; preserve all three outputs before the old-high lookup and the existing `write_mad64_carry_mask` call |
 | - | Admitting any compare the switch refuses today | lead, then Codex |
 | - | `write_mad64_carry_mask` (its SGPR write differs from the shared one in Wave32), the VOPC mask write (`lower/vopc_mask_write.cpp`), the carry mask write (`lower/carry_mask_write.cpp`), `v_mbcnt` | lead (wave masks) |

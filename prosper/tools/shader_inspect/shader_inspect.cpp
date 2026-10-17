@@ -3,6 +3,7 @@
 #include "gpu/diagnostics/refused_graphics_inputs.hpp"
 #include "gpu/recompiler/rdna2_launch_vgprs.hpp"
 #include "gpu/execute/skippable_instruction.hpp"
+#include "gpu/recompiler/float64_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
@@ -344,6 +345,9 @@ int replay_recorded_inputs(const std::string& code_path, const std::string& inpu
 } // namespace
 
 int main(int argc, char** argv) {
+    // The corpus models a device that enabled shaderFloat64 with DenormPreserve 64 (RADV does), so
+    // the gate measures the binary64 instructions a live run would execute (float64_support.hpp).
+    prosper::gpu::publish_float64_support(true, true, true);
     // Flags are parsed rather than positionally matched, so a mode can be added without the arity
     // of the previous one becoming load-bearing. `--mimg-sites` is exclusive: it replaces the
     // listing with a machine-readable census (see below), and combining it with a stage recompile

@@ -114,6 +114,19 @@ uint32_t emit_one(SpirvCompute& b, const Inst& inst, const uint32_t* x) {
         case Opcode::U64LShr: return b.u64_shift(Op_ShiftRightLogical, x[0], x[1]);
         case Opcode::U64AShr: return b.u64_shift(Op_ShiftRightArithmetic, x[0], x[1]);
         case Opcode::U64Bfe: return b.bfe_u64(x[0], x[1], x[2]);
+        // Binary64 relations: bitcast both U64 words to OpTypeFloat 64 (SpirvCompute::fcmp64).
+        case Opcode::F64Lt: return b.fcmp64(Op_FOrdLessThan, x[0], x[1]);
+        case Opcode::F64Eq: return b.fcmp64(Op_FOrdEqual, x[0], x[1]);
+        case Opcode::F64Le: return b.fcmp64(Op_FOrdLessThanEqual, x[0], x[1]);
+        case Opcode::F64Gt: return b.fcmp64(Op_FOrdGreaterThan, x[0], x[1]);
+        case Opcode::F64Lg: return b.fcmp64(Op_FOrdNotEqual, x[0], x[1]);
+        case Opcode::F64Ge: return b.fcmp64(Op_FOrdGreaterThanEqual, x[0], x[1]);
+        case Opcode::F64UnordLt: return b.fcmp64(Op_FUnordLessThan, x[0], x[1]);
+        case Opcode::F64UnordEq: return b.fcmp64(Op_FUnordEqual, x[0], x[1]);
+        case Opcode::F64UnordLe: return b.fcmp64(Op_FUnordLessThanEqual, x[0], x[1]);
+        case Opcode::F64UnordGt: return b.fcmp64(Op_FUnordGreaterThan, x[0], x[1]);
+        case Opcode::F64UnordNe: return b.fcmp64(Op_FUnordNotEqual, x[0], x[1]);
+        case Opcode::F64UnordGe: return b.fcmp64(Op_FUnordGreaterThanEqual, x[0], x[1]);
     }
     std::fprintf(stderr, "[ir] emit_one reached an input\n");   // emit_spirv binds inputs itself
     std::abort();

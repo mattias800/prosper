@@ -6,6 +6,7 @@
 #include "gpu/recompiler/ir/eval_float_unary.hpp"
 #include "gpu/recompiler/ir/eval_float_compare.hpp"
 #include "gpu/recompiler/ir/eval_integer64.hpp"
+#include "gpu/recompiler/ir/eval_float64.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -164,7 +165,7 @@ Known evaluate_op(Opcode op, uint32_t imm, uint32_t a, uint32_t b, uint32_t c) {
         case Opcode::SGt: return static_cast<uint32_t>(s(a) > s(b));
         case Opcode::SGe: return static_cast<uint32_t>(s(a) >= s(b));
         // A 64-bit word does not fit these 32-bit arguments: evaluate_wide routes them to
-        // evaluate_integer64 (eval_integer64.cpp).
+        // evaluate_integer64 (eval_integer64.cpp) and evaluate_float64 (eval_float64.cpp).
         case Opcode::PackU64:
         case Opcode::U64Lo:
         case Opcode::U64Hi:
@@ -177,7 +178,19 @@ Known evaluate_op(Opcode op, uint32_t imm, uint32_t a, uint32_t b, uint32_t c) {
         case Opcode::U64Shl:
         case Opcode::U64LShr:
         case Opcode::U64AShr:
-        case Opcode::U64Bfe: return std::nullopt;
+        case Opcode::U64Bfe:
+        case Opcode::F64Lt:
+        case Opcode::F64Eq:
+        case Opcode::F64Le:
+        case Opcode::F64Gt:
+        case Opcode::F64Lg:
+        case Opcode::F64Ge:
+        case Opcode::F64UnordLt:
+        case Opcode::F64UnordEq:
+        case Opcode::F64UnordLe:
+        case Opcode::F64UnordGt:
+        case Opcode::F64UnordNe:
+        case Opcode::F64UnordGe: return std::nullopt;
     }
     return std::nullopt;
 }
@@ -203,6 +216,10 @@ std::vector<Known64> evaluate_wide(const Block& block, std::span<const Known64> 
         if (!known) continue;
         if (is_integer64_opcode(inst.op)) {
             values[i] = evaluate_integer64(inst.op, args[0], args[1], args[2]);
+            continue;
+        }
+        if (is_float64_opcode(inst.op)) {
+            values[i] = evaluate_float64(inst.op, args[0], args[1]);
             continue;
         }
         // Every other opcode's arguments are U32 or Bool, which fit in 32 bits.

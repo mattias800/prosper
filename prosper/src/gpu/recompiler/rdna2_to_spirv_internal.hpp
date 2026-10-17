@@ -514,6 +514,13 @@ struct SpirvCompute {
     // reads the answer, and reads it as "no" until some device owner has measured a device.
     bool float_controls_declared = false;
     void declare_float_controls(uint32_t entry);
+    // Binary64 (float64.cpp, float64_support.hpp). t_f64() declares Float64, DenormPreserve 64 and
+    // the float-controls extension once, on first use; callers check float64_admitted() first.
+    uint32_t t_f64_cache = 0;
+    bool float_controls_extension_declared = false;
+    void declare_float_controls_extension();
+    uint32_t t_f64();
+    uint32_t fcmp64(uint32_t cmpop, uint32_t a64, uint32_t b64);   // U64 words -> Bool
     std::unordered_map<uint32_t, uint32_t> fconst_cache, uconst_cache;
     uint32_t next_id = 1;
     uint32_t stride = 1;

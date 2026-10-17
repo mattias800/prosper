@@ -32,6 +32,8 @@ private:
     uint32_t eff = 0;          // the v_cmp_* opcode (a v_cmpx_* maps to its compare)
     bool is_cmpx = false;
     bool integer64_compare = false;
+    bool float64_compare = false;   // V_CMP(X)_*_F64 (vopc_float64.cpp)
+    bool float64_flush_inputs = false;
     bool compare_wave_uniform = false;
     bool guest_compare_fact = false;
     uint32_t zero_cmp = 0;
@@ -45,6 +47,11 @@ private:
     void source_modifiers();
     void integer_sdwa_sources();
     Integer64Halves integer64_halves(const Operand& operand, uint32_t lo);
+    // F64 compares (vopc_float64.cpp): the device and MODE admission, then each source's halves
+    // after the 64-bit constant rules, ABS/NEG on the sign bit and the MODE input flush.
+    bool float64_admission();
+    Integer64Halves float64_source(int k, uint32_t raw);
+    void refuse(const char* reason);
     void record_guest_compare_facts(uint32_t cmp);
 
     // The comparison value (vopc_compare_values.cpp). Clears `ok` for an opcode it lacks.
