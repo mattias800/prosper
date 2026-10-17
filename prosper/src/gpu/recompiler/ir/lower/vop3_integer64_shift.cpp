@@ -1,6 +1,7 @@
 // Relocated from emit_alu with extract_case_routes.py. Numeric semantics are unchanged here.
 #include "gpu/recompiler/ir/lower/vop3_integer64_shift_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_integer64_shift_internal.hpp"
+#include "gpu/recompiler/ir/ops/integer64_shifts.hpp"
 namespace prosper::gpu::ir {
 bool lower_vop3_integer64_shift(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok) {
     Vop3Integer64ShiftLowering lower{b, rs, in, ok, rs.vreg};
@@ -25,13 +26,16 @@ void Vop3Integer64ShiftLowering::lshl() {
         opsel) {
         ok = false;
     } else {
-        const uint32_t amount = b.ibin(Op_BitwiseAnd, val(in.src[0]), b.uconst(63));
-        const uint32_t result =
-            b.u64_shift(Op_ShiftLeftLogical, b.u64_from_lohi(b.uconst(1), b.uconst(0)), amount);
+        const uint32_t amount = emit_integer64_shift_count(b, [&] { return val(in.src[0]); });
+        const auto& def = *find_integer64_shift(in.fmt, in.opcode);
+        const uint32_t result = emit_integer64_shift_result(b, def, [&](uint32_t source) {
+            return source == 2 ? amount : b.uconst(source == 0 ? 1 : 0);
+        });
         const int hi_dst = in.dst.value + 1;
         const uint32_t old_hi = vreg_old(b, rs, hi_dst);
-        vreg[in.dst.value] = b.u64_lo(result);
-        vreg[hi_dst] = b.u64_hi(result);
+        const auto words = emit_integer64_shift_words(b, result);
+        vreg[in.dst.value] = words[0];
+        vreg[hi_dst] = words[1];
         predicate_write(b, rs, hi_dst, old_hi);
     }
 }
@@ -48,15 +52,18 @@ void Vop3Integer64ShiftLowering::lshr() {
         opsel) {
         ok = false;
     } else {
-        const uint32_t amount = b.ibin(Op_BitwiseAnd, val(in.src[0]), b.uconst(63));
+        const uint32_t amount = emit_integer64_shift_count(b, [&] { return val(in.src[0]); });
         Operand high_source = in.src[1];
         ++high_source.value;
-        const uint32_t result = b.u64_shift(
-            Op_ShiftRightLogical, b.u64_from_lohi(val(in.src[1]), val(high_source)), amount);
+        const auto& def = *find_integer64_shift(in.fmt, in.opcode);
+        const uint32_t result = emit_integer64_shift_result(b, def, [&](uint32_t source) {
+            return source == 2 ? amount : val(source == 0 ? in.src[1] : high_source);
+        });
         const int hi_dst = in.dst.value + 1;
         const uint32_t old_hi = vreg_old(b, rs, hi_dst);
-        vreg[in.dst.value] = b.u64_lo(result);
-        vreg[hi_dst] = b.u64_hi(result);
+        const auto words = emit_integer64_shift_words(b, result);
+        vreg[in.dst.value] = words[0];
+        vreg[hi_dst] = words[1];
         predicate_write(b, rs, hi_dst, old_hi);
     }
 }

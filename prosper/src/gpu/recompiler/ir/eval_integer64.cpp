@@ -4,7 +4,7 @@
 namespace prosper::gpu::ir {
 
 bool is_integer64_opcode(Opcode op) {
-    return op >= Opcode::PackU64 && op <= Opcode::U64Ge;
+    return op >= Opcode::PackU64 && op <= Opcode::U64AShr;
 }
 
 Known64 evaluate_integer64(Opcode op, uint64_t a, uint64_t b) {
@@ -18,6 +18,12 @@ Known64 evaluate_integer64(Opcode op, uint64_t a, uint64_t b) {
         case Opcode::U64Le: return uint64_t(a <= b);
         case Opcode::U64Gt: return uint64_t(a > b);
         case Opcode::U64Ge: return uint64_t(a >= b);
+        case Opcode::U64Shl: return b < 64 ? Known64(a << b) : std::nullopt;
+        case Opcode::U64LShr: return b < 64 ? Known64(a >> b) : std::nullopt;
+        case Opcode::U64AShr:
+            if (b >= 64) return std::nullopt;
+            if (!b || !(a >> 63)) return a >> b;
+            return (a >> b) | (~uint64_t{0} << (64 - b));
         default: return std::nullopt;
     }
 }

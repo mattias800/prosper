@@ -170,7 +170,10 @@ Known evaluate_op(Opcode op, uint32_t imm, uint32_t a, uint32_t b, uint32_t c) {
         case Opcode::U64Lt:
         case Opcode::U64Le:
         case Opcode::U64Gt:
-        case Opcode::U64Ge: return std::nullopt;
+        case Opcode::U64Ge:
+        case Opcode::U64Shl:
+        case Opcode::U64LShr:
+        case Opcode::U64AShr: return std::nullopt;
     }
     return std::nullopt;
 }

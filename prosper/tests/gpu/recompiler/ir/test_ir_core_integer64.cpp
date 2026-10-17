@@ -36,6 +36,59 @@ TEST(IrCoreInteger64, PackAndUnpackAreHandWorked) {
         << "a logical, not arithmetic, shift";
 }
 
+TEST(IrCoreInteger64, ShiftsUseAllSixtyFourBitsAndRejectUnmaskedCounts) {
+    struct Row {
+        uint64_t word;
+        uint32_t count;
+        uint64_t left, logical, arithmetic;
+    };
+    for (const auto& r :
+         {Row{0x8000000000000001ull, 0, 0x8000000000000001ull, 0x8000000000000001ull,
+              0x8000000000000001ull},
+          Row{0x8000000000000001ull, 1, 2, 0x4000000000000000ull, 0xc000000000000000ull},
+          Row{0x8000000000000001ull, 31, 0x80000000ull, 0x100000000ull, 0xffffffff00000000ull},
+          Row{0x8000000000000001ull, 32, 0x100000000ull, 0x80000000ull, 0xffffffff80000000ull},
+          Row{0x8000000000000001ull, 33, 0x200000000ull, 0x40000000ull, 0xffffffffc0000000ull},
+          Row{0x8000000000000001ull, 63, 0x8000000000000000ull, 1, UINT64_MAX},
+          Row{0x7fffffffffffffffull, 63, 0x8000000000000000ull, 0, 0}}) {
+        EXPECT_EQ(evaluate_integer64(Opcode::U64Shl, r.word, r.count), Known64(r.left));
+        EXPECT_EQ(evaluate_integer64(Opcode::U64LShr, r.word, r.count), Known64(r.logical));
+        EXPECT_EQ(evaluate_integer64(Opcode::U64AShr, r.word, r.count), Known64(r.arithmetic));
+    }
+    for (const auto op : {Opcode::U64Shl, Opcode::U64LShr, Opcode::U64AShr})
+        for (const uint32_t count : {64u, 65u, UINT32_MAX})
+            EXPECT_FALSE(evaluate_integer64(op, UINT64_MAX, count));
+}
+
+TEST(IrCoreInteger64, ShiftsRequireWideDataAndNarrowCounts) {
+    for (const auto op : {Opcode::U64Shl, Opcode::U64LShr, Opcode::U64AShr}) {
+        EXPECT_DEATH(
+            {
+                prosper::test::suppress_coredump();
+                Block block;
+                Builder ir(block);
+                block.append({op, Type::U64, 0, {ir.c32(1), ir.c32(1)}});
+            },
+            "argument type mismatch");
+        EXPECT_DEATH(
+            {
+                prosper::test::suppress_coredump();
+                Block block;
+                Builder ir(block);
+                const Value wide = ir.pack_u64(ir.c32(1), ir.c32(2));
+                block.append({op, Type::U64, 0, {wide, wide}});
+            },
+            "argument type mismatch");
+        Block block;
+        Builder ir(block);
+        const Value word = ir.input(Type::U64), count = ir.input(Type::U32);
+        const Value result = block.append({op, Type::U64, 0, {word, count}});
+        for (const auto in :
+             {std::array<Known64, 2>{std::nullopt, 1}, std::array<Known64, 2>{1, std::nullopt}})
+            EXPECT_FALSE(evaluate_wide(block, in)[result.index]);
+    }
+}
+
 TEST(IrCoreInteger64, RelationsAreUnsignedOverAllSixtyFourBits) {
     struct Row {
         uint64_t a, b;
@@ -151,7 +204,7 @@ TEST(IrCoreInteger64, EveryOpcodeRunsLikeItsEvaluationPerLane) {
     const uint32_t words[] = {0u,          1u,          0x7fffffffu, 0x80000000u,
                               0xffffffffu, 0x12345678u, 0xffffffc0u, 0x0000003fu};
     std::set<Opcode> seen;
-    for (uint32_t op = uint32_t(Opcode::PackU64); op <= uint32_t(Opcode::U64Ge); ++op) {
+    for (uint32_t op = uint32_t(Opcode::PackU64); op <= uint32_t(Opcode::U64AShr); ++op) {
         const Opcode opcode = static_cast<Opcode>(op);
         Block block;
         Builder ir(block);
@@ -161,13 +214,16 @@ TEST(IrCoreInteger64, EveryOpcodeRunsLikeItsEvaluationPerLane) {
         Value result = a;
         if (opcode == Opcode::U64Lo) result = ir.u64lo(a);
         if (opcode == Opcode::U64Hi) result = ir.u64hi(a);
-        if (opcode >= Opcode::U64Eq) {
+        if (opcode >= Opcode::U64Eq && opcode <= Opcode::U64Ge) {
             const Value c = ir.pack_u64(c_lo, c_hi);
             result = block.append({opcode, Type::Bool, 0, {a, c}});
         }
-        // A packed word leaves through both halves, so the store reads all 64 bits.
-        const Value lo = opcode == Opcode::PackU64 ? ir.u64lo(a) : result;
-        const Value hi = opcode == Opcode::PackU64 ? ir.u64hi(a) : result;
+        if (opcode >= Opcode::U64Shl && opcode <= Opcode::U64AShr)
+            result = block.append({opcode, Type::U64, 0, {a, ir.and_(c_lo, ir.c32(63))}});
+        // Every wide result leaves through both halves, so the store reads all 64 bits.
+        const bool wide = block.at(result).type == Type::U64;
+        const Value lo = wide ? ir.u64lo(result) : result;
+        const Value hi = wide ? ir.u64hi(result) : result;
         for (const Inst& inst : block.insts()) seen.insert(inst.op);
         for (const uint32_t x : words)
             for (const uint32_t y : words) {
@@ -189,7 +245,7 @@ TEST(IrCoreInteger64, EveryOpcodeRunsLikeItsEvaluationPerLane) {
                 }
             }
     }
-    for (uint32_t op = uint32_t(Opcode::PackU64); op <= uint32_t(Opcode::U64Ge); ++op)
+    for (uint32_t op = uint32_t(Opcode::PackU64); op <= uint32_t(Opcode::U64AShr); ++op)
         EXPECT_TRUE(seen.contains(static_cast<Opcode>(op))) << opcode_info(Opcode(op)).name;
 }
 

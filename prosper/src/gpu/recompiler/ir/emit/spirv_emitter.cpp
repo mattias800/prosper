@@ -108,6 +108,9 @@ uint32_t emit_one(SpirvCompute& b, const Inst& inst, const uint32_t* x) {
         case Opcode::U64Le: return b.ucmp(Op_ULessThanEqual, x[0], x[1]);
         case Opcode::U64Gt: return b.ucmp(Op_UGreaterThan, x[0], x[1]);
         case Opcode::U64Ge: return b.ucmp(Op_UGreaterThanEqual, x[0], x[1]);
+        case Opcode::U64Shl: return b.u64_shift(Op_ShiftLeftLogical, x[0], x[1]);
+        case Opcode::U64LShr: return b.u64_shift(Op_ShiftRightLogical, x[0], x[1]);
+        case Opcode::U64AShr: return b.u64_shift(Op_ShiftRightArithmetic, x[0], x[1]);
     }
     std::fprintf(stderr, "[ir] emit_one reached an input\n");   // emit_spirv binds inputs itself
     std::abort();

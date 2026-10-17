@@ -132,6 +132,15 @@ public:
     Value pack_u64_signed_order(Value lo, Value hi) {
         return pack_u64(lo, xor_(hi, c32(0x80000000u)));
     }
+    Value u64shl(Value word, Value count) {
+        return block_.append({Opcode::U64Shl, Type::U64, 0, {word, count}});
+    }
+    Value u64lshr(Value word, Value count) {
+        return block_.append({Opcode::U64LShr, Type::U64, 0, {word, count}});
+    }
+    Value u64ashr(Value word, Value count) {
+        return block_.append({Opcode::U64AShr, Type::U64, 0, {word, count}});
+    }
     Value u64lo(Value v) { return block_.append({Opcode::U64Lo, Type::U32, 0, {v}}); }
     Value u64hi(Value v) { return block_.append({Opcode::U64Hi, Type::U32, 0, {v}}); }
     Value u64eq(Value a, Value b) { return cmp(Opcode::U64Eq, a, b); }

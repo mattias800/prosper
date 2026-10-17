@@ -134,6 +134,9 @@ enum class Opcode : uint8_t {
     U64Le,
     U64Gt,
     U64Ge,   // u64 x u64 -> bool, unsigned order
+    U64Shl,
+    U64LShr,
+    U64AShr,   // (u64 raw word, u32 count) -> u64; unknown for count >= 64
 };
 
 struct OpcodeInfo {

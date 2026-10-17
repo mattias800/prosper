@@ -457,6 +457,25 @@ struct Interpreter {
       set(l, a[1], a[0], {uint32_t(op == 173 ? x > y : op == 175 ? x >= y : x <= y)});
       return true;
     }
+    if (op == 195 && a.size() == 4 && unsigned_type(a[0]) && size(a[0]) == 2) {
+        // SPIR-V OpShiftRightArithmetic fills from Base's most significant bit, including
+        // an unsigned raw U64 Base. A count at least its width is poison.
+        const auto x = value(l, a[2]), y = value(l, a[3]);
+        if (x.type != a[0] || !unsigned_type(y.type) || x.words.size() != 2 ||
+            y.words.size() != size(y.type))
+            fail("arithmetic64 shift operand types");
+        if (!x.defined || !y.defined) {
+            set_unsigned(l, a[1], a[0], 0, false);
+            return true;
+        }
+        const uint64_t bits = unsigned_value(x), count = unsigned_value(y);
+        if (count >= 64) fail("poison arithmetic64 shift");
+        const uint64_t result = !count || !(bits >> 63)
+                                    ? bits >> count
+                                    : (bits >> count) | (~uint64_t{0} << (64 - count));
+        set_unsigned(l, a[1], a[0], result);
+        return true;
+    }
     if (op == 195) {   // OpShiftRightArithmetic
       if (a.size() != 4 || !int_type(a[0])) fail("unsupported ShiftRightArithmetic");
       const uint32_t shift = int_word(l, a[3]);
