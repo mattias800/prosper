@@ -3591,6 +3591,11 @@ if(TARGET prosper_core)
     INCLUDES tests
     LIBRARIES prosper_core)
 
+  # #4096: observed compute FP16 overflow metadata never aliases missing state.
+  prosper_add_gtest(test_compute_fp16_overflow
+    SOURCES tests/gpu/execute/test_compute_fp16_overflow.cpp
+    LIBRARIES prosper_core)
+
   # #4877: actual graphics compiler inputs and fail-closed stage/source replay.
   prosper_add_gtest(test_refused_graphics_inputs
     SOURCES tests/gpu/diagnostics/test_refused_graphics_inputs.cpp

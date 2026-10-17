@@ -213,3 +213,31 @@ TEST(ComputeDispatchLaunch, WarmCacheCannotReuseFullMaskForChangedRawControl) {
     EXPECT_EQ(stats.hits, 1u);
     clear_shader_recompile_cache();
 }
+
+// The producer helper must remain wired at the real register-file realization boundary.
+TEST(ComputeDispatchLaunch, ActualExecutorRetainsIndependentFp16OverflowKnownness) {
+    alignas(256) static const uint32_t code[] = {0x7e000280u, 0xbf810000u};
+    static ComputeShaderBlob blob;
+    ASSERT_TRUE(register_compute(code, std::size(code), blob));
+    clear_shader_recompile_cache();
+    for (const auto expected :
+         {Fp16OverflowMode{}, Fp16OverflowMode{true, false}, Fp16OverflowMode{true, true}}) {
+        auto dispatch = packet();
+        auto producing = std::make_shared<GpuState>(*dispatch.state);
+        for (const auto& reg : blob.registers) producing->sh.set(reg.offset, reg.value);
+        if (expected.available)
+            producing->sh.set(prosper::agc::Pm4::COMPUTE_PGM_RSRC1,
+                              expected.saturate ? 1u << 26 : 0u);
+        dispatch.state = producing;
+        GpuState state;
+        state.dispatches.push_back(dispatch);
+        std::vector<OperationRealizationFailure> failures;
+        const auto items = realize_compute_dispatches(state, 4096, &failures);
+        ASSERT_TRUE(failures.empty());
+        ASSERT_EQ(items.size(), 1u);
+        ASSERT_TRUE(items[0].recompile_config_available);
+        EXPECT_EQ(items[0].recompile_config.fp16_overflow, expected);
+        EXPECT_EQ(items[0].recompile_config.compute_pgm_rsrc1, expected.saturate ? 1u << 26 : 0u);
+    }
+    clear_shader_recompile_cache();
+}
