@@ -167,6 +167,9 @@ public:
     Value f64unordgt(Value a, Value b) { return cmp(Opcode::F64UnordGt, a, b); }
     Value f64unordne(Value a, Value b) { return cmp(Opcode::F64UnordNe, a, b); }
     Value f64unordge(Value a, Value b) { return cmp(Opcode::F64UnordGe, a, b); }
+    // Cross-lane (eval_lanes.hpp).
+    Value lane_id() { return block_.append({Opcode::LaneId, Type::U32, 0, {}}); }
+    Value shuffle(Value value, Value lane) { return u32(Opcode::Shuffle, value, lane); }
 
 private:
     Value u32(Opcode op, Value a, Value b) { return block_.append({op, Type::U32, 0, {a, b}}); }

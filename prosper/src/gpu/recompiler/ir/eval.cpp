@@ -191,6 +191,9 @@ Known evaluate_op(Opcode op, uint32_t imm, uint32_t a, uint32_t b, uint32_t c) {
         case Opcode::F64UnordGt:
         case Opcode::F64UnordNe:
         case Opcode::F64UnordGe: return std::nullopt;
+        // Cross-lane: one invocation cannot know another's value (eval_lanes.hpp).
+        case Opcode::LaneId:
+        case Opcode::Shuffle: return std::nullopt;
     }
     return std::nullopt;
 }
