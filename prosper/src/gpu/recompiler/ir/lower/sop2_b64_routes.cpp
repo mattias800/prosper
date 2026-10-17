@@ -200,7 +200,23 @@ std::optional<bool> Sop2Lowering::route_lshr_b64_exec_pack() {
 }
 
 std::optional<bool> Sop2Lowering::route_shift_b64() {
-    if (in.opcode == 0x1f || in.opcode == 0x21) {
+    if (in.opcode == 0x23) {
+        // New ASHR is ordinary SGPR DATA only. It grants no special-register/mask write,
+        // and SGPR pairs use the ISA's even alignment. The existing source service and
+        // central effects/marks retain the current assignment obligations on all three words.
+        const bool ordinary_pair = in.src[0].kind == OperandKind::SGPR && in.src[0].value >= 0 &&
+                                   in.src[0].value <= 104 && !(in.src[0].value & 1);
+        const bool ordinary_count = (in.src[1].kind == OperandKind::SGPR && in.src[1].value >= 0 &&
+                                     in.src[1].value <= 105) ||
+                                    in.src[1].kind == OperandKind::InlineInt ||
+                                    (in.src[1].kind == OperandKind::Literal && in.has_literal);
+        if (in.dst.kind != OperandKind::SGPR || in.dst.value < 0 || in.dst.value > 104 ||
+            (in.dst.value & 1) || !ordinary_pair || !ordinary_count) {
+            ok = false;
+            return true;
+        }
+    }
+    if (in.opcode == 0x1f || in.opcode == 0x21 || in.opcode == 0x23) {
         // Ordinary s_lshl/lshr_b64 operates on a complete scalar-data pair. Generated
         // compute shaders frequently borrow VCC_LO/HI for 64-bit address arithmetic; that
         // lifetime coexists with VCC's per-lane predicate view, so retain both exactly.

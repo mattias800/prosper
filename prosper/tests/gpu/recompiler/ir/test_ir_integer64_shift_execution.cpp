@@ -1,6 +1,7 @@
 // Independent raw-word expectations and real recompiler output for the existing vector shifts.
 // Each saved module stores one half; the paired modules observe both destination words.
 #include "gpu/recompiler/ir/ops/integer64_shifts.hpp"
+#include "gpu/recompiler/ir/integer64_shift_witness.hpp"
 #include "gpu/recompiler/ir/vector_compare_harness.hpp"
 #include "gpu/recompiler/ir/vector_lane_harness.hpp"
 #include <gtest/gtest.h>
@@ -39,39 +40,37 @@ LaneProgram program(uint32_t op, uint32_t form, uint32_t wave, uint32_t half) {
     if (half) lp.code[lp.code.size() - 2] = 0x80020200; // store v2 instead of v1
     return lp;
 }
-std::vector<uint32_t> buffer(const LaneInputs& in) {
-    std::vector<uint32_t> out;
-    for (const auto* v : {&in.s0, &in.s1, &in.old_d}) out.insert(out.end(), v->begin(), v->end());
-    for (const bool active : in.active) out.push_back(active ? 1 : 0);
-    out.insert(out.end(), in.s2.begin(), in.s2.end());
-    out.insert(out.end(), in.s3.begin(), in.s3.end());
-    return out;
+void check_module(const std::vector<uint32_t>& spv, const LaneInputs& in, uint32_t op,
+                  uint32_t form, uint32_t wave, uint32_t half) {
+    const auto run = execute_integer64_shift_module(spv, in);
+    ASSERT_TRUE(run.error.empty()) << run.error;
+    ASSERT_EQ(run.d.size(), 64u);
+    for (size_t lane = 0; lane < 64; ++lane) {
+        const uint32_t count = (form == 0 ? in.s0[lane] : 33) & 63;
+        const uint64_t source =
+            op == 0x2ff ? 1 : uint64_t(in.s2[lane]) | (uint64_t(in.s3[lane]) << 32);
+        const uint64_t right = op == 0x301 && count && (source >> 63)
+                                   ? (source >> count) | (UINT64_MAX << (64 - count))
+                                   : source >> count;
+        const uint64_t result = op == 0x2ff ? source << count : right;
+        const uint32_t want = uint32_t(result >> (half * 32));
+        EXPECT_EQ(run.d[lane], in.active[lane] ? want
+                               : half          ? in.s0[lane]
+                                               : in.old_d[lane])
+            << "op " << op << " form " << form << " wave " << wave << " half " << half << " lane "
+            << lane;
+    }
 }
 void check(uint32_t op, uint32_t form, uint32_t wave, uint32_t half, uint32_t seed) {
     const auto in = inputs(seed);
     const auto lp = program(op, form, wave, half);
     const auto spv = recompile_compute(lp.code.data(), lp.code.size(), &lp.table, lp.config);
-    ASSERT_FALSE(spv.empty());
-    bpermute_oracle::Interpreter vm(spv);
-    const auto run = vm.run_buffers(64, {{3, buffer(in)}}, 3);
-    ASSERT_TRUE(vm.error.empty()) << vm.error;
-    ASSERT_GE(run.size(), 64u);
-    for (size_t lane = 0; lane < 64; ++lane) {
-        const uint32_t count = (form == 0 ? in.s0[lane] : 33) & 63;
-        const uint64_t source =
-            op == 0x2ff ? 1 : uint64_t(in.s2[lane]) | (uint64_t(in.s3[lane]) << 32);
-        const uint64_t result = op == 0x2ff ? source << count : source >> count;
-        const uint32_t want = uint32_t(result >> (half * 32));
-        EXPECT_EQ(run[lane], in.active[lane] ? want
-                             : half          ? in.s0[lane]
-                                             : in.old_d[lane])
-            << "op " << op << " form " << form << " wave " << wave << " half " << half << " lane "
-            << lane;
-    }
+    check_module(spv, in, op, form, wave, half);
 }
+
 } // namespace
 TEST(IrInteger64ShiftExecution, ExistingFormsObserveBothHalvesAndInactiveCanariesInBothWaves) {
-    for (const uint32_t op : {0x2ffu, 0x300u})
+    for (const uint32_t op : {0x2ffu, 0x300u, 0x301u})
         for (const uint32_t form : {0u, 1u, 2u, 3u})
             for (const uint32_t wave : {32u, 64u})
                 for (const uint32_t half : {0u, 1u})
@@ -107,13 +106,56 @@ TEST(IrInteger64ShiftExecution, ExportsExistingFormsForTheCorpusGate) {
     const auto dump = root / "refused_shaders_20000101-000000Z_synthetic";
     ASSERT_TRUE(fs::create_directories(dump));
     size_t count = 0;
-    for (const uint32_t op : {0x2ffu, 0x300u})
+    for (const uint32_t op : {0x2ffu, 0x300u, 0x301u})
         for (const uint32_t wave : {32u, 64u})
             for (const uint32_t half : {0u, 1u})
                 for (uint32_t form = 0; form < 4; ++form) {
                     const auto lp = program(op, form, wave, half);
-                    write_compare_witness_program(dump, 0x6450000000ull + count * 0x100, count, lp);
+                    const auto spv = saved_integer64_shift_witness(
+                        dump, 0x6450000000ull + count * 0x100, count, lp);
+                    check_module(spv, inputs(17), op, form, wave, half);
                     ++count;
                 }
-    EXPECT_EQ(count, 32u);
+    EXPECT_EQ(count, 48u);
+}
+
+TEST(IrInteger64ShiftExecution, APreviouslyUnwrittenHighDestinationWorksUnderFullExec) {
+    for (uint32_t op : {0x2ffu, 0x300u, 0x301u})
+        for (uint32_t wave : {32u, 64u})
+            for (uint32_t half : {0u, 1u}) {
+                auto in = inputs(397);
+                std::fill(in.active.begin(), in.active.end(), true);
+                auto op_words = words(op, 0);
+                op_words[0] = (op_words[0] & ~255u) | 24; // v[24:25] has no initial load
+                op_words.push_back(vop1(1, 1, 256 + 24 + half));
+                auto lp = lane_program(op_words, 64, wave, true, true);
+                lp.code.erase(lp.code.begin() + 13); // six two-word loads, waitcnt, then CMPX
+                const auto spv =
+                    recompile_compute(lp.code.data(), lp.code.size(), &lp.table, lp.config);
+                check_module(spv, in, op, 0, wave, half);
+            }
+}
+TEST(IrInteger64ShiftExecution, SourceDestinationPairOverlapReadsBothOldWordsFirst) {
+    for (uint32_t op : {0x300u, 0x301u})
+        for (uint32_t wave : {32u, 64u})
+            for (uint32_t half : {0u, 1u}) {
+                const auto in = inputs(419);
+                auto lp = lane_program({0xd4000001u | (op << 16), 259u | (257u << 9)}, 64, wave);
+                if (half) lp.code[lp.code.size() - 2] = 0x80020200;
+                const auto spv =
+                    recompile_compute(lp.code.data(), lp.code.size(), &lp.table, lp.config);
+                const auto run = execute_integer64_shift_module(spv, in);
+                ASSERT_TRUE(run.error.empty()) << run.error;
+                ASSERT_EQ(run.d.size(), in.lanes());
+                for (size_t lane = 0; lane < in.lanes(); ++lane) {
+                    const uint64_t old = uint64_t(in.old_d[lane]) | (uint64_t(in.s0[lane]) << 32);
+                    const uint32_t n = in.s1[lane] & 63;
+                    const uint64_t result = op == 0x301 && n && (old >> 63)
+                                                ? (old >> n) | (UINT64_MAX << (64 - n))
+                                                : old >> n;
+                    EXPECT_EQ(run.d[lane], in.active[lane] ? uint32_t(result >> (32 * half))
+                                           : half          ? in.s0[lane]
+                                                           : in.old_d[lane]);
+                }
+            }
 }

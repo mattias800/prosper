@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <set>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 using namespace prosper::gpu;
@@ -250,3 +251,28 @@ TEST(IrCoreInteger64, EveryOpcodeRunsLikeItsEvaluationPerLane) {
 }
 
 } // namespace
+
+TEST(IrCoreInteger64Oracle, ArithmeticShiftPropagatesUndefinedAndRejectsPoisonCounts) {
+    using bpermute_oracle::Interpreter;
+    SpirvCompute b;
+    b.begin(10, nullptr, 64, 1, 1, 64, 0, true, true);
+    const uint32_t word = b.u64_from_lohi(b.uconst(1), b.uconst(0x80000000));
+    const uint32_t count = b.u64_from_lohi(b.uconst(1), b.uconst(0));
+    b.store_output_word(b.uconst(0), 1, 0);
+    Interpreter vm(b.finish());
+    ASSERT_TRUE(vm.error.empty());
+    bpermute_oracle::Lane lane;
+    const uint32_t wide_type = b.t_u64();
+    lane.v[word] = {wide_type, {1, 0x80000000}, false};
+    lane.v[count] = {wide_type, {1, 0}, true};
+    const uint32_t result = 999;
+    ASSERT_TRUE(vm.scalar_alu_op(lane, Op_ShiftRightArithmetic, {wide_type, result, word, count}));
+    EXPECT_FALSE(lane.v.at(result).defined);
+    lane.v[word].defined = true;
+    lane.v[count].words = {64, 0};
+    EXPECT_THROW(vm.scalar_alu_op(lane, Op_ShiftRightArithmetic, {wide_type, result, word, count}),
+                 std::runtime_error);
+    lane.v[count].words = {1, 1};   // a wide count must not be silently truncated to its low word
+    EXPECT_THROW(vm.scalar_alu_op(lane, Op_ShiftRightArithmetic, {wide_type, result, word, count}),
+                 std::runtime_error);
+}

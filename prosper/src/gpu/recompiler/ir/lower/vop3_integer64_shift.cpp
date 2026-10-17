@@ -13,6 +13,16 @@ bool lower_vop3_integer64_shift(SpirvCompute& b, RegState& rs, const Rdna2Inst& 
         lower.lshr();
         return true;
     }
+    if (in.opcode == 0x301) {
+        // New arithmetic-right admission: unused SRC2 is canonical zero; the pair/source,
+        // destination and integer modifier guards below remain the existing LSHR boundary.
+        if (in.has_modifier || in.has_dpp || in.has_sdwa || (in.words[1] & (0x1ffu << 18))) {
+            ok = false;
+            return true;
+        }
+        lower.lshr();
+        return true;
+    }
     return false;
 }
 void Vop3Integer64ShiftLowering::lshl() {
