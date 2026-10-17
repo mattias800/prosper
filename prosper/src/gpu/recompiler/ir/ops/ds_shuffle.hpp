@@ -3,6 +3,7 @@
 #pragma once
 
 #include "gpu/recompiler/ir/builder.hpp"
+#include "gpu/recompiler/ir/ir.hpp"
 
 #include <cstdint>
 #include <functional>

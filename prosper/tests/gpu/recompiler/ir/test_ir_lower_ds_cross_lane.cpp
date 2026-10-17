@@ -2,9 +2,12 @@
 // In particular, a native-only BPERMUTE must not absorb the portable dispatcher's event route.
 #include "gpu/recompiler/ir/lower/ds_cross_lane_lowering.hpp"
 #include "gpu/recompiler/ir/lowering_fixture.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 

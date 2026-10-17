@@ -4,7 +4,11 @@
 #include "gpu/recompiler/ir/ops/ds_shuffle.hpp"
 
 #include "gpu/recompiler/rdna2_alu_support.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+
+#include <cstdint>
+#include <optional>
 
 namespace prosper::gpu::ir {
 
@@ -69,7 +73,7 @@ std::optional<bool> lower_ds_cross_lane(SpirvCompute& b, RegState& rs, const Rdn
                                         bool& ok) {
     if (in.fmt != Rdna2Format::DS) return std::nullopt;
     DsCrossLaneLowering lowering{b, rs, in, ok};
-    if (auto routed = lowering.route_bpermute()) return *routed;
+    if (auto routed = lowering.route_bpermute()) return routed;
     return lowering.route_swizzle();
 }
 

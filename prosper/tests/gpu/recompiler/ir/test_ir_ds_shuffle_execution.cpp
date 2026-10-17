@@ -1,18 +1,26 @@
 // Native DS values through the real recompiler: differing peers, source/destination EXEC,
 // byte-address carry, aliases, and raw-program/sidecar/saved-module witness replay.
+#include "gpu/diagnostics/refused_shader_inputs.hpp"
+#include "gpu/recompiler/bpermute_spirv_oracle.hpp"
+#include "gpu/recompiler/ir/builder.hpp"
 #include "gpu/recompiler/ir/ds_shuffle_cases.hpp"
 #include "gpu/recompiler/ir/eval_lanes.hpp"
+#include "gpu/recompiler/ir/ir.hpp"
 #include "gpu/recompiler/ir/ops/ds_shuffle.hpp"
 #include "gpu/recompiler/ir/vector_compare_harness.hpp"
-#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/ir/vector_lane_harness.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <ios>
+#include <string>
 #include <system_error>
 #include <vector>
 
@@ -62,9 +70,9 @@ void check_definition(const ds::Case& c, const LaneInputs& in) {
     const auto got = evaluate_lanes(block, rows);
     const auto expected = ds::expected(c, in);
     for (uint32_t lane = 0; lane < c.wave; ++lane) {
-        ASSERT_TRUE(got[lane][d.index].has_value());
-        EXPECT_EQ(in.active[lane] ? static_cast<uint32_t>(*got[lane][d.index]) : in.old_d[lane],
-                  expected[lane])
+        const Known value = got[lane][d.index];
+        ASSERT_TRUE(value.has_value());
+        EXPECT_EQ(in.active[lane] ? value : Known{in.old_d[lane]}, Known{expected[lane]})
             << "lane=" << lane;
     }
 }

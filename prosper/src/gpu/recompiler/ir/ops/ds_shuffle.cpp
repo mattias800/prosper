@@ -2,9 +2,12 @@
 #include "gpu/recompiler/ir/ops/ds_shuffle.hpp"
 
 #include "gpu/recompiler/ir/emit/spirv_emitter.hpp"
+#include "gpu/recompiler/ir/ir.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
 #include <array>
+#include <cstdint>
+#include <functional>
 
 namespace prosper::gpu::ir {
 namespace {

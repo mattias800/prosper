@@ -1,14 +1,18 @@
 // AMD 70648 10.4.4 and 12.13.1 give these byte-address and lane tables. Run the same IR graph
 // per lane through evaluation and emitted SPIR-V; hand tables, not eval, supply the expected peer.
 #include "gpu/recompiler/bpermute_spirv_oracle.hpp"
+#include "gpu/recompiler/ir/builder.hpp"
 #include "gpu/recompiler/ir/emit/spirv_emitter.hpp"
+#include "gpu/recompiler/ir/eval.hpp"
 #include "gpu/recompiler/ir/eval_lanes.hpp"
+#include "gpu/recompiler/ir/ir.hpp"
 #include "gpu/recompiler/ir/ops/ds_shuffle.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
