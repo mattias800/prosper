@@ -287,6 +287,176 @@ still take the switch.
 **4. The positive control is louder.** Swapping `v_add_nc_u32`'s operands changed 754 modules
 (752 by replay, 2 by stage). VALU ops are everywhere, so a vector family's gate is a strong check.
 
+## Mask-writing compares (VOPC)
+
+VOPC is already out of `rdna2_emit_alu.cpp`, and the F32 group (`v_cmp_*_f32` and
+`v_cmpx_*_f32`, both encodings) already goes through the IR. The remaining groups move by adding
+definitions; nobody relocates anything again. A compare is two halves, and only the first is yours:
+
+1. **The value.** The lane's test result, a Bool, as a function of its two source words. It is
+   different for every opcode, and it is what you migrate.
+2. **The mask write.** What every compare then does with that Bool: a V_CMPX narrows EXEC, any
+   other compare writes EXEC & value to VCC or to its SGPR destination, and the mask-domain
+   bookkeeping and proof facts go with it. It is the same for all 193 compares, and it already
+   lives in one function, `write_vopc_mask` (`lower/vopc_mask_write.cpp`).
+
+Where things are:
+
+| file | holds |
+| --- | --- |
+| `ops/vector_compare.hpp`, `ops/vector_compare.cpp` | `VectorCompareDef {opcode, build}`, the group list, `find_vector_compare`, `eval_vector_compare`, `emit_vector_compare` |
+| `ops/vector_compare_f32.cpp` | the worked example: 16 definitions, one per V_CMP_*_F32 opcode |
+| `lower/vopc.cpp` | `VopcLowering::lower()`: source reads, admission and refusals, source modifiers, SDWA selects, 64-bit halves, the value overrides, then the value and the mask write |
+| `lower/vopc_compare_values.cpp` | `compare_value()`: the value overrides, then a definition if one exists, then the remaining `switch`, one function per not-yet-migrated group |
+| `lower/vopc_mask_write.cpp` | `write_vopc_mask`, the shared mask write |
+| `tests/gpu/recompiler/ir/vector_compare_harness.hpp` | the per-lane MASK harness and the witness exporter |
+
+### What goes in `ops/`
+
+One file per group, `ops/vector_compare_<group>.cpp`, holding a table of `VectorCompareDef`. Each
+`build` appends the relation and returns a **Bool**. Then:
+
+- declare `vector_compare_<group>_defs()` in `ops/vector_compare.hpp`;
+- add it to `vector_compare_groups()` in `ops/vector_compare.cpp`.
+
+A definition is keyed by the **V_CMP_*** opcode. The V_CMPX_* twin (opcode + 0x10, see
+`vopc_is_cmpx`) and the VOP3 (e64) encodings decode as VOPC with the same number, and the lowering
+looks them up by the compare opcode (`eff`), so one definition serves all four forms. Never add a
+CMPX row.
+
+A definition receives the sources **after** the lowering has prepared them. Preparing a source is
+operand bookkeeping, not the relation, so it stays in `lower/`:
+
+- the float ABS/NEG modifiers (`source_modifiers`);
+- the integer SDWA byte and word selects (`integer_sdwa_sources`);
+- the f16 unpack, including inline-constant encodings and the SDWA WORD_1 select (`compare_f16`'s
+  `f16v`);
+- the 64-bit source halves (`integer64_halves`);
+- for `v_cmp_class_f32`, the integer-domain ABS/NEG of the RAW S0 word (`class_raw`). CLASS reads
+  `ra`/`rc`, not the float-modified `a`/`c`, so its lowering passes `class_raw` and `rc` to the
+  definition. `source_modifiers` still runs first and its unused output stays, for byte identity.
+
+What belongs in the definition is everything after that: for the 16-bit integer group, the
+`bfe_s`/`bfe_u` extension of bits [15:0] is part of the relation, so it moves into the definition.
+
+Match the old bytes the same way every family does: append in the old order, with the old nesting.
+`cmp_o` appends both `F32Eq`s before the `BoolAnd`, as the old `case 0x07` did.
+
+### NaN and signed zero: what the F32 group pins
+
+AMD 70648 12.9, Table 61. These rules apply to every float group (F16 and F64 too):
+
+- LT, EQ, LE, GT, LG and GE are **ordered**: false when either source is a NaN.
+- Each N-form is the plain negation of its ordered relation (`NGE = !(S0 >= S1)`), so it is
+  **unordered**: true when either source is a NaN. The ISA says so in a note on each N-form ("With
+  NAN inputs this is not the same operation as <").
+- LG is ordered not-equal (`F32Lg`, `OpFOrdNotEqual`). NEQ is `!(S0 == S1)`, unordered
+  (`F32UnordNe`). They differ only on a NaN.
+- O is "neither is a NaN" and U is "either is a NaN". F is constant false and TRU constant true.
+- +0 equals -0, and each infinity is the extreme of its sign.
+
+The IR has all twelve binary32 relations: `F32Lt/Eq/Le/Gt/Lg/Ge` and
+`F32UnordLt/Eq/Le/Gt/Ne/Ge`. The F16 group compares its unpacked values with the same opcodes,
+because f16 embeds exactly in f32. The integer groups use `IEq/INe/ULt.../SGe`.
+
+### What you must never touch
+
+Each of these is either mask or proof state, or an override of the value that a proof pass reads.
+Changing any of them is a lead change, even when it looks mechanical:
+
+- `lower/vopc_mask_write.cpp`, and with it `exec_masked_predicate`, `exec_subset_of`, `sreg_bool*`
+  and `vcc_wave_uniform`;
+- `VopcLowering::lower()`'s call order;
+- `compare_wave_uniform`, `scalar_data_operand` and `scalar_integer64_operand`;
+- the value overrides `zero_compare` and `magnitude_compare`, and `record_guest_compare_facts`.
+  `compare_value()` returns an override before it looks for a definition, so a definition never
+  replaces one;
+- the refusals: V_CMPX without `allow_exec_update`, integer64 compares with ABS/NEG, an inline
+  float in a 64-bit integer compare, and `ok = false` for an opcode with no value.
+
+### Steps for one group
+
+1. Write the definitions (above). If you need an IR opcode, add it in all five places
+   (`HOW_TO_ADD_A_FAMILY.md` step 3), and add its SPIR-V instruction to the interpreter
+   (`tests/gpu/recompiler/bpermute_spirv_oracle.hpp`) if it is missing. The F32 group added the
+   eight missing float relations to both.
+2. In `lower/vopc_compare_values.cpp`, delete the group's `case` labels and its function. The
+   definition lookup runs first, so they are dead once the definitions exist.
+3. **Admit nothing new.** Only the opcodes the old switch handled get definitions. The switch
+   handles the F16 group only at 0xC9-0xCE (LT, EQ, LE, GT, LG, GE), and it has no F64, no
+   `class_f16` and no `v_cmp_f/t` for the integer types. Adding any of those is a behaviour change:
+   do it in a separate, explained PR, as in Group 5.
+4. Run the corpus gate, a witness corpus and the controls (below).
+
+**64-bit groups (I64, U64, F64): stop and report.** The IR has no 64-bit type. The current
+lowering builds the operands with `u64_from_lohi`, which no IR opcode expresses, and an opcode has
+at most three arguments. The lead adds the type first.
+
+### How to test the mask
+
+Copy `test_ir_vector_compare_execution.cpp` into `test_ir_vector_compare_<group>_execution.cpp`
+and change its inputs and its hand-worked table. The harness (`vector_compare_harness.hpp`) runs
+each opcode in five forms:
+
+- VOPC e32 to VCC;
+- VOP3 to an SGPR pair;
+- VOP3 to VCC;
+- V_CMPX in each of its two encodings.
+
+Each form runs in Wave64 and Wave32, and reads the **mask** back rather than a VGPR. After a
+compare, it restores EXEC and runs `v_cndmask_b32_e64 v1, 0, 1, <mask>`, so every lane, active or
+not, stores its mask bit. An inactive lane must read **0**: `VCC[n] = EXEC[n] & test` (ISA 3.9).
+After a V_CMPX, it runs `v_mov_b32 v1, 1`, so exactly the lanes where EXEC & test holds read 1, and
+the rest keep their old v1.
+
+Keep these four tests for each group:
+
+- **Every definition, every form, both waves**, against `eval_vector_compare`.
+- **A hand-worked truth table from the ISA.** Never take it from eval. For float groups, include a
+  NaN on each side, +0 against -0, and the infinities. For integer groups, include the signed and
+  unsigned extremes, and for 16-bit groups, the bits above [15:0].
+- **The harness's own positive control.** `InactiveLanesReadZeroAndActiveLanesDiffer` fails if
+  EXEC is not observed: at least one inactive lane must have a true test.
+- **Effects agreement.** Each definition's name comes from `rdna2_instruction_effects`. Its V_CMPX
+  twin sits at +0x10, and each new IR opcode is used.
+
+`test_ir_lower_vopc.cpp` pins the mask write for every group: the VCC and SGPR destinations, CMPX
+and its `exec_subset_of` record, the `vcc_wave_uniform` proof, and the refusals. You do not need to
+extend it, and its assertions must not change.
+
+The F32 group's mutations, each of which turned a test red:
+
+- `F32Le` evaluated as `<`;
+- `F32UnordLt` emitted as `OpFOrdLessThan`;
+- LG defined as NEQ;
+- O reading S0 twice;
+- the mask write without `exec_masked_predicate`;
+- CMPX writing the raw compare to EXEC;
+- CMPX without its `exec_subset_of` record;
+- the definition lookup switched off;
+- the definition's sources swapped;
+- the source modifiers skipped;
+- the interpreter treating unordered relations as ordered.
+
+### Gate and controls
+
+Run the gate on the recorded corpus and on a witness corpus, exported with
+`PROSPER_IR_WITNESS_DIR=~/<slug>-witness ./test_ir_vector_compare_<group>_execution
+--gtest_filter='*Exports*'`, then `recompile_corpus.py harvest ~/<slug>-witness --root
+~/<slug>-witness`. Run one positive control **per comparison kind**: each is a byte-changing but
+neutral edit, such as a mirrored relation with swapped operands, or swapped `BoolAnd` arguments.
+The F32 group's results:
+
+| control | recorded corpus (1,448 modules) | witness (160 programs) |
+| --- | --- | --- |
+| ordered LT..GE mirrored | output-changed 1,325 | output-changed 60 |
+| N-forms mirrored | output-changed 271 | output-changed 60 |
+| O/U arguments swapped | output-changed 22 | output-changed 20 |
+| F/TRU rewritten as `F32Lg(s0,s0)` / `F32UnordEq(s0,s0)` | **none**: the corpus never runs them | output-changed 20 |
+
+So the witness corpus is required. The recorded corpus alone could not show that the constant
+compares still work.
+
 ## Family list and order
 
 Remaining in `rdna2_emit_alu.cpp`, in the order to migrate them. Codex takes the open groups; the
@@ -304,7 +474,12 @@ and leave the reserved ones in the `switch`.
 | 5 | VOP3 (e64) encodings of VOP2/VOP1 ops that emit_alu does not admit today | Codex, but ADMITTING them is a behaviour change: corpus-explained, separate PR |
 | 6 | VOP3P packed 16-bit ops | Codex |
 | 7 | VINTRP | Codex, with the lead reviewing: it reads M0 |
-| - | VOP2 `v_cndmask_b32`, carry ops `v_add/sub/subrev_co_ci_u32` (VCC), every VOPC (writes VCC/EXEC), VOP3B (`v_add_co_u32`, `v_div_scale`, `v_mad_u64_u32`: SGPR carry masks), `v_mbcnt` | lead (wave masks) |
+| 8 | VOPC I32 and U32 (`v_cmp/cmpx_{lt,eq,le,gt,ne,ge}_{i32,u32}`, both encodings) | Codex, using the compare recipe |
+| 9 | VOPC I16 and U16 (the same six relations; the [15:0] extension goes in the definition) | Codex, using the compare recipe |
+| 10 | VOPC F16 (`v_cmp/cmpx_{lt,eq,le,gt,lg,ge}_f16`: only the six the switch admits) | Codex, using the compare recipe |
+| 11 | VOPC `v_cmp/cmpx_class_f32` | Codex, using the compare recipe |
+| - | VOPC I64, U64 and F64 (needs a 64-bit IR type first), and admitting any compare the switch refuses today | lead, then Codex |
+| - | VOP2 `v_cndmask_b32`, carry ops `v_add/sub/subrev_co_ci_u32` (VCC), the VOPC mask write (`lower/vopc_mask_write.cpp`), VOP3B (`v_add_co_u32`, `v_div_scale`, `v_mad_u64_u32`: SGPR carry masks), `v_mbcnt` | lead (wave masks) |
 | - | DPP (the VOP1/VOP2 DPP routes and SRC0 stage), `v_permlane*`, `v_readlane/writelane/readfirstlane`, `ds_bpermute/permute`, quad and swizzle ops | lead (cross-lane) |
 | - | `v_movrel*`, `s_movrel*`, and the memory families SMEM, MUBUF/MTBUF, FLAT, MIMG, DS (descriptor provenance, raw windows, active-word marks) | lead (proof and definedness) |
 | - | SOPP, `rdna2_emit_cfg.cpp`, the SOP `*_routes.cpp` | lead (control flow, mask routes) |
