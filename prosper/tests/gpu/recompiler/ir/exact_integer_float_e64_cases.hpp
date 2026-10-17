@@ -64,6 +64,7 @@ inline uint32_t inline_word(uint32_t selector) {
 }
 inline std::vector<uint32_t> literals() {
     std::vector<uint32_t> out;
+    out.reserve(kHand.size() + 32u);
     for (const auto& h : kHand) out.push_back(h.raw);
     // Each significant-bit boundary: exact high mantissa plus the nearest discarded-bit error.
     for (uint32_t shift = 1; shift <= 8; ++shift) {

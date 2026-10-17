@@ -2,6 +2,11 @@
 // Uniform encoded sources still require differing per-lane EXEC and inactive destination canaries.
 #include "gpu/recompiler/ir/exact_integer_float_e64_cases.hpp"
 #include "gpu/recompiler/ir/ops/vector_exact_integer_float_e64.hpp"
+#include "gpu/recompiler/ir/ops/vector_conversion.hpp"
+#include "gpu/recompiler/ir/vector_lane_harness.hpp"
+#include "gpu/recompiler/bpermute_spirv_oracle.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/diagnostics/refused_shader_inputs.hpp"
 #include "fixtures/test_scratch.h"
 #include <gtest/gtest.h>

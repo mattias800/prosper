@@ -1,6 +1,9 @@
 // These aliases reuse integer conversion values; their constant-only admission stays in lower/.
 #pragma once
 #include "gpu/recompiler/ir/ops/vector_conversion.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include <cstdint>
+#include <span>
 
 namespace prosper::gpu::ir {
 std::span<const ConversionDef> vector_exact_integer_float_e64_defs();

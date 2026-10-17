@@ -1,6 +1,10 @@
 // AMD70648 12.8/12.8.1: the e64 integer-to-F32 values are the existing VOP1 conversions.
 #include "gpu/recompiler/ir/ops/vector_exact_integer_float_e64.hpp"
+#include "gpu/recompiler/ir/ops/vector_conversion.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include <array>
+#include <cstdint>
+#include <span>
 
 namespace prosper::gpu::ir {
 std::span<const ConversionDef> vector_exact_integer_float_e64_defs() {

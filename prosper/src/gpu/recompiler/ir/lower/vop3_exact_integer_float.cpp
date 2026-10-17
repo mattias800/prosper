@@ -1,6 +1,7 @@
 // AMD70648 6.4/12.8: all round modes agree for exactly representable integer inputs.
 // Zero stays outside: Vulkan's implicit NSZ on OpConvertSToF/UToF does not prove its raw sign.
 #include "gpu/recompiler/ir/lower/vop3_exact_integer_float_lowering.hpp"
+#include "gpu/recompiler/ir/ops/vector_conversion.hpp"
 #include "gpu/recompiler/ir/ops/vector_exact_integer_float_e64.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"

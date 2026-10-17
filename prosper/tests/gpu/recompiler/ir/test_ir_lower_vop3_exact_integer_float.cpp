@@ -4,7 +4,9 @@
 #include "gpu/recompiler/ir/lower/vop3_float_integer_lowering.hpp"
 #include "gpu/recompiler/ir/lowering_fixture.hpp"
 #include "gpu/recompiler/ir/ops/vector_exact_integer_float_e64.hpp"
+#include "gpu/recompiler/ir/ops/vector_conversion.hpp"
 #include "gpu/recompiler/ir/ops/vector_float_integer_e64.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include <gtest/gtest.h>
 #include <cstdint>
