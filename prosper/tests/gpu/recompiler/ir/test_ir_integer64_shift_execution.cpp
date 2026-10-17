@@ -1,14 +1,20 @@
 // Independent raw-word expectations and real recompiler output for the existing vector shifts.
 // Each saved module stores one half; the paired modules observe both destination words.
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/ir/eval.hpp"
+#include <optional>
 #include "gpu/recompiler/ir/ops/integer64_shifts.hpp"
 #include "gpu/recompiler/ir/integer64_shift_witness.hpp"
 #include "gpu/recompiler/ir/vector_compare_harness.hpp"
 #include "gpu/recompiler/ir/vector_lane_harness.hpp"
 #include <gtest/gtest.h>
 #include <array>
+#include <algorithm>
+#include <cstddef>
+#include <cstdlib>
+#include <system_error>
 #include <cstdint>
 #include <filesystem>
-#include <fstream>
 #include <string>
 #include <vector>
 using namespace prosper::gpu;
@@ -27,6 +33,8 @@ LaneInputs inputs(uint32_t seed) {
     auto in = lane_inputs(seed);
     const uint32_t counts[] = {0, 1, 31, 32, 33, 63, 64, 65, 0xffffffff};
     uint32_t state = seed;
+    in.s2.reserve(in.lanes());
+    in.s3.reserve(in.lanes());
     for (size_t lane = 0; lane < in.lanes(); ++lane) {
         state = state * 1664525u + 1013904223u;
         in.s0[lane] = lane < std::size(counts) ? counts[lane] : state;

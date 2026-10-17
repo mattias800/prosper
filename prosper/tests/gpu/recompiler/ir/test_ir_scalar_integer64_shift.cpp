@@ -1,12 +1,19 @@
 // Ordinary scalar shift sources are uniform within a guest wave. Numeric core tests separately
 // exercise differing raw words per invocation; these programs test genuine S_MOV producers.
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/ir/lower/scalar_alu_lowering.hpp"
+#include "gpu/recompiler/ir/vector_lane_harness.hpp"
 #include "gpu/recompiler/ir/lowering_fixture.hpp"
 #include "gpu/recompiler/ir/integer64_shift_witness.hpp"
 #include "gpu/recompiler/ir/scalar_encoding.hpp"
 #include "gpu/recompiler/ir/vector_compare_harness.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include <gtest/gtest.h>
-#include <array>
+#include <cstddef>
+#include <cstdlib>
+#include <system_error>
 #include <cstdint>
 #include <filesystem>
 #include <string>

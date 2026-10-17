@@ -131,8 +131,8 @@ std::optional<bool> Sop1Lowering::route_flbit() {
         } else {
             ok = false; return true;
         }
-        // FindUMsb is undefined at zero, so never hand it a zero: OR in bit 0 (which cannot
-        // change the highest set bit of a non-zero value) and select the zero answer after.
+        // Preserve the original OR1 graph: setting bit 0 cannot change a nonzero MSB.
+        // The outer select supplies the zero sentinel after evaluating both branches.
         auto leading_zeros = [&](uint32_t word) {
             return b.ibin(Op_ISub, b.uconst(31),
                           b.find_umsb(b.ibin(Op_BitwiseOr, word, b.uconst(1))));

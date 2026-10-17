@@ -1,7 +1,15 @@
 // Save the actual sidecar-replayed module, then execute that same module with lane-owned inputs.
 #pragma once
+#include "gpu/recompiler/ir/vector_lane_harness.hpp"
+#include "gpu/recompiler/bpermute_spirv_oracle.hpp"
+#include "gpu/diagnostics/refused_shader_inputs.hpp"
+#include <ios>
 #include "gpu/recompiler/ir/vector_compare_harness.hpp"
 #include <filesystem>
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <vector>
 #include <fstream>
 namespace prosper::test::ir {
 inline std::vector<uint32_t> saved_integer64_shift_witness(const std::filesystem::path& dump,
@@ -23,6 +31,8 @@ inline LaneRun execute_integer64_shift_module(const std::vector<uint32_t>& modul
                                               const LaneInputs& in) {
     if (module.empty()) return {{}, "empty shift module"};
     std::vector<uint32_t> input;
+    input.reserve(in.s0.size() + in.s1.size() + in.old_d.size() + in.active.size() + in.s2.size() +
+                  in.s3.size());
     for (const auto* v : {&in.s0, &in.s1, &in.old_d})
         input.insert(input.end(), v->begin(), v->end());
     for (bool active : in.active) input.push_back(active ? 1 : 0);

@@ -1,6 +1,7 @@
 // The 64-bit word opcodes (PackU64, U64Lo, U64Hi, U64Eq..U64Ge): hand-worked evaluation, Block
 // type rules, the 32-bit view of a U64 value, and every opcode's SPIR-V run per lane in the integer
 // interpreter against its own evaluation.
+#include <optional>
 #include "gpu/recompiler/bpermute_spirv_oracle.hpp"
 #include "gpu/recompiler/ir/builder.hpp"
 #include "gpu/recompiler/ir/emit/spirv_emitter.hpp"

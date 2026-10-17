@@ -1,4 +1,7 @@
 // Relocated from emit_alu with extract_case_routes.py. Numeric semantics are unchanged here.
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_alu_support.hpp"
+#include <cstdint>
 #include "gpu/recompiler/ir/lower/vop3_integer64_shift_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_integer64_shift_internal.hpp"
 #include "gpu/recompiler/ir/ops/integer64_shifts.hpp"

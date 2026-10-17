@@ -1,4 +1,12 @@
 // AMD70648 12.12/13.2: numeric raw-word shifts with the guest count modulo 64.
+#include "gpu/recompiler/ir/ir.hpp"
+#include "gpu/recompiler/ir/eval.hpp"
+#include "gpu/recompiler/ir/ops/vector_ternary_integer.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include <array>
+#include <cstdint>
+#include <span>
+#include <functional>
 #include "gpu/recompiler/ir/ops/integer64_shifts.hpp"
 #include "gpu/recompiler/ir/emit/spirv_emitter.hpp"
 #include <vector>
@@ -54,6 +62,7 @@ Known64 eval_integer64_shift(const Integer64ShiftDef& def, Known low, Known high
     const std::array<Known64, 3> sources = {low, high, masked};
     const Built out = build(def);
     std::vector<Known64> inputs;
+    inputs.reserve(out.sources.size());
     for (const uint32_t slot : out.sources) inputs.push_back(sources[slot]);
     return evaluate_wide(out.block, inputs)[out.result.index];
 }

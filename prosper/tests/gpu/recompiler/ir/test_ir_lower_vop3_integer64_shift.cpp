@@ -1,9 +1,9 @@
 // The relocated integer64 shifts keep exact source/modifier admission and both destination words.
+#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/ir/lower/vop3_integer64_shift_lowering.hpp"
 #include "gpu/recompiler/ir/lowering_fixture.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include <gtest/gtest.h>
-#include <array>
 #include <cstdint>
 #include <vector>
 using namespace prosper::gpu;
