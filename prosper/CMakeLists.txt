@@ -6278,15 +6278,15 @@ endif()
         LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan
         PROPERTIES TIMEOUT 180)
 
-      # The MIMG coordinate definition (ir/ops/image_coordinates.cpp) on the live Vulkan compute
-      # backend: per-lane coordinates, partial EXEC, both wave sizes, and the out-of-range read
-      # that robustImageAccess makes 0. The interpreter cannot run an image access.
       prosper_add_gtest(test_ir_image_store_values_execution
         SOURCES tests/gpu/recompiler/ir/test_ir_image_store_values_execution.cpp
         INCLUDES frontends src tests
         LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan
         PROPERTIES TIMEOUT 120)
 
+      # The MIMG coordinate definition (ir/ops/image_coordinates.cpp) on the live Vulkan compute
+      # backend: per-lane coordinates, partial EXEC, both wave sizes, and the out-of-range read
+      # that robustImageAccess makes 0. The interpreter cannot run an image access.
       prosper_add_gtest(test_ir_image_coordinates_execution
         SOURCES tests/gpu/recompiler/ir/test_ir_image_coordinates_execution.cpp
         INCLUDES frontends src tests
