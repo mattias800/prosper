@@ -160,7 +160,8 @@ void check_lane_matrix(bool typed, uint32_t components, uint32_t format, uint32_
     // NOLINTNEXTLINE(concurrency-mt-unsafe): the launch environment is immutable.
     const char* directory = std::getenv("PROSPER_IR_WITNESS_DIR");
     if (directory && !partial) {
-        const auto dump = std::filesystem::path(directory) / "refused_shaders_pcrel_format_bounds";
+        const auto dump =
+            std::filesystem::path(directory) / "refused_shaders_20000101-000000Z_synthetic";
         std::filesystem::create_directories(dump);
         const uint32_t key = (uint32_t(typed) << 20u) | (components << 16u) | (format << 8u) |
                              (table_words << 4u) | uint32_t(wave == 64u);
