@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <ios>
 #include <string>
 #include <vector>
 
@@ -69,7 +70,7 @@ void check(bool typed, bool past_end, uint32_t arm) {
         const Rdna2Inst in = rdna2_decode_one(p.code.data() + 17, p.code.size() - 17);
         ASSERT_EQ(in.fmt, typed ? Rdna2Format::MTBUF : Rdna2Format::MUBUF);
         if (typed) ASSERT_EQ(in.mtbuf_format, 77u);
-        const uint64_t address = 0x5383000000ull + arm * 0x1000 + wave * 0x10;
+        const uint64_t address = 0x5383000000ull + uint64_t(arm) * 0x1000u + uint64_t(wave) * 0x10u;
         const auto module = recompile_compute(p.code.data(), p.code.size(), &p.table, p.config,
                                               {RecompileDiagnosticStage::Compute, address});
         ASSERT_FALSE(module.empty()) << last_terminal_reject_reason(address);
