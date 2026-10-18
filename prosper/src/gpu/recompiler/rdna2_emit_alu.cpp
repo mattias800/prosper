@@ -8,6 +8,7 @@
 #include "gpu/recompiler/ir/lower/flat_window_lowering.hpp"
 #include "gpu/recompiler/ir/lower/ds_address_lowering.hpp"
 #include "gpu/recompiler/ir/lower/image_coordinates_lowering.hpp"
+#include "gpu/recompiler/ir/lower/image_mip_clamp_lowering.hpp"
 #include "gpu/recompiler/ir/lower/image_operand_coordinates_lowering.hpp"
 #include "gpu/recompiler/ir/lower/image_gather_layer_lowering.hpp"
 #include "gpu/recompiler/ir/lower/image_store_values_lowering.hpp"
@@ -4023,8 +4024,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         // derivation of it: for this packet family they are the same VGPR, and
                         // reading it from one place keeps them that way.
                         const uint32_t requested = vread(static_cast<int>(dynamic_mip_vgpr));
-                        const uint32_t lod = b.uext2(
-                            Glsl_UMin, requested, b.uconst(materialized_mip_levels - 1u));
+                        const uint32_t lod =
+                            ir::lower_image_mip_clamp(b, requested, materialized_mip_levels);
                         b.image_fetch_2d_lod(res->binding, cu, cv, lod, out);
                     }
                     else                   b.image_fetch_2d (res->binding, cu, cv, out);
