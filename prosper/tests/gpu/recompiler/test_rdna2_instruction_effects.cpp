@@ -6,6 +6,7 @@
 // was silent -- a missed SCC reader drops the wave vote a consumer needs, and an under-counted
 // destination lets an analysis believe a clobbered register still holds its old value.
 //
+// Family table fragments share one translation unit; the tests pin their public lookup.
 // What is pinned here:
 //   * COVERAGE: every opcode the decoder can produce in a tabulated format has an entry, named or
 //     explicitly reserved. A new decodable opcode without an entry turns this red; so does deleting
