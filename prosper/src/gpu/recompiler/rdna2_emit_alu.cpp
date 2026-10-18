@@ -1683,6 +1683,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     if (offen) { Operand ov{OperandKind::VGPR, in.src[0].value};
                                  addr = b.ibin(Op_IAdd, addr, val(ov)); }
                     uint32_t idx = b.ibin(Op_ShiftRightLogical, addr, b.uconst(2));
+                    // ISA 70648 section 8.1: formatted loads are bounded all-or-nothing.
+                    // Subtract on the host first so a large guest address cannot wrap the check.
+                    // MTBUF uses identity DST_SEL (Table 31), so no SEL_1 exception applies here.
+                    uint32_t format_in_bounds = 0;
+                    if (mtbuf_pcrel_fold)
+                        format_in_bounds = n <= tab.size()
+                                               ? b.ucmp(Op_ULessThanEqual, addr,
+                                                        b.uconst((uint32_t(tab.size()) - n) * 4u))
+                                               : b.bfalse();
                     for (uint32_t k = 0; k < n; k++) {
                         int d = in.dst.value + (int)k;
                         uint32_t old = vreg_old(b, rs, d);
@@ -1690,6 +1699,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         uint32_t acc = b.uconst(0);   // OOB -> 0
                         for (uint32_t t = 0; t < (uint32_t)tab.size(); t++)
                             acc = b.sel(b.ucmp(Op_IEqual, kidx, b.uconst(t)), b.uconst(tab[t]), acc);
+                        if (mtbuf_pcrel_fold) acc = b.sel(format_in_bounds, acc, b.uconst(0));
                         rs.vreg[d] = acc;
                         predicate_write(b, rs, d, old);
                     }

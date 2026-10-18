@@ -3678,6 +3678,7 @@ if(TARGET prosper_core)
           ir_flat_window_values
           ir_lower_flat_window
           ir_buffer_store_values
+          ir_buffer_pcrel_format_bounds_execution
           ir_core
           ir_half_fma_finite
           ir_half_fma_finite_execution
