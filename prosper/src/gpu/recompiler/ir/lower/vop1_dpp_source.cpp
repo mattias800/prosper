@@ -1,6 +1,7 @@
-// Relocated verbatim with extract_case_routes.py; only compute row-XOR values migrate here.
+// Relocated verbatim with extract_case_routes.py; compute source values use IR; reserved paths stay here.
 #include "gpu/recompiler/ir/lower/vop1_dpp_source_lowering.hpp"
 #include "gpu/recompiler/ir/ops/vector_dpp_row_xor.hpp"
+#include "gpu/recompiler/ir/lower/vector_dpp_source_lowering.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 namespace prosper::gpu::ir {
@@ -50,19 +51,10 @@ std::optional<bool> Vop1DppSourceLowering::stage_dpp_source() {
             }
             if (b.is_compute) {
                 b.mark_subgroup_min16();
-                const uint32_t shift = in.dpp_ctrl - 0x110u;
-                const uint32_t lane = b.subgroup_local_id();
-                const uint32_t row_lane = b.ibin(Op_BitwiseAnd, lane, b.uconst(15));
-                dpp_active = b.ucmp(Op_UGreaterThanEqual, row_lane, b.uconst(shift));
-                const uint32_t source_lane =
-                    b.sel(dpp_active, b.ibin(Op_ISub, lane, b.uconst(shift)), lane);
-                const uint32_t shuffled = b.subgroup_shuffle(a, source_lane);
-                // FI0 zeroes an inactive source; only row bounds disable a BC0 write.
-                const uint32_t source_active =
-                    b.subgroup_shuffle(b.sel(rs.exec, b.uconst(1), b.uconst(0)), source_lane);
-                const uint32_t source =
-                    b.sel(b.ucmp(Op_INotEqual, source_active, b.uconst(0)), shuffled, b.uconst(0));
-                a = in.dpp_bound_ctrl ? b.sel(dpp_active, source, b.uconst(0)) : source;
+                const auto source =
+                    emit_dpp_row_shr_source(b, a, rs.exec, in.dpp_ctrl - 0x110u, in.dpp_bound_ctrl);
+                dpp_active = source.in_bounds;
+                a = source.word;
             } else {
                 a = b.uconst(0);
             }
