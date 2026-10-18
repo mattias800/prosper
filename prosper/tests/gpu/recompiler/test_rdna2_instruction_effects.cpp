@@ -1354,6 +1354,7 @@ TEST(Rdna2InstructionEffectsRegression, Wave32LaneMaskSourceIsOneSgpr) {
     for (const uint32_t op : {0x101u, 0x128u, 0x129u, 0x12au}) {
         const Rdna2Inst in = decode_vop3_sgpr(op);
         EXPECT_TRUE(valu_lane_mask_source(in, 2)) << std::hex << op;
+        EXPECT_TRUE(rdna2_instruction_effects(in).lane_mask_src2) << std::hex << op;
         EXPECT_EQ(scalar_alu_source_words(in, 2, 32), 1u) << std::hex << op;
         EXPECT_EQ(scalar_alu_source_words(in, 2, 64), 2u) << std::hex << op;
         EXPECT_EQ(scalar_alu_source_words(in, 2), 2u) << std::hex << op << " width-free form";
@@ -1372,6 +1373,16 @@ TEST(Rdna2InstructionEffectsRegression, Wave32LaneMaskSourceIsOneSgpr) {
                 ++narrowed;
     }
     EXPECT_EQ(narrowed, 4u);
+    // The fact lives in the effects table (lane_mask_src2), not in a private opcode list: exactly
+    // four VALU rows carry it, and no SRC0/SRC1 is ever reported as a lane mask.
+    size_t lane_mask_rows = 0;
+    for (uint32_t op = 0; op < 0x400; ++op) {
+        const Rdna2Inst in = decode_vop3_sgpr(op);
+        if (in.fmt != Rdna2Format::VOP3) continue;
+        if (rdna2_instruction_effects(in).lane_mask_src2) ++lane_mask_rows;
+        EXPECT_FALSE(valu_lane_mask_source(in, 0) || valu_lane_mask_source(in, 1)) << std::hex << op;
+    }
+    EXPECT_EQ(lane_mask_rows, 4u);
     // The source marks keep VCC_LO's pair (the entry-VCC witness); VCC_HI and an SGPR narrow.
     for (const uint32_t src2 : {106u, 107u, 20u}) {
         const uint32_t code[2] = {0xD4000000u | (0x128u << 16) | (106u << 8) | 4u,

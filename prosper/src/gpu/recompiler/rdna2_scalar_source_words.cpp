@@ -65,11 +65,10 @@ uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
 }
 
 bool valu_lane_mask_source(const Rdna2Inst& in, uint32_t source) {
-    // SRC2 of v_cndmask_b32_e64 (VOP3 0x101) and of the VOP3B carry-in forms v_add_co_ci_u32,
-    // v_sub_co_ci_u32 and v_subrev_co_ci_u32 (VOP3 0x128-0x12a). Their VOP2 twins read VCC
-    // implicitly and have no SRC2.
-    return in.fmt == Rdna2Format::VOP3 && source == 2 &&
-           (in.opcode == 0x101 || (in.opcode >= 0x128 && in.opcode <= 0x12a));
+    // The instruction-effects table records which SRC2 is a lane mask (lane_mask_src2).
+    if (in.fmt != Rdna2Format::VOP3 || source != 2) return false;
+    const Rdna2InstructionEffects& effects = rdna2_instruction_effects(in);
+    return effects.describes_sources() && effects.lane_mask_src2;
 }
 
 uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source, uint32_t wave_size) {
