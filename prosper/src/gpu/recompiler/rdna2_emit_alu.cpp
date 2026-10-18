@@ -7,6 +7,7 @@
 #include "gpu/recompiler/ir/lower/smem_index_lowering.hpp"
 #include "gpu/recompiler/ir/lower/flat_window_lowering.hpp"
 #include "gpu/recompiler/ir/lower/ds_address_lowering.hpp"
+#include "gpu/recompiler/ir/lower/image_coordinates_lowering.hpp"
 #include "gpu/recompiler/ir/lower/buffer_format_values.hpp"
 #include "gpu/recompiler/ir/lower/buffer_store_values.hpp"
 #include "gpu/recompiler/ir/lower/ds_cross_lane_lowering.hpp"
@@ -3786,12 +3787,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (!b.declare_texture(res->binding, Dim_3D, uint_texture)) {
                     ok = false; return true;
                 }
-                uint32_t cu = vread(cvg(0)), cv = vread(cvg(1)), cw = vread(cvg(2));
-                if (!is_load) {
-                    cu = normalized_spatial(cu, res->width);
-                    cv = normalized_spatial(cv, res->height);
-                    cw = normalized_spatial(cw, res->depth);
-                }
+                // ir/ops/image_coordinates.cpp; the reader keeps the MIMG source proof per slot.
+                const auto coords3 = ir::lower_image_coordinates(
+                    b, ok,
+                    {3, ir::ImageCoordinateForm::Separate,
+                     !is_load && normalize_sampler_coordinates,
+                     {res->width, res->height, res->depth}},
+                    [&](uint32_t k) { return vread(cvg(k)); });
+                const uint32_t cu = coords3[0], cv = coords3[1], cw = coords3[2];
                 if (is_sample)      b.image_sample_3d(res->binding, cu, cv, cw, out);
                 else if (is_load)   b.image_fetch_3d(res->binding, cu, cv, cw, out);
                 else if (is_sample_l)
@@ -3994,19 +3997,15 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         normalized_spatial(vread(cvg(2)), res->width),
                         normalized_spatial(vread(cvg(3)), res->height), out);
                 } else {
-                    uint32_t cu, cv;
-                    if (in.mimg_a16) {
-                        const uint32_t packed = vread(cvg(0));
-                        cu = b.bfe_u(packed, b.uconst(0), b.uconst(16));
-                        cv = b.bfe_u(packed, b.uconst(16), b.uconst(16));
-                    } else {
-                        cu = vread(cvg(0));
-                        cv = vread(cvg(1));
-                    }
-                    if (!is_load) {
-                        cu = normalized_spatial(cu, res->width);
-                        cv = normalized_spatial(cv, res->height);
-                    }
+                    const auto coords2 = ir::lower_image_coordinates(
+                        b, ok,
+                        {2,
+                         in.mimg_a16 ? ir::ImageCoordinateForm::Packed16
+                                     : ir::ImageCoordinateForm::Separate,
+                         !is_load && normalize_sampler_coordinates,
+                         {res->width, res->height, 0u}},
+                        [&](uint32_t k) { return vread(cvg(k)); });
+                    const uint32_t cu = coords2[0], cv = coords2[1];
                     if (is_sample)         b.image_sample_2d(res->binding, cu, cv, out);
                     else if (is_sample_lz) b.image_sample_lod_2d(res->binding, cu, cv, b.uconst(0), out);      // LOD 0
                     // Explicit-LOD plain 2D uses [u,v,lod]. Graphics keeps the established
