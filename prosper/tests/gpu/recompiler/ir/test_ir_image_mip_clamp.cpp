@@ -49,6 +49,7 @@ TEST(IrImageMipClamp, EveryEmittedLaneMatchesEvaluation) {
     const std::array<uint32_t, 11> edges{0, 1,  2,           3,           5,          6,
                                          7, 31, 0x7fffffffu, 0x80000000u, 0xffffffffu};
     std::vector<uint32_t> words;
+    words.reserve(n);
     for (uint32_t lane = 0; lane < n; ++lane)
         words.push_back(lane < edges.size() ? edges[lane] : lane * 0x1020304u);
     for (uint32_t levels : {1u, 3u, 6u, 7u, 32u}) {
