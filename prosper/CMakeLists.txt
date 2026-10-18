@@ -6295,6 +6295,12 @@ endif()
         LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan
         PROPERTIES TIMEOUT 60)
 
+      prosper_add_gtest(test_ir_image_mip_clamp_execution
+        SOURCES tests/gpu/recompiler/ir/test_ir_image_mip_clamp_execution.cpp
+        INCLUDES frontends src tests
+        LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan
+        PROPERTIES TIMEOUT 180)
+
       prosper_add_gtest(test_ir_image_operand_coordinates_execution
         SOURCES tests/gpu/recompiler/ir/test_ir_image_operand_coordinates_execution.cpp
         INCLUDES frontends src tests
