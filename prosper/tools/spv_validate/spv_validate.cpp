@@ -34,6 +34,7 @@
 #include "../../tests/fixtures/ds_address_ir.hpp"
 #include "../../tests/fixtures/smem_index_ir.hpp"
 #include "../../tests/fixtures/flat_window_ir.hpp"
+#include "../../tests/fixtures/integer_float_rte_ir.hpp"
 #include "../../tests/fixtures/spirv_wave_width_fixtures.hpp"
 #include "../../tests/fixtures/ngg_lane_slots.hpp"
 #include "../../tests/fixtures/ngg_bool_copy.hpp"
@@ -1077,6 +1078,13 @@ int main(int argc, char** argv) {
         builder.begin(4, nullptr, 32, 1, 1, 32, 0, true, true);
         prosper::test::ir::flat_window::emit_fixture(builder);
         dump(dir, "ir_flat_window_values", builder.finish());
+    }
+    for (uint32_t opcode : {0x185u, 0x186u}) {
+        SpirvCompute builder;
+        builder.begin(1, nullptr, 32, 1, 1, 32, 0, true, true);
+        prosper::test::ir::integer_float_rte::emit_fixture(builder, opcode);
+        const auto name = "ir_integer_float_rte_" + std::to_string(opcode);
+        dump(dir, name.c_str(), builder.finish());
     }
     // This VOP3 LSHL_ADD route calls the ordered IR input resolver; validate its containing module.
     {

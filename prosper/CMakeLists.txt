@@ -3672,6 +3672,9 @@ if(TARGET prosper_core)
   # test_ir_scalar_alu_execution runs each scalar-op definition's SPIR-V in the integer interpreter
   # against its own constant evaluation (#2514).
   foreach(ir_test
+          ir_integer_float_rte_values
+          ir_lower_vop3_integer_float_rte
+          ir_integer_float_rte_execution
           ir_flat_window_values
           ir_lower_flat_window
           ir_buffer_store_values
@@ -3929,6 +3932,11 @@ if(TARGET prosper_core)
       INCLUDES tests
       LIBRARIES prosper_core Vulkan::Vulkan
       PROPERTIES TIMEOUT 300)
+    prosper_add_gtest(test_compute_integer_float_rte_e64
+      SOURCES tests/gpu/execute/test_compute_integer_float_rte_e64.cpp
+      INCLUDES tests
+      LIBRARIES prosper_core Vulkan::Vulkan
+      PROPERTIES TIMEOUT 120)
     prosper_add_gtest(test_compute_f32_fma_rounding
       SOURCES tests/gpu/execute/test_compute_f32_fma_rounding.cpp
       INCLUDES tests
