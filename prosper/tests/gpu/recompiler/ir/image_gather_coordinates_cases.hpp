@@ -6,6 +6,7 @@
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <cstddef>
 #include <vector>
 
 namespace prosper::test::ir::image_gather {
@@ -98,7 +99,7 @@ inline uint32_t expected(const Arm& a, const Data& in, uint32_t lane, uint32_t r
 }
 inline std::vector<uint32_t> buffer_words(const Data& in) {
     std::vector<uint32_t> out;
-    out.reserve(9u * kLanes);
+    out.reserve(std::size_t{9} * kLanes);
     for (const auto& s : in.source) out.insert(out.end(), s.begin(), s.end());
     for (const auto& s : in.old) out.insert(out.end(), s.begin(), s.end());
     for (bool active : in.active) out.push_back(active ? 1u : 0u);
