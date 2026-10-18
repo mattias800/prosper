@@ -62,6 +62,10 @@ void add_phi_writes(const Rdna2Inst& in, int max_vgpr, PhiSets& out);
 // word; the pair for a 64-bit scalar-data result; nothing for a 64-bit shift into EXEC. The
 // emitter's scan (loop_written_regs) charges SOP2 through this too, so the two cannot disagree.
 uint32_t sop2_phi_words(const Rdna2Inst& in);
+// The same for one SOP1 result: one word; the pair when the lowering writes both words as scalar
+// data (s_mov_b64, s_bitreplicate_b64_b32, ...); the low word for a mask-domain pair (SAVEEXEC,
+// s_not_b64, ...) and for EXEC (#5439).
+uint32_t sop1_phi_words(const Rdna2Inst& in);
 
 // Every IfThen, IfElse, Loop and CountedLoop reachable from the root. Empty when the root is
 // Unstructured. `ins` is the instruction vector `cfg` and `tree` were built from.

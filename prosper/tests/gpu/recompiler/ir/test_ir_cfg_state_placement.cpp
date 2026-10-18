@@ -109,7 +109,14 @@ TEST(IrStatePlacement, EachInventoryRule) {
         {{0x7E0A0501u}, {}, {5}, "v_readfirstlane_b32 s5: its SGPR"},
         {{0x7E068501u}, {3, 4, 5, 6}, {}, "v_movreld_b32 v3: every VGPR from v3 up"},
         {{0x7E082101u}, {4}, {}, "v_cvt_f64_f32 v[4:5]: VDST alone (legacy VOP1 width)"},
-        {{0xBE860400u}, {}, {6}, "s_mov_b64 s[6:7]: one word (legacy SOP1 width)"},
+        {{0xBE850300u}, {}, {5}, "s_mov_b32 s5: one word"},
+        {{0xBE860400u}, {}, {6, 7}, "s_mov_b64 s[6:7]: the pair (#5439)"},
+        {{0xBEEA0400u}, {}, {106, 107}, "s_mov_b64 vcc: the pair (its data words)"},
+        {{0xBEFE0400u}, {}, {126}, "s_mov_b64 exec: the low word (writes rs.exec only)"},
+        {{0xBE8E3B00u}, {}, {14, 15}, "s_bitreplicate_b64_b32 s[14:15]: the pair"},
+        {{0xBE88246Au}, {}, {8}, "s_and_saveexec_b64 s[8:9]: the low word (mask domain)"},
+        {{0xBE8A0800u}, {}, {10}, "s_not_b64 s[10:11]: the low word (mask domain)"},
+        {{0xBE8C0A00u}, {}, {12}, "s_wqm_b64 s[12:13]: the low word (mask-domain row)"},
         {{0x87880200u}, {}, {8}, "s_and_b64 s[8:9]: one word (lane-mask pair)"},
         {{0x8F8A8200u}, {}, {10, 11}, "s_lshl_b64 s[10:11]: the pair"},
         {{0x90FE817Eu}, {}, {}, "s_lshr_b64 exec: the mask domain only"},
@@ -128,7 +135,7 @@ TEST(IrStatePlacement, EachInventoryRule) {
         const PhiSets got = inventory(ins.at(0), 6);
         EXPECT_EQ(got.vgprs, rule.vgprs) << rule.what;
         EXPECT_EQ(got.sgprs, rule.sgprs) << rule.what;
-        // The emitter's scan charges the same registers (#5436). It bounds v_movreld by the
+        // The emitter's scan charges the same registers (#5436, #5439). It bounds v_movreld by the
         // program's own highest VGPR, so the inventory is given the same bound here.
         PhiSets scan;
         loop_written_regs(ins, ins[0].pc, ins[0].pc + 1, scan.vgprs, scan.sgprs);

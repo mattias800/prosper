@@ -179,7 +179,7 @@ void add_phi_writes(const Rdna2Inst& in, int max_vgpr, PhiSets& out) {
         case Rdna2Format::MTBUF:
         case Rdna2Format::MIMG:
         case Rdna2Format::FLAT: add_memory_writes(in, true, out); return;
-        case Rdna2Format::SOP1: out.sgprs.insert(in.dst.value); return;
+        case Rdna2Format::SOP1: add_words(out.sgprs, in.dst.value, sop1_phi_words(in)); return;
         case Rdna2Format::SOPK:
             if (!effects.known() || effects.sdst_dwords != 0) out.sgprs.insert(in.dst.value);
             return;
@@ -209,6 +209,37 @@ uint32_t sop2_phi_words(const Rdna2Inst& in) {
     const bool shift_into_exec = effects.ssrc_dwords[0] == 2 && effects.ssrc_dwords[1] == 1 &&
                                  (in.dst.value == 126 || in.dst.value == 127);
     return mask_pair_op ? 1u : (shift_into_exec ? 0u : 2u);
+}
+
+// One word, except a 64-bit result its lowering writes as scalar data in both words: the pair.
+// The table's pair rows split three ways:
+// - Scalar data (the pair): s_mov_b64, s_bitreplicate_b64_b32, s_getpc_b64 and the rows the
+//   lowering refuses (s_cmov_b64, s_brev_b64, s_bitset*_b64, s_movrels_b64, s_swappc_b64).
+//   s_mov_b64 overwrites both words in every lowering (ir/lower/sop1_b64_mask_routes.cpp): it
+//   copies an SGPR pair, an inline constant or a literal, and a saved lane mask (EXEC, VCC)
+//   either publishes both ballot words or retires both. s_bitreplicate_b64_b32 publishes both
+//   words (sop1_data_routes.cpp); s_getpc_b64 retires both.
+// - The mask domain (the low word, as SOP2's 64-bit bitwise ops of two pairs): the SAVEEXEC and
+//   WREXEC families (D = a lane mask; both words are retired, the value lives in sreg_bool), and
+//   the SCC-writing unary ops of a pair, s_not_b64, s_wqm_b64 and s_quadmask_b64. s_not_b64 is
+//   mask-only; the numeric s_wqm_b64 route and s_quadmask_b64 also write both data words, which
+//   this charge does not see (ir/cfg/AGENTS.md records the exception; #5441).
+// - Into EXEC: the low word. s_mov_b64 and s_bitreplicate_b64_b32 into EXEC write rs.exec only.
+// An M0-relative destination (s_movreld_b64, refused) charges the SDST field. An encoding the
+// table does not know, and every one-word or no-word row, charges one word, as before.
+// CONFIDENCE: HIGH for s_mov_b64 and s_bitreplicate_b64_b32 into an ordinary SGPR pair (#5439: an
+// execution witness drops the high word at an if merge with the one-word charge).
+uint32_t sop1_phi_words(const Rdna2Inst& in) {
+    const Rdna2InstructionEffects& effects = rdna2_instruction_effects(in);
+    if (!effects.known() || effects.sdst_dwords != 2) return 1;
+    if (effects.exec != Rdna2ExecEffect::None) return 1;
+    if (effects.m0_relative == Rdna2M0Relative::Destination ||
+        effects.m0_relative == Rdna2M0Relative::Both)
+        return 1;
+    const bool mask_unary =
+        (effects.implicit_writes & kRdna2ImplicitScc) != 0 && effects.ssrc_dwords[0] == 2;
+    if (mask_unary) return 1;
+    return in.dst.value == 126 || in.dst.value == 127 ? 1u : 2u;
 }
 
 StatePlacement place_state(const GuestCfg& cfg, const RegionTree& tree,

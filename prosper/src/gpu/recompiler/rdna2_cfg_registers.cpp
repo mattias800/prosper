@@ -1,4 +1,5 @@
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
+#include "gpu/recompiler/ir/cfg/state_placement.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
@@ -79,7 +80,10 @@ void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t 
                 if (const int tfe_status = rdna2_tfe_status_vgpr(in); tfe_status >= 0)
                     vregs.insert(tfe_status);
                 break;
-            case Rdna2Format::SOP1: sregs.insert(in.dst.value); break;
+            case Rdna2Format::SOP1:   // the instruction-effects table's widths (#5439)
+                for (uint32_t word = 0; word < ir::cfg::sop1_phi_words(in); ++word)
+                    sregs.insert(in.dst.value + static_cast<int>(word));
+                break;
             case Rdna2Format::SOPK:
                 if (sopk_writes_scalar_data(in.opcode)) sregs.insert(in.dst.value);
                 break;
