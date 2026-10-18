@@ -8,6 +8,7 @@
 #include "gpu/recompiler/ir/lower/flat_window_lowering.hpp"
 #include "gpu/recompiler/ir/lower/ds_address_lowering.hpp"
 #include "gpu/recompiler/ir/lower/image_coordinates_lowering.hpp"
+#include "gpu/recompiler/ir/lower/image_operand_coordinates_lowering.hpp"
 #include "gpu/recompiler/ir/lower/buffer_format_values.hpp"
 #include "gpu/recompiler/ir/lower/buffer_store_values.hpp"
 #include "gpu/recompiler/ir/lower/ds_cross_lane_lowering.hpp"
@@ -3701,12 +3702,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             const bool normalize_sampler_coordinates =
                 res->unnormalized &&
                 compiler_choice(CompilerChoice::NormalizeSamplerCoordinates) != 0;
-            auto normalized_spatial = [&](uint32_t coordinate, uint32_t extent) {
-                if (!normalize_sampler_coordinates) return coordinate;
-                if (!extent) { ok = false; return b.uconst(0); }
-                return b.fbin(Op_FMul, coordinate,
-                              b.uconst(fbits(1.0f / static_cast<float>(extent))));
-            };
+            ir::LegacyImageSpatialNormalizer normalized_spatial{b, ok,
+                                                                normalize_sampler_coordinates};
             // UNRM=1 supplies unnormalized (texel-space) coordinates (Table 100). Compilers set it
             // only on loads/stores/atomics — and our fetch paths are already texel-space — but a
             // SAMPLER op with UNRM set would treat texel coords as normalized and sample a wildly
