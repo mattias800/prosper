@@ -29,10 +29,15 @@ protected:
         ASSERT_TRUE(prosper::frontend::live_compute_storage_image_device().initialized);
     }
 };
-void execute(const cases::Arm& arm, uint32_t wave, uint32_t mask, uint32_t index, bool d16 = true) {
+void execute(const cases::Arm& arm, uint32_t wave, uint32_t mask, uint32_t index, bool d16 = true,
+             bool past_tie = false) {
     const auto in = cases::inputs(arm, mask);
     auto& buffer = retain(cases::buffer_words(in));
     auto& texture = retain(cases::texture_words());
+    const auto adjust = [past_tie](uint32_t word) {
+        return past_tie && (word == 0x3f803000u || word == 0xbf803000u) ? word + 1u : word;
+    };
+    for (auto& word : texture) word = adjust(word);
     const auto p = cases::program(arm, wave, reinterpret_cast<uint64_t>(buffer.data()),
                                   reinterpret_cast<uint64_t>(texture.data()), d16);
     const uint64_t address = 0x5d54200000ull + uint64_t(index) * 0x100u;
@@ -53,13 +58,21 @@ void execute(const cases::Arm& arm, uint32_t wave, uint32_t mask, uint32_t index
         for (uint32_t lane = 0; lane < cases::kLanes; ++lane)
             EXPECT_EQ(buffer[c * cases::kLanes + lane],
                       (d16 ? cases::expected(arm, in, lane, c)
-                           : cases::texel(cases::x(lane), cases::y(lane), c).f32))
+                           : adjust(cases::texel(cases::x(lane), cases::y(lane), c).f32)))
                 << "lane=" << lane << " result=" << c;
 }
 TEST_F(IrImageD16Execution, DwordControlPreservesRoundingInputsBeforePacking) {
     uint32_t index = 3000;
     for (bool nsa : {false, true})
         for (uint32_t wave : {32u, 64u}) execute({0, 15, nsa}, wave, 0, index++, false);
+}
+TEST_F(IrImageD16Execution, DwordControlPreservesInputsJustPastTheTie) {
+    uint32_t index = 4000;
+    for (uint32_t wave : {32u, 64u}) execute({0, 15, false}, wave, 0, index++, false, true);
+}
+TEST_F(IrImageD16Execution, NonTieInputsJustPastTheTieAreComparedWithRte) {
+    uint32_t index = 5000;
+    for (uint32_t wave : {32u, 64u}) execute({0, 15, false}, wave, 0, index++, true, true);
 }
 TEST_F(IrImageD16Execution, EveryMaskPacksHalvesAndPreservesFollowingRegisters) {
     uint32_t index = 1;
