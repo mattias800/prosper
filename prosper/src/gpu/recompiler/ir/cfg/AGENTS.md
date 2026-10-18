@@ -3,16 +3,16 @@
 Steps 1, 2 and 4 of `docs/architecture/IR_CONTROL_FLOW_PLAN.md`. One control-flow graph built once
 from the decoded program (`guest_cfg`), and the structured regions derived from it
 (`region_tree`): ifs (step 1) and loops (step 4). Both are plain data: building them allocates no
-SPIR-V id and calls no `SpirvCompute`, so they cannot change an emitted byte.
+SPIR-V id and calls no `SpirvCompute`, so they cannot change an emitted byte. The shadow check
+(`region_shadow`) compares the region tree with `detect_forward_ifs`, `detect_divergent_loops` and
+`detect_counted_loop` in a gtest over the committed fixtures and in `shader_inspect --cfg-regions`
+over the corpus.
 
-**One consumer so far (step 2):** `structured_if_cursor` walks the tree's IfThen/IfElse children in
-preorder for structured emission, after comparing every record with the detector's sequence.
-Loops, detector refusals and any tree/order disagreement keep the detector cursor for the whole
-program. Register state, joins, proof facts and the dispatcher stay with their existing owners.
-The shadow check (`region_shadow`) compares the region tree with `detect_forward_ifs`,
-`detect_divergent_loops` and `detect_counted_loop` in a gtest over the committed fixtures and in
-`shader_inspect --cfg-regions` over the corpus. Loop consumers switch over in a later step, after
-their own shadow check agrees.
+**Consumers (steps 2 and 4b).** `structured_if_cursor` walks the tree's IfThen/IfElse children
+and `structured_loop_cursor` reads its loop records (see [Consumers](#consumers-step-4b)), each only
+when the tree's complete record sequence equals the detector's. Any disagreement keeps the detector
+records for the whole program. Register state, joins, proof facts and the dispatcher stay with their
+existing owners. A consumer switches over after its own shadow check agrees.
 
 | path | role |
 | --- | --- |
@@ -22,6 +22,7 @@ their own shadow check agrees.
 | `region_builder.hpp` | the builder class the two `.cpp` files share; internal, not an interface |
 | `structured_if_cursor.hpp/.cpp` | guarded tree preorder for `emit_structured`, with whole-program legacy fallback |
 | `region_shadow.hpp/.cpp` | the pc-level comparison with the three detectors, shared by the test and the census |
+| `structured_loop_cursor.hpp/.cpp` | step 4b: the DivLoop cursor and the CountedLoop record `emit_body` consumes, from the tree when equal to the detector |
 
 Tests: `tests/gpu/recompiler/ir/test_ir_cfg_*.cpp`, one per source file.
 
@@ -156,3 +157,23 @@ truncated streams, and declines to the general route when the prelude scan refus
 models that decline only for a loop in the prelude. One corpus program shows the rest (the step 4a
 result in the plan): every route refuses it, and the shadow reports the counted detector's loop
 against the tree's refusal.
+
+## Consumers (step 4b)
+
+`emit_body` reads two things from `structured_loop_cursor`: the divergent-loop cursor that
+`emit_structured` walks (`next_before`, `take`, `next_pc`, replacing the `li` index over `Ls`), and
+the counted route's `CountedLoop`. Both take the tree's records **only when the complete sequence
+equals the detector's, field for field and in order**: every `DivLoop` field (`header_pc`,
+`exit_branch_pc`, `backedge_pc`, `exit_pc`, `break_pcs`, both break flags, `bottom_tested`,
+`condition`, `continue_on_set`), and every `CountedLoop` field. The tree's loops are read in
+preorder, which is header order. Anything else keeps the detector's records for the whole program,
+and `route()` says why: `NoLoops`, `DetectorRefused` (`cf_rejected`), `Unstructured`, or
+`Mismatch` (a different field, count or order, a loop of the other kind, or a malformed walk).
+Equal records make emission byte-identical by construction, so the corpus gate must report
+`changes: none` for this step. `RegState`, joins, loop carry, phis, proof facts and
+`LoopBlanketCheck` are untouched.
+
+The divergent cursor is built from emit_body's **final** `Ls`, after the compute guards and the
+`cf_rejected` clear, so a loop the compute guards dropped is `NoLoops` rather than a mismatch. The
+`RegionPolicy` is `structured_loop_policy`: the detectors' own inputs (`safe`, the stage, the
+fragment wave64 vote).

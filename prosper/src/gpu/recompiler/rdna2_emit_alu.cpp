@@ -9,6 +9,7 @@
 #include "gpu/recompiler/ir/lower/ds_address_lowering.hpp"
 #include "gpu/recompiler/ir/lower/image_coordinates_lowering.hpp"
 #include "gpu/recompiler/ir/lower/image_mip_clamp_lowering.hpp"
+#include "gpu/recompiler/ir/lower/image_cube_coordinates_lowering.hpp"
 #include "gpu/recompiler/ir/lower/image_operand_coordinates_lowering.hpp"
 #include "gpu/recompiler/ir/lower/image_gather_layer_lowering.hpp"
 #include "gpu/recompiler/ir/lower/image_store_values_lowering.hpp"
@@ -3745,13 +3746,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     !is_sample_c_lz) { ok = false; return true; }
                 // Modifier-first order: _b carries bias in vaddr0; _c_lz carries DREF there.
                 const uint32_t ci = (is_sample_b || is_sample_c_lz) ? 1u : 0u;
-                uint32_t x = vread(cvg(ci)), y = vread(cvg(ci + 1)), fid = vread(cvg(ci + 2));
-                const uint32_t one = b.uconst(fbits(1.0f)), zero = b.uconst(fbits(0.0f));
-                uint32_t uf = b.fbin(Op_FSub, x, one);
-                uint32_t vf = b.fext2(Glsl_FMax, b.fext2(Glsl_FMin, b.fbin(Op_FSub, y, one), one), zero);
-                uint32_t layer = b.fext1(Glsl_RoundEven,
-                                     b.fext2(Glsl_FMax, b.fext2(Glsl_FMin, fid, b.uconst(fbits(5.0f))), zero));
-                uint32_t v6 = b.fbin(Op_FMul, b.fbin(Op_FAdd, layer, vf), b.uconst(fbits(1.0f / 6.0f)));
+                const auto cube = ir::lower_image_cube_coordinates(
+                    b, ci, [&](uint32_t k) { return vread(cvg(k)); });
+                const uint32_t uf = cube[0], v6 = cube[3];
                 if (is_sample_c_lz) {
                     // Point-light shadow maps use the same cube-processed coordinates as ordinary
                     // samples, with DREF prepended: [dref, x, y, face]. The renderer uploads cube

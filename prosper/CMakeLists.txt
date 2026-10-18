@@ -3839,9 +3839,11 @@ if(TARGET prosper_core)
           ir_image_coordinates
           ir_image_mip_clamp
           ir_lower_image_mip_clamp
+          ir_image_cube_coordinates
           ir_image_operand_coordinates
           ir_lower_image_operand_coordinates
           ir_lower_image_coordinates
+          ir_lower_image_cube_coordinates
           ir_lower_image_gather_layer
           ir_lower_image_store_values
           ir_image_store_values
@@ -3857,6 +3859,8 @@ if(TARGET prosper_core)
           ir_cfg_region_shadow
           ir_cfg_structured_execution
           ir_cfg_structured_cursor
+          ir_cfg_structured_loop_cursor
+          ir_cfg_structured_loop_execution
           )
     prosper_add_gtest(test_${ir_test}
       SOURCES tests/gpu/recompiler/ir/test_${ir_test}.cpp
@@ -6305,6 +6309,12 @@ endif()
 
       prosper_add_gtest(test_ir_image_operand_coordinates_execution
         SOURCES tests/gpu/recompiler/ir/test_ir_image_operand_coordinates_execution.cpp
+        INCLUDES frontends src tests
+        LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan
+        PROPERTIES TIMEOUT 180)
+
+      prosper_add_gtest(test_ir_image_cube_coordinates_execution
+        SOURCES tests/gpu/recompiler/ir/test_ir_image_cube_coordinates_execution.cpp
         INCLUDES frontends src tests
         LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan
         PROPERTIES TIMEOUT 180)
