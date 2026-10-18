@@ -2,7 +2,6 @@
 #include "gpu/recompiler/compiler_choices.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <cstddef>
-#include "gpu/execute/float_controls_probe.hpp"
 #include "gpu/recompiler/float32_rte_support.hpp"
 #include "gpu/recompiler/ir/integer_float_rte_e64_cases.hpp"
 #include "gpu/recompiler/ir/lower/vop3_integer_float_rte_lowering.hpp"
@@ -48,19 +47,6 @@ TEST_F(IrLowerVop3IntegerFloatRte, UnpublishedOrAnyWeakerDeviceCannotBeOverridde
         EXPECT_FALSE(t.rs.vreg.contains(1));
         EXPECT_FALSE(has_mode(t.b));
     }
-}
-TEST_F(IrLowerVop3IntegerFloatRte, PropertyRequiresRteAndIndependent32BitRounding) {
-    VkPhysicalDeviceFloatControlsProperties p{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
-    for (auto independence : {VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE,
-                              VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_32_BIT_ONLY,
-                              VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL})
-        for (bool rte : {false, true}) {
-            p.roundingModeIndependence = independence;
-            p.shaderRoundingModeRTEFloat32 = rte;
-            EXPECT_EQ(float32_rte_controls_compatible(p),
-                      rte && independence != VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE);
-        }
 }
 TEST_F(IrLowerVop3IntegerFloatRte, AllModeBytesRequireKnownRteAndDeclareItOnlyOnce) {
     publish_float32_rte_support(true, true, true);

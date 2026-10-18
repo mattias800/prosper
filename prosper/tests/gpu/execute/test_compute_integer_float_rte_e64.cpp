@@ -116,3 +116,17 @@ TEST(ComputeIntegerFloatRteE64, EveryAdmittedFormRoundsAndPreservesInactiveWords
     RecordProperty("lanes_checked", lanes);
     reset_float32_rte_support_for_test();
 }
+
+TEST(IrLowerVop3IntegerFloatRte, PropertyRequiresRteAndIndependent32BitRounding) {
+    VkPhysicalDeviceFloatControlsProperties p{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
+    for (auto independence : {VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE,
+                              VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_32_BIT_ONLY,
+                              VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL})
+        for (bool rte : {false, true}) {
+            p.roundingModeIndependence = independence;
+            p.shaderRoundingModeRTEFloat32 = rte;
+            EXPECT_EQ(float32_rte_controls_compatible(p),
+                      rte && independence != VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE);
+        }
+}
