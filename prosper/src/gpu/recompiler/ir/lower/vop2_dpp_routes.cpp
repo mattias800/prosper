@@ -2,6 +2,7 @@
 // Relocated verbatim from emit_alu's VOP2 case by tools/refactor/extract_case_routes.py (ADR 0012).
 #include "gpu/recompiler/ir/lower/vector_lowering_internal.hpp"
 #include "gpu/recompiler/ir/ops/vector_dpp_row_xor.hpp"
+#include "gpu/recompiler/ir/lower/vector_dpp_source_lowering.hpp"
 
 namespace prosper::gpu::ir {
 
@@ -99,21 +100,10 @@ std::optional<bool> Vop2Lowering::stage_dpp_source() {
                 // BOUND_CTRL=1 substitutes zero before the row; BOUND_CTRL=0 disables the
                 // instruction for those lanes, preserving the old destination exactly.
                 b.mark_subgroup_min16();
-                const uint32_t shift = in.dpp_ctrl - 0x110u;
-                const uint32_t lane = b.subgroup_local_id();
-                const uint32_t row_lane = b.ibin(Op_BitwiseAnd, lane, b.uconst(15));
-                dpp_active = b.ucmp(Op_UGreaterThanEqual, row_lane, b.uconst(shift));
-                // Never issue a shuffle with an out-of-range unsigned lane after subtraction;
-                // inactive lanes address themselves and are then zeroed or masked off.
-                const uint32_t source_lane = b.sel(
-                    dpp_active, b.ibin(Op_ISub, lane, b.uconst(shift)), lane);
-                const uint32_t shuffled = b.subgroup_shuffle(a, source_lane);
-                // FI0 applies before the ALU operation; keep BC0's row predicate independent.
-                const uint32_t source_active =
-                    b.subgroup_shuffle(b.sel(rs.exec, b.uconst(1), b.uconst(0)), source_lane);
-                const uint32_t source =
-                    b.sel(b.ucmp(Op_INotEqual, source_active, b.uconst(0)), shuffled, b.uconst(0));
-                a = in.dpp_bound_ctrl ? b.sel(dpp_active, source, b.uconst(0)) : source;
+                const auto source =
+                    emit_dpp_row_shr_source(b, a, rs.exec, in.dpp_ctrl - 0x110u, in.dpp_bound_ctrl);
+                dpp_active = source.in_bounds;
+                a = source.word;
             }
         } else {
             if (!fop) { ok = false; return true; }
