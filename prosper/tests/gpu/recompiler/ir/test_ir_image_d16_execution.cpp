@@ -30,12 +30,12 @@ protected:
         ASSERT_TRUE(prosper::frontend::live_compute_storage_image_device().initialized);
     }
 };
-void execute(const cases::Arm& arm, uint32_t wave, uint32_t mask, uint32_t index) {
+void execute(const cases::Arm& arm, uint32_t wave, uint32_t mask, uint32_t index, bool d16 = true) {
     const auto in = cases::inputs(arm, mask);
     auto& buffer = retain(cases::buffer_words(in));
     auto& texture = retain(cases::texture_words());
     const auto p = cases::program(arm, wave, reinterpret_cast<uint64_t>(buffer.data()),
-                                  reinterpret_cast<uint64_t>(texture.data()));
+                                  reinterpret_cast<uint64_t>(texture.data()), d16);
     const uint64_t address = 0x5d54200000ull + uint64_t(index) * 0x100u;
     ComputeItem item;
     item.spirv = recompile_compute(p.code.data(), p.code.size(), &p.table, p.config,
@@ -52,8 +52,15 @@ void execute(const cases::Arm& arm, uint32_t wave, uint32_t mask, uint32_t index
     ASSERT_TRUE(prosper::frontend::execute_live_compute_items({item}));
     for (uint32_t c = 0; c < 4; ++c)
         for (uint32_t lane = 0; lane < cases::kLanes; ++lane)
-            EXPECT_EQ(buffer[c * cases::kLanes + lane], cases::expected(arm, in, lane, c))
+            EXPECT_EQ(buffer[c * cases::kLanes + lane],
+                      (d16 ? cases::expected(arm, in, lane, c)
+                           : cases::texel(cases::x(lane), cases::y(lane), c).f32))
                 << "lane=" << lane << " result=" << c;
+}
+TEST_F(IrImageD16Execution, DwordControlPreservesRoundingInputsBeforePacking) {
+    uint32_t index = 3000;
+    for (bool nsa : {false, true})
+        for (uint32_t wave : {32u, 64u}) execute({0, 15, nsa}, wave, 0, index++, false);
 }
 TEST_F(IrImageD16Execution, EveryMaskPacksHalvesAndPreservesFollowingRegisters) {
     uint32_t index = 1;
