@@ -490,6 +490,24 @@ the tree takes the general route (two divergent loops), so the records differ, a
 prelude scan declines the counted route as well. No call was `Unstructured` or `DetectorRefused`;
 the latter cannot occur at the cursor today, because `cf_rejected` clears `Ls` first.
 
+**Step 5 result** (`ir/cfg/dispatch_blocks`, the service split in `guest_cfg`; contract in
+`ir/cfg/AGENTS.md`). `build_guest_cfg` with `split_at_services` reproduces the dispatcher's blocks
+and successors; the service predicate stays in `emit_cfg_state_machine`, which passes the pcs it
+synchronizes as `SplitPolicy::services`. The dispatcher takes `starts` and `successors` from the
+GuestCfg only when they are identical to its own. `shader_inspect --cfg-dispatch-blocks` over the
+corpus (each distinct program once by `--stage`, `--synthetic-table` for graphics, and every
+sidecar by `--inputs`; 4,570 runs) saw **2,213 dispatcher regions, all equal**, from 377 distinct
+programs (compute 2,172 regions, fragment 14, vertex 27); the one run without an answer is the
+empty corpus file. The corpus gate against `a43dcc9cc` reports `changes: none` (4,000 entries,
+1,444 SPIR-V modules compared). Two mutation arms: a builder that ignores the services makes 678
+regions differ and still reports `changes: none`, because the guard keeps the dispatcher's own
+blocks; the same builder without the guard reports 29 changed programs (3 newly accepted, 3 newly
+refused, 14 changed output). The one shape known to differ is outside the corpus: a branch target
+inside an instruction, where the dispatcher starts a case at a pc no decoded instruction begins
+(`TheDispatcherKeepsItsOwnBlocksForATargetInsideALiteral`). That is why the dispatcher's own
+computation and the guard stay: without them such a program would no longer get a case at
+that pc. `Unstructured` regions are not marked yet.
+
 **When the parked red tests become fixable:**
 
 - `indirect_pointer_descriptor_range` has two gaps (#5202). The first, charging a Wave32 lane-mask

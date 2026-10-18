@@ -4,6 +4,7 @@
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 
 #include <algorithm>
+#include <set>
 #include <unordered_map>
 
 namespace prosper::gpu::ir::cfg {
@@ -83,6 +84,10 @@ void link_blocks(GuestCfg& cfg, std::span<const Rdna2Inst> ins) {
         block.taken_pc = sopp_target(last);
         block.succ[1] = cfg.block_at_pc(block.taken_pc);
     }
+}
+
+void link_preds(GuestCfg& cfg) {
+    const uint32_t n = static_cast<uint32_t>(cfg.blocks.size());
     cfg.preds.assign(n, {});
     for (uint32_t b = 0; b < n; ++b) {
         const auto& succ = cfg.blocks[b].succ;
@@ -155,6 +160,84 @@ void dominators(GuestCfg& cfg) {
     }
 }
 
+// --- The dispatcher's split (SplitPolicy::split_at_services) ---------------------------------
+
+bool dispatch_linearized(const SplitPolicy& policy, const Rdna2Inst& in) {
+    return policy.linearized && in.fmt == Rdna2Format::SOPP && policy.linearized->contains(in.pc);
+}
+
+bool is_service(const SplitPolicy& policy, const Rdna2Inst& in) {
+    return policy.services && policy.services->contains(in.pc);
+}
+
+// emit_cfg_state_machine's `cfg_terminator`: s_endpgm, then s_trap and the branches it does not
+// linearize. Every other instruction, the indirect and call forms included, stays inside its case.
+Terminator dispatch_terminator_of(const SplitPolicy& policy, const Rdna2Inst& in) {
+    if (in.is_end) return Terminator::End;
+    if (dispatch_linearized(policy, in)) return Terminator::Fallthrough;
+    const Terminator term = terminator_of(in);
+    return term == Terminator::Trap || has_taken_edge(term) ? term : Terminator::Fallthrough;
+}
+
+// Leader pcs over ins[0..end], where ins[end] is the first s_endpgm. A branch target is kept only
+// when it is the pc of a decoded instruction; the dispatcher also starts a block at a target inside
+// an instruction, which this graph cannot express (AGENTS.md).
+std::set<uint32_t> dispatch_leaders(std::span<const Rdna2Inst> ins, size_t end,
+                                    const SplitPolicy& policy) {
+    const uint32_t end_pc = ins[end].pc;
+    std::set<uint32_t> out{ins.front().pc, end_pc};
+    auto split_around = [&](size_t i) {
+        out.insert(ins[i].pc);
+        if (ins[i + 1].pc <= end_pc) out.insert(ins[i + 1].pc);
+    };
+    for (size_t i = 0; i < end; ++i) {
+        const Rdna2Inst& in = ins[i];
+        if (is_service(policy, in)) split_around(i);
+        const Terminator term = terminator_of(in);
+        if (term == Terminator::Trap) {
+            split_around(i);
+            continue;
+        }
+        if (dispatch_linearized(policy, in) || !has_taken_edge(term)) continue;
+        if (sopp_target(in) <= end_pc) out.insert(sopp_target(in));
+        if (ins[i + 1].pc <= end_pc) out.insert(ins[i + 1].pc);
+    }
+    return out;
+}
+
+GuestCfg build_dispatch_cfg(std::span<const Rdna2Inst> ins, const SplitPolicy& policy) {
+    GuestCfg cfg;
+    size_t end = 0;
+    while (end < ins.size() && !ins[end].is_end) ++end;
+    if (end == ins.size()) return cfg;   // the dispatcher refuses a region without s_endpgm
+    std::unordered_map<uint32_t, uint32_t> index_of_pc;
+    for (uint32_t i = 0; i <= end; ++i) index_of_pc.emplace(ins[i].pc, i);
+    std::vector<uint32_t> starts;
+    for (uint32_t pc : dispatch_leaders(ins, end, policy))
+        if (const auto it = index_of_pc.find(pc); it != index_of_pc.end())
+            starts.push_back(it->second);
+    for (size_t k = 0; k < starts.size(); ++k) {
+        GuestBlock block;
+        block.first = starts[k];
+        block.last = k + 1 < starts.size() ? starts[k + 1] - 1 : static_cast<uint32_t>(end);
+        block.pc = ins[block.first].pc;
+        cfg.blocks.push_back(block);
+    }
+    const uint32_t n = static_cast<uint32_t>(cfg.blocks.size());
+    for (uint32_t b = 0; b < n; ++b) {
+        GuestBlock& block = cfg.blocks[b];
+        const Rdna2Inst& last = ins[block.last];
+        block.term = dispatch_terminator_of(policy, last);
+        if (is_service(policy, last)) block.service_event = last.pc;
+        if (block.term == Terminator::Fallthrough || terminator_is_conditional(block.term))
+            block.succ[0] = b + 1;   // the last block is s_endpgm, so b + 1 exists
+        if (!has_taken_edge(block.term)) continue;
+        block.taken_pc = sopp_target(last);
+        if (block.taken_pc <= ins[end].pc) block.succ[1] = cfg.block_at_pc(block.taken_pc);
+    }
+    return cfg;
+}
+
 }   // namespace
 
 bool terminator_is_conditional(Terminator term) {
@@ -178,7 +261,15 @@ uint32_t GuestCfg::block_at_pc(uint32_t pc) const {
 
 GuestCfg build_guest_cfg(std::span<const Rdna2Inst> ins, const SplitPolicy& policy) {
     GuestCfg cfg;
-    if (ins.empty() || policy.split_at_services) return cfg;   // see SplitPolicy
+    if (ins.empty()) return cfg;
+    if (policy.split_at_services) {
+        cfg = build_dispatch_cfg(ins, policy);
+        if (cfg.blocks.empty()) return cfg;
+        link_preds(cfg);
+        depth_first(cfg);
+        dominators(cfg);
+        return cfg;
+    }
     std::unordered_map<uint32_t, uint32_t> index_of_pc;
     for (uint32_t i = 0; i < ins.size(); ++i) index_of_pc.emplace(ins[i].pc, i);
     const std::vector<uint32_t> starts = leaders(ins, index_of_pc);
@@ -191,6 +282,7 @@ GuestCfg build_guest_cfg(std::span<const Rdna2Inst> ins, const SplitPolicy& poli
         cfg.blocks.push_back(block);
     }
     link_blocks(cfg, ins);
+    link_preds(cfg);
     depth_first(cfg);
     dominators(cfg);
     return cfg;

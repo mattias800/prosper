@@ -1,9 +1,9 @@
 // guest_cfg.hpp -- the guest program's control-flow graph, built once from the decoded stream.
 //
-// IR_CONTROL_FLOW_PLAN.md step 1. Plain data: building it allocates no SPIR-V id and calls no
-// SpirvCompute, so it cannot change an emitted byte. Nothing in emission reads it yet; the region
-// tree (region_tree.hpp) and the shadow census are its only users. The terminator contract is in
-// AGENTS.md next to this file.
+// IR_CONTROL_FLOW_PLAN.md steps 1 and 5. Plain data: building it allocates no SPIR-V id and calls
+// no SpirvCompute, so it cannot change an emitted byte. The region tree (region_tree.hpp) reads the
+// control-flow split; the CFG dispatcher reads the service split (dispatch_blocks.hpp). The
+// terminator contract is in AGENTS.md next to this file.
 #pragma once
 
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -11,6 +11,7 @@
 #include <array>
 #include <cstdint>
 #include <span>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -49,8 +50,8 @@ struct GuestBlock {
     // outside the stream): `taken_pc` then still names it.
     std::array<uint32_t, 2> succ = {kNone, kNone};
     uint32_t taken_pc = kNone;   // the branch target pc, for Branch and the conditional forms
-    // A cross-lane service ending this block (the dispatcher's split policy). Always kNone until
-    // SplitPolicy::split_at_services is implemented (plan step 5).
+    // The pc of the synchronized cross-lane service ending this block, under
+    // SplitPolicy::split_at_services; kNone otherwise. Such a block is that one instruction.
     uint32_t service_event = kNone;
 };
 
@@ -73,12 +74,21 @@ struct GuestCfg {
 // How blocks are split. The structured emitter splits only at control flow: block leaders are the
 // entry, every in-stream branch target and the instruction after every terminator.
 //
-// Hook for plan step 5: the CFG dispatcher (emit_cfg_state_machine) also ends a block after each
-// synchronized cross-lane service and records it in GuestBlock::service_event. That policy needs
-// the dispatcher's service predicate here; it is not implemented, and build_guest_cfg returns an
-// empty graph when asked for it.
+// split_at_services is the CFG dispatcher's split (emit_cfg_state_machine, plan step 5), which
+// differs in more than the services; AGENTS.md has the table. The graph covers the instructions up
+// to the first s_endpgm (`is_end`) and is empty without one. Terminators are s_endpgm, s_trap and
+// the SOPP branches not in `linearized`; s_setpc, s_swappc, s_call, s_cbranch_cdbg* and the other
+// s_endpgm forms are ordinary instructions. Leaders are the entry, s_endpgm, every service in
+// `services` and every s_trap together with the instruction after it, and for each such branch the
+// instruction after it and its target when that is at or before s_endpgm.
 struct SplitPolicy {
     bool split_at_services = false;
+    // split_at_services only. The pcs the dispatcher ends a block around: its own service
+    // predicate, evaluated by emit_cfg_state_machine (there is no service list here). Null: none.
+    const std::unordered_set<uint32_t>* services = nullptr;
+    // split_at_services only. SOPP pcs the dispatcher linearizes rather than branches on (the
+    // graphics stages' `safe` set). Null: none.
+    const std::unordered_set<uint32_t>* linearized = nullptr;
 };
 
 GuestCfg build_guest_cfg(std::span<const Rdna2Inst> ins, const SplitPolicy& policy);
