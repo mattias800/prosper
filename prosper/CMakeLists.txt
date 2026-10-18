@@ -3668,6 +3668,14 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_rdna2_instruction_effects.cpp
     LIBRARIES prosper_core)
 
+  # ADR 0038 step 8a: new effects metadata only, with no production consumer.
+  prosper_add_gtest(test_rdna2_memory_effects
+    SOURCES tests/gpu/recompiler/test_rdna2_memory_effects.cpp
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_rdna2_scalar_results
+    SOURCES tests/gpu/recompiler/test_rdna2_scalar_results.cpp
+    LIBRARIES prosper_core)
+
   # The recompiler IR (ADR 0012): one focused test per piece under tests/gpu/recompiler/ir/.
   # test_ir_scalar_alu_execution runs each scalar-op definition's SPIR-V in the integer interpreter
   # against its own constant evaluation (#2514).

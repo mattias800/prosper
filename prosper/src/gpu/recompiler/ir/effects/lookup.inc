@@ -50,6 +50,14 @@ constexpr auto kVopcTable = dense<0x100>(F::VOPC, kVopc);
 constexpr auto kVop3Table = dense<0x400>(F::VOP3, kVop3);
 constexpr auto kVop3pTable = dense<0x100>(F::VOP3P, kVop3p);
 
+constexpr auto kDsTable = dense<0x100>(F::DS, kDs);
+constexpr auto kMubufTable = dense<0x100>(F::MUBUF, kMubuf);
+constexpr auto kMtbufTable = dense<0x10>(F::MTBUF, kMtbuf);
+constexpr auto kMimgTable = dense<0x100>(F::MIMG, kMimg);
+constexpr auto kFlatTable = dense<0x80>(F::FLAT, kFlat);
+constexpr auto kVintrpTable = dense<0x4>(F::VINTRP, kVintrp);
+constexpr auto kExpTable = dense<0x1>(F::EXP, kExp);
+
 Rdna2OpcodeRange range_for(Rdna2Format fmt) {
     switch (fmt) {
         case F::SOP2: return kSop2Range;
@@ -63,6 +71,13 @@ Rdna2OpcodeRange range_for(Rdna2Format fmt) {
         case F::VOPC: return kVopcRange;
         case F::VOP3: return kVop3Range;
         case F::VOP3P: return kVop3pRange;
+        case F::DS: return {0, 0x100};
+        case F::MUBUF: return {0, 0x100};
+        case F::MTBUF: return {0, 0x10};
+        case F::MIMG: return {0, 0x100};
+        case F::FLAT: return {0, 0x80};
+        case F::VINTRP: return {0, 0x4};
+        case F::EXP: return {0, 0x1};
         default: return {};
     }
 }
@@ -87,6 +102,13 @@ const Rdna2InstructionEffects* entry_for(Rdna2Format fmt, uint32_t opcode) {
         case F::VOPC: return lookup(kVopcTable, opcode);
         case F::VOP3: return lookup(kVop3Table, opcode);
         case F::VOP3P: return lookup(kVop3pTable, opcode);
+        case F::DS: return lookup(kDsTable, opcode);
+        case F::MUBUF: return lookup(kMubufTable, opcode);
+        case F::MTBUF: return lookup(kMtbufTable, opcode);
+        case F::MIMG: return lookup(kMimgTable, opcode);
+        case F::FLAT: return lookup(kFlatTable, opcode);
+        case F::VINTRP: return lookup(kVintrpTable, opcode);
+        case F::EXP: return lookup(kExpTable, opcode);
         default: return nullptr;
     }
 }
@@ -107,6 +129,13 @@ std::vector<Row> all_rows() {
     append(kVopc);
     append(kVop3);
     append(kVop3p);
+    append(kDs);
+    append(kMubuf);
+    append(kMtbuf);
+    append(kMimg);
+    append(kFlat);
+    append(kVintrp);
+    append(kExp);
     for (const ReservedRange& range : kReserved)
         for (uint32_t opcode = range.first; opcode <= range.last; ++opcode)
             rows.push_back({range.fmt, opcode, reserved()});

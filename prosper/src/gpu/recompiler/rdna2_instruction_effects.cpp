@@ -7,6 +7,8 @@
 // space; where the two sources differ the row says so and carries a CONFIDENCE mark.
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 
+#include "gpu/recompiler/ir/effects/operand_effects.hpp"
+
 #include <array>
 #include <cstddef>
 
@@ -99,8 +101,11 @@ constexpr Rdna2InstructionEffects valu(const char* name, uint8_t s0, uint8_t s1,
 constexpr Rdna2InstructionEffects vcmp(const char* name, uint8_t s0, uint8_t s1) {
     Rdna2InstructionEffects e = valu(name, s0, s1, 0);
     e.vdst_dwords = 0;
+    e.scalar_result = {Rdna2ScalarDestination::Dst, 2, true};
     return e;
 }
+#include "gpu/recompiler/ir/effects/valu_results.inc"
+
 // A VALU instruction with no lane result and no operands (v_nop, v_pipeflush, v_clrexcp).
 constexpr Rdna2InstructionEffects no_result(const char* name) {
     Rdna2InstructionEffects e = valu(name, 0, 0, 0);
@@ -126,6 +131,7 @@ constexpr Rdna2InstructionEffects accumulate(Rdna2InstructionEffects e) {
 constexpr Rdna2InstructionEffects flow(Rdna2InstructionEffects e, Rdna2LaneFlow lanes,
                                        uint8_t reads = 0) {
     e.lane_flow = lanes;
+    if (lanes == Rdna2LaneFlow::ReadLane) e.scalar_result = {Rdna2ScalarDestination::Dst, 1, false};
     e.implicit_reads = reads;
     return e;
 }
@@ -152,6 +158,13 @@ constexpr Rdna2InstructionEffects reserved() {
 #include "gpu/recompiler/ir/effects/vector_compare.inc"
 #include "gpu/recompiler/ir/effects/vector3.inc"
 #include "gpu/recompiler/ir/effects/packed.inc"
+#include "gpu/recompiler/ir/effects/memory_constructors.inc"
+#include "gpu/recompiler/ir/effects/ds.inc"
+#include "gpu/recompiler/ir/effects/buffer.inc"
+#include "gpu/recompiler/ir/effects/typed_buffer.inc"
+#include "gpu/recompiler/ir/effects/flat.inc"
+#include "gpu/recompiler/ir/effects/image.inc"
+#include "gpu/recompiler/ir/effects/misc_memory.inc"
 #include "gpu/recompiler/ir/effects/reserved.inc"
 
 #include "gpu/recompiler/ir/effects/lookup.inc"
