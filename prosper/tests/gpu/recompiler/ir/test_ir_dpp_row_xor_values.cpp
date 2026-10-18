@@ -134,7 +134,7 @@ TEST(IrDppRowXorValues, GuestWave32RowsStayInsideNative64Rows) {
         const uint32_t peer = source_lane(lane, stride);
         EXPECT_EQ(evaluated[lane][built.result.index], source[peer]);
         ASSERT_TRUE(source[peer].has_value());
-        EXPECT_EQ(emitted[lane], *source[peer]);
+        EXPECT_EQ(emitted[lane], source[peer].value_or(0u));
     }
 }
 
