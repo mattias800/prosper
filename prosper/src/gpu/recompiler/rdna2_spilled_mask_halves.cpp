@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <set>
 
 namespace prosper::gpu {
 namespace {
@@ -79,7 +80,7 @@ namespace {
 // Whether `in` reads a relayed word: the same inputs scalar_source_marks() charges in the emitter
 // (scalar operands, a read-modify-write destination, SCC), on the state BEFORE `in`. SMEM's
 // address words are not data.
-bool reads_relayed_word(const std::set<int>& relayed, const Rdna2Inst& in) {
+bool reads_relayed_word(const std::set<int>& relayed, const Rdna2Inst& in, uint32_t wave_size) {
     if (in.fmt == Rdna2Format::SMEM) return false;
     const auto any = [&](int first, uint32_t width) {
         for (uint32_t w = 0; w < width; ++w)
@@ -91,7 +92,7 @@ bool reads_relayed_word(const std::set<int>& relayed, const Rdna2Inst& in) {
         const bool scalar = o.kind == OperandKind::SGPR ||
                             (o.kind == OperandKind::Special && o.value >= 106 && o.value <= 124);
         if (!scalar) continue;
-        uint32_t width = scalar_alu_source_words(in, k);
+        uint32_t width = scalar_source_mark_words(in, k, wave_size);
         if (width == 0 || width == UINT32_MAX) width = 2;   // unknown: both words of a pair
         if (width > 2) width = static_cast<uint32_t>(std::max(0, 125 - o.value));   // a range
         if (any(o.value, width)) return true;
@@ -130,8 +131,9 @@ SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& st
     // so a numeric copy or lane selector cannot become genuine merely at a later CFG edge.
     const bool missing_scc = !load && scalar_reads_scc(in) && !definite_scc;
     bool vector_relay =
-        missing_scc || ((!load || in.fmt == Rdna2Format::DS) &&
-                        (vector_any(state.relayed_vectors) || reads_relayed_word(relayed, in)));
+        missing_scc ||
+        ((!load || in.fmt == Rdna2Format::DS) &&
+         (vector_any(state.relayed_vectors) || reads_relayed_word(relayed, in, wave_size)));
     // A load overwrites its old DATA generation. Preserve unavailable current address inputs
     // across case edges too; neither a clean old destination nor memory storage authenticates it.
     if (load && (in.fmt == Rdna2Format::FLAT || in.fmt == Rdna2Format::MUBUF ||
@@ -165,8 +167,8 @@ SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& st
         }
     }
     if (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x43) vector_relay = true;
-    bool memory =
-        load || vector_any(state.memory_vectors) || reads_relayed_word(state.memory_words, in);
+    bool memory = load || vector_any(state.memory_vectors) ||
+                  reads_relayed_word(state.memory_words, in, wave_size);
     // An ordinary absent SGPR is fabricated before any instruction has relayed it. Retain
     // that consumed scalar dependency separately from whole-vector marks, so a defined
     // constant spill slot can stay genuine beside an unrelated marked slot.
@@ -203,7 +205,7 @@ SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& st
     // one of its inputs does. A compare is the only scalar writer certain to rewrite SCC.
     const bool readlane = in.fmt == Rdna2Format::VOP3 && in.opcode == kOpReadlane;
     const bool relays =
-        missing_scc || missing_scalar_word || reads_relayed_word(relayed, in) ||
+        missing_scc || missing_scalar_word || reads_relayed_word(relayed, in, wave_size) ||
         (readlane ? state.lane_written_vgprs.contains(in.src[0].value) &&
                             !(constant_lane(in) &&
                               defined.contains({in.src[0].value, in.src[1].value})) ||
@@ -224,12 +226,11 @@ SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& st
     // bounded read (below); scalar, SCC and M0-relative inputs carry no arbitrary property.
     // #5193: a bounded read through a genuine resource is arbitrary when its relayed address
     // words are (dispatcher_arbitrary_read, rdna2_loaded_arbitrary.cpp).
-    const bool nonarbitrary = missing_scc || missing_scalar_word ||
-                              (load && !dispatcher_arbitrary_read(in, scalar_words, relayed,
-                                                                  definite_scc, relocation)) ||
-                              (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x43) ||
-                              reads_relayed_word(relayed, in) ||
-                              vector_any(state.nonarbitrary_vectors);
+    const bool nonarbitrary =
+        missing_scc || missing_scalar_word ||
+        (load && !dispatcher_arbitrary_read(in, scalar_words, relayed, definite_scc, relocation)) ||
+        (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x43) ||
+        reads_relayed_word(relayed, in, wave_size) || vector_any(state.nonarbitrary_vectors);
     return {vector_relay, relays, memory, nonarbitrary, active_defined, active_complete};
 }
 

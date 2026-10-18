@@ -62,4 +62,46 @@ TEST(Wave32LaneMaskSourceMarks, VccLoStillChargesVccHi) {
     }
 }
 
+SpilledVectorSourceMarks marked_source(const uint32_t (&words)[2], int mask, int marked,
+                                       uint32_t wave) {
+    const uint32_t code[2] = {words[0], (words[1] & ~(0x1ffu << 18)) | (uint32_t(mask) << 18)};
+    const Rdna2Inst in = rdna2_decode_one(code, 2);
+    SpilledMaskHalves state;
+    state.relayed_words.insert(marked);
+    state.memory_words.insert(marked);
+    // Both words have storage; only the independently marked word has a tainted dependency.
+    return spilled_vector_source_marks(state, in, {}, {mask, mask + 1}, true, wave);
+}
+
+void expect_dependency(const SpilledVectorSourceMarks& source, bool marked) {
+    EXPECT_EQ(source.vector_relay, marked);
+    EXPECT_EQ(source.scalar_relay, marked);
+    EXPECT_EQ(source.memory, marked);
+    EXPECT_EQ(source.nonarbitrary, marked);
+}
+
+// A one-word overwrite can leave the adjacent word relayed. The Wave32 instruction reads only
+// its genuine mask; the neighbour must not make its result a fabricated or memory-derived relay.
+TEST(Wave32LaneMaskSourceMarks, UnreadNeighbourCannotSupplyRelayOrMemoryMarks) {
+    for (const auto* words : {&kCarryIn, &kCndmask})
+        for (const int mask : {kMask, 107}) {
+            SCOPED_TRACE(testing::Message() << "op=" << (*words)[0] << " mask=" << mask);
+            expect_dependency(marked_source(*words, mask, mask + 1, 32), false);
+        }
+}
+
+TEST(Wave32LaneMaskSourceMarks, ConsumedWordsRetainRelayAndMemoryMarks) {
+    for (const auto* words : {&kCarryIn, &kCndmask}) {
+        for (const int mask : {kMask, 107}) {
+            // The actual Wave32 source still carries its dependency.
+            expect_dependency(marked_source(*words, mask, mask, 32), true);
+            // Wave64 and an unknown wave width still consume the pair.
+            for (uint32_t wave : {64u, 0u})
+                expect_dependency(marked_source(*words, mask, mask + 1, wave), true);
+        }
+        // Preserve VCC_LO's explicit entry-provenance exception in Wave32.
+        expect_dependency(marked_source(*words, 106, 107, 32), true);
+    }
+}
+
 }   // namespace
