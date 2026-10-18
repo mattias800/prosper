@@ -33,6 +33,9 @@ inline std::vector<Case> cases() {
                 for (const auto op : kFloatOps) out.push_back({wave, control, op, bound});
             }
         }
+        // Additional conversion forms observed in the changed recorded modules.
+        for (uint32_t control : {0x44u, 0xeeu, 0xf5u})
+            out.push_back({wave, control, Op::Cvt, true});
     }
     return out;
 }

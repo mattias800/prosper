@@ -209,6 +209,6 @@ TEST(IrDpp16InactiveSource, ExportsEveryChangedSourceShapeAndControl) {
     }
     attributes.close();
     EXPECT_TRUE(attributes.good());
-    EXPECT_EQ(index, 1280u);
+    EXPECT_EQ(index, 1286u);
 }
 } // namespace
