@@ -38,19 +38,8 @@ void add_valu_writes(const Rdna2Inst& in, const Rdna2InstructionEffects& effects
     out.vgprs.insert(in.dst.value);
 }
 
-// SOP2: one word, except a 64-bit result that is scalar data (the table's pair destination whose
-// sources are not two lane-mask pairs, or s_cselect_b64). A 64-bit shift into EXEC lives in the
-// mask domain only and adds nothing.
-void add_sop2_writes(const Rdna2Inst& in, const Rdna2InstructionEffects& effects, PhiSets& out) {
-    uint32_t words = 1;
-    if (effects.known() && effects.sdst_dwords == 2) {
-        const bool mask_pair_op = effects.scc_read == Rdna2SccRead::None &&
-                                  effects.ssrc_dwords[0] == 2 && effects.ssrc_dwords[1] == 2;
-        const bool shift_into_exec = effects.ssrc_dwords[0] == 2 && effects.ssrc_dwords[1] == 1 &&
-                                     (in.dst.value == 126 || in.dst.value == 127);
-        words = mask_pair_op ? 1u : (shift_into_exec ? 0u : 2u);
-    }
-    add_words(out.sgprs, in.dst.value, words);
+void add_sop2_writes(const Rdna2Inst& in, PhiSets& out) {
+    add_words(out.sgprs, in.dst.value, sop2_phi_words(in));
 }
 
 void add_memory_writes(const Rdna2Inst& in, bool status_word, PhiSets& out) {
@@ -194,7 +183,7 @@ void add_phi_writes(const Rdna2Inst& in, int max_vgpr, PhiSets& out) {
         case Rdna2Format::SOPK:
             if (!effects.known() || effects.sdst_dwords != 0) out.sgprs.insert(in.dst.value);
             return;
-        case Rdna2Format::SOP2: add_sop2_writes(in, effects, out); return;
+        case Rdna2Format::SOP2: add_sop2_writes(in, out); return;
         case Rdna2Format::SMEM:
             // A reserved encoding keeps a one-register clobber.
             add_words(out.sgprs, in.dst.value,
@@ -202,6 +191,24 @@ void add_phi_writes(const Rdna2Inst& in, int max_vgpr, PhiSets& out) {
             return;
         default: return;   // VOPC/SOPC write VCC/SCC/EXEC, which have their own phis
     }
+}
+
+// One word, except a 64-bit result that is scalar data (the table's pair destination whose sources
+// are not two lane-mask pairs, or s_cselect_b64). A 64-bit bitwise op of two pairs (s_and_b64, ...)
+// charges its low word: its value lives in the mask domain. A 64-bit shift into EXEC lives in the
+// mask domain only and charges nothing. An encoding the table does not know charges one word.
+// CONFIDENCE: HIGH -- every pair row's lowering writes both words of an ordinary SGPR destination
+// (ir/lower/sop2_b64_routes.cpp; s_bfm_b64 through record_s_bfm_b64_scalar_data). #5436: the scan's
+// own opcode list charged the pair for s_cselect/s_lshl/s_lshr_b64 only, and dropped the high word
+// of s_ashr_i64, s_bfe_u64, s_bfe_i64 and s_bfm_b64 at every merge.
+uint32_t sop2_phi_words(const Rdna2Inst& in) {
+    const Rdna2InstructionEffects& effects = rdna2_instruction_effects(in);
+    if (!effects.known() || effects.sdst_dwords != 2) return 1;
+    const bool mask_pair_op = effects.scc_read == Rdna2SccRead::None &&
+                              effects.ssrc_dwords[0] == 2 && effects.ssrc_dwords[1] == 2;
+    const bool shift_into_exec = effects.ssrc_dwords[0] == 2 && effects.ssrc_dwords[1] == 1 &&
+                                 (in.dst.value == 126 || in.dst.value == 127);
+    return mask_pair_op ? 1u : (shift_into_exec ? 0u : 2u);
 }
 
 StatePlacement place_state(const GuestCfg& cfg, const RegionTree& tree,

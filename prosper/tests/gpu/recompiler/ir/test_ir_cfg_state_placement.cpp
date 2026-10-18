@@ -1,8 +1,8 @@
 // test_ir_cfg_state_placement -- IR_CONTROL_FLOW_PLAN step 6. The state placement's phi sets
 // (state_placement.hpp) against the structured emitter's own, three ways: per instruction against
 // loop_written_regs on every committed fixture, per join at every loop header and if merge the
-// structured route reaches when the fixtures are recompiled, and the guard itself -- a program
-// whose placement differs from the emitter's set must compile to the same module as with the
+// structured route reaches when the fixtures are recompiled, and the guard itself -- a differing
+// placement leaves the emitter's set, and an equal one compiles to the same module as with the
 // placement withheld.
 #include "gpu/recompiler/ir/cfg/state_placement.hpp"
 
@@ -77,19 +77,6 @@ PhiSets inventory(const Rdna2Inst& in, int max_vgpr = 255) {
     return out;
 }
 
-// The one documented class where the inventory charges more than loop_written_regs: a 64-bit SOP2
-// scalar-data result other than s_cselect/s_lshl/s_lshr, whose high word the legacy scan drops,
-// and a 64-bit shift other than s_lshr into EXEC (AGENTS.md, "State placement").
-bool documented_difference(const Rdna2Inst& in) {
-    if (in.fmt != Rdna2Format::SOP2) return false;
-    const char* name = rdna2_instruction_effects(in).name;
-    if (!name) return false;
-    const std::string op = name;
-    const bool into_exec = in.dst.value == 126 || in.dst.value == 127;
-    return op == "s_ashr_i64" || op == "s_bfe_u64" || op == "s_bfe_i64" || op == "s_bfm_b64" ||
-           (op == "s_lshl_b64" && into_exec);
-}
-
 TEST(IrStatePlacement, InventoryEqualsTheEmitterScanOnEveryFixtureInstruction) {
     size_t compared = 0, writers = 0;
     for (const auto& path : guest_program_fixtures()) {
@@ -101,21 +88,15 @@ TEST(IrStatePlacement, InventoryEqualsTheEmitterScanOnEveryFixtureInstruction) {
             const PhiSets placed = inventory(in, max_vgpr);
             ++compared;
             writers += !legacy.vgprs.empty() || !legacy.sgprs.empty();
-            if (placed == legacy) continue;
-            EXPECT_TRUE(documented_difference(in))
+            // #5436 removed the one documented class (a 64-bit SOP2 result's high word): both
+            // charge SOP2 through sop2_phi_words now, so every instruction must agree.
+            EXPECT_EQ(placed, legacy)
                 << path.filename() << " pc=" << in.pc << " fmt=" << static_cast<int>(in.fmt)
                 << " opcode=0x" << std::hex << in.opcode;
         }
     }
     EXPECT_GT(compared, 2000u);
     EXPECT_GT(writers, 1500u);
-}
-
-Rdna2Inst decode_one(std::vector<uint32_t> words) {
-    words.push_back(prosper::test::cfg_streams::kEndpgm);
-    const auto ins = walk(words);
-    EXPECT_GE(ins.size(), 2u);
-    return ins.empty() ? Rdna2Inst{} : ins[0];
 }
 
 TEST(IrStatePlacement, EachInventoryRule) {
@@ -132,13 +113,26 @@ TEST(IrStatePlacement, EachInventoryRule) {
         {{0x87880200u}, {}, {8}, "s_and_b64 s[8:9]: one word (lane-mask pair)"},
         {{0x8F8A8200u}, {}, {10, 11}, "s_lshl_b64 s[10:11]: the pair"},
         {{0x90FE817Eu}, {}, {}, "s_lshr_b64 exec: the mask domain only"},
-        {{0x928C8081u}, {}, {12, 13}, "s_bfm_b64 s[12:13]: the pair (the scan drops s13)"},
+        {{0x928C8081u}, {}, {12, 13}, "s_bfm_b64 s[12:13]: the pair"},
+        {{0x948E8104u}, {}, {14, 15}, "s_bfe_u64 s[14:15]: the pair"},
+        {{0x91908104u}, {}, {16, 17}, "s_ashr_i64 s[16:17]: the pair"},
+        {{0x8FFE817Eu}, {}, {}, "s_lshl_b64 exec: the mask domain only"},
         {{0xBF8C0000u}, {}, {}, "s_waitcnt: nothing"},
     };
     for (const Rule& rule : rules) {
-        const PhiSets got = inventory(decode_one(rule.words), 6);
+        const auto ins = walk([&] {
+            auto words = rule.words;
+            words.push_back(prosper::test::cfg_streams::kEndpgm);
+            return words;
+        }());
+        const PhiSets got = inventory(ins.at(0), 6);
         EXPECT_EQ(got.vgprs, rule.vgprs) << rule.what;
         EXPECT_EQ(got.sgprs, rule.sgprs) << rule.what;
+        // The emitter's scan charges the same registers (#5436). It bounds v_movreld by the
+        // program's own highest VGPR, so the inventory is given the same bound here.
+        PhiSets scan;
+        loop_written_regs(ins, ins[0].pc, ins[0].pc + 1, scan.vgprs, scan.sgprs);
+        EXPECT_EQ(scan, inventory(ins[0], shader_max_vgpr(ins))) << rule.what;
     }
 }
 
@@ -254,7 +248,8 @@ TEST(IrStatePlacement, EveryVisitedJoinOfEveryFixtureIsEqual) {
     RecordProperty("absent", static_cast<int>(total.absent));
 }
 
-// s_bfm_b64 s[40:41] in the then-arm: the placement charges s41, the emitter's scan does not.
+// s_bfm_b64 s[40:41] in the then-arm. Before #5436 the emitter's scan dropped s41 here, and this
+// was the program the guard kept the emitter's set for.
 std::vector<uint32_t> bfm_in_then_arm() {
     prosper::test::ir::cfg_structured::Stream s;
     s.choose(true, [&] {
@@ -270,18 +265,38 @@ std::vector<uint32_t> compile(const std::vector<uint32_t>& ops) {
     return recompile_compute(p.code.data(), p.code.size(), &p.table, p.config);
 }
 
+// No instruction makes the placement and the scan differ any more, so the guard is driven
+// directly: a differing placement leaves the emitter's sets and is reported as such.
 TEST(IrStatePlacement, TheGuardKeepsTheEmitterSetWhereThePlacementDiffers) {
+    StatePlacementCensus census;
+    const PhiSets placed{{3}, {40, 41}};
+    std::set<int> vgprs{3}, sgprs{40};
+    take_placed_if_equal(&placed, PhiSite::IfMerge, 7, vgprs, sgprs);
+    EXPECT_EQ(vgprs, (std::set<int>{3}));
+    EXPECT_EQ(sgprs, (std::set<int>{40}));
+    ASSERT_EQ(census.sites().size(), 1u);
+    EXPECT_EQ(census.sites()[0].verdict, PlacementSiteRecord::Verdict::Differs);
+    EXPECT_EQ(census.sites()[0].difference, "placed-only=s41");
+    std::set<int> absent_v{3}, absent_s{40};
+    take_placed_if_equal(nullptr, PhiSite::IfMerge, 9, absent_v, absent_s);
+    EXPECT_EQ(absent_s, (std::set<int>{40}));
+    ASSERT_EQ(census.sites().size(), 2u);
+    EXPECT_EQ(census.sites()[1].verdict, PlacementSiteRecord::Verdict::Absent);
+}
+
+// The former differing program: its merge is now equal, and taking the placement's set changes
+// nothing against the placement withheld.
+TEST(IrStatePlacement, AScalarPairResultInAnArmMergesEqually) {
     const auto ops = bfm_in_then_arm();
     std::vector<uint32_t> guarded, withheld;
-    size_t differs = 0;
+    size_t equal = 0;
     {
         StatePlacementCensus census;
         guarded = compile(ops);
-        for (const auto& site : census.sites())
-            if (site.verdict == PlacementSiteRecord::Verdict::Differs) {
-                ++differs;
-                EXPECT_EQ(site.difference, "placed-only=s41");
-            }
+        for (const auto& site : census.sites()) {
+            EXPECT_NE(site.verdict, PlacementSiteRecord::Verdict::Differs) << site.difference;
+            equal += site.verdict == PlacementSiteRecord::Verdict::Equal;
+        }
     }
     {
         StatePlacementCensus census(/*withhold=*/true);
@@ -289,10 +304,8 @@ TEST(IrStatePlacement, TheGuardKeepsTheEmitterSetWhereThePlacementDiffers) {
         EXPECT_TRUE(census.sites().empty());
     }
     ASSERT_FALSE(guarded.empty());
-    // Without this the comparison below proves nothing: the case must reach a differing join.
-    ASSERT_EQ(differs, 1u);
+    ASSERT_GT(equal, 0u) << "the case must reach a guarded join";
     EXPECT_EQ(guarded, withheld);
-    EXPECT_EQ(compile(ops), withheld);
 }
 
 TEST(IrStatePlacement, AnEqualIfMergeIsTakenFromThePlacement) {
