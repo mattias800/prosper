@@ -1,3 +1,4 @@
+#include "gpu/recompiler/ir/cfg/structured_if_cursor.hpp"
 // rdna2_emit_cfg.cpp — the divergent-control-flow state machine and emit_body, split out of
 // rdna2_to_spirv.cpp. Shared state lives in gpu/recompiler/rdna2_to_spirv_internal.hpp.
 #include <atomic>
@@ -6362,17 +6363,14 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             (void)safe_branches;
             return true;
         }
-        // Structured uniform IFs (forward s_cbranch_scc*/vcc*), possibly SEQUENTIAL and/or NESTED
-        // (detect_forward_ifs verified the region tree). Each if emits as OpSelectionMerge +
-        // OpBranchConditional on the SCC/VCC bool, with an OpPhi per register written in the
-        // conditional block that is live after the merge — the same phi machinery as the original
-        // single-if path (which this generalizes 1:1: a single if takes exactly the old shape).
-        // Recursion handles nesting: the then-block emitter re-enters for inner branches.
-        // CONFIDENCE: MED-HIGH — guarded by the test suite + exec-diff; DOLL's two-vccz color-grade
-        // PS and nested-vccz lighting PS are the motivating real shaders (#273).
+        // Structured IFs consume guarded tree preorder and one phi per write live after the merge.
+        // A cursor owns the branch position; recursive arm emission keeps RegState threaded
+        // in its existing order. CONFIDENCE: MED-HIGH, guarded by corpus/execution checks.
         auto vget = [&](int r) { return vreg_seed(b, rs, r); };
         auto sget = [&](int r) { return scalar_merge_seed(b, rs, r); };
-        size_t bi = 0;   // next unconsumed branch in Fs (pc order; recursion consumes nested ones)
+
+        ir::cfg::StructuredIfCursor if_cursor(
+            ins, Fs, ir::cfg::structured_if_policy(b.is_compute, &safe, code, dwords), cf_rejected);
         size_t li = 0;   // next unconsumed loop in Ls (pc order)
         const DivLoop* active_direct_wave_loop = nullptr;
         uint32_t* active_direct_wave_continue = nullptr;
@@ -6647,7 +6645,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         emit_structured =
             [&](uint32_t lo, uint32_t hi, uint32_t cont) -> bool {
             for (;;) {
-                const uint32_t next_br = (bi < Fs.size() && Fs[bi].branch_pc < hi) ? Fs[bi].branch_pc : hi;
+                const uint32_t next_br = if_cursor.next_before(hi);
                 const uint32_t next_lp = (li < Ls.size() && Ls[li].header_pc < hi) ? Ls[li].header_pc : hi;
                 if (next_lp < next_br) {                     // a loop begins before the next if
                     if (!emit_range(lo, next_lp)) return false;
@@ -6658,7 +6656,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                 }
                 if (!emit_range(lo, next_br)) return false;
                 if (next_br == hi) return true;
-                const ForwardIf F = Fs[bi++];
+                const ForwardIf F = if_cursor.take();
                 if (idx < ins.size() && ins[idx].pc == F.branch_pc) ++idx;   // skip the branch itself
                 // Arm merges synthesize zero for a scalar absent on either predecessor. Keep the
                 // branch-free prefix eligible for exact path-local proofs, then turn them off for
@@ -6886,7 +6884,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         if (!emit_structured(0, UINT32_MAX, UINT32_MAX)) {
             if (getenv("PROSPER_DBG")) {
                 const uint32_t next_pc = idx < ins.size() ? ins[idx].pc : UINT32_MAX;
-                const uint32_t next_if = bi < Fs.size() ? Fs[bi].branch_pc : UINT32_MAX;
+                const uint32_t next_if = if_cursor.next_pc();
                 const uint32_t next_loop = li < Ls.size() ? Ls[li].header_pc : UINT32_MAX;
                 log_recompile_diagnostic(
                     b.diagnostic, "compute-struct-reject", "consequent",

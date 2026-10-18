@@ -1,13 +1,18 @@
 # `gpu/recompiler/ir/cfg` — the guest CFG and its region tree
 
-Steps 1 and 4 of `docs/architecture/IR_CONTROL_FLOW_PLAN.md`. One control-flow graph built once
+Steps 1, 2 and 4 of `docs/architecture/IR_CONTROL_FLOW_PLAN.md`. One control-flow graph built once
 from the decoded program (`guest_cfg`), and the structured regions derived from it
 (`region_tree`): ifs (step 1) and loops (step 4). Both are plain data: building them allocates no
-SPIR-V id and calls no `SpirvCompute`, so they cannot change an emitted byte. **Nothing in emission
-reads them yet.** Their only user is the shadow check (`region_shadow`), which compares the region
-tree with `detect_forward_ifs`, `detect_divergent_loops` and `detect_counted_loop` in a gtest over
-the committed fixtures and in `shader_inspect --cfg-regions` over the corpus. A consumer switches
-over in a later step, after its own shadow check agrees.
+SPIR-V id and calls no `SpirvCompute`, so they cannot change an emitted byte.
+
+**One consumer so far (step 2):** `structured_if_cursor` walks the tree's IfThen/IfElse children in
+preorder for structured emission, after comparing every record with the detector's sequence.
+Loops, detector refusals and any tree/order disagreement keep the detector cursor for the whole
+program. Register state, joins, proof facts and the dispatcher stay with their existing owners.
+The shadow check (`region_shadow`) compares the region tree with `detect_forward_ifs`,
+`detect_divergent_loops` and `detect_counted_loop` in a gtest over the committed fixtures and in
+`shader_inspect --cfg-regions` over the corpus. Loop consumers switch over in a later step, after
+their own shadow check agrees.
 
 | path | role |
 | --- | --- |
@@ -15,6 +20,7 @@ over in a later step, after its own shadow check agrees.
 | `region_tree.hpp/.cpp` | `Region`, `RegionTree`, `RegionPolicy`, `build_region_tree`; the walk, `Seq`, `Block`, `IfThen`, `IfElse`, `Unstructured` |
 | `region_loops.cpp` | `Loop` and `CountedLoop`: finding the loops in the CFG and admitting them |
 | `region_builder.hpp` | the builder class the two `.cpp` files share; internal, not an interface |
+| `structured_if_cursor.hpp/.cpp` | guarded tree preorder for `emit_structured`, with whole-program legacy fallback |
 | `region_shadow.hpp/.cpp` | the pc-level comparison with the three detectors, shared by the test and the census |
 
 Tests: `tests/gpu/recompiler/ir/test_ir_cfg_*.cpp`, one per source file.
