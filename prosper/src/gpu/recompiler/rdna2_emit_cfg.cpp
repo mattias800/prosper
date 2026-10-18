@@ -6369,7 +6369,6 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // in its existing order. CONFIDENCE: MED-HIGH, guarded by corpus/execution checks.
         auto vget = [&](int r) { return vreg_seed(b, rs, r); };
         auto sget = [&](int r) { return scalar_merge_seed(b, rs, r); };
-
         ir::cfg::StructuredIfCursor if_cursor(
             ins, Fs, ir::cfg::structured_if_policy(b.is_compute, &safe, code, dwords), cf_rejected);
         ir::cfg::StructuredLoopCursor loop_cursor(ins, Ls, loop_policy, cf_rejected);   // pc order
