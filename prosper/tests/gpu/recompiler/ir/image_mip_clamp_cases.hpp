@@ -69,11 +69,11 @@ inline std::vector<uint8_t> image_bytes(const Geometry& g = kAllTail64R32) {
         const uint32_t value = 0x7100u + level;
         for (size_t t = 0; t < texels; ++t) std::memcpy(pixels.data() + t * bpe, &value, bpe);
         if (layout.in_tail)
-            tile_surface_level(bytes.data(), bytes.size(), pixels.data(), level_width,
-                               level_width, kTile, bpe, layout.tail_x, layout.tail_y);
+            tile_surface_level(bytes.data(), bytes.size(), pixels.data(), level_width, level_width,
+                               kTile, bpe, layout.tail_x, layout.tail_y);
         else
-            tile_surface(bytes.data() + layout.byte_offset, pixels.data(), level_width,
-                         level_width, kTile, 0, bpe);
+            tile_surface(bytes.data() + layout.byte_offset, pixels.data(), level_width, level_width,
+                         kTile, 0, bpe);
     }
     return bytes;
 }
@@ -136,4 +136,4 @@ inline LaneProgram program(bool nsa, uint32_t levels, uint32_t wave, uint64_t bu
     p.config.user_sgprs.resize(32);
     return p;
 }
-} // namespace prosper::test::ir::image_mip_clamp
+}   // namespace prosper::test::ir::image_mip_clamp

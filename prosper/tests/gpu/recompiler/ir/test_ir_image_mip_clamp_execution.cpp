@@ -113,8 +113,8 @@ TEST(IrImageMipClampExecution, AllTailChainsAcrossElementSizeAndExtent) {
         for (uint32_t wave : {64u, 32u})
             for (uint32_t levels : shape.levels)
                 for (bool nsa : {false, true}) {
-                    SCOPED_TRACE(testing::Message() << shape.name << " wave " << wave
-                                                    << " levels " << levels << " nsa " << nsa);
+                    SCOPED_TRACE(testing::Message() << shape.name << " wave " << wave << " levels "
+                                                    << levels << " nsa " << nsa);
                     const auto out = run(nsa, levels, wave, in, shape.g);
                     ASSERT_EQ(out.size(), cases::kLanes);
                     for (uint32_t lane = 0; lane < cases::kLanes; ++lane)
@@ -142,8 +142,8 @@ TEST(IrImageMipClampCases, TailBasePlacementFollowsTheDescriptorContract) {
     const ShaderResource control = cases::texture(7u, kBase, cases::kNonTail256R32);
     EXPECT_FALSE(control.in_mip_tail);
     EXPECT_EQ(control.gpu_addr,
-              kBase + tiled_mip_level_layout(256, 256, 4, cases::kTile, cases::kMaxMip, 0)
-                          .byte_offset);
+              kBase +
+                  tiled_mip_level_layout(256, 256, 4, cases::kTile, cases::kMaxMip, 0).byte_offset);
     EXPECT_GT(control.gpu_addr, kBase);
 }
 
