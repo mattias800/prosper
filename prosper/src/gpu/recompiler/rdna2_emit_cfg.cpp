@@ -4,6 +4,7 @@
 #include <atomic>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/rdna2_cfg_use_proofs.hpp"
+#include "gpu/recompiler/ir/cfg/structured_loop_cursor.hpp"
 #include "gpu/recompiler/smem_x16_descriptor_proof.hpp"
 #include "gpu/recompiler/fragment_packet_definedness.hpp"
 #include "gpu/recompiler/rdna2_packet_raw_masks.hpp"
@@ -5407,7 +5408,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                                       exp_fn, code, dwords, initial_dispatch_active);
     }
     std::unordered_set<uint32_t> effective_safe = safe;
-    const CountedLoop L = detect_counted_loop(ins);
+    const auto loop_policy =
+        ir::cfg::structured_loop_policy(b.is_compute, b.is_fragment, &safe, code, dwords);
+    const CountedLoop L =
+        ir::cfg::counted_loop_record(ins, detect_counted_loop(ins), loop_policy).loop;
     size_t idx = 0;
     // Cross-lane wave ops (mbcnt) emit LDS + barriers, which are only valid at wave-uniform points — so
     // they're allowed ONLY in the straight-line path (no divergent loop/if around them). Set true below.
@@ -5552,11 +5556,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         return true;
     };
     auto& safe_branches = effective_safe;
-    // The counted-loop route claims the whole program, but `detect_counted_loop` only counts
-    // s_branch and SCC back-edges: a bottom-tested EXEC loop (`s_andn2_b64 exec, exec, vcc;
-    // s_cbranch_execnz header`) in the prelude is invisible to it. Probe the prelude before
-    // committing, so a prelude this route cannot structure falls back to the general route below
-    // (divergent loops, forward ifs, then the CFG dispatcher), which does know that loop shape.
+    // The counted-loop route claims the whole program, but `detect_counted_loop` misses a
+    // bottom-tested EXEC loop (`s_andn2_b64 exec, exec, vcc; s_cbranch_execnz header`) in the
+    // prelude. Probe the prelude first: one this route cannot structure falls back to the general
+    // route below (divergent loops, forward ifs, then the CFG dispatcher), which knows that shape.
     bool counted_route = L.found;
     bool guarded_narrow_entry = false;
     std::vector<ForwardIf> preloop_ifs;
@@ -5933,10 +5936,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                                               allow_smem, exp_fn))
             return false;
     } else if (std::vector<DivLoop> Ls; true) {
-        // EXEC/VCC/SCC-exit loops (#273/#615/#1554) + structured scalar IFs. Each is a real SPIR-V
-        // loop with header phis for carried register/mask state. Fragment conditions are exact wave64
-        // votes; vertex and the guarded compute cases retain their per-invocation form. The IF
-        // machinery recurses into loop bodies and handles their nested forward-execz regions.
+        // EXEC/VCC/SCC-exit loops (#273/#615/#1554) and structured scalar IFs: SPIR-V loops with
+        // header phis. Fragment conditions are wave64 votes; vertex and guarded compute per lane.
         Ls = detect_divergent_loops(ins, safe, b.is_fragment, b.diagnostic);
         if (b.is_compute) {
             // Compute VCC-exit loops (#590, extending #615): the fragment-stage uniformity proof is
@@ -6371,7 +6372,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
 
         ir::cfg::StructuredIfCursor if_cursor(
             ins, Fs, ir::cfg::structured_if_policy(b.is_compute, &safe, code, dwords), cf_rejected);
-        size_t li = 0;   // next unconsumed loop in Ls (pc order)
+        ir::cfg::StructuredLoopCursor loop_cursor(ins, Ls, loop_policy, cf_rejected);   // pc order
         const DivLoop* active_direct_wave_loop = nullptr;
         uint32_t* active_direct_wave_continue = nullptr;
         // `cont` = the pc control flows to after `hi` — the enclosing construct's merge chain. An
@@ -6646,10 +6647,10 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             [&](uint32_t lo, uint32_t hi, uint32_t cont) -> bool {
             for (;;) {
                 const uint32_t next_br = if_cursor.next_before(hi);
-                const uint32_t next_lp = (li < Ls.size() && Ls[li].header_pc < hi) ? Ls[li].header_pc : hi;
+                const uint32_t next_lp = loop_cursor.next_before(hi);
                 if (next_lp < next_br) {                     // a loop begins before the next if
                     if (!emit_range(lo, next_lp)) return false;
-                    const DivLoop& L = Ls[li++];
+                    const DivLoop& L = loop_cursor.take();
                     if (!emit_divloop(L)) return false;
                     lo = L.exit_pc;
                     continue;
@@ -6885,7 +6886,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             if (getenv("PROSPER_DBG")) {
                 const uint32_t next_pc = idx < ins.size() ? ins[idx].pc : UINT32_MAX;
                 const uint32_t next_if = if_cursor.next_pc();
-                const uint32_t next_loop = li < Ls.size() ? Ls[li].header_pc : UINT32_MAX;
+                const uint32_t next_loop = loop_cursor.next_pc();
                 log_recompile_diagnostic(
                     b.diagnostic, "compute-struct-reject", "consequent",
                     "structured emission stopped next-pc=%u next-if=%u next-loop=%u",
