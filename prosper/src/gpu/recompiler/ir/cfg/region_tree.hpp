@@ -6,8 +6,8 @@
 // rdna2_cfg_support.hpp; the loops themselves are found from the CFG's back edges. The contract
 // (terminator table, RegionPolicy rules, loop shapes) is in AGENTS.md next to this file.
 //
-// Shadow only: nothing in emission reads the tree. region_shadow.hpp compares it with the
-// detector.
+// region_shadow.hpp compares it with the detectors. Emission reads only its loop records, through
+// structured_loop_cursor.hpp, and only where they equal the detectors' (plan step 4b).
 #pragma once
 
 #include "gpu/recompiler/ir/cfg/guest_cfg.hpp"

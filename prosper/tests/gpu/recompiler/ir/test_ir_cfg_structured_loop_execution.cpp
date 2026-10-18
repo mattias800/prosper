@@ -9,6 +9,7 @@
 // computed here, independently of the encoder, including EXEC-inactive lanes.
 #include "gpu/recompiler/ir/cfg/structured_loop_cursor.hpp"
 #include "gpu/recompiler/ir/vector_lane_harness.hpp"
+#include "gpu/recompiler/rdna2_recompile_shared.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 
 #include <gtest/gtest.h>
@@ -61,6 +62,7 @@ struct Case {
     const char* name;
     std::vector<uint32_t> words;
     bool counted;   // the counted route (one loop) rather than the divergent cursor
+    bool all_lanes;   // the program widens EXEC first, so inactive lanes gain too
     size_t loops;
     uint32_t (*gain)(uint32_t s0);
 };
@@ -68,10 +70,14 @@ struct Case {
 std::vector<Case> cases() {
     std::vector<uint32_t> two = scc_do_while(12, 4);
     for (uint32_t w : scc_do_while(13, 3)) two.push_back(w);
+    // The counted lowering refuses a loop entered with narrowed EXEC, so this one widens it.
+    std::vector<uint32_t> counted{0xbefe04c1u};   // s_mov_b64 exec, -1
+    for (uint32_t w : scc_do_while(12, 4)) counted.push_back(w);
     return {
-        {"counted do-while", scc_do_while(12, 4), true, 1, [](uint32_t) { return 6u; }},
-        {"two scc do-whiles", two, false, 2, [](uint32_t) { return 9u; }},
-        {"exec do-while", exec_do_while(), false, 1, [](uint32_t s0) { return (s0 & 3u) + 1u; }},
+        {"counted do-while", counted, true, true, 1, [](uint32_t) { return 6u; }},
+        {"two scc do-whiles", two, false, false, 2, [](uint32_t) { return 9u; }},
+        {"exec do-while", exec_do_while(), false, false, 1,
+         [](uint32_t s0) { return (s0 & 3u) + 1u; }},
     };
 }
 
@@ -130,8 +136,8 @@ TEST(IrCfgStructuredLoopExecution, EveryLaneGetsItsGuestResult) {
             ASSERT_TRUE(run.error.empty()) << run.error;
             ASSERT_EQ(run.d.size(), in.lanes());
             for (uint32_t lane = 0; lane < in.lanes(); ++lane) {
-                const uint32_t want =
-                    in.active[lane] ? in.old_d[lane] + c.gain(in.s0[lane]) : in.old_d[lane];
+                const bool runs = c.all_lanes || in.active[lane];
+                const uint32_t want = in.old_d[lane] + (runs ? c.gain(in.s0[lane]) : 0u);
                 EXPECT_EQ(run.d[lane], want) << "lane " << lane;
             }
         }
