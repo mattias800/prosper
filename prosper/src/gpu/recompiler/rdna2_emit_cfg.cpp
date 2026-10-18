@@ -6364,7 +6364,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             (void)safe_branches;
             return true;
         }
-        // Structured IFs retain detector order and one phi per write live after the merge.
+        // Structured IFs consume guarded tree preorder and one phi per write live after the merge.
         // A cursor owns the branch position; recursive arm emission keeps RegState threaded
         // in its existing order. CONFIDENCE: MED-HIGH, guarded by corpus/execution checks.
         auto vget = [&](int r) { return vreg_seed(b, rs, r); };

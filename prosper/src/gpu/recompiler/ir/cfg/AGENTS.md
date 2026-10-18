@@ -1,17 +1,17 @@
 # `gpu/recompiler/ir/cfg` — the guest CFG and its region tree
 
-Step 1 of `docs/architecture/IR_CONTROL_FLOW_PLAN.md`. One control-flow graph built once from the
-decoded program (`guest_cfg`), and the structured regions derived from it (`region_tree`). Both
-are plain data: building them allocates no SPIR-V id and calls no `SpirvCompute`, so they cannot
-change an emitted byte. **Nothing in emission reads them yet.** Their only user is the shadow
-check (`region_shadow`), which compares the region tree with `detect_forward_ifs` in a gtest over
-the committed fixtures and in `shader_inspect --cfg-regions` over the corpus. A consumer switches
-over in a later step, after its own shadow check agrees.
+The guest CFG and region tree are plain data: building them allocates no SPIR-V id and calls no
+`SpirvCompute`. `structured_if_cursor` now consumes the tree's IfThen/IfElse children in preorder
+for structured emission, after comparing every emitted record with the detector's sequence.
+Loops, detector refusals and any tree/order disagreement retain the detector cursor for the whole
+program. Register state, joins, proof facts and the dispatcher remain in their existing owners.
+`region_shadow` retains the independent stage-level comparison used by tests and the CLI census.
 
 | path | role |
 | --- | --- |
 | `guest_cfg.hpp/.cpp` | `GuestBlock`, `GuestCfg`, `build_guest_cfg`: blocks, successors, preds, rpo, idom, back edges, reachability |
 | `region_tree.hpp/.cpp` | `Region`, `RegionTree`, `RegionPolicy`, `build_region_tree`: `Seq`, `Block`, `IfThen`, `IfElse`, `Unstructured` |
+| `structured_if_cursor.hpp/.cpp` | guarded tree preorder for `emit_structured`, with whole-program legacy fallback |
 | `region_shadow.hpp/.cpp` | the pc-level comparison with `detect_forward_ifs`, shared by the test and the census |
 
 Tests: `tests/gpu/recompiler/ir/test_ir_cfg_*.cpp`, one per source file.
