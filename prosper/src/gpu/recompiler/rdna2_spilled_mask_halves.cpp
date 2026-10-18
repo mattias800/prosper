@@ -178,7 +178,9 @@ SpilledVectorSourceMarks spilled_vector_source_marks(const SpilledMaskHalves& st
                 operand.kind == OperandKind::SGPR || (operand.kind == OperandKind::Special &&
                                                       operand.value >= 106 && operand.value <= 124);
             if (!scalar) continue;
-            uint32_t width = scalar_alu_source_words(in, source);
+            // A Wave32 lane mask is one SGPR (#5202), VCC_LO excepted, as scalar_source_marks
+            // charges it (scalar_source_mark_words).
+            uint32_t width = scalar_source_mark_words(in, source, wave_size);
             if (!width || width == UINT32_MAX) width = 2;
             if (width > 2) width = static_cast<uint32_t>(std::max(0, 125 - operand.value));
             for (uint32_t word = 0; word < width; ++word) {

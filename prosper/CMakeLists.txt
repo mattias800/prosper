@@ -4365,6 +4365,10 @@ endif()
     SOURCES tests/gpu/recompiler/test_scalar_condition_preservation.cpp
     LIBRARIES prosper_core)
 
+  prosper_add_gtest(test_wave32_lane_mask_source_marks
+    SOURCES tests/gpu/recompiler/test_wave32_lane_mask_source_marks.cpp
+    LIBRARIES prosper_core)
+
   prosper_add_gtest(test_s_movrels_read_range
     SOURCES tests/gpu/recompiler/test_s_movrels_read_range.cpp
     LIBRARIES prosper_core)

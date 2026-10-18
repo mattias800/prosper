@@ -44,7 +44,9 @@ uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
             // Every VALU source width comes from the instruction-effects table, derived from the
             // ISA (70648 12.7-12.12) and checked against llvm-mc: a B32 operand is one SGPR, an
             // F64/I64/U64/B64 operand a pair, and a lane mask (SRC2 of v_cndmask_b32 and the
-            // carry-in forms) the Wave64 pair. The MAD_U64/I64 SRC2 is a numeric addend pair.
+            // carry-in forms) the Wave64 pair; a caller that knows the program is Wave32 asks the
+            // wave-aware overload below, which charges it one SGPR (#5202). The MAD_U64/I64 SRC2
+            // is a numeric addend pair.
             // It replaces an allowlist of B32
             // VOP3 opcodes over a "two dwords" default, extended one opcode at a time as titles
             // were refused (V_LSHL_ADD_U32 #2790, V_MUL_LO/HI_U32 #2952, V_MED3_F32 #4429,
@@ -60,6 +62,41 @@ uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
         }
         default: return 0;
     }
+}
+
+bool valu_lane_mask_source(const Rdna2Inst& in, uint32_t source) {
+    // SRC2 of v_cndmask_b32_e64 (VOP3 0x101) and of the VOP3B carry-in forms v_add_co_ci_u32,
+    // v_sub_co_ci_u32 and v_subrev_co_ci_u32 (VOP3 0x128-0x12a). Their VOP2 twins read VCC
+    // implicitly and have no SRC2.
+    return in.fmt == Rdna2Format::VOP3 && source == 2 &&
+           (in.opcode == 0x101 || (in.opcode >= 0x128 && in.opcode <= 0x12a));
+}
+
+uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source, uint32_t wave_size) {
+    // A lane mask holds one bit per lane. ISA 70648 6.2.3 ("Wave64 use of SGPRs"): a mask source
+    // makes "each workitem receive a separate value, and two consecutive SGPRs are read" -- in
+    // Wave64. In Wave32 there are 32 lanes and "the upper half of EXEC and VCC are ignored"
+    // (2.1), so the mask is ONE SGPR: llvm-mc gfx1030 (wavefrontsize32) prints the operand as a
+    // 32-bit register (`v_add_co_ci_u32_e64 v44, vcc_lo, 0, v32, s107`). Charging the pair there
+    // reads a neighbour the instruction never reads; when that neighbour is absent the marks call
+    // the mask fabricated and refuse a defined carry (#5202). CONFIDENCE: HIGH.
+    const uint32_t words = scalar_alu_source_words(in, source);
+    if (wave_size == 32 && words == 2 && valu_lane_mask_source(in, source)) return 1u;
+    return words;
+}
+
+uint32_t scalar_source_mark_words(const Rdna2Inst& in, uint32_t source, uint32_t wave_size) {
+    // VCC_LO keeps the pair, as a stand-in for a fact the marks do not otherwise carry. Every
+    // compute/graphics shell starts with rs.vcc = false, which sreg_word_absent_unmasked counts
+    // as a real VCC_LO, although no launch provides VCC. What made a read of that entry VCC hard
+    // was the never-written VCC_HI beside it, charged as the second word of the pair. Charging
+    // VCC_LO alone would publish data selected by the unprovided entry VCC
+    // (Wave32ExecBoundary.ExplicitCndmaskCannotUseUnprovidedVccToPublishCurrentData). So a Wave32
+    // VCC_LO mask still asks for VCC_HI until entry-VCC provenance is tracked directly; that only
+    // ever refuses more. Every other Wave32 mask source (an SGPR, VCC_HI) is its one word.
+    if (valu_lane_mask_source(in, source) && in.src[source].value == 106)
+        return scalar_alu_source_words(in, source);
+    return scalar_alu_source_words(in, source, wave_size);
 }
 
 }   // namespace prosper::gpu

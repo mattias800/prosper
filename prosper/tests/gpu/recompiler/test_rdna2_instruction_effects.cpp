@@ -1345,6 +1345,43 @@ TEST(Rdna2InstructionEffectsRegression, ValuSourceWidthsComeFromTheIsaNotAnAllow
     EXPECT_EQ(scalar_alu_source_words(rdna2_decode_one(cvt_e32, 1), 0), 2u) << "v_cvt_f32_f64_e32";
 }
 
+// #5202: a lane mask is one bit per lane, so a Wave32 mask source is ONE SGPR (ISA 70648 2.1,
+// 6.2.3; llvm-mc wavefrontsize32 prints `v_add_co_ci_u32_e64 v44, vcc_lo, 0, v32, s107`). The
+// width-free form charges it the Wave64 pair, and the fresh-mask proof then refused a defined
+// Wave32 carry-in because the never-written word above it was "fabricated". Exactly the four
+// lane-mask sources narrow; a numeric pair (v_mad_u64_u32's addend, an F64 operand) does not.
+TEST(Rdna2InstructionEffectsRegression, Wave32LaneMaskSourceIsOneSgpr) {
+    for (const uint32_t op : {0x101u, 0x128u, 0x129u, 0x12au}) {
+        const Rdna2Inst in = decode_vop3_sgpr(op);
+        EXPECT_TRUE(valu_lane_mask_source(in, 2)) << std::hex << op;
+        EXPECT_EQ(scalar_alu_source_words(in, 2, 32), 1u) << std::hex << op;
+        EXPECT_EQ(scalar_alu_source_words(in, 2, 64), 2u) << std::hex << op;
+        EXPECT_EQ(scalar_alu_source_words(in, 2), 2u) << std::hex << op << " width-free form";
+        for (const uint32_t source : {0u, 1u})
+            EXPECT_EQ(scalar_alu_source_words(in, source, 32), 1u) << std::hex << op;
+    }
+    EXPECT_EQ(scalar_alu_source_words(decode_vop3_sgpr(0x176), 2, 32), 2u) << "v_mad_u64_u32";
+    EXPECT_EQ(scalar_alu_source_words(decode_vop3_sgpr(0x164), 1, 32), 2u) << "v_add_f64";
+    // Every other VOP3 source keeps its width in Wave32: the four above are the whole difference.
+    size_t narrowed = 0;
+    for (uint32_t op = 0; op < 0x400; ++op) {
+        const Rdna2Inst in = decode_vop3_sgpr(op);
+        if (in.fmt != Rdna2Format::VOP3) continue;
+        for (uint32_t source = 0; source < 3; ++source)
+            if (scalar_alu_source_words(in, source, 32) != scalar_alu_source_words(in, source, 64))
+                ++narrowed;
+    }
+    EXPECT_EQ(narrowed, 4u);
+    // The source marks keep VCC_LO's pair (the entry-VCC witness); VCC_HI and an SGPR narrow.
+    for (const uint32_t src2 : {106u, 107u, 20u}) {
+        const uint32_t code[2] = {0xD4000000u | (0x128u << 16) | (106u << 8) | 4u,
+                                  2u | (6u << 9) | (src2 << 18)};
+        const Rdna2Inst carry = rdna2_decode_one(code, 2);
+        EXPECT_EQ(scalar_source_mark_words(carry, 2, 32), src2 == 106 ? 2u : 1u) << src2;
+        EXPECT_EQ(scalar_source_mark_words(carry, 2, 64), 2u) << src2;
+    }
+}
+
 // ---- VALU vector results -----------------------------------------------------------------------
 
 // ISA-side checks of the vector-result fields, each against a list or rule stated here

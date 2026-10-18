@@ -19,10 +19,16 @@ std::optional<bool> Vop3MaskLowering::route_carry_in_out() {
     const Operand& s2 = in.src[2];
     uint32_t cin_mask = 0;
     if (s2.value == 106 || s2.value == 107) {
+        // As v_cndmask_b32_e64 reads SRC2 (vop3_cndmask.cpp): a Wave32 form may name either VCC
+        // word as its own one-dword mask, so prefer that typed lifetime. Only VCC_LO may fall back
+        // to the architectural predicate. VCC_HI is a distinct word in Wave32: read through
+        // rs.vcc it would take VCC_LO's lanes for a register that may hold scalar data. That was
+        // unreachable while the fresh-mask proof charged a Wave32 mask the pair and refused on
+        // the never-written word above VCC_HI (#5202).
         auto it = rs.sreg_bool.find(s2.value);
         if (rs.sreg_bool_b32.contains(s2.value) && it != rs.sreg_bool.end())
             cin_mask = it->second;
-        else
+        else if (s2.value == 106)
             cin_mask = rs.vcc;
     } else if (s2.kind == OperandKind::SGPR) {
         auto it = rs.sreg_bool.find(s2.value);

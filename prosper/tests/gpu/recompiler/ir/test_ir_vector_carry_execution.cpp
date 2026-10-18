@@ -48,11 +48,13 @@ std::vector<uint32_t> carry_program(const VectorCarryDef& def, const CarryForm& 
                    read_carry ? read_mask(form.cout) : std::vector<uint32_t>{}});
 }
 
-// In Wave32 the VOP3B carry-in forms are refused before they lower: the fresh-mask proof
-// (fresh_mask_sources_defined) charges SRC2 the Wave64 register pair, and the second word is never
-// written. That is the pre-IR verdict, kept; Wave32RefusalsStay pins it.
-bool admitted(const VectorCarryDef& def, uint32_t wave) {
-    return wave == 64 || def.fmt == Rdna2Format::VOP2 || !def.reads_carry_in;
+// The Wave32 VOP3B carry-in forms were all refused before they lowered: the fresh-mask proof
+// charged SRC2 the Wave64 pair, and the word above the one-SGPR carry-in is never written. Since
+// #5202 a carry-in from an SGPR is charged its one word, and EveryDefinitionEveryFormBothWaves runs
+// it. A carry-in from VCC_LO still charges VCC_HI (scalar_source_mark_words: the witness for an
+// unprovided entry VCC), so those forms stay refused; Wave32RefusalsStay pins them.
+bool admitted(const VectorCarryDef& def, const CarryForm& form, uint32_t wave) {
+    return wave == 64 || def.fmt == Rdna2Format::VOP2 || !def.reads_carry_in || form.cin != kVcc;
 }
 
 KnownCarry lane_eval(const VectorCarryDef& def, const LaneInputs& in, size_t lane) {
@@ -137,7 +139,7 @@ TEST(IrVectorCarryExecution, EveryDefinitionEveryFormBothWaves) {
         SCOPED_TRACE(effects_name(def));
         for (const CarryForm& form : forms_of(def))
             for (const uint32_t wave : {64u, 32u})
-                for (uint32_t seed = 1; seed <= 2 && admitted(def, wave); ++seed)
+                for (uint32_t seed = 1; seed <= 2 && admitted(def, form, wave); ++seed)
                     check_carry_run(def, form, wave, mask_lane_inputs(seed * 0x5c41u + def.opcode));
     }
 }
@@ -167,7 +169,7 @@ TEST(IrVectorCarryExecution, HandWorkedIsaTruthTable) {
         }
         for (const uint32_t wave : {64u, 32u})
             for (const bool read_carry : {false, true}) {
-                if (!admitted(def, wave)) continue;
+                if (!admitted(def, forms_of(def).front(), wave)) continue;
                 const auto run = run_vector_op_per_lane(
                     carry_program(def, forms_of(def).front(), read_carry), in, wave);
                 ASSERT_TRUE(run.error.empty()) << run.error;
@@ -209,8 +211,8 @@ TEST(IrVectorCarryExecution, HarnessSeesExecAndBothCarries) {
 TEST(IrVectorCarryExecution, Wave32RefusalsStay) {
     size_t refused = 0;
     for (const auto& def : vector_carry_defs()) {
-        if (admitted(def, 32)) continue;
         for (const CarryForm& form : forms_of(def)) {
+            if (admitted(def, form, 32)) continue;
             const auto run =
                 run_vector_op_per_lane(carry_program(def, form, false), mask_lane_inputs(7), 32);
             EXPECT_NE(run.error.find("fabricated-fresh-mask-source"), std::string::npos)
@@ -218,7 +220,74 @@ TEST(IrVectorCarryExecution, Wave32RefusalsStay) {
             ++refused;
         }
     }
-    EXPECT_EQ(refused, 12u);
+    EXPECT_EQ(refused, 6u);   // three carry-in ops, each from VCC_LO to VCC and to an SGPR pair
+}
+
+namespace {
+
+constexpr uint32_t kVccHi = 107;
+
+// D of one lane: the op's result when the lane is active, the old VDST when it is not.
+uint32_t lane_d(const VectorCarryDef& def, const LaneInputs& in, size_t lane, uint32_t cin) {
+    if (!in.active[lane]) return in.old_d[lane];
+    // NOLINTNEXTLINE(bugprone-unchecked-optional-access): concrete carry inputs give a known D.
+    return *eval_vector_carry(def, in.s0[lane], in.s1[lane], cin).d;
+}
+
+std::vector<const VectorCarryDef*> vop3_carry_in_defs() {
+    std::vector<const VectorCarryDef*> out;
+    for (const auto& def : vector_carry_defs())
+        if (def.fmt == Rdna2Format::VOP3 && def.reads_carry_in) out.push_back(&def);
+    return out;
+}
+
+}   // namespace
+
+// #5202, in the shape of indirect_pointer_descriptor_range's 64-bit address add: in Wave32 the low
+// add writes its carry to VCC_HI, and the high add takes its carry-in from VCC_HI. The mask is that
+// ONE SGPR (ISA 70648 2.1, 6.2.3); the word above it (ttmp0) is never written. Charged the Wave64
+// pair, the fresh-mask proof found that word missing and refused the carry-in.
+TEST(IrVectorCarryExecution, Wave32CarryInFromVccHiReadsItsOneWord) {
+    ASSERT_EQ(vop3_carry_in_defs().size(), 3u);
+    for (const VectorCarryDef* def : vop3_carry_in_defs()) {
+        SCOPED_TRACE(effects_name(*def));
+        const auto program =
+            concat({carry_from_s2(kVccHi), vop3_words(def->opcode, kCarryOut, kVccHi)});
+        const LaneInputs in = mask_lane_inputs(0x5202u + def->opcode);
+        const auto run = run_vector_op_per_lane(program, in, 32);
+        ASSERT_TRUE(run.error.empty()) << run.error;
+        ASSERT_EQ(run.d.size(), in.lanes());
+        for (size_t lane = 0; lane < in.lanes(); ++lane) {
+            const uint32_t cin = in.active[lane] && in.s2[lane] != 0 ? 1u : 0u;
+            ASSERT_EQ(run.d[lane], lane_d(*def, in, lane, cin))
+                << "lane " << lane << " active " << in.active[lane];
+        }
+    }
+}
+
+// The carry-in route must not read a Wave32 VCC_HI that holds scalar DATA through VCC_LO's
+// predicate. VCC_HI = -1 is a carry-in of 1 in every lane, while VCC_LO holds a carry that is 0 in
+// some active lanes, so reading rs.vcc for VCC_HI gives a different D there (the positive control).
+// The route has no data-to-mask projection, so it refuses; before #5202 the fresh-mask proof
+// refused first, on the never-written word above VCC_HI, which hid the fallback. A lowering that
+// learns the projection must replace this with a check against lane_d(..., 1).
+TEST(IrVectorCarryExecution, Wave32CarryInFromVccHiDataIsNotReadAsVccLo) {
+    constexpr uint32_t kSMovVccHiAllOnes = 0xbeeb03c1u;   // s_mov_b32 vcc_hi, -1
+    for (const VectorCarryDef* def : vop3_carry_in_defs()) {
+        SCOPED_TRACE(effects_name(*def));
+        const auto program = concat({{kSMovVccHiAllOnes},
+                                     carry_from_s2(kVcc),
+                                     vop3_words(def->opcode, kCarryOut, kVccHi)});
+        const LaneInputs in = mask_lane_inputs(0x5203u + def->opcode);
+        size_t visible = 0;
+        for (size_t lane = 0; lane < in.lanes(); ++lane) {
+            const uint32_t stale = in.active[lane] && in.s2[lane] != 0 ? 1u : 0u;
+            visible += lane_d(*def, in, lane, stale) != lane_d(*def, in, lane, 1u);
+        }
+        ASSERT_GT(visible, 0u);
+        const auto run = run_vector_op_per_lane(program, in, 32);
+        EXPECT_FALSE(run.error.empty()) << "VCC_HI data was lowered as a lane mask";
+    }
 }
 
 TEST(IrVectorCarryExecution, DefinitionsAgreeWithTheEffectsTable) {
@@ -411,10 +480,10 @@ TEST(IrVectorCarryExecution, ExportsReplayableWitnessPrograms) {
         for (const CarryForm& form : forms_of(def))
             for (const bool read_carry : {false, true}) {
                 MaskWitness program{carry_program(def, form, read_carry)};
-                if (!admitted(def, 32)) program.waves = {64u};
+                if (!admitted(def, form, 32)) program.waves = {64u};
                 programs.push_back(program);
             }
-    EXPECT_EQ(export_mask_witness(programs, "vector-carry-witness", 0x5c41000000ull), 60u);
+    EXPECT_EQ(export_mask_witness(programs, "vector-carry-witness", 0x5c41000000ull), 72u);
 }
 
 // The #5348 programs as a witness corpus of their own (Wave64 is the unchanged control): the

@@ -55,6 +55,16 @@ inline bool sopp_is_noop(const Rdna2Inst& in) {
 }
 uint32_t scalar_implicit_destination_read_width(const Rdna2Inst& in);
 uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source);
+// The VALU sources that are lane masks: SRC2 of v_cndmask_b32_e64 and the VOP3B carry-in forms.
+bool valu_lane_mask_source(const Rdna2Inst& in, uint32_t source);
+// scalar_alu_source_words for a program of a known wave width: a Wave32 lane mask is ONE SGPR,
+// where the width-free form charges every lane mask the Wave64 pair (#5202). Any other wave_size
+// value (64, or unknown) keeps the pair.
+uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source, uint32_t wave_size);
+// The words the source MARKS charge (scalar_source_marks and the dispatcher's
+// spilled_vector_source_marks): the wave-aware width, except that a Wave32 VCC_LO lane mask still
+// charges VCC_HI, the only witness the marks have of an unprovided entry VCC.
+uint32_t scalar_source_mark_words(const Rdna2Inst& in, uint32_t source, uint32_t wave_size);
 
 // What a surviving read of R is allowed to be.
 //
@@ -1815,7 +1825,8 @@ inline ScalarSourceMarks scalar_source_marks(const RegState& rs, const Rdna2Inst
             }
             if (genuine) continue;
         }
-        uint32_t width = scalar_alu_source_words(in, k);
+        // A Wave32 lane mask is one SGPR (#5202), VCC_LO excepted (scalar_source_mark_words).
+        uint32_t width = scalar_source_mark_words(in, k, rs.vector_wave_size);
         if (width == 0 || width == UINT32_MAX) width = 2;   // unknown: both words of a pair
         if (width > 2) width = static_cast<uint32_t>(std::max(0, 125 - o.value));   // a range
         for (uint32_t w = 0; w < width; ++w) word(o.value + static_cast<int>(w));
