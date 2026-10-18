@@ -15,4 +15,6 @@ v1 under the narrowed EXEC. A new family adds its tests here and to the
 `src/gpu/recompiler/ir/HOW_TO_ADD_A_FAMILY.md`.
 The interpreter fails an out-of-range buffer access instead of returning 0, so a memory family's
 robustness arm runs on Vulkan: `test_ir_buffer_address_robustness` links Vulkan and is registered
-beside `test_traversal_chase`, not in that list.
+beside `test_traversal_chase`, not in that list. It cannot run an image access at all, so
+`test_ir_image_coordinates_execution` runs its arms (`image_coordinates_cases.hpp`) on the live
+Vulkan compute backend, registered beside `test_ir_buffer_store_execution`.

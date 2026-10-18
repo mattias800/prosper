@@ -1114,8 +1114,160 @@ instead: returning 4 from it turns that test red, and restoring it turns it gree
 | MUBUF/MTBUF descriptor resolution, folded vertex fetch decision, indirect-pointer source and per-title exact sites | lead | provenance |
 | FLAT/GLOBAL window path (`addr_lo - base_lo`, plus 4 per component, `>> 2`) | Codex, value-only | pure; the window resolution (`by_fetch_pc`, `flat_base_sgpr`, the push-constant base load) stays |
 | FLAT/GLOBAL relocated indirect carriers and the packed-pointer shadow | lead | the address is checked against the indirect-pointer proof's records |
-| MIMG (T#/S# resolution, sampled arrays, coordinates, LOD, `image_get_lod`) | lead first, then Codex for the coordinate and result-packing values | descriptor provenance and fragment derivatives; the coordinate conversions are pure once relocated |
+| MIMG spatial coordinates of the plain-2D and 3D paths | **done** (`ops/image_coordinates.cpp`) | the worked example of "Image instructions (MIMG)" |
+| MIMG remaining coordinate, packing and store-data values | Codex, using the MIMG recipe | see "The remaining MIMG value groups" |
+| MIMG T#/S# resolution, sampled arrays, admission, LOD/derivatives, atomics, BVH | lead | descriptor provenance, proof state and fragment derivatives |
 | DS atomics, `ds_append/consume`, GWS | lead | memory side effects with ordering |
+
+## Image instructions (MIMG)
+
+A MIMG instruction splits the same three ways as any memory instruction ("Memory instructions"),
+and the access and proof halves are larger than anywhere else. In emit_alu's MIMG case they are:
+
+- **The MIMG source proof.** `begin_mimg_source_proof(rs, in.pc)` opens it;
+  `mimg_address_vgpr(rs, in, k)` (the `cvg` lambda) maps address slot `k` to its VGPR, through the
+  NSA bytes when `len_dwords > 2`, and records a missing NSA operand; `read_mimg_source_word(b, rs,
+  reg)` (the `vread` lambda) records the word's definedness and its #5193 arbitrary/hard verdict in
+  `rs.mimg_sources`. `mimg_result_may_be_arbitrary` (`rdna2_loaded_arbitrary.cpp`) reads that
+  record after the case. Outside the case, #5179's active-word rule admits an image result only
+  when every address VGPR (`rdna2_mimg_read_address_count` / `_address_vgpr`) is positively current,
+  and #5193's relay rule gives an image result no relayed facts; neither reads the coordinate ids.
+- **T#/S# resolution.** `rt->image_by_fetch_pc`, then `sreg_srt_range_tag` +
+  `rt->image_by_srt_offset`, `sreg_range_written` + `rt->image_by_sgpr_base`, and the
+  `sreg_range_ud_alias` copy (#1773), all class-filtered by `ImageResourceRequirement`; the BVH
+  form's `rt->by_fetch_pc` and `is_proven_null_bvh`; the failure report's
+  `rt->by_srt_offset` / `rt->by_sgpr_base` probes.
+- **Admission.** `sampled_array_contract`, `mimg_single_level_implicit_form`,
+  `rdna2_mimg_zero_mip_shape` / `rdna2_mimg_dynamic_mip_shape` with `res->proven_zero_mip` and
+  `shader_resource_compute_mip_chain_levels`, the MSAA and A16 shape gates, the storage-image
+  native-format decisions, and `declare_texture` / `declare_storage_image`.
+- **The access and the write.** Every `image_*` call on `SpirvCompute` (fetch, read, write, sample,
+  gather, atomic), `write_mimg_results` (`vreg_old` / `predicate_write` per VDATA word), the T#
+  DST_SEL routing (`storage_load_selects`, `storage_store_sources`) and `mimg_store_components`.
+
+**Measure.** `tools/rdna2_ref/decode.py` stops at the first MIMG with bit 0 set, which it reads as
+NSA; bit 0 is the opcode's MSB, and NSA is bits [2:1] (`rdna2_decode.cpp`). Walk the program with
+it, but step over MIMG yourself: length `8 + 4 * NSA` bytes, opcode `(w0 & 1) << 7 | w0[24:18]`,
+DIM `w0[5:3]`, A16 `w1[30]`, D16 `w1[31]`. On the recorded corpus (2026-10-18, 1,003 distinct
+programs, 699 with MIMG, 212 stopping early on another format):
+
+| opcode | programs | instructions |
+| --- | --- | --- |
+| `image_load` | 305 | 1,827 |
+| `image_sample_lz` | 278 | 1,778 |
+| `image_store` | 206 | 526 |
+| `image_sample_b` | 150 | 461 |
+| `image_sample_l` | 116 | 1,250 |
+| `image_sample` | 82 | 304 |
+| `image_atomic_umax` | 40 | 161 |
+| `image_gather4_lz` | 38 | 131 |
+| `image_sample_d` | 18 | 24 |
+| `image_get_lod` | 12 | 14 |
+
+and by shape (programs): `image_sample_lz` 2D 216 (+81 NSA), `image_load` 2D 212 (+48 NSA, 17
+A16, 6 A16+D16), `image_sample_b` 2D 141, `image_store` 2D 101, `image_sample_l` 2D 77 (+43 NSA),
+`image_sample` 2D 77, `image_sample_lz` 3D 71 (+33 NSA), `image_store` 3D 56, `image_load` 2D_ARRAY
+52 (+44 NSA), `image_load` 3D 43 (+19 NSA), `image_sample_l` CUBE 26. Everything else is under 25.
+
+### The worked example: the spatial coordinates
+
+`ops/image_coordinates.cpp` is how the address VGPRs become the coordinates of the two paths that
+carry the most-used shapes: the plain-2D tail (`image_sample_lz`, `image_load` including A16,
+`image_sample`, `image_sample_l`, the dynamic `image_load_mip`) and the 3D path (`image_sample*`,
+`image_load`). It was chosen because those shapes are most of the corpus, the value is genuinely
+pure (an A16 unpack and the FORCE_UNNORMALIZED scale), and both paths compute it in sequenced
+statements before the access, so the old emission order is unambiguous.
+
+| form | value |
+| --- | --- |
+| `Separate` | axis k = address slot k (2 or 3 axes) |
+| `Packed16` | x = slot0[15:0], y = slot0[31:16] (2D `image_load` A16 only; emit_alu refuses other A16) |
+| `normalize` (on either form) | axis k = coordinate * f32(1 / extent[k]); extent 0 gives the constant 0 and the lowering clears `ok` |
+
+`normalize` is `!is_load && normalize_sampler_coordinates`, decided in emit_alu where the old code
+decided it.
+
+**The reader is the proof.** The definition reads its inputs as Block inputs, and
+`emit_image_coordinates` resolves each at its position through a callback that emit_alu writes as
+`[&](uint32_t k) { return vread(cvg(k)); }`, so `mimg_address_vgpr` and `read_mimg_source_word`
+run in the same order with the same arguments, and the `uconst(0)` that `read_mimg_source_word`
+emits for an unwritten register lands where it did. The `Separate` form appends no instruction at
+all: its SPIR-V is the reads.
+
+**The relocation is a function, not a route.** Both runs declare locals for the access below them,
+so move each as a RAW segment (`extract_case_routes.py`, route `-`) into a file you have started
+with the function's signature, pass emit_alu's lambdas in (`read` for `vread(cvg(k))`, and for the
+relocation commit only `normalized_spatial`), bind them to the old names so the moved text compiles
+unchanged, and close the function by hand. Gate it (`changes: none`) and commit it alone. Then
+replace the body with the definition; the shape replaces the `normalized_spatial` callback, whose
+other call sites stay.
+
+What did not move, and must not: everything in the list above, the cube, array, `_b`, `_o`,
+`_lz_o`, `_d` and gather coordinate expressions (see below), the LOD and offset operands (they are
+arguments of the access call), and every refusal.
+
+### Testing it
+
+- `test_ir_image_coordinates.cpp`: ISA values worked by hand for every form (A16 halves with the
+  top bit set, power-of-two and non-power-of-two extents, the zero extent), the slots each shape
+  reads in order, an unknown word leaving only its axis unknown, and every shape's Block per lane
+  in the integer interpreter against its own evaluation.
+- `test_ir_lower_image_coordinates.cpp`: one read per slot in slot order, the reader's ids returned
+  unchanged for `Separate`, and `ok` cleared exactly when a normalized axis has extent 0.
+- `test_ir_image_coordinates_execution.cpp` (Vulkan, live compute backend): `image_load` 2D
+  (consecutive and NSA), 2D A16, 3D NSA, and `image_sample_lz` 2D and 3D on a FORCE_UNNORMALIZED
+  S#, Wave64 and Wave32, on the vector harness's program with a texture T# at s[16:23]. Every lane
+  has its own coordinates; inactive lanes keep their old VDST; integer lanes past the image read 0
+  (robustImageAccess, #3531); sampled lanes hit texel centres with point filtering. The NSA and A16
+  arms put a poison value in v3, which they must not read. The interpreter cannot run an image
+  access, so this binary is registered beside `test_ir_buffer_store_execution`, not in the
+  `ir_test` list.
+
+Mutations that went red: the `Separate` axes read in reverse (core, lowering, and every
+`Separate` and sampled execution arm); A16's y offset 16 -> 15 (core and the A16 arm); axis 0
+normalized by the height (core and both sampled arms); the zero-extent refusal dropped (lowering).
+
+### Gate and controls
+
+Witness: `PROSPER_IR_WITNESS_DIR=~/<slug>-witness-src ./test_ir_image_coordinates_execution
+--gtest_filter='*Exports*'`, then `recompile_corpus.py harvest ~/<slug>-witness --root
+~/<slug>-witness-src`: 12 entries, the six arms in two wave sizes (6 distinct programs).
+
+| | recorded corpus (1,442 modules) | witness (12) |
+| --- | --- | --- |
+| the relocation | `changes: none` | |
+| the migration | `changes: none` | `changes: none` |
+| `Packed16`: y extracted before x | output-changed 3 | output-changed 2 (of 10, before the 3D sample arm was added) |
+| `normalize`: the multiply with swapped operands | `changes: none` | output-changed 4 |
+| `Separate` | no SPIR-V of its own | no SPIR-V of its own |
+
+The recorded corpus never reaches the FORCE_UNNORMALIZED form on these two paths, so the witness
+is the only gate for it. `Separate` emits nothing that a byte comparison could see; its control is
+the reversed-read mutation above, which every `Separate` execution arm catches.
+
+### The remaining MIMG value groups
+
+**A hazard every remaining coordinate group shares:** the old code computes those coordinates as
+nested arguments of one access call, for example
+`b.image_sample_bias_2d(binding, normalized_spatial(vread(cvg(1)), w), normalized_spatial(vread(cvg(2)), h), vread(cvg(0)), out)`.
+C++ leaves the order of those arguments unspecified, so the order of the reads and of the
+reciprocal constants is whatever the compiler chose. The definition must reproduce that order:
+write it, run the gate, and let the byte comparison decide; build a witness first, because the
+recorded corpus does not reach FORCE_UNNORMALIZED. Never hoist the arguments into statements in the
+relocation commit; that is a behaviour change the gate will report.
+
+| group | who | why |
+| --- | --- | --- |
+| Operand-first 2D coordinates: `_b` (bias first), `_o` / `_lz_o` (offset first), `_d` (four gradients scaled per axis), the 2D-array sample's `au`/`av` | Codex, using this recipe | pure; the bias, offset and layer stay operands of the access, and the argument-order hazard above applies |
+| Gather coordinates (`gather4_lz`, `gather4_lz_o`, the float-array layer) | Codex, using this recipe | pure; the channel select from DMASK and the gather itself stay |
+| CUBE stacked-face transform (`uf`, `vf`, `layer`, `v6`) | Codex, using this recipe | pure float math on three reads; the face layout is a renderer contract (CONFIDENCE: MED in the code), so keep the expressions exactly |
+| D16 result packing (`write_mimg_results`' packed halves, the gather's `pack_half2x16`) | Codex, value-only | the packed word is pure; `vreg_old` / `predicate_write` stay per word and interleave with it, so the definition is per output word |
+| Storage store data (`mimg_store_components`) and the DST_SEL routing selects | Codex, value-only | pure selection and conversion; the store and the refusals stay |
+| Dynamic `image_load_mip` clamp (`UMin(mip, levels - 1)`) | Codex, value-only | pure; `materialized_mip_levels` and the shape admission are facts passed in |
+| Compute atomic-buffer flat index and bound (`row`, `index`, `active`) | lead | the bound is the safety contract for an image atomic, which Vulkan leaves undefined out of range |
+| `image_bvh_intersect_ray` | lead | one exact contract behind a descriptor gate and a null-BVH proof, with clamped node loads inside the value |
+| Implicit-LOD and derivative forms (`image_sample` in fragment, `image_get_lod`, `_d` gradients' LOD use) | lead | quad derivatives; only their coordinates are value |
+| T#/S# resolution, admission, `mimg_sources`, the access and the result write | lead | provenance and proof state (the list at the top of this section) |
 
 ## Family list and order
 
@@ -1150,7 +1302,8 @@ and leave the reserved ones in the `switch`.
 | 18 | Cross-lane values: `v_writelane_b32` (native dynamic selector), `v_permlane16/x16_b32`, the compute DPP16 SRC0 transforms, `ds_swizzle_b32` and the native `ds_bpermute_b32`, and the fragment static-lane readlane | Codex, using the cross-lane recipe ("Cross-lane operations"); `v_readlane_b32`'s native value is done |
 | - | `v_readfirstlane_b32`, fragment DPP `quad_perm` (`dpp_quad`), DPP8, the portable `ds_bpermute`, `ds_permute`, and the readlane/writelane scratch, lane-slot, mask-half and NGG paths | lead (cross-lane), see "The remaining cross-lane members" |
 | 19 | Memory values: the MUBUF/MTBUF PC-relative table, format decode and store packing; the DS address; the SMEM dynamic index; the FLAT window address | Codex, value-only, using the memory recipe ("Memory instructions"); the MUBUF/MTBUF address is **done** (`ops/buffer_address.cpp`) |
-| - | `v_movrel*`, `s_movrel*`, and the memory families' access and proof state: SMEM routes, descriptor resolution, FLAT/GLOBAL, MIMG, DS atomics (see "The remaining memory groups") | lead (proof and definedness) |
+| 19a | MIMG values: the operand-first, gather and CUBE coordinates, D16 result packing, storage store data and DST_SEL selects, the dynamic mip clamp | Codex, using the MIMG recipe ("Image instructions (MIMG)"); the plain-2D and 3D spatial coordinates are **done** (`ops/image_coordinates.cpp`) |
+| - | `v_movrel*`, `s_movrel*`, and the memory families' access and proof state: SMEM routes, descriptor resolution, FLAT/GLOBAL, MIMG resolution/admission/LOD/atomics/BVH, DS atomics (see "The remaining memory groups" and "The remaining MIMG value groups") | lead (proof and definedness) |
 | - | SOPP, `rdna2_emit_cfg.cpp`, the SOP `*_routes.cpp` | lead (control flow, mask routes) |
 
 ## Byte-identical, or explained

@@ -15,6 +15,11 @@ them, so the folder cannot fold one. Their lowerings are `lower/vop3_cross_lane.
 The first memory definition is the MUBUF/MTBUF address (`ops/buffer_address.cpp`, lowered by
 `lower/buffer_address.cpp`): the address arithmetic only. The access and every descriptor, provenance
 and proof step stay in emit_alu's MUBUF/MTBUF case (`HOW_TO_ADD_A_FAMILY.md`, "Memory instructions").
+The first image definition is the MIMG spatial coordinates of the plain-2D and 3D paths
+(`ops/image_coordinates.cpp`, lowered by `lower/image_coordinates.cpp`): the A16 unpack and the
+FORCE_UNNORMALIZED scale. The T#/S# resolution, the MIMG source proof (emit_alu passes
+`vread(cvg(k))` as the reader), the access and the result write stay in emit_alu's MIMG case
+(`HOW_TO_ADD_A_FAMILY.md`, "Image instructions (MIMG)").
 Everything here is private to `gpu/recompiler`.
 
 | path | role |

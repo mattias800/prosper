@@ -3787,8 +3787,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 if (!b.declare_texture(res->binding, Dim_3D, uint_texture)) {
                     ok = false; return true;
                 }
-                const auto coords3 = ir::lower_image_coordinates_3d(
-                    b, res, is_load, [&](uint32_t k) { return vread(cvg(k)); }, normalized_spatial);
+                // ir/ops/image_coordinates.cpp; the reader keeps the MIMG source proof per slot.
+                const auto coords3 = ir::lower_image_coordinates(
+                    b, ok,
+                    {3, ir::ImageCoordinateForm::Separate,
+                     !is_load && normalize_sampler_coordinates,
+                     {res->width, res->height, res->depth}},
+                    [&](uint32_t k) { return vread(cvg(k)); });
                 const uint32_t cu = coords3[0], cv = coords3[1], cw = coords3[2];
                 if (is_sample)      b.image_sample_3d(res->binding, cu, cv, cw, out);
                 else if (is_load)   b.image_fetch_3d(res->binding, cu, cv, cw, out);
@@ -3992,9 +3997,14 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                         normalized_spatial(vread(cvg(2)), res->width),
                         normalized_spatial(vread(cvg(3)), res->height), out);
                 } else {
-                    const auto coords2 = ir::lower_image_coordinates_2d(
-                        b, in, res, is_load, [&](uint32_t k) { return vread(cvg(k)); },
-                        normalized_spatial);
+                    const auto coords2 = ir::lower_image_coordinates(
+                        b, ok,
+                        {2,
+                         in.mimg_a16 ? ir::ImageCoordinateForm::Packed16
+                                     : ir::ImageCoordinateForm::Separate,
+                         !is_load && normalize_sampler_coordinates,
+                         {res->width, res->height, 0u}},
+                        [&](uint32_t k) { return vread(cvg(k)); });
                     const uint32_t cu = coords2[0], cv = coords2[1];
                     if (is_sample)         b.image_sample_2d(res->binding, cu, cv, out);
                     else if (is_sample_lz) b.image_sample_lod_2d(res->binding, cu, cv, b.uconst(0), out);      // LOD 0
