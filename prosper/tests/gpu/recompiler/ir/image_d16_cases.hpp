@@ -6,6 +6,7 @@
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <cstddef>
 #include <vector>
 namespace prosper::test::ir::image_d16 {
 inline constexpr uint32_t kLanes = 64, kW = 64, kH = 4;
@@ -75,7 +76,7 @@ inline std::vector<uint32_t> buffer_words(const Data& in) {
 }
 inline std::vector<uint32_t> texture_words() {
     std::vector<uint32_t> out;
-    out.reserve(kW * kH * 4);
+    out.reserve(std::size_t{kW} * kH * 4);
     for (uint32_t yy = 0; yy < kH; ++yy)
         for (uint32_t xx = 0; xx < kW; ++xx)
             for (uint32_t c = 0; c < 4; ++c) out.push_back(texel(xx, yy, c).f32);
@@ -93,8 +94,9 @@ inline uint32_t expected(const Arm& a, const Data& in, uint32_t lane, uint32_t w
         for (uint32_t c = 0; c < 4; ++c)
             if (a.dmask & (1u << c)) half.push_back(texel(x(lane), y(lane), c).f16);
     }
-    if (word * 2 >= half.size()) return in.old[word][lane];
-    return half[word * 2] | (word * 2 + 1 < half.size() ? half[word * 2 + 1] << 16 : 0u);
+    const std::size_t at = std::size_t{word} * 2;
+    if (at >= half.size()) return in.old[word][lane];
+    return half[at] | (at + 1 < half.size() ? half[at + 1] << 16 : 0u);
 }
 inline LaneProgram program(const Arm& a, uint32_t wave, uint64_t buffer = 0, uint64_t image = 0,
                            bool d16 = true, bool integer = false) {
@@ -131,7 +133,7 @@ inline LaneProgram program(const Arm& a, uint32_t wave, uint64_t buffer = 0, uin
     t.height = kH;
     t.declared_mip_levels = 1;
     t.gpu_addr = image;
-    t.size = kW * kH * 4u * sizeof(uint32_t);
+    t.size = kW * kH * 4u * uint32_t{sizeof(uint32_t)};
     for (uint32_t c = 0; c < 4; ++c) t.swizzle[c] = 4 + c;
     t.mag_filter = t.min_filter = 0;
     p.table.resources.push_back(t);

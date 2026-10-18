@@ -3,7 +3,6 @@
 #include "gpu/recompiler/ir/image_d16_cases.hpp"
 #include "gpu/recompiler/ir/vector_compare_harness.hpp"
 #include "gpu/execute/gpu_execute.hpp"
-#include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "shared/live/live_compute.hpp"
 #include <gtest/gtest.h>
