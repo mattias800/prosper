@@ -1,18 +1,21 @@
 # `gpu/recompiler/ir/cfg` — the guest CFG and its region tree
 
-Step 1 of `docs/architecture/IR_CONTROL_FLOW_PLAN.md`. One control-flow graph built once from the
-decoded program (`guest_cfg`), and the structured regions derived from it (`region_tree`). Both
-are plain data: building them allocates no SPIR-V id and calls no `SpirvCompute`, so they cannot
-change an emitted byte. **Nothing in emission reads them yet.** Their only user is the shadow
-check (`region_shadow`), which compares the region tree with `detect_forward_ifs` in a gtest over
+Steps 1 and 4 of `docs/architecture/IR_CONTROL_FLOW_PLAN.md`. One control-flow graph built once
+from the decoded program (`guest_cfg`), and the structured regions derived from it
+(`region_tree`): ifs (step 1) and loops (step 4). Both are plain data: building them allocates no
+SPIR-V id and calls no `SpirvCompute`, so they cannot change an emitted byte. **Nothing in emission
+reads them yet.** Their only user is the shadow check (`region_shadow`), which compares the region
+tree with `detect_forward_ifs`, `detect_divergent_loops` and `detect_counted_loop` in a gtest over
 the committed fixtures and in `shader_inspect --cfg-regions` over the corpus. A consumer switches
 over in a later step, after its own shadow check agrees.
 
 | path | role |
 | --- | --- |
 | `guest_cfg.hpp/.cpp` | `GuestBlock`, `GuestCfg`, `build_guest_cfg`: blocks, successors, preds, rpo, idom, back edges, reachability |
-| `region_tree.hpp/.cpp` | `Region`, `RegionTree`, `RegionPolicy`, `build_region_tree`: `Seq`, `Block`, `IfThen`, `IfElse`, `Unstructured` |
-| `region_shadow.hpp/.cpp` | the pc-level comparison with `detect_forward_ifs`, shared by the test and the census |
+| `region_tree.hpp/.cpp` | `Region`, `RegionTree`, `RegionPolicy`, `build_region_tree`; the walk, `Seq`, `Block`, `IfThen`, `IfElse`, `Unstructured` |
+| `region_loops.cpp` | `Loop` and `CountedLoop`: finding the loops in the CFG and admitting them |
+| `region_builder.hpp` | the builder class the two `.cpp` files share; internal, not an interface |
+| `region_shadow.hpp/.cpp` | the pc-level comparison with the three detectors, shared by the test and the census |
 
 Tests: `tests/gpu/recompiler/ir/test_ir_cfg_*.cpp`, one per source file.
 
@@ -43,17 +46,20 @@ each synchronized cross-lane service and splits around `s_trap`. Only `false` is
 
 ## `RegionPolicy`: what the tree may structure
 
-The rules are `detect_forward_ifs`' own (`../../rdna2_cfg_support.hpp`). The tree calls the same
-predicates, never a copy: `classify_forward_if_branch`, `resolve_forward_if_target`,
+The rules are the detectors' own (`../../rdna2_cfg_support.hpp`). The tree calls the same
+predicates, never a copy. Ifs: `classify_forward_if_branch`, `resolve_forward_if_target`,
 `compute_execz_region_admissible`, `wave_vcc_region_admissible`, `forward_if_workgroup_uniform`.
-A rule change goes there, and both structurers follow it.
+Loops: `counted_loop_backedge_candidate`, `counted_loop_from_backedge`,
+`counted_route_exec_guard`, `div_loop_backedge_candidate`, `div_loop_from_backedge`,
+`sort_div_loops_by_header`, `validate_div_loops`. A rule change goes there, and both structurers
+follow it.
 
 | Rule | Graphics (`allow_vcc`) | Compute (`compute_wave_branches`) |
 | --- | --- | --- |
 | `s_cbranch_scc0/1` | an if, unless in `linearized` (kill-mask tests, waterfalls) | an if, unless in `linearized` |
 | `s_cbranch_vccz/vccnz` | an if (a vote) | an if decided per guest wave (`wave_vote`) |
 | `s_cbranch_execz` | an if, unless in `linearized` (`safe_execz_branches`) | an if (a subgroup vote), unless in `linearized` |
-| `s_cbranch_execnz` | refused (only a loop back edge, step 4) | refused |
+| `s_cbranch_execnz` | refused, unless it is a loop's back edge | refused, unless it is a loop's back edge |
 | Neither flag set | VCC and EXECZ branches are refused | - |
 | Target | forward and at most `end_pc`; past `s_endpgm` only when the code there ends at once (an early-out, `merge = kNone`) | same |
 | Else | the block before the target ends in a forward `s_branch` whose target lies after the if's target and at or before `end_pc` | same |
@@ -62,7 +68,7 @@ A rule change goes there, and both structurers follow it.
 | Workgroup uniformity | - | VCC (#1554) and SCC (#3713) proofs set `uniform_workgroup` |
 
 Structure: each arm is built over its own block range, so a branch from one arm into another, a
-plain if leaving its range, an unclaimed `s_branch`, a call, or a back edge refuses. An if/else
+plain if leaving its range, an unclaimed `s_branch`, a call, or an unadmitted back edge refuses. An if/else
 whose merge lies past its enclosing range is accepted as the detector accepts it (the
 shared-outer-merge cascade) and recorded with `end_block < merge`. **Any refusal makes the whole
 program one `Unstructured` region**, which is today's behaviour: the detector refuses the program
@@ -76,3 +82,71 @@ the merge, not the arm), and a target or merge outside the decoded stream when t
 `test_ir_cfg_region_shadow`, and `emit_structured` refuses that program anyway (the vertex stage
 stops at the then-arm's `s_branch`), so the detector's admission is not a silent miscompile. The
 second is one truncated corpus dump.
+
+## Loops (step 4)
+
+**Finding them.** Every CFG back edge must end in a backward branch whose target block dominates
+its source (`idom`); anything else is `irreducible back edge`. Each back edge goes to the detector
+whose candidate it is: `counted_loop_backedge_candidate` (a backward `s_branch`, or a backward
+`s_cbranch_scc0/1` that is not a waterfall) and `div_loop_backedge_candidate` (those plus a
+backward `s_cbranch_execnz`, minus the stage's `linearized` set). A backward branch that is
+neither and is not linearized is refused. A linearized one (a waterfall, a safe EXECZ) is not a
+loop: its block is a plain `Block`. The CFG sees only reachable code, the detectors scan pcs; a
+loop nothing can reach is the one known difference (`AnUnreachableLoopIsADisagreement`).
+
+**Which route.** `emit_body`'s order:
+
+1. **Counted.** Exactly one counted candidate, and `counted_loop_from_backedge` accepts it. If a
+   divergent candidate lies before its header, `emit_body`'s prelude scan refuses and falls back to
+   the general route, and so does the tree. One after it (the counted postlude) is refused: the tree
+   does not model the postlude route yet.
+2. **Divergent.** Otherwise the divergent candidates in header order, through
+   `div_loop_from_backedge` and `validate_div_loops` (the pairs, per-loop, children and entry-edge
+   rules). One refusal refuses the program.
+
+On top of the rules, the tree checks in block terms that each loop is the contiguous range
+`[header, latch]`, entered only at its header and left only for the block after its latch.
+
+**Shapes.** A `Loop`/`CountedLoop` region covers `[header, latch + 1)`. `header` is the back
+edge's target, `continue_block` the latch (the block ending in the back edge), `merge` the block
+after it (`kNone` past the stream), and `exit_branch` the block ending in the canonical exit test.
+`children = {body}`, a `Seq` over the same range that starts with the header block. The back edge
+and the canonical exit are claimed: their blocks are plain `Block`s, never ifs.
+
+| Shape | Back edge | Exit test (`exit_branch`) | `condition.flag` | `loop.continue_on_set` |
+| --- | --- | --- | --- | --- |
+| top-tested EXEC | `s_branch` | first branch after the branch-free condition region: `s_cbranch_execz` to the merge | `Exec` | true |
+| top-tested VCC | `s_branch` | `s_cbranch_vccz` to the merge, if `vcc_exit_is_wave_uniform` or `fragment_wave_breaks` | `Vcc` | true |
+| top-tested SCC | `s_branch` | `s_cbranch_scc0` (continue while set) or `scc1` (leave while set) | `Scc` | scc0 |
+| execnz, header exit | `s_cbranch_execnz` | the header itself is the `execz` exit | `Exec` | true |
+| bottom-tested EXEC | `s_cbranch_execnz` | the back edge (`loop.bottom_tested`); the instruction before it writes EXEC | `Exec` | true |
+| bottom-tested SCC | `s_cbranch_scc0/1` | the back edge; one straight-line SOPC decides it (`scc_do_while_condition_pc`) | `Scc` | scc1 |
+| `CountedLoop` top-tested | `s_branch` | the single `s_cbranch_scc0/1` to the merge | `Scc` | scc0 |
+| `CountedLoop` do-while | `s_cbranch_scc0/1` | the back edge; no other exit | `Scc` | scc1 |
+
+**Breaks** (`Loop` only): a further forward `s_cbranch_vccz`/`execz` to the merge, listed in
+`breaks`. Each is an `IfThen` with `loop_break` whose arm is the rest of the loop body (latch
+included): the lowering skips to the back edge, where the cleared lane leaves at the next test. A
+break must sit at the top level of its loop body; inside an inner if it refuses
+(`break leaves its region`), as the detector's nesting check does. `loop.direct_exec_breaks`
+(an execz break with an `s_branch` back edge) and `loop.direct_wave_breaks` (a fragment vccz
+break) are the detector's flags, copied.
+
+**Nesting.** Ifs nest inside loop bodies and loops inside if arms and other loop bodies, each
+over its own block range; a loop leaving its enclosing range refuses. A forward if whose target
+follows an inner loop's latch is not an if/else: the latch's `s_branch` is a back edge.
+
+**Counted-loop proof inputs.** `CountedLoop` records what `counted_loop_from_backedge` proved:
+the header, the one exit test (or the do-while back edge), the back edge, the exit and its SCC
+polarity. The trip count itself is not proved here; the counted lowering reads it from the SCC
+compare as it does today. Inside the counted route an `s_cbranch_execz` in the loop, or one
+before it targeting the header or later (`counted_route_exec_guard`), is a plain `Block`: the
+counted lowering linearizes a guard it proves (`mark_counted_loop_exec_guards`) and `emit_alu`
+refuses the rest, so neither is an if.
+
+**Known shadow difference.** For a counted program the shadow compares only the loop. The
+counted route checks its prelude and postlude with separate `detect_forward_ifs` calls over
+truncated streams, and declines to the general route when the prelude scan refuses; the shadow
+models that decline only for a loop in the prelude. One corpus program shows the rest (the step 4a
+result in the plan): every route refuses it, and the shadow reports the counted detector's loop
+against the tree's refusal.

@@ -16,6 +16,7 @@ inline constexpr uint32_t kBarrier = 0xBF8A0000u;
 inline constexpr uint32_t kTrap = 0xBF920000u;
 inline constexpr uint32_t kSMovS0Zero = 0xBE800380u;   // s_mov_b32 s0, 0
 inline constexpr uint32_t kSMovVccLoZero = 0xBEEA0380u;   // s_mov_b32 vcc_lo, 0
+inline constexpr uint32_t kSMovExecZero = 0xBEFE0480u;   // s_mov_b64 exec, 0
 inline constexpr uint32_t kVNop = 0x7E000000u;   // v_nop
 inline constexpr uint32_t kSetpc = 0xBE802000u;   // s_setpc_b64 s[0:1]
 inline constexpr uint32_t kSwappc = 0xBE822100u;   // s_swappc_b64 s[2:3], s[0:1]
