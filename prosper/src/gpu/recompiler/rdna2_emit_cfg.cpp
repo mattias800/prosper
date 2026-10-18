@@ -66,6 +66,7 @@
 #include "gpu/recompiler/fragment_packet_mask_requirements.hpp"
 #include "gpu/recompiler/rdna2_structured_mask_reductions.hpp"
 #include "gpu/recompiler/rdna2_structured_saved_masks.hpp"
+#include "gpu/recompiler/ir/cfg/dispatch_blocks.hpp"
 
 namespace prosper::gpu {
 
@@ -493,6 +494,15 @@ bool emit_cfg_state_machine(
         start_set.insert(ins[i].pc);
         if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc) start_set.insert(ins[i + 1].pc);
     };
+    // The services this dispatcher synchronizes: the service predicate that SplitPolicy carries
+    // into build_guest_cfg (IR_CONTROL_FLOW_PLAN step 5).
+    std::unordered_set<uint32_t> service_pcs;
+    for (const auto& in : ins)
+        if (quad_or.contains(in.pc)) service_pcs.insert(in.pc);
+    auto split_service = [&](size_t i) {
+        service_pcs.insert(ins[i].pc);
+        split_around(i);
+    };
     std::unordered_map<uint32_t, uint32_t> mbcnt_event_for_pc;
     std::unordered_map<uint32_t, uint32_t> append_event_for_pc;
     bool has_gds_append = false;
@@ -542,18 +552,18 @@ bool emit_cfg_state_machine(
             !mbcnt_has_intrinsic_numeric_source(in)) {
             mbcnt_event_for_pc.emplace(in.pc,
                 static_cast<uint32_t>(mbcnt_event_for_pc.size()));
-            split_around(i);
+            split_service(i);
         }
         if (in.fmt == Rdna2Format::DS && (in.opcode == 0x3d || in.opcode == 0x3e)) {
             append_event_for_pc.emplace(in.pc,
                 static_cast<uint32_t>(append_event_for_pc.size()));
             if (in.ds_gds) has_gds_append = true;
             else has_lds_append = true;
-            split_around(i);
+            split_service(i);
         }
         if (in.fmt == Rdna2Format::DS && in.opcode == 0x35) {
             swizzle_pcs.insert(in.pc);
-            split_around(i);
+            split_service(i);
         }
         if (in.fmt == Rdna2Format::DS && in.opcode == kDsOpcodeBpermuteB32) {
             if (!b.is_compute || in.ds_gds ||
@@ -561,14 +571,14 @@ bool emit_cfg_state_machine(
                 return reject_cfg(in.pc, "ds-bpermute-native-wave-contract");
             bpermute_event_for_pc.emplace(
                 in.pc, static_cast<uint32_t>(bpermute_event_for_pc.size() + 1));
-            split_around(i);
+            split_service(i);
         }
         if (fragment_dpp_min_row_shr(in)) {
             fragment_dpp_min_row_shr_pcs.insert(in.pc);
             fragment_dpp_min_event_for_pc.emplace(
                 in.pc, static_cast<uint32_t>(fragment_dpp_min_event_for_pc.size() + 1));
             fragment_dpp_min_row_shr_dsts.insert(in.dst.value);
-            split_around(i);
+            split_service(i);
         }
         if (compute_dpp_row_shr(in)) {
             has_compute_dpp_row_maximum |= is_inplace_vmax_u32_dpp_row_shr(in);
@@ -577,7 +587,7 @@ bool emit_cfg_state_machine(
             compute_dpp_row_shr_pcs.insert(in.pc);
             compute_dpp_row_shr_event_for_pc.emplace(in.pc, next_compute_dpp_event++);
             compute_dpp_row_shr_dsts.insert(in.dst.value);
-            split_around(i);
+            split_service(i);
         }
         if (compute_dpp_row_ror8(in)) {
             has_compute_dpp_row_fadd |= dpp_row_ror8_op(in) == DppRowRor8Op::AddF32;
@@ -585,31 +595,31 @@ bool emit_cfg_state_machine(
             compute_dpp_ror8_event_for_pc.emplace(
                 in.pc, next_compute_dpp_event++);
             compute_dpp_row_ror8_dsts.insert(in.dst.value);
-            split_around(i);
+            split_service(i);
         }
         if (compute_dpp_add_row_mask(in)) {
             compute_dpp_add_row_mask_pcs.insert(in.pc);
-            split_around(i);
+            split_service(i);
         }
         if (packet_raw_masks.contains(in.pc))
-            split_around(i);
+            split_service(i);
         if (portable_mask_ffbh_candidate(in)) {
             portable_mask_ffbh_event_for_pc.emplace(
                 in.pc, static_cast<uint32_t>(portable_mask_ffbh_event_for_pc.size() + 1));
             portable_mask_ffbh_dsts.insert(in.dst.value);
-            split_around(i);
+            split_service(i);
         }
         if (portable_mask_reduction_candidate(in)) {
             portable_mask_reduction_event_for_pc.emplace(
                 in.pc, static_cast<uint32_t>(portable_mask_reduction_event_for_pc.size() + 1));
             portable_mask_reduction_dsts.insert(in.dst.value);
-            split_around(i);
+            split_service(i);
         }
         if (packet_wqm_candidate(in)) {
             packet_wqm_event_for_pc.emplace(
                 in.pc, static_cast<uint32_t>(packet_wqm_event_for_pc.size() + 1));
             packet_wqm_dsts.insert(in.dst.value);
-            split_around(i);
+            split_service(i);
         }
         if (owned_or_portable_readfirstlane_enabled(b) && in.fmt == Rdna2Format::VOP1 &&
             in.opcode == 0x02) {
@@ -618,7 +628,7 @@ bool emit_cfg_state_machine(
             portable_readfirstlane_event_for_pc.emplace(
                 in.pc, static_cast<uint32_t>(portable_readfirstlane_event_for_pc.size() + 1));
             portable_readfirstlane_dsts.insert(in.dst.value);
-            split_around(i);
+            split_service(i);
         }
         if (b.has_workgroup_execution() && !b.native_subgroup_size &&
             in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360 &&
@@ -626,14 +636,14 @@ bool emit_cfg_state_machine(
             portable_readlane_event_for_pc.emplace(
                 in.pc, static_cast<uint32_t>(portable_readlane_event_for_pc.size() + 1));
             portable_readlane_dsts.insert(in.dst.value);
-            split_around(i);
+            split_service(i);
         }
         if (synchronize_lds_fminmax && b.atomicized_lds_store_pcs.contains(in.pc)) {
             if (!b.is_compute || in.fmt != Rdna2Format::DS || in.ds_gds ||
                 b.local_count > b.wave_size)
                 return reject_cfg(in.pc, "lds-store-common-phase-contract");
             synchronized_lds_store_pcs.insert(in.pc);
-            split_around(i);
+            split_service(i);
         }
         if (synchronize_lds_fminmax && in.fmt == Rdna2Format::DS &&
             (in.opcode == kDsOpcodeMinF32 || in.opcode == kDsOpcodeMaxF32)) {
@@ -642,18 +652,18 @@ bool emit_cfg_state_machine(
                 b.compute_pgm_rsrc1 == UINT32_MAX)
                 return reject_cfg(in.pc, "lds-fminmax-common-phase-contract");
             lds_fminmax_pcs.insert(in.pc);
-            split_around(i);
+            split_service(i);
         }
         if (mask_zero_compare_candidate_source(in) >= 0)
-            split_around(i);
+            split_service(i);
         if (exec_saved_mask_compare_source(in) >= 0)
-            split_around(i);
+            split_service(i);
         if (saved_mask_pair_compare_sources(in)[0] >= 0)
-            split_around(i);
+            split_service(i);
         if (vopc_mask_zero_compare_source(in) >= 0)
-            split_around(i);
+            split_service(i);
         if (b64_mask_scc_vote_pcs.contains(in.pc))
-            split_around(i);
+            split_service(i);
         if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x12) {
             split_around(i);
             continue;
@@ -844,6 +854,14 @@ bool emit_cfg_state_machine(
                 add_successor(terminator->pc + terminator->len_dwords);
         }
         if (reads_dynamic_vector_range) vector_reads[block] = vregs;
+    }
+    {
+        ir::cfg::SplitPolicy split_policy;
+        split_policy.split_at_services = true;
+        split_policy.services = &service_pcs;
+        split_policy.linearized = graphics ? &safe : nullptr;
+        // Identical by the guard, so block_for_pc and the vectors above stay valid.
+        ir::cfg::adopt_guest_cfg_blocks(ins, split_policy, starts, successors);
     }
 
     // #3133's `entry_m0_may_hold` is a WHOLE-STREAM MAY set, and `load_state` stamps it at EVERY

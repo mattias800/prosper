@@ -5,6 +5,7 @@
 #include "gpu/execute/skippable_instruction.hpp"
 #include "gpu/recompiler/float64_support.hpp"
 #include "gpu/recompiler/float32_rte_support.hpp"
+#include "gpu/recompiler/ir/cfg/dispatch_blocks.hpp"
 #include "gpu/recompiler/ir/cfg/region_shadow.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
@@ -19,6 +20,7 @@
 #include <fstream>
 #include <ios>
 #include <iterator>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -363,6 +365,24 @@ int print_cfg_regions(const std::vector<Rdna2Inst>& instructions, const std::str
     return 0;
 }
 
+// --cfg-dispatch-blocks: one line per CFG dispatcher region the recompile below builds, saying
+// whether its blocks and successors equal build_guest_cfg's (dispatch_blocks.hpp), then a sentinel.
+// Printed when main returns, whichever mode produced the recompile.
+struct DispatchBlocksReport {
+    prosper::gpu::ir::cfg::DispatchBlocksCapture capture;
+    ~DispatchBlocksReport() {
+        for (const auto& record : capture.records()) {
+            std::printf("cfg-dispatch-blocks entry=%u verdict=%s blocks=%zu cfg-blocks=%zu "
+                        "services=%zu",
+                        record.entry_pc, record.adopted ? "equal" : "differ", record.blocks,
+                        record.cfg_blocks, record.services);
+            if (!record.adopted) std::printf(" difference=\"%s\"", record.difference.c_str());
+            std::printf("\n");
+        }
+        std::printf("cfg-dispatch-blocks-end regions=%zu\n", capture.records().size());
+    }
+};
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -384,6 +404,7 @@ int main(int argc, char** argv) {
     bool wave64 = false;
     bool synthetic_table = false;
     bool cfg_regions = false;
+    bool cfg_dispatch_blocks = false;
     std::string inputs_path;
     std::string spirv_out;
     bool bad_usage = false;
@@ -406,6 +427,8 @@ int main(int argc, char** argv) {
             synthetic_table = true;
         } else if (arg == "--cfg-regions") {
             cfg_regions = true;
+        } else if (arg == "--cfg-dispatch-blocks") {
+            cfg_dispatch_blocks = true;
         } else if (arg == "--inputs") {
             if (i + 1 >= argc)
                 bad_usage = true;
@@ -436,6 +459,7 @@ int main(int argc, char** argv) {
           raw_wide_proof || synthetic_table)) ||
         (cfg_regions && (stage.empty() || mimg_sites || skippable_mimg || wave_reasons ||
                          raw_wide_proof || synthetic_table || !inputs_path.empty())) ||
+        (cfg_dispatch_blocks && ((stage.empty() && inputs_path.empty()) || cfg_regions)) ||
         (!stage.empty() && stage != "vertex" && stage != "fragment" && stage != "compute")) {
         std::fprintf(stderr, "usage: %s <raw-rdna2.bin> [--stage vertex|fragment|compute]\n", argv[0]);
         std::fprintf(stderr,
@@ -451,6 +475,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
                      "       %s <raw-rdna2.bin> --cfg-regions --stage vertex|fragment|compute\n",
                      argv[0]);
+        std::fprintf(stderr,
+                     "       add --cfg-dispatch-blocks to a --stage or --inputs recompile\n");
         std::fprintf(
             stderr,
             "\n"
@@ -501,6 +527,12 @@ int main(int argc, char** argv) {
             "agree-structured, agree-linear, agree-loops, agree-counted, agree-refused, disagree\n"
             "(with the first difference).\n"
             "\n"
+            "--cfg-dispatch-blocks adds, after a --stage or --inputs recompile, one\n"
+            "`cfg-dispatch-blocks` line per CFG dispatcher region it built: `equal` when the\n"
+            "dispatcher's blocks and successors equal build_guest_cfg's service split\n"
+            "(IR_CONTROL_FLOW_PLAN step 5), else `differ` with the first difference. A\n"
+            "`cfg-dispatch-blocks-end regions=N` sentinel follows.\n"
+            "\n"
             "--synthetic-table (vertex/fragment only) fabricates one descriptor per use so the\n"
             "recompile runs past descriptor resolution. It is a COMPILE PROBE: a pass shows only\n"
             "that nothing outside descriptor resolution refuses the program, never that it is\n"
@@ -544,6 +576,8 @@ int main(int argc, char** argv) {
 
     std::vector<uint32_t> words(bytes.size() / sizeof(uint32_t));
     std::memcpy(words.data(), bytes.data(), bytes.size());
+    std::optional<DispatchBlocksReport> dispatch_blocks_report;
+    if (cfg_dispatch_blocks) dispatch_blocks_report.emplace();
     if (!inputs_path.empty())
         return replay_recorded_inputs(input_path, inputs_path, words, spirv_out);
     std::vector<Rdna2Inst> instructions;
