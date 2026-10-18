@@ -91,6 +91,7 @@
 #include <functional>
 #include "gpu/recompiler/ir/lower/vop1_conversion_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop1_float_source.hpp"
+#include "gpu/recompiler/ir/lower/vop1_dpp_source_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop3_half_integer_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop1_unary_float_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop1_unary_f16_lowering.hpp"
@@ -291,65 +292,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
         case Rdna2Format::VOP1: {
             uint32_t a = val(in.src[0]); uint32_t old_d = vreg_old(b, rs, in.dst.value);
             uint32_t dpp_active = 0;
-            // DPP16 quad_perm on src0 (#273): fragment shaders reconstruct the selected quad lane
-            // from derivatives. Compute shaders use the exact subgroup quad-swap operation for the
-            // three XOR permutations emitted by Astro Bot's blur kernels: horizontal (0xb1), vertical
-            // (0x4e), and diagonal (0x1b). Quad boundaries are architectural and remain exact even
-            // when the host subgroup width differs from the guest wave width.
-            if (in.has_dpp) {
-                const bool row_shr = in.dpp_ctrl >= 0x111u && in.dpp_ctrl <= 0x11Fu;
-                uint32_t row_xor = 0;
-                const bool row_ror8 = dpp_row_xor_ctrl(in.dpp_ctrl, &row_xor);
-                if (row_ror8) {
-                    // Direct shuffle is valid only when one native subgroup is exactly one guest
-                    // wave. Portable/default-subgroup compute is routed through synchronized CFG
-                    // scratch below. FI=0 makes an EXEC-inactive rotated source read as zero; a
-                    // ROW_ROR source is always in-range, so BOUND_CTRL does not decide this case.
-                    if (!b.is_compute || dpp_row_ror8_op(in) != DppRowRor8Op::MovB32 ||
-                        !b.native_subgroup_size) {
-                        ok = false; return true;
-                    }
-                    uint32_t valid_source = 0;
-                    const uint32_t rotated =
-                        b.subgroup_row_xor(a, rs.exec, row_xor, &valid_source);
-                    a = b.sel(valid_source, rotated, b.uconst(0));
-                } else if (row_shr) {
-                    // The portable NGG vertex shell represents the one live guest lane as lane 0.
-                    // Every non-zero row-right shift therefore addresses a lane before the start of
-                    // its row; BOUND_CTRL=1 supplies the architectural zero.  An unbounded access
-                    // retains the prior destination value and cannot be represented here, so reject.
-                    if (b.is_fragment || (!b.is_compute && !in.dpp_bound_ctrl) ||
-                        (b.is_compute && in.opcode != 0x01)) {
-                        ok = false; return true;
-                    }
-                    if (b.is_compute) {
-                        b.mark_subgroup_min16();
-                        const uint32_t shift = in.dpp_ctrl - 0x110u;
-                        const uint32_t lane = b.subgroup_local_id();
-                        const uint32_t row_lane = b.ibin(Op_BitwiseAnd, lane, b.uconst(15));
-                        dpp_active = b.ucmp(Op_UGreaterThanEqual, row_lane, b.uconst(shift));
-                        const uint32_t source_lane = b.sel(
-                            dpp_active, b.ibin(Op_ISub, lane, b.uconst(shift)), lane);
-                        const uint32_t shuffled = b.subgroup_shuffle(a, source_lane);
-                        a = in.dpp_bound_ctrl ? b.sel(dpp_active, shuffled, b.uconst(0))
-                                              : shuffled;
-                    } else {
-                        a = b.uconst(0);
-                    }
-                } else {
-                if (b.is_fragment) {
-                    if (in.opcode != 0x01) { ok = false; return true; }
-                    a = b.dpp_quad(a, in.dpp_ctrl);
-                } else if (b.is_compute) {
-                    // DPP transforms SRC0 before the VOP1 operation. v_mov and the numeric
-                    // v_cvt_u32_f32 used by UE light-grid kernels are lane-pure afterward.
-                    if (in.opcode != 0x01 && in.opcode != 0x07) { ok = false; return true; }
-                    a = b.subgroup_quad_permute(a, in.dpp_ctrl);
-                } else {
-                    ok = false; return true;
-                }
-                }
-            }
+            if (auto routed = ir::lower_vop1_dpp_source(b, rs, in, ok, a, dpp_active))
+                return *routed;
             ir::lower_vop1_float_source(b, in, a);
             ir::select_vop1_conversion_source(b, in, a);
             ir::select_vop1_integer_source(b, in, a);
