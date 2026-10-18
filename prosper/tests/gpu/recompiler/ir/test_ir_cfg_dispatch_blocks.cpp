@@ -40,7 +40,9 @@ GuestCfg service_cfg(const std::vector<Rdna2Inst>& ins,
     return build_guest_cfg(ins, policy);
 }
 
-std::vector<uint32_t> starts_of(const GuestCfg& cfg) { return dispatch_blocks(cfg).starts; }
+std::vector<uint32_t> starts_of(const GuestCfg& cfg) {
+    return dispatch_blocks(cfg).starts;
+}
 
 TEST(IrDispatchBlocks, AServiceIsABlockOfItsOwn) {
     const auto ins = walk({kSMovS0Zero, kVNop, kSMovS0Zero, kEndpgm});
@@ -85,8 +87,9 @@ TEST(IrDispatchBlocks, SuccessorsListTheTakenEdgeFirstWithoutRepeats) {
               (Successors{{2, 1}, {2}, {}}));
     EXPECT_EQ(dispatch_blocks(service_cfg(walk({sopp(kScc0, 0), kEndpgm}))).successors,
               (Successors{{1}, {}}));
-    EXPECT_EQ(dispatch_blocks(service_cfg(walk({sopp(kBranch, 1), kSMovS0Zero, kEndpgm}))).successors,
-              (Successors{{2}, {2}, {}}));
+    EXPECT_EQ(
+        dispatch_blocks(service_cfg(walk({sopp(kBranch, 1), kSMovS0Zero, kEndpgm}))).successors,
+        (Successors{{2}, {2}, {}}));
 }
 
 TEST(IrDispatchBlocks, CodeAfterTheFirstEndpgmIsOutsideTheGraph) {
@@ -156,10 +159,11 @@ TEST(IrDispatchBlocks, TheDifferenceNamesTheFirstSuccessorMismatch) {
 // targets pc 6, the literal of the s_mov at pc 5. The dispatcher starts a case there; the graph
 // cannot, so the guard keeps the dispatcher's own blocks and the recompile is unchanged.
 TEST(IrDispatchBlocks, TheDispatcherKeepsItsOwnBlocksForATargetInsideALiteral) {
-    const std::vector<uint32_t> words{sopp(kScc1, 1), kSMovS0Zero,   kSMovS0Zero, sopp(kScc0, -3),
-                                      sopp(kVccz, 1), kSMovS0Literal, 7u,         kEndpgm};
+    const std::vector<uint32_t> words{sopp(kScc1, 1), kSMovS0Zero,    kSMovS0Zero, sopp(kScc0, -3),
+                                      sopp(kVccz, 1), kSMovS0Literal, 7u,          kEndpgm};
     DispatchBlocksCapture capture;
-    const auto spirv = recompile_compute(words.data(), words.size(), nullptr, ComputeShaderConfig{});
+    const auto spirv =
+        recompile_compute(words.data(), words.size(), nullptr, ComputeShaderConfig{});
     EXPECT_FALSE(spirv.empty());
     ASSERT_EQ(capture.records().size(), 1u);
     EXPECT_FALSE(capture.records()[0].adopted);
