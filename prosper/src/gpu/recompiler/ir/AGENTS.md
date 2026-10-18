@@ -30,6 +30,7 @@ Everything here is private to `gpu/recompiler`.
 | `emit/` | the SPIR-V half of every opcode: a Block emitted through `SpirvCompute`, in Block order |
 | `ops/` | ONE definition per guest operation (`scalar_alu.cpp`, `scalar_compare.cpp`, `vector_alu.cpp`), used by both evaluation and emission |
 | `lower/` | RDNA2 -> IR per format: `sop1.cpp`, `sop2.cpp`, `sopc.cpp`, `sopk.cpp`, `vop2.cpp`, the relocated `*_routes.cpp` / `*_stages.cpp`, and `lowering_context.hpp` (emit_alu's shared locals) |
+| `cfg/` | control flow as IR data (IR_CONTROL_FLOW_PLAN step 1): the guest CFG and its region tree, shadow-checked against `detect_forward_ifs`; nothing in emission reads them yet. See `cfg/AGENTS.md` |
 | `HOW_TO_ADD_A_FAMILY.md` | the recipe for migrating the next family |
 
 **The boundary that matters: `ops/` holds semantics, `lower/` holds bookkeeping.** A definition in

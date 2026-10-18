@@ -1699,3 +1699,44 @@ TEST(Rdna2InstructionEffectsRegression, Sop1SccPredicatesComeFromTheTable) {
     EXPECT_TRUE(sop1_opcode_is_saveexec_b32(0x45)) << "s_orn1_saveexec_b32";
     EXPECT_FALSE(sop1_opcode_is_saveexec_b64(0x2c)) << "s_quadmask_b32";
 }
+
+// The PC effect of every row (IR_CONTROL_FLOW_PLAN step 1: ir/cfg/guest_cfg reads it instead of
+// keeping its own branch-opcode list). Exactly these named instructions change the PC; every other
+// row, reserved rows included, continues at the next instruction.
+TEST(Rdna2InstructionEffects, ControlFlowIsExactlyThePcChangingInstructions) {
+    using C = Rdna2ControlFlow;
+    const std::map<std::string, C> expected = {
+        {"s_endpgm", C::End},
+        {"s_endpgm_saved", C::End},
+        {"s_endpgm_ordered_ps_done", C::End},
+        {"s_code_end", C::End},
+        {"s_branch", C::Jump},
+        {"s_cbranch_scc0", C::BranchScc0},
+        {"s_cbranch_scc1", C::BranchScc1},
+        {"s_cbranch_vccz", C::BranchVccz},
+        {"s_cbranch_vccnz", C::BranchVccnz},
+        {"s_cbranch_execz", C::BranchExecz},
+        {"s_cbranch_execnz", C::BranchExecnz},
+        {"s_trap", C::Trap},
+        {"s_setpc_b64", C::Indirect},
+        {"s_swappc_b64", C::IndirectCall},
+        {"s_rfe_b64", C::Indirect},
+        {"s_call_b64", C::Call},
+        {"s_cbranch_cdbgsys", C::DebugBranch},
+        {"s_cbranch_cdbguser", C::DebugBranch},
+        {"s_cbranch_cdbgsys_or_user", C::DebugBranch},
+        {"s_cbranch_cdbgsys_and_user", C::DebugBranch},
+    };
+    size_t seen = 0;
+    for (const auto& row : rdna2_instruction_effects_rows()) {
+        const char* name = row.effects.name;
+        const auto it = name ? expected.find(name) : expected.end();
+        if (it == expected.end()) {
+            EXPECT_EQ(row.effects.control, C::None) << (name ? name : "reserved row");
+            continue;
+        }
+        ++seen;
+        EXPECT_EQ(row.effects.control, it->second) << name;
+    }
+    EXPECT_EQ(seen, expected.size());
+}
