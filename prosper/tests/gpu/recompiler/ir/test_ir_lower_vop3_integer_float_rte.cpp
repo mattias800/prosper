@@ -176,3 +176,45 @@ TEST_F(IrLowerVop3IntegerFloatRte, PresentStorageDoesNotBypassTheExistingMaskAnd
             EXPECT_FALSE(has_mode(t.b));
         }
 }
+
+TEST_F(IrLowerVop3IntegerFloatRte, RecordedCapabilityAndRequestSurviveOppositeAmbientPublication) {
+    for (bool capable : {false, true}) {
+        reset_float32_rte_support_for_test();
+        publish_float32_rte_support(capable, true, true);
+        const auto in = LoweringFixture::decode(cases::words({0x185}));
+        LoweringFixture first;
+        first.b.compute_pgm_rsrc1 = 0x30000;
+        first.rs.vreg[2] = first.b.load_input(0);
+        CompilerChoiceTrace recorded;
+        {
+            CompilerChoiceScope recording(recorded);
+            EXPECT_EQ(lower_vop3_integer_float_rte(first.b, first.rs, in, first.ok), capable);
+        }
+        ASSERT_TRUE(recorded.error.empty());
+        ASSERT_EQ(recorded.reads.size(), 1u);
+        EXPECT_EQ(recorded.reads[0], (CompilerChoiceRead{CompilerChoice::Float32Rte, capable}));
+        reset_float32_rte_support_for_test();
+        publish_float32_rte_support(!capable, true, true);
+        LoweringFixture replayed;
+        replayed.b.compute_pgm_rsrc1 = 0x30000;
+        replayed.rs.vreg[2] = replayed.b.load_input(0);
+        {
+            CompilerChoiceScope replay(static_cast<const CompilerChoiceTrace&>(recorded));
+            EXPECT_EQ(lower_vop3_integer_float_rte(replayed.b, replayed.rs, in, replayed.ok),
+                      capable);
+            EXPECT_NO_THROW(replay.finish_replay());
+        }
+        EXPECT_EQ(replayed.b.code, first.b.code);
+        EXPECT_EQ(replayed.b.exec, first.b.exec);
+        EXPECT_EQ(has_mode(replayed.b), capable);
+        CompilerChoiceSet request;
+        request.set(CompilerChoice::Float32Rte, capable);
+        LoweringFixture supplied;
+        supplied.b.compute_pgm_rsrc1 = 0x30000;
+        supplied.rs.vreg[2] = supplied.b.load_input(0);
+        CompilerChoiceScope use_request(request);
+        EXPECT_EQ(lower_vop3_integer_float_rte(supplied.b, supplied.rs, in, supplied.ok), capable);
+        EXPECT_EQ(supplied.b.code, first.b.code);
+        EXPECT_EQ(has_mode(supplied.b), capable);
+    }
+}

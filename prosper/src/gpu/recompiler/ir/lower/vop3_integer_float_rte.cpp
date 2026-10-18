@@ -15,7 +15,11 @@ bool lower_vop3_integer_float_rte(SpirvCompute& b, RegState& rs, const Rdna2Inst
     const auto mode = launch_float_mode(b);
     // Preserve the previous unmatched boundary until BOTH guest and executing-device
     // rounding authority exist. A CPU evaluator's nominal RTE is not device authority.
-    if (!mode.mode_available || (mode.mode & 3u) != 0 || !float32_rte_admitted()) return false;
+    if (!mode.mode_available || (mode.mode & 3u) != 0) return false;
+    const auto rte32 = compiler_choice(CompilerChoice::Float32Rte, [] {
+        return float32_rte_admitted() ? int64_t{1} : int64_t{0};
+    });
+    if (rte32 != 1) return false;
     const uint32_t selector = in.words[1] & 0x1ffu;
     if (in.src[0] != decode_src_field(selector)) return false;
     const bool ordinary_sgpr = in.src[0].kind == OperandKind::SGPR;
