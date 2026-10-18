@@ -8,7 +8,6 @@
 
 namespace prosper::gpu {
 
-
 // Complex CFG dispatch and the narrow loop structurizers persist B64 mask values, but not the
 // separate one-word-validity state required by Wave32 aliases. Conservatively find any B32 mask
 // copy that the region could create. The source set is deliberately path-insensitive: a pair made a
