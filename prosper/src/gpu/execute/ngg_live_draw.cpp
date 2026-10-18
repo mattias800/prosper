@@ -7,6 +7,8 @@
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/state/graphics_float_mode.hpp"
 #include "gpu/recompiler/ngg_subgroup_abi.hpp"
+#include "gpu/recompiler/compiler_choices.hpp"
+#include "gpu/recompiler/float32_rte_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/resources/shader_resources.hpp"
 
@@ -91,6 +93,7 @@ std::vector<uint32_t> pixel_input_shape(const PixelInputMapping* mapping) {
 // Everything a compiled stage depends on besides W (see the header's CACHING note).
 struct StageKey {
     GraphicsFloatMode float_mode{};
+    bool float32_rte = false;
     std::vector<uint32_t> program;   // the linked chain, compared exactly
     ResourceKey resources;
     std::vector<uint32_t> pixel_inputs;   // pixel_input_shape()
@@ -118,6 +121,7 @@ struct StageKeyHash {
         hash = mix(hash, key.float_mode.ieee_mode);
         hash = mix(hash, key.float_mode.fp16_overflow.available);
         hash = mix(hash, key.float_mode.fp16_overflow.saturate);
+        hash = mix(hash, key.float32_rte);
         hash = mix(hash, key.interpolation_layout);
         hash = mix(
             hash,
@@ -391,6 +395,7 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
 
     StageKey key;
     key.float_mode = input.registers.float_mode;
+    key.float32_rte = float32_rte_admitted();
     key.program = *input.linked;
     key.resources = resource_key(input.resources, input.linked);
     key.pixel_inputs = pixel_input_shape(input.pixel_inputs);
@@ -505,6 +510,9 @@ NggLiveDrawResult realize_ngg_live_draw(const NggLiveDrawInput& input,
         }
         const std::lock_guard compile_lock(entry->compile);
         if (!entry->attempted[waves]) {
+            CompilerChoiceSet choices;
+            choices.set(CompilerChoice::Float32Rte, key.float32_rte);
+            CompilerChoiceScope supplied(choices);
             entry->stages[waves] =
                 compile_ngg_subgroup_stages(request, waves, &entry->refusal[waves]);
             entry->attempted[waves] = true;
