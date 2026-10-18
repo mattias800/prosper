@@ -3948,6 +3948,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                                        host_array || declared_arrayed)) {
                     ok = false; return true;
                 }
+                ir::ImageOperandCoordinateNormalizer operand_spatial{b, ok,
+                                                                     normalize_sampler_coordinates};
                 if (msaa_array_fetch || load_2d_array || mip_load_2d_array) {
                     b.image_fetch_2d_array(
                         res->binding, vread(cvg(0)), vread(cvg(1)), vread(cvg(2)), out);
@@ -3959,8 +3961,8 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     // across every textured surface -- correct in compute, wrong on a wall.
                     // image_sample_2d_array picks implicit or explicit by stage exactly as the
                     // non-array image_sample_2d does, so compute behaviour is preserved bit for bit.
-                    const uint32_t au = normalized_spatial(vread(cvg(0)), res->width);
-                    const uint32_t av = normalized_spatial(vread(cvg(1)), res->height);
+                    const uint32_t au = operand_spatial(vread(cvg(0)), res->width);
+                    const uint32_t av = operand_spatial(vread(cvg(1)), res->height);
                     const uint32_t layer = vread(cvg(2));
                     if (is_sample)
                         b.image_sample_2d_array(res->binding, au, av, layer, out);
@@ -3969,31 +3971,25 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                             res->binding, au, av, layer,
                             is_sample_l ? vread(cvg(3)) : b.uconst(fbits(0.0f)), out);
                 } else if (is_sample_b) {      // vaddr order for _b: [bias, u, v]
-                    b.image_sample_bias_2d(
-                        res->binding,
-                        normalized_spatial(vread(cvg(1)), res->width),
-                        normalized_spatial(vread(cvg(2)), res->height),
-                        vread(cvg(0)), out);
+                    b.image_sample_bias_2d(res->binding, operand_spatial(vread(cvg(1)), res->width),
+                                           operand_spatial(vread(cvg(2)), res->height),
+                                           vread(cvg(0)), out);
                 } else if (is_sample_o) {   // vaddr order for _o: [packed offset, u, v]
                     b.image_sample_offset_2d(
-                        res->binding, normalized_spatial(vread(cvg(1)), res->width),
-                        normalized_spatial(vread(cvg(2)), res->height), vread(cvg(0)), out);
+                        res->binding, operand_spatial(vread(cvg(1)), res->width),
+                        operand_spatial(vread(cvg(2)), res->height), vread(cvg(0)), out);
                 } else if (is_sample_lz_o) {   // vaddr order for _o: [packed offset, u, v]
                     b.image_sample_lz_offset_2d(
-                        res->binding,
-                        normalized_spatial(vread(cvg(1)), res->width),
-                        normalized_spatial(vread(cvg(2)), res->height),
-                        vread(cvg(0)), out);
+                        res->binding, operand_spatial(vread(cvg(1)), res->width),
+                        operand_spatial(vread(cvg(2)), res->height), vread(cvg(0)), out);
                 } else if (
                     is_sample_d) {   // vaddr order for _d: [Ds/Dx, Dt/Dx, Ds/Dy, Dt/Dy, u, v]
-                    b.image_sample_grad_2d(
-                        res->binding,
-                        normalized_spatial(vread(cvg(4)), res->width),
-                        normalized_spatial(vread(cvg(5)), res->height),
-                        normalized_spatial(vread(cvg(0)), res->width),
-                        normalized_spatial(vread(cvg(1)), res->height),
-                        normalized_spatial(vread(cvg(2)), res->width),
-                        normalized_spatial(vread(cvg(3)), res->height), out);
+                    b.image_sample_grad_2d(res->binding, operand_spatial(vread(cvg(4)), res->width),
+                                           operand_spatial(vread(cvg(5)), res->height),
+                                           operand_spatial(vread(cvg(0)), res->width),
+                                           operand_spatial(vread(cvg(1)), res->height),
+                                           operand_spatial(vread(cvg(2)), res->width),
+                                           operand_spatial(vread(cvg(3)), res->height), out);
                 } else {
                     const auto coords2 = ir::lower_image_coordinates(
                         b, ok,

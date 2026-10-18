@@ -5,6 +5,7 @@
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include "shared/live/live_compute.hpp"
 
 #include <gtest/gtest.h>

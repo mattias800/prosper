@@ -46,6 +46,10 @@ struct ImageCoordinateBlock {
     std::array<Value, 3> coord;   // the first `axes` are valid
 };
 
+// Shared per-axis value, after the caller has read its word. This appends the original
+// reciprocal constant before the multiply; it never resolves an address or changes proof state.
+Value build_normalized_image_coordinate(Builder& ir, Value coordinate, uint32_t extent);
+
 // Builds the definition. Inputs and constants are appended where the pre-IR emitter read the
 // address VGPR or allocated the constant, so the emitted SPIR-V is the old SPIR-V.
 ImageCoordinateBlock build_image_coordinates(const ImageCoordinateShape& shape);
