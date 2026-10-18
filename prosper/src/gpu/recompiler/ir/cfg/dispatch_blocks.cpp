@@ -1,6 +1,8 @@
 // dispatch_blocks.cpp -- see dispatch_blocks.hpp and AGENTS.md.
 #include "gpu/recompiler/ir/cfg/dispatch_blocks.hpp"
 
+#include "gpu/recompiler/ir/cfg/exec_value_census.hpp"
+
 #include <algorithm>
 #include <utility>
 
@@ -62,6 +64,7 @@ bool adopt_guest_cfg_blocks(std::span<const Rdna2Inst> ins, const SplitPolicy& p
                             std::vector<std::vector<uint32_t>>& successors) {
     DispatchBlocks own{starts, successors};
     const GuestCfg cfg = build_guest_cfg(ins, policy);
+    exec_census_program(cfg, ins, true);   // step 7a shadow: each block is a dispatcher case
     DispatchBlocks from_cfg = dispatch_blocks(cfg);
     DispatchBlocksRecord record;
     record.services = static_cast<size_t>(

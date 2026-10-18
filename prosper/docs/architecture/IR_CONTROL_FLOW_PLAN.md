@@ -522,6 +522,29 @@ inside an instruction, where the dispatcher starts a case at a pc no decoded ins
 computation and the guard stay: without them such a program would no longer get a case at
 that pc. `Unstructured` regions are not marked yet.
 
+**Step 7a result** (`ir/cfg/exec_values`, `ir/cfg/exec_value_census`; contract in
+`ir/cfg/AGENTS.md`). Every EXEC definition has a static value (`Entry`, `Write`, `Phi`,
+`DispatchReload`), and the subset and complement relations are the ones the emitter's recognisers
+record, stated over those values. Nothing in emission reads them: the corpus gate against
+`f0be48728` reports `changes: none` (4,000 entries, 1,444 SPIR-V modules compared). `shader_inspect
+--cfg-exec-values` over the corpus (each program by `--stage`, `--synthetic-table` for graphics and
+every sidecar by `--inputs`; 10,214 runs, 2,470 of them reaching `exec_within`) answers each
+`exec_within` call and complement read again from the static relations: of 426,613 `exec_within`
+answers, 421,455 are equal, 4,100 static-stronger, **0 static-weaker** and 1,058 unmapped; of
+333,524 complement reads, 327,411 are equal, 6,113 static-stronger and 0 static-weaker. The first
+run had 5 weaker answers and 4 weaker complement reads, all from one shape (`s_cselect_b64 s[N:N+1],
+exec, 0` then `s_mov_b64 exec, s[N:N+1]`): a move into EXEC from a pair holding no known mask now
+names that pair with the new value, as S_MOV_B64 copies it. The stronger answers are a SPIR-V id the
+emitter replaced while the guest value did not change (2,220 at joins where every edge carries the
+same value, 476 at a move from a saved EXEC the emitter rebuilt from words, 91 at dispatcher reloads)
+and chains of relations the emitter records only in part (1,313). The unmapped ones are ids no
+instruction hook sees: 534 with the reader unmapped, such as the merge phi of two structured ifs
+that share one guest merge block (the graph has one phi there); 446 with the owner unmapped,
+mostly at dispatcher case entries, all of which the SPIR-V relation answers no too; 78 with both. Removing the
+compare rule from the static pass makes 147,327 answers static-weaker, and removing the complement
+rule 34,440 complement reads, so the census does see a missing rule. Step 7b maps `ExecValue` to
+SPIR-V ids in emission and makes `exec_subset_of` a view of these relations.
+
 **When the parked red tests become fixable:**
 
 - `indirect_pointer_descriptor_range` has two gaps (#5202). The first, charging a Wave32 lane-mask

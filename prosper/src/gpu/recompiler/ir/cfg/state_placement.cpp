@@ -2,6 +2,7 @@
 // "State placement" section of AGENTS.md (the inventory rules and where they differ).
 #include "gpu/recompiler/ir/cfg/state_placement.hpp"
 
+#include "gpu/recompiler/ir/cfg/exec_value_census.hpp"
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 
@@ -249,6 +250,7 @@ StatePlacement place_state(const GuestCfg& cfg, const RegionTree& tree,
 
 StatePlacement place_state(const std::vector<Rdna2Inst>& ins, const RegionPolicy& policy) {
     const GuestCfg cfg = build_guest_cfg(std::span<const Rdna2Inst>(ins), SplitPolicy{});
+    exec_census_program(cfg, ins, false);   // step 7a shadow: the structured route's program
     return place_state(cfg, build_region_tree(cfg, ins, policy), ins);
 }
 
