@@ -239,20 +239,6 @@ TEST(CfgSpilledMaskHalves, TheRebuiltMaskReplacesAStaleVcc) {
             << "lane " << lane << ": EXEC is the rebuilt mask, not the stale VCC (x < 8)";
 }
 
-TEST(CfgSpilledMaskHalves, HalvesThatAreNotOneProvenPairStayRefused) {
-    EXPECT_TRUE(compile(kEdgeBetweenReloadAndMove).empty())
-        << "a dispatcher edge between the reloads and the move ends the reloaded halves' facts";
-    EXPECT_TRUE(compile(kHalvesOfTwoInstances).empty())
-        << "halves spilled from two different saved-mask instances are not one mask";
-    EXPECT_TRUE(compile(kSwappedHalves).empty()) << "the halves must be low in sN, high in sN+1";
-    EXPECT_TRUE(compile(kHighHalfOverwritten).empty())
-        << "a write between the reload and the move ends the high half's fact";
-    // A regression pin only: the portable dispatcher refuses this program for its own reasons, so
-    // it stays refused even with the rule's native-Wave64 gate removed (measured).
-    EXPECT_TRUE(compile(kReassembled, /*native_subgroup_size*/ 0).empty())
-        << "without an exact native Wave64 subgroup the program stays refused";
-}
-
 namespace {
 std::vector<uint32_t> run_native(const std::vector<uint32_t>& spv) {
     std::vector<uint32_t> out;
@@ -262,6 +248,52 @@ std::vector<uint32_t> run_native(const std::vector<uint32_t>& spv) {
     return out;
 }
 }   // namespace
+
+// These four programs were refused until #5439. None rebuilds the spilled mask as a mask fact (an
+// edge ends the reloaded halves' facts; two instances, swapped halves or an overwritten high half
+// are not one proven pair), but each reload publishes its exact word (a ballot of the spilled Bool,
+// AReloadedHighHalfReadsAsItsExactUpperWord), so `s_mov_b64 vcc, s[2:3]` copies two genuine data
+// words. Since #5439 the dispatcher persists both words of that move (it persisted VCC_LO alone),
+// and the restore `s_mov_b64 exec, vcc` in the next block rebuilds EXEC from them. So each
+// program now compiles and must compute the ARCHITECTURAL result of the words it actually moved:
+// the swapped pair is lanes 0..7 and 32..63, and the overwritten high half leaves lanes 0..31.
+// Restoring the one-word charge for VCC alone refuses all four again (measured).
+TEST(CfgSpilledMaskHalves, HalvesThatAreNotOneProvenPairRestoreExecFromTheirWords) {
+    struct Case {
+        const char* name;
+        std::vector<uint32_t> spv;
+        uint32_t (*want)(uint32_t);
+    };
+    const auto spilled_mask = [](uint32_t lane) {
+        return lane < 16 ? 107u : lane < 40 ? 100u : 0u;
+    };
+    const Case cases[] = {
+        {"a dispatcher edge between the reloads and the move", compile(kEdgeBetweenReloadAndMove),
+         spilled_mask},
+        {"halves of two saved-mask instances", compile(kHalvesOfTwoInstances), spilled_mask},
+        {"swapped halves: vcc = 0xffffffff'000000ff", compile(kSwappedHalves),
+         [](uint32_t lane) {
+             return lane < 8 ? 107u : lane < 16 ? 7u : lane < 32 ? 0u : 100u;
+         }},
+        {"high half overwritten: vcc = 0x00000000'ffffffff", compile(kHighHalfOverwritten),
+         [](uint32_t lane) { return lane < 16   ? 107u
+                                    : lane < 32 ? 100u
+                                                : 0u; }},
+    };
+    for (const Case& c : cases) ASSERT_FALSE(c.spv.empty()) << c.name;
+    // A regression pin only: the portable dispatcher refuses this program for its own reasons, so
+    // it stays refused even with the rule's native-Wave64 gate removed (measured).
+    EXPECT_TRUE(compile(kReassembled, /*native_subgroup_size*/ 0).empty())
+        << "without an exact native Wave64 subgroup the program stays refused";
+    if (!prosper::test::default_compute_required_subgroup_supported(64u, kLanes))
+        GTEST_SKIP() << "the device cannot require a 64-lane compute subgroup";
+    for (const Case& c : cases) {
+        const auto out = run_native(c.spv);
+        ASSERT_EQ(out.size(), kLanes) << c.name;
+        for (uint32_t lane = 0; lane < kLanes; ++lane)
+            EXPECT_EQ(out[lane], c.want(lane)) << c.name << ", lane " << lane;
+    }
+}
 
 TEST(CfgSpilledMaskHalves, ReloadedHalvesFeedAB64LogicalAsTheSpilledMask) {
     const std::vector<uint32_t> spv = compile(kVopcHalvesIntoLogical, 64, true, true, 0x50610010u);

@@ -242,23 +242,24 @@ packet false), which is not the textbook "every register written":
 | VINTRP | VDST, except P1 (`rdna2_vintrp_is_p1`: the native lowering folds it into P2) | - |
 | DS | `rdna2_vgpr_write_count` | - |
 | MUBUF, MTBUF, MIMG, FLAT | `rdna2_vgpr_write_count`, plus the TFE status VGPR | - |
-| SOP1 | the SDST field, one word | finer: `s_mov_b64` and every pair result charge the low word; coarser: rows that write nothing (`s_setpc_b64`) charge the field |
+| SOP1 | one word; the pair for a 64-bit result its lowering writes as scalar data (`s_mov_b64`, `s_bitreplicate_b64_b32`, `s_getpc_b64`); the low word for a mask-domain pair and for EXEC (`sop1_phi_words`) | finer: the SAVEEXEC/WREXEC families, `s_not_b64`, `s_wqm_b64` and `s_quadmask_b64` charge their low word (their value lives in the mask domain; the numeric `s_wqm_b64` route and `s_quadmask_b64` do write both data words, so their high word gets no phi, #5441); coarser: `s_mov_b64`/`s_bitreplicate_b64_b32` into EXEC charge `s126` although they write `rs.exec` only, an M0-relative destination charges the field, and rows that write nothing (`s_setpc_b64`) charge the field |
 | SOPK | the SDST word when the table says it writes one (or does not know) | - |
 | SOP2 | one word; the pair for a 64-bit scalar-data result; nothing for a 64-bit shift into EXEC | finer: a 64-bit bitwise op of two pairs (`s_and_b64`, ...) charges its low word: its value lives in the mask domain |
 | SMEM | what SDATA receives; one register for a reserved encoding | - |
 | VOPC, SOPC, SOPP, EXP | nothing | VCC, SCC and EXEC have their own phis |
 
 **Where the placement and the emitter's scan differ: nowhere, per instruction.** Both charge SOP2
-through `sop2_phi_words` (`state_placement.hpp`). Until #5436 the scan named three opcodes
-(`s_cselect_b64`, `s_lshl_b64`, `s_lshr_b64`) and charged the low word alone for `s_ashr_i64`,
+through `sop2_phi_words` and SOP1 through `sop1_phi_words` (`state_placement.hpp`). Until #5436
+the scan named three opcodes (`s_cselect_b64`, `s_lshl_b64`, `s_lshr_b64`) and charged the low word alone for `s_ashr_i64`,
 `s_bfe_u64`, `s_bfe_i64` and `s_bfm_b64`, although their lowerings write both words: a high SGPR
 written in an arm got no merge phi and kept an arm-local value that does not dominate the merge.
 It also charged one or two words for `s_lshl_b64`, `s_ashr_i64` and `s_bfe_*` into EXEC, which now
 charge nothing. `s_bfm_b64` into EXEC charges the pair, since its sources are not a pair; its
 lowering writes only the per-lane EXEC value, so that is an over-charge. The CFG dispatcher's
 persisted set comes from the same scan, so it now also keeps `s107` after `s_bfe_u64`/`s_bfm_b64`
-into VCC and `s127` after `s_bfm_b64` into EXEC. The SOP1 pair results keep their one-word charge
-and have the same defect (#5439).
+into VCC and `s127` after `s_bfm_b64` into EXEC. SOP1 had the same defect until #5439: one word
+for every row, so `s_mov_b64` and `s_bitreplicate_b64_b32` into an SGPR pair dropped the high word
+at every merge. The mask-domain and EXEC rows keep the one word they had.
 
 **The guard** (`take_placed_if_equal`). The emitter computes its own set as before and takes the
 placement's only when the two are equal element for element; a missing placement or any
