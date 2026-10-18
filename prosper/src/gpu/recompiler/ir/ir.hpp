@@ -165,6 +165,9 @@ enum class Opcode : uint8_t {
     F64UnordGt,
     F64UnordNe,
     F64UnordGe,
+    // MIMG D16 only: inexact half conversions evaluate to unknown (#5420).
+    ImagePackHalfLo,
+    ImagePackHalf2,
     // Cross-lane values (HOW_TO_ADD_A_FAMILY.md, "Cross-lane operations"). Their result depends on
     // other invocations of the host subgroup, so `evaluate` (one invocation; the constant folder)
     // never knows one. eval_lanes.hpp evaluates a Block over an explicit vector of invocations.

@@ -55,6 +55,10 @@ public:
     Value f32eq(Value a, Value b) { return cmp(Opcode::F32Eq, a, b); }
     Value f32clamp01(Value a) { return block_.append({Opcode::F32Clamp01, Type::U32, 0, {a}}); }
     Value pack_half_lo(Value a) { return block_.append({Opcode::PackHalfLo, Type::U32, 0, {a}}); }
+    Value image_pack_half_lo(Value a) {
+        return block_.append({Opcode::ImagePackHalfLo, Type::U32, 0, {a}});
+    }
+    Value image_pack_half2(Value a, Value b) { return u32(Opcode::ImagePackHalf2, a, b); }
     Value pack_normalized_field(Value a, uint32_t width, bool is_signed) {
         const uint32_t mode =
             width >= 2 && width <= 16 ? width | (uint32_t(is_signed) << 8) : 0xffffffffu;

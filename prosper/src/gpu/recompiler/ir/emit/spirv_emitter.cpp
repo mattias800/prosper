@@ -47,6 +47,8 @@ uint32_t emit_one(SpirvCompute& b, const Inst& inst, const uint32_t* x) {
             return is_signed ? b.fext2(Glsl_FMax, value, b.bcu(b.fconstf(-1.0f))) : value;
         }
         case Opcode::PackHalfLo: return b.pack_half_lo(x[0]);
+        case Opcode::ImagePackHalfLo: return b.pack_half_lo(x[0]);
+        case Opcode::ImagePackHalf2: return b.pack_half2x16(x[0], x[1]);
         case Opcode::PackNormalizedField: {
             const uint32_t width = inst.imm & 31u;
             const bool is_signed = (inst.imm & 0x100u) != 0;

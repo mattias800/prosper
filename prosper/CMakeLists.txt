@@ -3836,6 +3836,8 @@ if(TARGET prosper_core)
           ir_buffer_address
           ir_buffer_address_execution
           ir_lower_buffer_address
+          ir_image_d16_values
+          ir_lower_image_d16
           ir_image_coordinates
           ir_image_mip_clamp
           ir_lower_image_mip_clamp
@@ -6297,6 +6299,12 @@ endif()
       # The MIMG coordinate definition (ir/ops/image_coordinates.cpp) on the live Vulkan compute
       # backend: per-lane coordinates, partial EXEC, both wave sizes, and the out-of-range read
       # that robustImageAccess makes 0. The interpreter cannot run an image access.
+      prosper_add_gtest(test_ir_image_d16_execution
+        SOURCES tests/gpu/recompiler/ir/test_ir_image_d16_execution.cpp
+        INCLUDES frontends src tests
+        LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan
+        PROPERTIES TIMEOUT 120)
+
       prosper_add_gtest(test_ir_image_coordinates_execution
         SOURCES tests/gpu/recompiler/ir/test_ir_image_coordinates_execution.cpp
         INCLUDES frontends src tests

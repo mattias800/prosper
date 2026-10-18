@@ -8,6 +8,7 @@
 #include "gpu/recompiler/ir/lower/flat_window_lowering.hpp"
 #include "gpu/recompiler/ir/lower/ds_address_lowering.hpp"
 #include "gpu/recompiler/ir/lower/image_coordinates_lowering.hpp"
+#include "gpu/recompiler/ir/lower/image_d16_lowering.hpp"
 #include "gpu/recompiler/ir/lower/image_mip_clamp_lowering.hpp"
 #include "gpu/recompiler/ir/lower/image_cube_coordinates_lowering.hpp"
 #include "gpu/recompiler/ir/lower/image_operand_coordinates_lowering.hpp"
@@ -3149,8 +3150,6 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 }
                 if (!d16_float_resource) return false;
 
-                uint32_t packed = b.uconst(0);
-                int component_index = 0;
                 int word_index = 0;
                 auto write_packed = [&](uint32_t value) {
                     const uint32_t old = vreg_old(b, rs, vd + word_index);
@@ -3158,20 +3157,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     predicate_write(b, rs, vd + word_index, old);
                     ++word_index;
                 };
-                for (uint32_t component = 0; component < 4; ++component) {
-                    if (!(in.mimg_dmask & (1u << component))) continue;
-                    const uint32_t half = b.pack_half_lo(out[component]);
-                    if ((component_index & 1) == 0) {
-                        packed = half;
-                    } else {
-                        packed = b.ibin(
-                            Op_BitwiseOr, packed,
-                            b.ibin(Op_ShiftLeftLogical, half, b.uconst(16)));
-                        write_packed(packed);
-                    }
-                    ++component_index;
-                }
-                if (component_index & 1) write_packed(packed); // odd dmask: high half is zero.
+                ir::lower_image_d16_results(b, in, out, write_packed);
                 return true;
             };
 
@@ -3907,7 +3893,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     for (uint32_t word = 0; word < 2; ++word) {
                         const uint32_t old = vreg_old(b, rs, vd + static_cast<int>(word));
                         rs.vreg[vd + static_cast<int>(word)] =
-                            b.pack_half2x16(out[word * 2], out[word * 2 + 1]);
+                            ir::lower_image_d16_gather_word(b, out, word);
                         predicate_write(b, rs, vd + static_cast<int>(word), old);
                     }
                 } else {

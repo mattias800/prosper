@@ -124,6 +124,8 @@ constexpr OpcodeInfo kInfo[] = {
     {"f64.unord.gt", 2, Type::Bool},
     {"f64.unord.ne", 2, Type::Bool},
     {"f64.unord.ge", 2, Type::Bool},
+    {"image.pack.half.lo", 1, Type::U32},
+    {"image.pack.half2", 2, Type::U32},
     {"lane.id", 0, Type::U32},
     {"shuffle", 2, Type::U32},
 };
