@@ -526,11 +526,13 @@ The carry-in is produced the way guest code produces one, by an earlier carry op
 `v_add_co_u32 v7, <mask>, v5, -1`); the cndmask selector by `v_cmp_ne_u32_e64` (`mask_from_s2`).
 Two harness traps, each found the hard way:
 
-- **In Wave32, the VOP3B `_co_ci` forms are refused** (`fabricated-fresh-mask-source`): the proof
-  reads SRC2 as the Wave64 pair the effects table charges it, and the second word is never written
-  (CONFIDENCE: MED, from reading the code; not A/B-tested). The refusal comes from emit_alu's
-  prologue (`refuse_mask_write`), which this migration does not touch, so it is the pre-IR verdict.
-  `Wave32RefusalsStay` pins it, and the witness exporter leaves those programs out of Wave32.
+- **In Wave32, a VOP3B `_co_ci` carry-in from `vcc_lo` is refused** (`fabricated-fresh-mask-source`):
+  the source marks still charge it VCC_HI, the only witness they have of an unprovided entry VCC
+  (`scalar_source_mark_words`), and the harness never writes VCC_HI. A carry-in from an SGPR or
+  from `vcc_hi` is charged its one word (ISA 70648 2.1, 6.2.3; #5202) and runs in both waves.
+  `Wave32RefusalsStay` pins the refusal, the witness exporter leaves those programs out of Wave32,
+  and `Wave32CarryInFromVccHiReadsItsOneWord` covers the carry-in from `vcc_hi` that
+  `indirect_pointer_descriptor_range`'s address add uses.
 - **`read_mask` reads VCC back with `v_cndmask_b32_e32`.** It was written that way because the
   e64 form read a stale VCC_LO lifetime after a VOP2 carry (#5348). That is fixed, and
   `E64CndmaskReadsTheVop2CarryNotTheStaleVccLo` covers the e64 reader. The VOP3B carry-in from
@@ -554,6 +556,10 @@ Witness: `PROSPER_IR_WITNESS_DIR=~/<slug>-witness/carry ./test_ir_vector_carry_e
 --gtest_filter='*Exports*'` (likewise `cndmask`), then `recompile_corpus.py harvest` on each. Each
 control is a neutral byte change in one definition: swapped IAdd operands for add, and a mirrored
 borrow `UGt(y, x)` for the subtractions.
+
+The table below records the original migration's controls, before #5202 expanded the carry
+witness from 60 programs to 72. Its counts apply to that historical 60-program set; they do not
+qualify the expanded witness. The exporter command above now emits 72 carry programs.
 
 | control | recorded corpus (1,442 modules) | carry witness (60) | cndmask witness (12) |
 | --- | --- | --- | --- |

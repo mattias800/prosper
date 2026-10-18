@@ -132,8 +132,13 @@ struct Rdna2InstructionEffects {
     // (SSRC0/SSRC1 for SALU, SRC0-SRC2 for VALU). 0 means the instruction has no such source.
     // SOPK and SOPP have no SSRC fields; SOPK forms that read their SDST field are not described
     // here yet. A VALU lane-mask source (SRC2 of v_cndmask_b32 and of the carry-in forms) is
-    // charged the Wave64 pair.
+    // charged the Wave64 pair; in Wave32 it is one SGPR (scalar_alu_source_words's wave-aware
+    // overload, #5202).
     uint8_t ssrc_dwords[3] = {0, 0, 0};
+    // SRC2 is a lane mask, one bit per lane (v_cndmask_b32_e64 and the VOP3B carry-in forms, ISA
+    // 70648 6.2.3): its ssrc_dwords entry is the Wave64 pair, and a Wave32 program reads only
+    // the named SGPR (2.1). The VOP2 forms read VCC implicitly and have no SRC2.
+    bool lane_mask_src2 = false;
     Rdna2M0Relative m0_relative = Rdna2M0Relative::None;
     Rdna2ExecEffect exec = Rdna2ExecEffect::None;
     // ---- Vector result (VALU rows; status Valu). ----
