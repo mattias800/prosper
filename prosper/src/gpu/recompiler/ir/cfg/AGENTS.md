@@ -248,23 +248,28 @@ packet false), which is not the textbook "every register written":
 | SMEM | what SDATA receives; one register for a reserved encoding | - |
 | VOPC, SOPC, SOPP, EXP | nothing | VCC, SCC and EXEC have their own phis |
 
-**Where the placement and the emitter's scan differ.** Only SOP2, because the scan names three
-opcodes (`s_cselect_b64`, `s_lshl_b64`, `s_lshr_b64`) and the table's rows for `s_lshl_b64`/`s_lshr_b64`
-equal those of `s_ashr_i64`/`s_bfe_u64`/`s_bfe_i64` field for field. Matching the scan would need
-an opcode list. The placement charges the pair for `s_ashr_i64`, `s_bfe_u64`, `s_bfe_i64` and
-`s_bfm_b64` (the scan charges the low word, although their lowerings write both), and nothing for
-`s_lshl_b64`, `s_ashr_i64` or `s_bfe_*` into EXEC (the scan charges one or two words). A join
-holding one of these keeps the emitter's set.
+**Where the placement and the emitter's scan differ: nowhere, per instruction.** Both charge SOP2
+through `sop2_phi_words` (`state_placement.hpp`). Until #5436 the scan named three opcodes
+(`s_cselect_b64`, `s_lshl_b64`, `s_lshr_b64`) and charged the low word alone for `s_ashr_i64`,
+`s_bfe_u64`, `s_bfe_i64` and `s_bfm_b64`, although their lowerings write both words: a high SGPR
+written in an arm got no merge phi and kept an arm-local value that does not dominate the merge.
+It also charged one or two words for `s_lshl_b64`, `s_ashr_i64` and `s_bfe_*` into EXEC, which now
+charge nothing. `s_bfm_b64` into EXEC charges the pair, since its sources are not a pair; its
+lowering writes only the per-lane EXEC value, so that is an over-charge. The CFG dispatcher's
+persisted set comes from the same scan, so it now also keeps `s107` after `s_bfe_u64`/`s_bfm_b64`
+into VCC and `s127` after `s_bfm_b64` into EXEC. The SOP1 pair results keep their one-word charge
+and have the same defect (#5439).
 
 **The guard** (`take_placed_if_equal`). The emitter computes its own set as before and takes the
 placement's only when the two are equal element for element; a missing placement or any
-difference keeps its own. So emission is byte-identical by construction, and the corpus gate
-reports `changes: none`. `if_join_regs` and `loop_join_regs` (`../../rdna2_cfg_registers.hpp`)
+difference keeps its own. Since #5436 the per-instruction inventories agree, so a difference can
+only come from the region ranges; the census over the shader corpus finds none. `if_join_regs` and `loop_join_regs` (`../../rdna2_cfg_registers.hpp`)
 and `LaneSlotLoopCarry::open` are the call sites. The dispatcher's sets, `loop_scalar_may_writes`,
 the PROSPER_DBG loop trace and `rdna2_vector_word_marks` still call `loop_written_regs` directly.
 
 **The census.** `StatePlacementCensus` (thread-local, RAII) records each guarded join: equal,
 differs (with the registers on each side) or absent (the tree has no such region). `shader_inspect
 --cfg-placement` prints it after any recompile (`--stage`, `--synthetic-table`, `--inputs`);
-`test_ir_cfg_state_placement` runs it over the committed fixtures, and its `withhold` mode
-compiles a differing program without the placement to show the guard keeps the module.
+`test_ir_cfg_state_placement` runs it over the committed fixtures, drives the guard directly with
+a differing placement, and uses `withhold` mode to show that taking an equal placement keeps the
+module.

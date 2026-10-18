@@ -83,19 +83,9 @@ void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t 
             case Rdna2Format::SOPK:
                 if (sopk_writes_scalar_data(in.opcode)) sregs.insert(in.dst.value);
                 break;
-            case Rdna2Format::SOP2:
-                // s_lshr_b64 -> EXEC is modeled only in the per-lane mask domain. It does not
-                // produce scalar SGPR data, so carrying a scalar value through a loop/if merge is
-                // both unnecessary and semantically wrong.
-                if (in.opcode != 0x21 || (in.dst.value != 126 && in.dst.value != 127)) {
-                    uint32_t words = 1;
-                    if (in.opcode == 0x0b)
-                        words = scalar_write_width(in);
-                    else if (in.opcode == 0x1f || in.opcode == 0x21)
-                        words = 2;
-                    for (uint32_t word = 0; word < words; ++word)
-                        sregs.insert(in.dst.value + static_cast<int>(word));
-                }
+            case Rdna2Format::SOP2:   // the instruction-effects table's widths (#5436)
+                for (uint32_t word = 0; word < ir::cfg::sop2_phi_words(in); ++word)
+                    sregs.insert(in.dst.value + static_cast<int>(word));
                 break;
             case Rdna2Format::SMEM: {   // the SGPRs SDATA may receive (the effects table)
                 // A reserved encoding keeps the old conservative one-register clobber.

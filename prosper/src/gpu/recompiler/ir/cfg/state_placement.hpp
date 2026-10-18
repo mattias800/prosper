@@ -58,6 +58,10 @@ struct StatePlacement {
 // The registers one instruction adds to a join's sets (the inventory the rules in AGENTS.md
 // describe). `max_vgpr` bounds an M0-relative destination.
 void add_phi_writes(const Rdna2Inst& in, int max_vgpr, PhiSets& out);
+// The SGPRs from SDST up that one SOP2 result charges, from the instruction-effects table: one
+// word; the pair for a 64-bit scalar-data result; nothing for a 64-bit shift into EXEC. The
+// emitter's scan (loop_written_regs) charges SOP2 through this too, so the two cannot disagree.
+uint32_t sop2_phi_words(const Rdna2Inst& in);
 
 // Every IfThen, IfElse, Loop and CountedLoop reachable from the root. Empty when the root is
 // Unstructured. `ins` is the instruction vector `cfg` and `tree` were built from.
