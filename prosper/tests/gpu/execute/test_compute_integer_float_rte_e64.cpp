@@ -110,6 +110,8 @@ TEST(ComputeIntegerFloatRteE64, EveryAdmittedFormRoundsAndPreservesInactiveWords
                 lanes += 64;
             }
         }
+    EXPECT_EQ(modules, 24u);
+    EXPECT_EQ(lanes, 4608u);
     RecordProperty("modules", modules);
     RecordProperty("lanes_checked", lanes);
     reset_float32_rte_support_for_test();

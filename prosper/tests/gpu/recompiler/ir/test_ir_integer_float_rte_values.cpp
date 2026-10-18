@@ -6,6 +6,7 @@
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include <gtest/gtest.h>
 #include <cstdint>
+#include <ios>
 using namespace prosper::gpu;
 using namespace prosper::gpu::ir;
 namespace cases = prosper::test::ir::integer_float_rte;
