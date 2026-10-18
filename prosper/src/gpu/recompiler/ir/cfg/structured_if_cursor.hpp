@@ -1,6 +1,8 @@
 // Structured-emission branch cursor. Register state and all joins remain in emit_body.
 #pragma once
 #include "gpu/recompiler/ir/cfg/region_tree.hpp"
+#include "gpu/recompiler/ir/cfg/guest_cfg.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include <cstdint>
 #include <cstddef>
 #include <vector>

@@ -3,6 +3,7 @@
 #include "gpu/recompiler/ir/cfg_structured_cases.hpp"
 #include "gpu/recompiler/ir/vector_compare_harness.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/ir/vector_lane_harness.hpp"
 #include <gtest/gtest.h>
 #include <cstdint>
 #include <cstddef>

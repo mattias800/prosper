@@ -4,6 +4,8 @@
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/ir/cfg_structured_cases.hpp"
 #include "gpu/recompiler/ir/cfg_streams.hpp"
+#include "gpu/recompiler/ir/cfg/region_tree.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include <gtest/gtest.h>
 #include <cstdint>
 #include <vector>
@@ -84,6 +86,8 @@ TEST(IrCfgStructuredCursor, TreePreorderConsumesEveryNestedAndSequentialRecord) 
         ASSERT_TRUE(cursor.uses_tree()) << "shape=" << shape;
         for (const auto& expected : fs) {
             EXPECT_EQ(cursor.next_pc(), expected.branch_pc);
+            EXPECT_EQ(cursor.next_before(expected.branch_pc - 1u), expected.branch_pc - 1u);
+            EXPECT_EQ(cursor.next_before(expected.branch_pc + 1u), expected.branch_pc);
             const auto actual = cursor.take();
             EXPECT_EQ(actual.found, expected.found);
             EXPECT_EQ(actual.branch_pc, expected.branch_pc);
@@ -112,23 +116,33 @@ TEST(IrCfgStructuredCursor, ARecordMismatchRetainsTheEntireDetectorSequence) {
     EXPECT_EQ(cursor.route(), StructuredIfCursor::Route::Mismatch);
     EXPECT_EQ(cursor.take().target_pc, fs[0].target_pc);
 }
-TEST(IrCfgStructuredCursor, IntoElseDisagreementKeepsDetectorAdmissionAndOrder) {
+TEST(IrCfgStructuredCursor, KnownDisagreementsKeepDetectorAdmissionAndOrder) {
     using namespace prosper::test::cfg_streams;
-    const std::vector<uint32_t> code{sopp(kScc0, 3), sopp(kScc1, 3), kVNop,  sopp(kBranch, 2),
-                                     kVNop,          kVNop,          kEndpgm};
-    const auto ins = walk(code);
-    bool refused = false;
-    const auto fs =
-        detect_forward_ifs(ins, true, code.data(), code.size(), nullptr, nullptr, &refused);
-    ASSERT_FALSE(refused);
-    ASSERT_EQ(fs.size(), 2u);
-    RegionPolicy policy;
-    policy.code = code.data();
-    policy.dwords = code.size();
-    StructuredIfCursor cursor(ins, fs, policy, refused);
-    EXPECT_FALSE(cursor.uses_tree());
-    EXPECT_EQ(cursor.route(), StructuredIfCursor::Route::Unstructured);
-    for (const auto& f : fs) EXPECT_EQ(cursor.take().branch_pc, f.branch_pc);
+    const std::vector<std::vector<uint32_t>> programs{
+        // An inner if targets the else arm, which the detector bounds only by the outer merge.
+        {sopp(kScc0, 3), sopp(kScc1, 3), kVNop, sopp(kBranch, 2), kVNop, kVNop, kEndpgm},
+        // #5415: no end marker leaves the detector's merge bound unbounded.
+        {sopp(kScc0, 2), kVNop, sopp(kBranch, 4), kVNop}};
+    for (const auto& code : programs) {
+        const auto ins = walk(code);
+        bool refused = false;
+        const auto fs =
+            detect_forward_ifs(ins, true, code.data(), code.size(), nullptr, nullptr, &refused);
+        ASSERT_FALSE(refused);
+        ASSERT_FALSE(fs.empty());
+        RegionPolicy policy;
+        policy.code = code.data();
+        policy.dwords = code.size();
+        StructuredIfCursor cursor(ins, fs, policy, refused);
+        EXPECT_FALSE(cursor.uses_tree());
+        EXPECT_EQ(cursor.route(), StructuredIfCursor::Route::Unstructured);
+        for (const auto& f : fs) {
+            const auto actual = cursor.take();
+            EXPECT_EQ(actual.branch_pc, f.branch_pc);
+            EXPECT_EQ(actual.target_pc, f.target_pc);
+            EXPECT_EQ(actual.merge_pc, f.merge_pc);
+        }
+    }
 }
 TEST(IrCfgStructuredCursor, WholeProgramLoopsAndDetectorRefusalsUseLegacyRecords) {
     using namespace prosper::test::cfg_streams;
@@ -141,4 +155,4 @@ TEST(IrCfgStructuredCursor, WholeProgramLoopsAndDetectorRefusalsUseLegacyRecords
     EXPECT_EQ(refused.route(), StructuredIfCursor::Route::DetectorRefused);
     EXPECT_EQ(refused.take().branch_pc, 3u);
 }
-} // namespace
+}   // namespace

@@ -2,6 +2,11 @@
 // No SPIR-V, register state or proof facts are created here; a disagreement retains Fs.
 #include "gpu/recompiler/ir/cfg/structured_if_cursor.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/ir/cfg/guest_cfg.hpp"
+#include "gpu/recompiler/ir/cfg/region_tree.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include <vector>
+#include <cstdint>
 #include <cstdlib>
 #include <tuple>
 namespace prosper::gpu::ir::cfg {
