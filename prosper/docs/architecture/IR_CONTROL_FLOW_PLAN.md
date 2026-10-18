@@ -548,6 +548,8 @@ that pc. `Unstructured` regions are not marked yet.
    ADR 0012 already covers. Step 8 makes one analysis the single owner of validity facts. That
    replaces most of the 37 analyses #5146 counts, and step 9 knowingly flips verdicts. That is an
    architectural decision for the owner, not a family migration.
+   Drafted as ADR 0038 (`docs/adr/0038-one-definedness-analysis.md`, proposed), which also
+   recommends an answer to question 4.
 2. **#5202 now or in step 10?** Adding an inside/outside split to `ScalarSourceMarks` now would
    unblock `indirect_pointer_descriptor_range` and some Kena guards sooner, at the cost of one more
    field that step 8 must reproduce exactly. Owner's call.

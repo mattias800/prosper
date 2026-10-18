@@ -205,6 +205,21 @@ provenance with their own write model.
 Status: proposed (adr:0027)
 Enforcement: adr:0027
 
+### GPU-6 -- a register word's validity has one analysis, queried by every route
+
+Whether a register word (SGPR, VGPR, VCC, EXEC, M0, SCC, a lane spill slot) holds a defined,
+arbitrary or hard value in the lanes a read uses, and in which mask domain, is answered by one
+dataflow analysis over the recompiler's CFG, solved once per compiled region before emission. The
+structured emitter, the dispatcher and its case reloads query it; none of them records or
+re-derives a validity fact of its own. An instruction whose effects the shared instruction-effects
+table cannot describe makes the words it may write hard, never defined. Descriptor provenance is
+`GPU-4`'s analysis, not this one.
+Violated today: the structured emitter records facts in `RegState` while it emits, and the
+dispatcher re-derives a coarser set in its own pre-pass and restores part of it at each case
+(`emit_cfg_state_machine`, `rdna2_spilled_mask_halves.cpp`, `rdna2_active_vector_words.cpp`).
+Status: proposed (adr:0038)
+Enforcement: adr:0038, review: (whether code derives a validity fact privately is a semantic property no scan can see; the analysis's shadow census reports disagreements between models, not a new private one)
+
 ### SYNC-1 -- one wait model, no host-thread identity across a fiber switch
 
 Every blocking guest wait goes through one model that names what it waits for. No state keyed by
