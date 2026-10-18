@@ -15,6 +15,8 @@
 #include "gpu/pm4/command_processor.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/ngg_subgroup_shell.hpp"
+#include "gpu/recompiler/compiler_choices.hpp"
+#include "gpu/recompiler/float32_rte_support.hpp"
 
 #include <gtest/gtest.h>
 
@@ -465,6 +467,59 @@ TEST_F(NggLiveDraw, IndependentHalfOverflowFactPartitionsStagesWithIdenticalShel
     }
     EXPECT_EQ(owners.size(), 3u);
     EXPECT_EQ(ngg_live_draw_cache_stats().stage_compiles, 3u);
+}
+
+namespace {
+NggLiveDrawInput inexact_integer_float_input() {
+    auto input = kena_input();
+    input.registers.float_mode = {true, 0x30, false};
+    auto words = std::make_shared<std::vector<uint32_t>>(*input.linked);
+    // Define an inexact integer and convert it before END. Earlier resource PCs stay unchanged.
+    // s_mov_b32 s50, 16777219; v_cvt_f32_i32_e64 v0, s50.
+    words->insert(words->end() - 1, {0xbeb203ffu, 0x01000003u, 0xd5850000u, 50u});
+    input.linked = words;
+    return input;
+}
+struct RestoreRte32 {
+    ~RestoreRte32() {
+        reset_float32_rte_support_for_test();
+        reset_ngg_live_draw_cache_for_test();
+    }
+};
+}   // namespace
+
+TEST_F(NggLiveDraw, Rte32PublicationInvalidatesCachedRefusalsAndAcceptedDraws) {
+    const RestoreRte32 restore;
+    const auto input = inexact_integer_float_input();
+    reset_float32_rte_support_for_test();
+    EXPECT_FALSE(realize_ngg_live_draw(input, radv()).draw);
+    publish_float32_rte_support(true, true, true);
+    const auto supported = realize_ngg_live_draw(input, radv());
+    EXPECT_TRUE(supported.draw) << supported.detail;
+    if (supported.draw) EXPECT_EQ(realize_ngg_live_draw(input, radv()).draw, supported.draw);
+
+    // A cold capable invocation independently proves this program is in the supported domain.
+    reset_ngg_live_draw_cache_for_test();
+    const auto cold = realize_ngg_live_draw(input, radv());
+    ASSERT_TRUE(cold.draw) << cold.detail;
+    publish_float32_rte_support(false, true, true);
+    EXPECT_FALSE(realize_ngg_live_draw(input, radv()).draw)
+        << "a cached capable module must not survive a weaker producing verdict";
+}
+
+TEST_F(NggLiveDraw, Rte32CompilationUsesItsOwnSnapshotAcrossAnOppositeOuterRequest) {
+    const RestoreRte32 restore;
+    const auto input = inexact_integer_float_input();
+    for (const bool capable : {false, true}) {
+        reset_ngg_live_draw_cache_for_test();
+        reset_float32_rte_support_for_test();
+        publish_float32_rte_support(capable, true, true);
+        CompilerChoiceSet outer;
+        outer.set(CompilerChoice::Float32Rte, !capable);
+        CompilerChoiceScope opposite(outer);
+        const auto result = realize_ngg_live_draw(input, radv());
+        EXPECT_EQ(bool(result.draw), capable) << result.detail;
+    }
 }
 
 TEST_F(NggLiveDraw, NothingCompilesOnceWarm) {
