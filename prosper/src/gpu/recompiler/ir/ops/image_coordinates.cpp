@@ -20,7 +20,8 @@ namespace {
 // pre-IR emitter allocated it (the constant before the multiply).
 Value normalized(Builder& ir, Value coordinate, uint32_t extent) {
     if (!extent) return ir.c32(0);
-    return ir.f32mul(coordinate, ir.c32(std::bit_cast<uint32_t>(1.0f / static_cast<float>(extent))));
+    return ir.f32mul(coordinate,
+                     ir.c32(std::bit_cast<uint32_t>(1.0f / static_cast<float>(extent))));
 }
 
 }   // namespace

@@ -51,7 +51,8 @@ protected:
 // Runs one arm and returns what each lane stored, or {} if it did not compile or execute.
 std::vector<uint32_t> run(cases::Arm arm, uint32_t wave, const LaneInputs& in, uint32_t index) {
     std::vector<uint32_t> words;
-    for (const auto* array : {&in.s0, &in.s1, &in.old_d}) words.insert(words.end(), array->begin(), array->end());
+    for (const auto* array : {&in.s0, &in.s1, &in.old_d})
+        words.insert(words.end(), array->begin(), array->end());
     for (bool active : in.active) words.push_back(active ? 1u : 0u);
     words.insert(words.end(), in.s2.begin(), in.s2.end());
     auto& buffer = keep_alive(std::move(words));
@@ -96,9 +97,12 @@ TEST_F(IrImageCoordinatesExecution, EveryLaneReadsItsOwnCoordinates) {
                 const uint32_t want = cases::expected(arm, in, lane);
                 EXPECT_EQ(got[lane], want) << "lane " << lane << std::hex << " s0 " << in.s0[lane]
                                            << " s1 " << in.s1[lane] << " s2 " << in.s2[lane];
-                if (!in.active[lane]) ++inactive;
-                else if (want == 0u) ++outside;
-                else ++data;
+                if (!in.active[lane])
+                    ++inactive;
+                else if (want == 0u)
+                    ++outside;
+                else
+                    ++data;
             }
             // The arm can see each property: lanes reading data, lanes past the image (the
             // integer arms), and lanes EXEC leaves alone.
@@ -118,8 +122,8 @@ TEST(IrImageCoordinatesCases, LanesUseDifferentCoordinates) {
         std::vector<uint32_t> seen;
         uint32_t xs = 0, ys = 0;
         for (uint32_t lane = 0; lane < cases::kLanes; ++lane) {
-            const auto c = cases::sampled(arm) ? cases::sampled_coordinates(lane)
-                                               : cases::coordinates(lane);
+            const auto c =
+                cases::sampled(arm) ? cases::sampled_coordinates(lane) : cases::coordinates(lane);
             xs |= 1u << (c.x % 32u);
             ys |= 1u << c.y;
             const uint32_t want = cases::expected(arm, in, lane);

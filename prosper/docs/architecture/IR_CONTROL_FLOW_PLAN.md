@@ -1,6 +1,6 @@
 ---
 kind: plan
-status: proposed
+status: current
 ---
 
 # Control flow and definedness on the recompiler IR

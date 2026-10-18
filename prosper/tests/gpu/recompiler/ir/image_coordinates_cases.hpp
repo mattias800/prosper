@@ -16,24 +16,28 @@ namespace prosper::test::ir::image_coordinates {
 inline constexpr uint32_t kLanes = 64, kW = 64, kH = 4, kD = 3;
 
 enum class Arm : uint32_t {
-    Load2d,          // image_load v1, v[2:3], s[16:23] dmask:0x1 dim:2D         (Separate, 2 axes)
-    Load2dNsa,       // image_load v1, [v2, v5], s[16:23] dmask:0x1 dim:2D       (Separate, NSA)
-    Load2dA16,       // image_load v1, v2, s[16:23] dmask:0x1 dim:2D a16         (Packed16)
-    Load3dNsa,       // image_load v1, [v2, v3, v5], s[16:23] dmask:0x1 dim:3D   (Separate, 3 axes)
-    SampleLz2dTexel, // image_sample_lz v1, v[2:3], s[16:23], s[24:27] dmask:0x1 dim:2D, on a
-                     // FORCE_UNNORMALIZED S#                                    (normalize)
-    SampleLz3dTexel, // image_sample_lz v1, [v2, v3, v5], s[16:23], s[24:27] dmask:0x1 dim:3D,
-                     // on a FORCE_UNNORMALIZED S#                               (normalize, 3 axes)
+    Load2d,   // image_load v1, v[2:3], s[16:23] dmask:0x1 dim:2D         (Separate, 2 axes)
+    Load2dNsa,   // image_load v1, [v2, v5], s[16:23] dmask:0x1 dim:2D       (Separate, NSA)
+    Load2dA16,   // image_load v1, v2, s[16:23] dmask:0x1 dim:2D a16         (Packed16)
+    Load3dNsa,   // image_load v1, [v2, v3, v5], s[16:23] dmask:0x1 dim:3D   (Separate, 3 axes)
+    SampleLz2dTexel,   // image_sample_lz v1, v[2:3], s[16:23], s[24:27] dmask:0x1 dim:2D, on a
+    // FORCE_UNNORMALIZED S#                                    (normalize)
+    SampleLz3dTexel,   // image_sample_lz v1, [v2, v3, v5], s[16:23], s[24:27] dmask:0x1 dim:3D,
+    // on a FORCE_UNNORMALIZED S#                               (normalize, 3 axes)
 };
-inline constexpr Arm kArms[] = {Arm::Load2d, Arm::Load2dNsa, Arm::Load2dA16, Arm::Load3dNsa,
-                                Arm::SampleLz2dTexel, Arm::SampleLz3dTexel};
+inline constexpr Arm kArms[] = {Arm::Load2d,    Arm::Load2dNsa,       Arm::Load2dA16,
+                                Arm::Load3dNsa, Arm::SampleLz2dTexel, Arm::SampleLz3dTexel};
 inline const char* name(Arm a) {
-    constexpr const char* names[] = {"Load2d", "Load2dNsa", "Load2dA16", "Load3dNsa",
-                                     "SampleLz2dTexel", "SampleLz3dTexel"};
+    constexpr const char* names[] = {"Load2d",    "Load2dNsa",       "Load2dA16",
+                                     "Load3dNsa", "SampleLz2dTexel", "SampleLz3dTexel"};
     return names[static_cast<uint32_t>(a)];
 }
-inline bool three_d(Arm a) { return a == Arm::Load3dNsa || a == Arm::SampleLz3dTexel; }
-inline bool sampled(Arm a) { return a == Arm::SampleLz2dTexel || a == Arm::SampleLz3dTexel; }
+inline bool three_d(Arm a) {
+    return a == Arm::Load3dNsa || a == Arm::SampleLz3dTexel;
+}
+inline bool sampled(Arm a) {
+    return a == Arm::SampleLz2dTexel || a == Arm::SampleLz3dTexel;
+}
 
 // The instruction words. MIMG word0: 0xf0000000 | op[6:0]<<18 | dmask<<8 | dim<<3 | nsa<<1;
 // word1: SSAMP/4 <<21 | SRSRC/4 <<16 | VDATA<<8 | VADDR, A16 = bit 30; NSA dword: address
@@ -105,8 +109,7 @@ inline uint32_t expected(Arm a, const LaneInputs& in, uint32_t lane) {
     if (!in.active[lane]) return in.old_d[lane];
     const Coordinates c = sampled(a) ? sampled_coordinates(lane) : coordinates(lane);
     if (sampled(a)) {
-        return std::bit_cast<uint32_t>(
-            static_cast<float>(texel(c.x, c.y, three_d(a) ? c.z : 0u)));
+        return std::bit_cast<uint32_t>(static_cast<float>(texel(c.x, c.y, three_d(a) ? c.z : 0u)));
     }
     if (!in_range(a, c)) return 0u;
     return texel(c.x, c.y, three_d(a) ? c.z : 0u);
@@ -120,8 +123,9 @@ inline std::vector<uint32_t> image_words(Arm a) {
     for (uint32_t z = 0; z < depth; ++z)
         for (uint32_t y = 0; y < kH; ++y)
             for (uint32_t x = 0; x < kW; ++x)
-                out.push_back(sampled(a) ? std::bit_cast<uint32_t>(static_cast<float>(texel(x, y, z)))
-                                         : texel(x, y, z));
+                out.push_back(sampled(a)
+                                  ? std::bit_cast<uint32_t>(static_cast<float>(texel(x, y, z)))
+                                  : texel(x, y, z));
     return out;
 }
 
