@@ -1202,8 +1202,7 @@ RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords,
         std::vector<Rdna2Inst> prefix;
         for (const auto& in : ins) {
             if (in.pc >= cL.header_pc) break;
-            if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x08 &&
-                branch_target(in) >= cL.header_pc) continue;
+            if (counted_route_exec_guard(in, cL)) continue;
             prefix.push_back(in);
         }
         Rdna2Inst prefix_end;

@@ -616,6 +616,17 @@ inline CountedLoop counted_loop_from_backedge(const std::vector<Rdna2Inst>& ins,
     return L;
 }
 
+// The counted route's EXEC guards: an s_cbranch_execz inside the counted loop [header, back-edge],
+// which counted_loop_from_backedge admits as predication, or one before the loop whose target lies
+// at or past the header (a wave-empty guard spanning the loop, kept out of the prelude's forward-if
+// scan). Neither is structured as an if: the counted lowering linearizes a guard it proves
+// (mark_counted_loop_exec_guards), and emit_alu proves full EXEC for the rest or refuses.
+inline bool counted_route_exec_guard(const Rdna2Inst& in, const CountedLoop& L) {
+    if (in.fmt != Rdna2Format::SOPP || in.opcode != 0x08) return false;
+    if (in.pc >= L.header_pc) return in.pc <= L.backedge_pc;
+    return branch_target(in) >= L.header_pc;
+}
+
 inline CountedLoop detect_counted_loop(const std::vector<Rdna2Inst>& ins) {
     // The single backward branch that closes the loop. A conditional scc0/scc1 back-edge is a
     // bottom-tested do-while; an unconditional s_branch is a top-tested loop.
