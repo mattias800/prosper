@@ -4045,6 +4045,10 @@ if(TARGET prosper_core)
   # #3203: the entry-M0 token containment's CFG-DISPATCHER re-arm. Its own binary rather than another
   # arm in test_rdna2_spirv_struct, because that one returns at its first failure and a mutation run
   # then cannot tell which arms moved. This reports every arm independently.
+  prosper_add_gtest(test_cfg_use_proofs
+    SOURCES tests/gpu/recompiler/test_cfg_use_proofs.cpp
+    LIBRARIES prosper_core)
+
   prosper_add_gtest(test_entry_m0_dispatcher
     SOURCES tests/gpu/recompiler/test_entry_m0_dispatcher.cpp
     LIBRARIES prosper_core)
