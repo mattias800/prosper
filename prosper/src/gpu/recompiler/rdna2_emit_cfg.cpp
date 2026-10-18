@@ -5787,7 +5787,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         for (int r : cv) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, vget(r), preheader, p); rs.vreg[r] = ph; phis.push_back({r, 0, ph, p}); }
         LoopBlanketCheck blanket_check(rs, cs, L.header_pc);
         for (int r : cs) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, sget(r), preheader, p); rs.sreg[r] = ph; phis.push_back({r, 1, ph, p}); }
-        LaneSlotLoopCarry lane_slots(rs, placement);   // notes the preheader marks, before the header's
+        LaneSlotLoopCarry lane_slots(rs,
+                                     placement);   // notes the preheader marks, before the header's
         mark_loop_carried(rs, cs, ins, L.header_pc, L.backedge_pc, blanket_check);
         // A poisoned (0) SCC live-in degrades to bfalse — the loop shapes re-produce SCC via their
         // in-loop s_cmp before any read, so the phi seed is dead in practice; 0 would be invalid SSA.
@@ -6429,7 +6430,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             for (int r : cv) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, vget(r), preheader, p); rs.vreg[r] = ph; phis.push_back({r, 0, ph, p}); }
             LoopBlanketCheck blanket_check(rs, cs, L.header_pc, retry_gate(b, ins, L, exec_proof));
             for (int r : cs) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, sget(r), preheader, p); rs.sreg[r] = ph; phis.push_back({r, 1, ph, p}); }
-            LaneSlotLoopCarry lane_slots(rs, placement);   // V_WRITELANE spill slots, as in the counted loop
+            LaneSlotLoopCarry lane_slots(
+                rs, placement);   // V_WRITELANE spill slots, as in the counted loop
             mark_loop_carried(rs, cs, ins, L.header_pc, L.backedge_pc, blanket_check);
             // A poisoned SCC live-in uses bfalse; loop headers reproduce SCC before any read.
             { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.scc ? rs.scc : b.bfalse(), preheader, p); rs.scc = ph; phis.push_back({0, 2, ph, p}); }

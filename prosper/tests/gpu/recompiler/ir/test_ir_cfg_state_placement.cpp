@@ -177,8 +177,8 @@ TEST(IrStatePlacement, EveryDetectedJoinOfEveryFixtureIsEqual) {
                 continue;
             std::unordered_set<uint32_t> safe;
             const StatePlacement placement = stage_placement(ins, stage, words, safe);
-            const std::string at = path.filename().string() + " stage " +
-                                   std::to_string(static_cast<int>(stage));
+            const std::string at =
+                path.filename().string() + " stage " + std::to_string(static_cast<int>(stage));
             for (const ShadowIf& f : shadow.detector) {
                 PhiSets legacy;
                 loop_written_regs(ins, f.branch_pc + 1, f.has_else ? f.sb_pc : f.target_pc,

@@ -488,8 +488,8 @@ int main(int argc, char** argv) {
           raw_wide_proof || synthetic_table)) ||
         (cfg_regions && (stage.empty() || mimg_sites || skippable_mimg || wave_reasons ||
                          raw_wide_proof || synthetic_table || !inputs_path.empty())) ||
-        (cfg_placement && ((stage.empty() && inputs_path.empty()) || mimg_sites ||
-                           skippable_mimg || wave_reasons || raw_wide_proof || cfg_regions)) ||
+        (cfg_placement && ((stage.empty() && inputs_path.empty()) || mimg_sites || skippable_mimg ||
+                           wave_reasons || raw_wide_proof || cfg_regions)) ||
         (cfg_dispatch_blocks && ((stage.empty() && inputs_path.empty()) || cfg_regions)) ||
         (!stage.empty() && stage != "vertex" && stage != "fragment" && stage != "compute")) {
         std::fprintf(stderr, "usage: %s <raw-rdna2.bin> [--stage vertex|fragment|compute]\n", argv[0]);

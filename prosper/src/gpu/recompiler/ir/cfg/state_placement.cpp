@@ -70,7 +70,8 @@ public:
     Placer(const GuestCfg& cfg, const RegionTree& tree, const std::vector<Rdna2Inst>& ins)
         : cfg_(cfg), tree_(tree), ins_(ins), max_vgpr_(shader_max_vgpr(ins)) {
         // Lane slots stop at the first s_endpgm, as LaneSlotLoopCarry's scan always did.
-        const auto end = std::find_if(ins.begin(), ins.end(), [](const auto& in) { return in.is_end; });
+        const auto end =
+            std::find_if(ins.begin(), ins.end(), [](const auto& in) { return in.is_end; });
         first_end_ = static_cast<uint32_t>(end - ins.begin());
     }
     StatePlacement run();
@@ -83,7 +84,8 @@ private:
     }
     void add_range(uint32_t first, uint32_t end, PhiSets& out) const {
         const auto [lo, hi] = span(first, end);
-        for (uint32_t i = lo; i < hi && i < ins_.size(); ++i) add_phi_writes(ins_[i], max_vgpr_, out);
+        for (uint32_t i = lo; i < hi && i < ins_.size(); ++i)
+            add_phi_writes(ins_[i], max_vgpr_, out);
     }
     void add_arm(uint32_t region, PhiSets& out) const {
         if (region == kNone || region >= tree_.regions.size()) return;
@@ -257,11 +259,11 @@ void take_placed_if_equal(const LaneSlotSet* placed, uint32_t pc, LaneSlotSet& s
     const bool equal = placed && *placed == slots;
     if (census) {
         using V = PlacementSiteRecord::Verdict;
-        census->record({PhiSite::LaneSlots, pc,
-                        !placed ? V::Absent : (equal ? V::Equal : V::Differs),
-                        placed && !equal ? difference_text(slots_only(slots, *placed),
-                                                           slots_only(*placed, slots))
-                                         : ""});
+        census->record(
+            {PhiSite::LaneSlots, pc, !placed ? V::Absent : (equal ? V::Equal : V::Differs),
+             placed && !equal
+                 ? difference_text(slots_only(slots, *placed), slots_only(*placed, slots))
+                 : ""});
     }
     if (!equal) return;   // the guard
     slots = *placed;
@@ -272,8 +274,12 @@ StatePlacementCensus::StatePlacementCensus(bool withhold)
     g_census = this;
 }
 
-StatePlacementCensus::~StatePlacementCensus() { g_census = previous_; }
+StatePlacementCensus::~StatePlacementCensus() {
+    g_census = previous_;
+}
 
-StatePlacementCensus* StatePlacementCensus::active() { return g_census; }
+StatePlacementCensus* StatePlacementCensus::active() {
+    return g_census;
+}
 
 }   // namespace prosper::gpu::ir::cfg

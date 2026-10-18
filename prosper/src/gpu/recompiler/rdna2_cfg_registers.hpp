@@ -43,8 +43,8 @@ void loop_join_regs(const std::vector<Rdna2Inst>&, uint32_t header_pc, uint32_t 
                     std::set<int>& cs, std::set<int>& condv, std::set<int>& conds);
 template <typename Loop>   // DivLoop or CountedLoop
 void loop_join_regs(const std::vector<Rdna2Inst>& ins, const Loop& L,
-                    const ir::cfg::StatePlacement& placement, std::set<int>& cv,
-                    std::set<int>& cs, std::set<int>& condv, std::set<int>& conds) {
+                    const ir::cfg::StatePlacement& placement, std::set<int>& cv, std::set<int>& cs,
+                    std::set<int>& condv, std::set<int>& conds) {
     loop_join_regs(ins, L.header_pc, L.backedge_pc, L.exit_branch_pc, placement, cv, cs, condv,
                    conds);
 }
