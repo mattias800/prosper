@@ -5,7 +5,7 @@
 // are the positive controls that the comparison can see a difference at all.
 #include "gpu/recompiler/ir/cfg/region_shadow.hpp"
 
-#include "fixtures/test_data.h"
+#include "gpu/recompiler/ir/cfg_fixtures.hpp"
 #include "gpu/recompiler/ir/cfg_streams.hpp"
 
 #include <gtest/gtest.h>
@@ -19,53 +19,16 @@
 
 using namespace prosper::gpu::ir::cfg;
 using namespace prosper::test::cfg_streams;
+using namespace prosper::test::cfg_fixtures;
 
 namespace {
-
-uint8_t nibble(char c) {
-    return static_cast<uint8_t>(c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10);
-}
-
-// A tests/data program: `.hex` holds the little-endian bytes as hex text, `.bin` the raw bytes.
-std::vector<uint32_t> load_words(const std::filesystem::path& path) {
-    std::ifstream input(path, std::ios::binary);
-    std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    std::vector<uint8_t> bytes;
-    if (path.extension() == ".hex") {
-        while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) text.pop_back();
-        for (size_t i = 0; i + 1 < text.size(); i += 2)
-            bytes.push_back(static_cast<uint8_t>(nibble(text[i]) << 4 | nibble(text[i + 1])));
-    } else {
-        bytes.assign(text.begin(), text.end());
-    }
-    std::vector<uint32_t> words(bytes.size() / 4);
-    for (size_t i = 0; i < words.size(); ++i)
-        words[i] = bytes[4 * i] | bytes[4 * i + 1] << 8 | bytes[4 * i + 2] << 16 |
-                   static_cast<uint32_t>(bytes[4 * i + 3]) << 24;
-    return words;
-}
-
-std::vector<std::filesystem::path> guest_program_fixtures() {
-    std::vector<std::filesystem::path> out;
-    const auto data = prosper::test::tests_root(__FILE__) / "data";
-    for (const auto& entry : std::filesystem::directory_iterator(data)) {
-        const auto ext = entry.path().extension();
-        const auto name = entry.path().filename().string();
-        // Every guest-code fixture: the .hex programs and the raw shader .bin files. The
-        // il2cpp symbol table and the console oracle folder are not guest code.
-        if (ext == ".hex" || (ext == ".bin" && name.find("symtab") == std::string::npos))
-            out.push_back(entry.path());
-    }
-    std::sort(out.begin(), out.end());
-    return out;
-}
 
 RegionShadow shadow_of(const std::vector<uint32_t>& words, ShadowStage stage) {
     return shadow_regions(walk(words), stage, words.data(), words.size());
 }
 
 TEST(IrRegionShadow, EveryCommittedFixtureAgreesUnderEveryStage) {
-    const auto fixtures = guest_program_fixtures();
+    const auto fixtures = guest_program_fixtures(__FILE__);
     ASSERT_GE(fixtures.size(), 9u) << "tests/data lost guest-program fixtures";
     size_t compared = 0;
     for (const auto& path : fixtures) {

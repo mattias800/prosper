@@ -95,6 +95,24 @@ prelude and postlude are not compared), `agree-refused` (both refuse the program
 which adds the first difference and the tree's refusal reason. Run it over a corpus with one call
 per distinct program; it never recompiles.
 
+## `--cfg-dispatch-blocks`: the CFG dispatcher's blocks against `build_guest_cfg`
+
+```bash
+./build-linux/shader_inspect cs_<key>.bin --inputs cs_<key>.inputs --cfg-dispatch-blocks
+cfg-dispatch-blocks entry=0 verdict=equal blocks=31 cfg-blocks=31 services=4
+cfg-dispatch-blocks-end regions=1
+```
+
+The step 5 census of `docs/architecture/IR_CONTROL_FLOW_PLAN.md`
+(`src/gpu/recompiler/ir/cfg/dispatch_blocks.hpp`). It is a modifier: add it to a `--stage` or
+`--inputs` recompile, which runs as usual, and after the recompile's own output it prints one line
+per CFG dispatcher region the recompile built (a program can build several: barrier phases and
+retries). `equal` means the dispatcher's block starts and successor lists equal the GuestCfg's
+service split, so the dispatcher took them from the GuestCfg; `differ` adds the first difference,
+and the dispatcher kept its own. `services` counts the GuestCfg blocks that end in a synchronized
+service. The `cfg-dispatch-blocks-end` sentinel separates "no dispatcher region" from a run that
+died before printing.
+
 ## `--skippable-mimg`: which image instructions scalar branches can skip
 
 ```bash

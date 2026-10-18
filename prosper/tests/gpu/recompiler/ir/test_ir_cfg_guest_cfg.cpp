@@ -144,11 +144,7 @@ TEST(IrGuestCfg, BranchToTheNextInstructionHasOnePredecessorEdge) {
     EXPECT_EQ(cfg.preds[1], std::vector<uint32_t>{0});
 }
 
-TEST(IrGuestCfg, ServiceSplitIsNotImplemented) {
-    const auto ins = walk({kSMovS0Zero, kEndpgm});
-    SplitPolicy policy;
-    policy.split_at_services = true;
-    EXPECT_TRUE(build_guest_cfg(ins, policy).blocks.empty());
+TEST(IrGuestCfg, AnEmptyStreamIsNoGraph) {
     EXPECT_TRUE(build_guest_cfg({}, SplitPolicy{}).blocks.empty());
 }
 

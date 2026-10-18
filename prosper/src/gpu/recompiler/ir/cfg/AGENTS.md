@@ -1,6 +1,6 @@
 # `gpu/recompiler/ir/cfg` — the guest CFG and its region tree
 
-Steps 1, 2, 4 and 6 of `docs/architecture/IR_CONTROL_FLOW_PLAN.md`. One control-flow graph built once
+Steps 1, 2, 4, 5 and 6 of `docs/architecture/IR_CONTROL_FLOW_PLAN.md`. One control-flow graph built once
 from the decoded program (`guest_cfg`), and the structured regions derived from it
 (`region_tree`): ifs (step 1) and loops (step 4). Both are plain data: building them allocates no
 SPIR-V id and calls no `SpirvCompute`, so they cannot change an emitted byte. The shadow check
@@ -12,7 +12,9 @@ over the corpus.
 and `structured_loop_cursor` reads its loop records (see [Consumers](#consumers-step-4b)), each only
 when the tree's complete record sequence equals the detector's. Any disagreement keeps the detector
 records for the whole program. Register state, joins, proof facts and the dispatcher stay with their
-existing owners. A consumer switches over after its own shadow check agrees.
+existing owners. A consumer switches over after its own shadow check agrees. The CFG dispatcher
+(step 5) reads its block list and successors through `dispatch_blocks` under the same guard; see
+[The dispatcher's split](#the-dispatchers-split-step-5).
 
 | path | role |
 | --- | --- |
@@ -23,6 +25,7 @@ existing owners. A consumer switches over after its own shadow check agrees.
 | `structured_if_cursor.hpp/.cpp` | guarded tree preorder for `emit_structured`, with whole-program legacy fallback |
 | `region_shadow.hpp/.cpp` | the pc-level comparison with the three detectors, shared by the test and the census |
 | `structured_loop_cursor.hpp/.cpp` | step 4b: the DivLoop cursor and the CountedLoop record `emit_body` consumes, from the tree when equal to the detector |
+| `dispatch_blocks.hpp/.cpp` | step 5: the dispatcher's `starts`/`successors` from the service split, the guard that adopts them only when identical, and `DispatchBlocksCapture` for the shadow test and census |
 | `state_placement.hpp/.cpp` | step 6: the phi sets of every if merge and loop header, the guard the emitter takes them through, and the census that observes it |
 
 Tests: `tests/gpu/recompiler/ir/test_ir_cfg_*.cpp`, one per source file.
@@ -48,9 +51,39 @@ A branch target is `pc + len + SIMM16` in dwords. A target that is not the pc of
 instruction (past `s_endpgm`, inside a literal, outside the stream) leaves `succ[1] = kNone` and is
 kept in `taken_pc`. `back_edges` are retreating DFS edges (`succ[0]` visited first).
 
-`SplitPolicy::split_at_services` is the hook for plan step 5: the dispatcher also ends a block after
-each synchronized cross-lane service and splits around `s_trap`. Only `false` is implemented;
-`true` returns an empty graph.
+`SplitPolicy::split_at_services` is the dispatcher's split, which differs from this table in more
+than the services: see the next section.
+
+## The dispatcher's split (step 5)
+
+`build_guest_cfg` with `SplitPolicy::split_at_services` reproduces `emit_cfg_state_machine`'s
+blocks and successors exactly. **The service predicate stays in the dispatcher**: it records the pc
+of every instruction it synchronizes (`split_service`, the DPP quad-OR events included) and passes
+that set as `SplitPolicy::services`; graphics stages pass `safe` as `linearized`. This folder keeps
+no list of services.
+
+| | control-flow split (default) | service split |
+| --- | --- | --- |
+| Instructions | the whole stream | up to the first `is_end` (`s_endpgm`); none is an empty graph |
+| `s_endpgm` | `End` (also `s_endpgm_saved`, `_ordered_ps_done`, `s_code_end`) | `End` only for `is_end`; the other forms are ordinary instructions |
+| `s_trap` | `Trap`, block ends after it | `Trap`, and a block also starts **at** it |
+| Services | ordinary instructions | a block of their own, `service_event` = its pc |
+| `s_setpc`, `s_rfe`, `s_swappc`, `s_call`, `s_cbranch_cdbg*` | `IndirectUnknown` | ordinary instructions: the dispatcher does not split at them |
+| A branch in `linearized` | a branch | an ordinary instruction (the stage predicates it) |
+| Target past `s_endpgm` | `succ[1]` when decoded there | no edge; `proven_exit_target` is the per-case emission's business |
+
+`dispatch_blocks` turns a graph into the dispatcher's form: `starts` (block pcs) and, per block, the
+taken successor then the fall-through one, without repeats. `adopt_guest_cfg_blocks` builds that
+and replaces the dispatcher's own `starts`/`successors` **only when they are identical**, so
+emission is byte-identical by construction; otherwise the dispatcher keeps its own. The one shape
+known to differ is a branch target inside an instruction (a literal): the dispatcher starts a case
+at that pc and the graph cannot, since no decoded instruction begins there. The dispatcher's own
+computation is kept for that reason; the census found no such program.
+
+Observation: `DispatchBlocksCapture` records every verdict on its thread
+(`test_ir_cfg_dispatch_blocks`, `shader_inspect --cfg-dispatch-blocks`). A region the dispatcher
+refuses before building its blocks (a service contract, scratch size, a target before the region)
+makes no record.
 
 ## `RegionPolicy`: what the tree may structure
 
