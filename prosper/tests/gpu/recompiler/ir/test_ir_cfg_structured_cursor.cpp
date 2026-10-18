@@ -68,40 +68,44 @@ TEST(IrCfgStructuredCursor, EmptySequencesReturnTheRequestedContinuation) {
 }
 TEST(IrCfgStructuredCursor, TreePreorderConsumesEveryNestedAndSequentialRecord) {
     namespace cases = prosper::test::ir::cfg_structured;
-    for (uint32_t shape = 0; shape < 5; ++shape) {
-        auto code = cases::words({shape, 3});
-        code.push_back(prosper::test::cfg_streams::kEndpgm);
-        const auto ins = prosper::test::cfg_streams::walk(code);
-        bool refused = false;
-        const auto fs = detect_forward_ifs(ins, false, code.data(), code.size(), nullptr, nullptr,
-                                           &refused, true);
-        ASSERT_FALSE(refused);
-        ASSERT_FALSE(fs.empty());
-        RegionPolicy policy;
-        policy.allow_vcc = false;
-        policy.compute_wave_branches = true;
-        policy.code = code.data();
-        policy.dwords = code.size();
-        StructuredIfCursor cursor(ins, fs, policy, refused);
-        ASSERT_TRUE(cursor.uses_tree()) << "shape=" << shape;
-        for (const auto& expected : fs) {
-            EXPECT_EQ(cursor.next_pc(), expected.branch_pc);
-            EXPECT_EQ(cursor.next_before(expected.branch_pc - 1u), expected.branch_pc - 1u);
-            EXPECT_EQ(cursor.next_before(expected.branch_pc + 1u), expected.branch_pc);
-            const auto actual = cursor.take();
-            EXPECT_EQ(actual.found, expected.found);
-            EXPECT_EQ(actual.branch_pc, expected.branch_pc);
-            EXPECT_EQ(actual.target_pc, expected.target_pc);
-            EXPECT_EQ(actual.has_else, expected.has_else);
-            EXPECT_EQ(actual.sb_pc, expected.sb_pc);
-            EXPECT_EQ(actual.merge_pc, expected.merge_pc);
-            EXPECT_EQ(actual.early_out, expected.early_out);
-            EXPECT_EQ(actual.on_scc0, expected.on_scc0);
-            EXPECT_EQ(actual.on_vcc, expected.on_vcc);
-            EXPECT_EQ(actual.on_exec, expected.on_exec);
-            EXPECT_EQ(actual.uniform_workgroup, expected.uniform_workgroup);
+    for (uint32_t stage : {0u, 1u, 2u}) {
+        const bool fragment = stage == 1u, compute = stage == 2u;
+        for (uint32_t shape = 0; shape < 5; ++shape) {
+            auto code = cases::words({shape, 3});
+            code.push_back(prosper::test::cfg_streams::kEndpgm);
+            const auto ins = prosper::test::cfg_streams::walk(code);
+            bool refused = false;
+            const auto fs = detect_forward_ifs(ins, !compute, code.data(), code.size(), nullptr,
+                                               nullptr, &refused, compute);
+            ASSERT_FALSE(refused);
+            ASSERT_FALSE(fs.empty());
+            RegionPolicy policy;
+            policy.allow_vcc = !compute;
+            policy.compute_wave_branches = compute;
+            policy.fragment_wave_breaks = fragment;
+            policy.code = code.data();
+            policy.dwords = code.size();
+            StructuredIfCursor cursor(ins, fs, policy, refused);
+            ASSERT_TRUE(cursor.uses_tree()) << "stage=" << stage << " shape=" << shape;
+            for (const auto& expected : fs) {
+                EXPECT_EQ(cursor.next_pc(), expected.branch_pc);
+                EXPECT_EQ(cursor.next_before(expected.branch_pc - 1u), expected.branch_pc - 1u);
+                EXPECT_EQ(cursor.next_before(expected.branch_pc + 1u), expected.branch_pc);
+                const auto actual = cursor.take();
+                EXPECT_EQ(actual.found, expected.found);
+                EXPECT_EQ(actual.branch_pc, expected.branch_pc);
+                EXPECT_EQ(actual.target_pc, expected.target_pc);
+                EXPECT_EQ(actual.has_else, expected.has_else);
+                EXPECT_EQ(actual.sb_pc, expected.sb_pc);
+                EXPECT_EQ(actual.merge_pc, expected.merge_pc);
+                EXPECT_EQ(actual.early_out, expected.early_out);
+                EXPECT_EQ(actual.on_scc0, expected.on_scc0);
+                EXPECT_EQ(actual.on_vcc, expected.on_vcc);
+                EXPECT_EQ(actual.on_exec, expected.on_exec);
+                EXPECT_EQ(actual.uniform_workgroup, expected.uniform_workgroup);
+            }
+            EXPECT_EQ(cursor.next_pc(), UINT32_MAX);
         }
-        EXPECT_EQ(cursor.next_pc(), UINT32_MAX);
     }
 }
 TEST(IrCfgStructuredCursor, ARecordMismatchRetainsTheEntireDetectorSequence) {
