@@ -4,6 +4,7 @@
 // ONLY place the executor touches process-global state; execute_gpustate() itself (gpu_execute.hpp) stays
 // pure. No Vulkan here — the backend is a std::function injected by whoever owns a device (the runtime
 // binary at startup, or a test via render_runner.h), so prosper_core links this without Vulkan.
+#include "gpu/recompiler/compiler_choices.hpp"
 #include "gpu/resources/fold_control_plan.hpp"
 #include "build_revision.hpp"
 #include "gpu/capture/fold_capture.hpp"

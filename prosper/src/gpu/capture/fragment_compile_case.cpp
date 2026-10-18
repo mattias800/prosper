@@ -1,3 +1,4 @@
+#include "gpu/recompiler/compiler_choices.hpp"
 #include "gpu/capture/fragment_compile_case.hpp"
 #include "build_revision.hpp"
 #include "gpu/capture/gpu_capture.hpp"

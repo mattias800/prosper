@@ -1,3 +1,4 @@
+#include "gpu/recompiler/compiler_choices.hpp"
 #include "gpu/execute/shader_cache_internal.hpp"
 #include "gpu/execute/graphics_shader_compile.hpp"
 #include "build_revision.hpp"

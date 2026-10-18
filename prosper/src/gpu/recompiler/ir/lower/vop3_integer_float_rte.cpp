@@ -1,3 +1,4 @@
+#include "gpu/recompiler/compiler_choices.hpp"
 #include "gpu/recompiler/ir/ops/vector_conversion.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include <cstdint>

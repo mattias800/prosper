@@ -1,3 +1,4 @@
+#include "gpu/recompiler/compiler_choices.hpp"
 #include "gpu/diagnostics/refused_shader_inputs.hpp"
 #include "gpu/diagnostics/refused_graphics_inputs.hpp"
 
@@ -250,7 +251,7 @@ std::vector<uint8_t> encode(const std::string& stage, uint64_t address,
         o.num<uint8_t>(config.fp16_overflow.available);
         o.num<uint8_t>(config.fp16_overflow.saturate);
     }
-    if (schema >= 8) o.num<uint8_t>(*rte32);
+    if (rte32) o.num<uint8_t>(*rte32);
     o.num<uint64_t>(fnv(o.bytes.data(), o.bytes.size()));
     return std::move(o.bytes);
 }

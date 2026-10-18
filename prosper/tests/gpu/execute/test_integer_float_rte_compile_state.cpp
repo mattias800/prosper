@@ -1,15 +1,18 @@
 // An RTE32 verdict changes admission and module requirements: cache and replay must retain it.
+#include "gpu/recompiler/compiler_choices.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/execute/graphics_shader_compile.hpp"
 #include "gpu/capture/fragment_compile_case.hpp"
 #include "gpu/execute/shader_cache_internal.hpp"
 #include "gpu/diagnostics/refused_shader_inputs.hpp"
 #include "gpu/recompiler/float32_rte_support.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/ir/integer_float_rte_e64_cases.hpp"
 #include "fixtures/test_scratch.h"
 #include <gtest/gtest.h>
 #include <cstdint>
-#include <filesystem>
+#include <memory>
+#include <cstddef>
 #include <string>
 using namespace prosper::gpu;
 namespace cases = prosper::test::ir::integer_float_rte;

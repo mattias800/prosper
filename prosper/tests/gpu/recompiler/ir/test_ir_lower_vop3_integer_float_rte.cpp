@@ -1,4 +1,5 @@
 // Guest RTE and a capable published device are independent necessary authorities.
+#include "gpu/recompiler/compiler_choices.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <cstddef>
 #include "gpu/execute/float_controls_probe.hpp"
