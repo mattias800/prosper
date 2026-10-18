@@ -462,17 +462,40 @@ truncated 64 KiB compute dump with no `s_endpgm`: `detect_forward_ifs`' forward 
 `end_pc`, which stays `UINT32_MAX` without one, so it admits an else merge outside the decoded
 stream, and the tree refuses it.
 
+**Step 4a result** (loops in the tree, shadow only; `region_loops.cpp`, contract in
+`ir/cfg/AGENTS.md`). The loops come from `GuestCfg`'s back edges and dominators; their admission
+calls the detectors' own rules, factored out of `detect_counted_loop` and `detect_divergent_loops`.
+The census now compares the 226 loop programs step 1 left out: 151 agree on divergent loops (471
+loops and 2,086 ifs equal at the pc level, breaks included; 100 programs hold more than one loop
+and 133 have ifs around or inside them), 42 agree on a counted loop, 32 agree on refusing, and 1
+disagrees. All 1,003 programs: 362 structured, 266 linear, 151 loops, 42 counted, 179 refused, 2
+disagree, 1 empty file. The new disagreement is `compute/cs_d9ed6de0de75c8778e229814.bin`, and
+it is the shadow's scope, not a structurer difference: the counted detector finds its loop, so the
+shadow compares only that loop, but `emit_body`'s counted route declines the program (its prelude
+scan refuses the VCC early-out at pc 41, whose region holds an `s_barrier`) and the general route
+then refuses it at the same branch. The tree refuses it too, first at an EXECZ if at pc 67 nested
+under that branch. Every route refuses; the shadow does not model the counted route's prelude
+decline. Step 4b consumes `Loop` in `emit_divloop` and `CountedLoop` in the counted route.
+
 **When the parked red tests become fixable:**
 
 - `indirect_pointer_descriptor_range` has two gaps (#5202). The first, charging a Wave32 lane-mask
-  source as a scalar pair, is a source-width bug in `rdna2_scalar_source_words`. It does not depend
-  on this plan and can be fixed now. The second needs the "arbitrary inside the owner, hard
-  outside" form that `ScalarSourceMarks` cannot express. In this plan that form is part of
-  `WordFact` (step 8) and reaches the structured emitter in step 10. Alternatively a field can be
-  added to `ScalarSourceMarks` now, to be subsumed later (open question 2).
-- `rdna2_to_spirv_exec`: this lane did not re-derive which assertion fails today. It should be
-  re-checked against main's Linux CI before step 8, and placed on this timeline if its cause is a
-  fact that one route carries and the other drops.
+  source as a scalar pair, was a source-width bug: the source marks now charge it one SGPR, except
+  VCC_LO, whose never-written VCC_HI is the marks' only witness of an unprovided entry VCC. That
+  moved the fixture's refusal from pc214 to pc582 (`v_cmp_eq_u32_sdwa s4, vcc_lo, v0` after
+  `v_readfirstlane_b32 vcc_lo, v0`). Whether pc582 is the second gap is not yet attributed. The
+  second gap needs the "arbitrary inside the owner, hard outside" form that `ScalarSourceMarks`
+  cannot express. In this plan that form is part of `WordFact` (step 8) and reaches the structured
+  emitter in step 10. Alternatively a field can be added to `ScalarSourceMarks` now, to be subsumed
+  later (open question 2).
+- `rdna2_to_spirv_exec` fails 11 of its 1192 checks, the same 11 on main and with the #5202 fix.
+  The breakdown is on #5039. Two groups belong on this timeline. In the first, the GTA Wave64
+  VCC_LO dispatch fixture is refused at pc15 because a constant-lane `v_readlane_b32` of the one lane
+  a narrowed write defined is marked hard. This is the same lane-confinement fact as #5202's second
+  gap. In the second, the three #2481 checks are refused at pc257 (`s_mov_b64 exec, s[6:7]`) because
+  the definedness of `s[6:7]`, written once on every path, does not survive the uniform branch
+  arms. Two groups are not yet classified: the pc213 same-site mutation (refused at pc232) and the
+  six portable/native ballot checks (native refuses with `wave64-ambiguous-mask-read`).
 
 ## Open questions
 
@@ -496,4 +519,7 @@ stream, and the tree refuses it.
 
 ## Ruled out
 
-None yet.
+- **#5202's second gap was the refusal at pc507.** With only the structured walk charging one SGPR,
+  the fixture is refused at pc507 (`v_add_co_u32 v11, vcc_hi, v27, v12`). When the dispatcher's
+  `spilled_vector_source_marks` charges one SGPR too, pc507 passes and the refusal moves to pc582.
+  So pc507 was the first gap on the dispatcher route, not the second gap (#5202).

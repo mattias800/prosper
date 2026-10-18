@@ -77,6 +77,11 @@ constexpr Rdna2InstructionEffects smem(const char* name, Rdna2ScalarMemory kind,
     e.smem = kind;
     return e;
 }
+// The same row with SRC2 recorded as a lane mask.
+constexpr Rdna2InstructionEffects lane_mask_src2(Rdna2InstructionEffects e) {
+    e.lane_mask_src2 = true;
+    return e;
+}
 // A VALU instruction: its source widths, and by default the common result shape -- one VGPR
 // written lane-wise from the explicit operands. The wrappers below state every other shape.
 constexpr Rdna2InstructionEffects valu(const char* name, uint8_t s0, uint8_t s1, uint8_t s2) {
@@ -906,7 +911,7 @@ constexpr Row kVopc[] = {
     {F::VOPC, 0x0ff, vcmp("v_cmpx_tru_f16", 1, 1)},
 };
 constexpr Row kVop3[] = {
-    {F::VOP3, 0x101, valu("v_cndmask_b32", 1, 1, 2)},
+    {F::VOP3, 0x101, lane_mask_src2(valu("v_cndmask_b32", 1, 1, 2))},
     {F::VOP3, 0x103, valu("v_add_f32", 1, 1, 0)},
     {F::VOP3, 0x104, valu("v_sub_f32", 1, 1, 0)},
     {F::VOP3, 0x105, valu("v_subrev_f32", 1, 1, 0)},
@@ -934,9 +939,9 @@ constexpr Row kVop3[] = {
     {F::VOP3, 0x125, valu("v_add_nc_u32", 1, 1, 0)},
     {F::VOP3, 0x126, valu("v_sub_nc_u32", 1, 1, 0)},
     {F::VOP3, 0x127, valu("v_subrev_nc_u32", 1, 1, 0)},
-    {F::VOP3, 0x128, valu("v_add_co_ci_u32", 1, 1, 2)},
-    {F::VOP3, 0x129, valu("v_sub_co_ci_u32", 1, 1, 2)},
-    {F::VOP3, 0x12a, valu("v_subrev_co_ci_u32", 1, 1, 2)},
+    {F::VOP3, 0x128, lane_mask_src2(valu("v_add_co_ci_u32", 1, 1, 2))},
+    {F::VOP3, 0x129, lane_mask_src2(valu("v_sub_co_ci_u32", 1, 1, 2))},
+    {F::VOP3, 0x12a, lane_mask_src2(valu("v_subrev_co_ci_u32", 1, 1, 2))},
     {F::VOP3, 0x12b, accumulate(valu("v_fmac_f32", 1, 1, 0))},
     {F::VOP3, 0x12f, valu("v_cvt_pkrtz_f16_f32", 1, 1, 0)},
     {F::VOP3, 0x132, half(valu("v_add_f16", 1, 1, 0))},

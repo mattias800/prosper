@@ -344,18 +344,19 @@ int replay_recorded_inputs(const std::string& code_path, const std::string& inpu
     return incomplete ? 7 : match ? 0 : 6;
 }
 
-// --cfg-regions: the step-1 shadow census line for one program (region_shadow.hpp).
+// --cfg-regions: the shadow census line for one program (region_shadow.hpp).
 int print_cfg_regions(const std::vector<Rdna2Inst>& instructions, const std::string& stage,
                       const std::vector<uint32_t>& words) {
     using namespace prosper::gpu::ir::cfg;
     const ShadowStage shadow_stage = stage == "compute"    ? ShadowStage::Compute
                                      : stage == "fragment" ? ShadowStage::Fragment
                                                            : ShadowStage::Vertex;
-    const ForwardIfShadow shadow =
-        shadow_forward_ifs(instructions, shadow_stage, words.data(), words.size());
-    std::printf("cfg-regions stage=%s category=%s blocks=%u detector-ifs=%zu tree-ifs=%zu",
+    const RegionShadow shadow =
+        shadow_regions(instructions, shadow_stage, words.data(), words.size());
+    std::printf("cfg-regions stage=%s category=%s blocks=%u detector-ifs=%zu tree-ifs=%zu "
+                "detector-loops=%zu tree-loops=%zu",
                 stage.c_str(), shadow_category(shadow), shadow.blocks, shadow.detector.size(),
-                shadow.tree.size());
+                shadow.tree.size(), shadow.detector_loops.size(), shadow.tree_loops.size());
     if (!shadow.tree_reason.empty()) std::printf(" tree-reason=\"%s\"", shadow.tree_reason.c_str());
     if (!shadow.difference.empty()) std::printf(" difference=\"%s\"", shadow.difference.c_str());
     std::printf("\n");
@@ -491,12 +492,14 @@ int main(int argc, char** argv) {
             "For a table-accurate verdict use gpu_replay, which has the real descriptors:\n"
             "  gpu_replay <capture>.prgcap --inspect-only\n"
             "\n"
-            "--cfg-regions prints ONLY one `cfg-regions` line: the IR region tree's structured "
-            "ifs\n"
-            "compared with detect_forward_ifs' (IR_CONTROL_FLOW_PLAN step 1 shadow check). Both\n"
-            "sides get the same stream and admission inputs; it compares the two structurers, not\n"
-            "a stage entry's own branch sets. Categories: agree-structured, agree-linear,\n"
-            "agree-refused, loops (not compared), disagree (with the first difference).\n"
+            "--cfg-regions prints ONLY one `cfg-regions` line: the IR region tree's ifs and "
+            "loops\n"
+            "compared with detect_forward_ifs, detect_divergent_loops and detect_counted_loop\n"
+            "(IR_CONTROL_FLOW_PLAN steps 1 and 4). Both sides get the same stream and admission\n"
+            "inputs; it compares the structurers, not a stage entry's own branch sets. "
+            "Categories:\n"
+            "agree-structured, agree-linear, agree-loops, agree-counted, agree-refused, disagree\n"
+            "(with the first difference).\n"
             "\n"
             "--synthetic-table (vertex/fragment only) fabricates one descriptor per use so the\n"
             "recompile runs past descriptor resolution. It is a COMPILE PROBE: a pass shows only\n"
