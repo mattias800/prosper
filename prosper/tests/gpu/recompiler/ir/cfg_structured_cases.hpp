@@ -16,7 +16,8 @@ public:
     void move(uint32_t vgpr) { words.push_back(vop1(1, 1, 256u + vgpr)); }
     void choose(bool condition, const std::function<void()>& yes,
                 const std::function<void()>& no = {}) {
-        words.insert(words.end(), {0xbe800380u | uint32_t(!condition), 0xbf008000u});
+        // Scalar buffer words0/1 are runtime0/1, so these conditions cannot fold away.
+        words.insert(words.end(), {0xf4200004u, 0xfa000000u | (condition ? 0u : 4u), 0xbf008000u});
         const auto branch = static_cast<uint32_t>(words.size());
         words.push_back(0);
         yes();
@@ -57,6 +58,9 @@ inline std::vector<uint32_t> words(Case c) {
             s.choose(b, [&] { s.move(6); });
             break;
     }
+    // The uniform barrier is after every merge. It keeps this program on the structured
+    // route instead of the generic compute dispatcher, whose cases cannot contain barriers.
+    s.words.push_back(cfg_streams::kBarrier);
     return s.words;
 }
 inline uint32_t source(Case c) {
