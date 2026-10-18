@@ -92,6 +92,33 @@ enum class Rdna2ExecEffect : uint8_t { None, SaveExec, WrExec, SubvectorLoop };
 // s_movrels reads SGPR[S0 + M0], s_movreld writes SGPR[D + M0], s_movrelsd_2 does both.
 enum class Rdna2M0Relative : uint8_t { None, Source, Destination, Both };
 
+// How an instruction changes the program counter (ISA 70648 12.5 SOPP, 12.3 SOP1, 12.2 SOPK).
+// None: execution continues at the next instruction. Jump: s_branch, PC += SIMM16 * 4 + 4.
+// Branch*: the conditional SOPP branches, named by the flag they test and its polarity; taken,
+// they jump like s_branch, otherwise they fall through. End: the wave ends (s_endpgm and its
+// variants; s_code_end is padding that is never executed and ends the stream). Trap: s_trap
+// enters the trap handler, which prosper does not emulate. Indirect: the next PC comes from an
+// SGPR pair and nothing returns (s_setpc_b64, s_rfe_b64). IndirectCall: s_swappc_b64, the same
+// jump saving a return address. Call: s_call_b64, a PC-relative jump saving a return address. In
+// both call forms the code after the instruction is reached again through an indirect return.
+// DebugBranch: s_cbranch_cdbg*, taken only while a debugger is attached.
+enum class Rdna2ControlFlow : uint8_t {
+    None,
+    Jump,
+    BranchScc0,
+    BranchScc1,
+    BranchVccz,
+    BranchVccnz,
+    BranchExecz,
+    BranchExecnz,
+    End,
+    Trap,
+    Indirect,
+    IndirectCall,
+    Call,
+    DebugBranch,
+};
+
 struct Rdna2InstructionEffects {
     Rdna2EffectsStatus status = Rdna2EffectsStatus::Unknown;
     const char* name = nullptr;   // the llvm-mc mnemonic; nullptr unless Known
@@ -131,6 +158,9 @@ struct Rdna2InstructionEffects {
     // atomic, the returned old value, written only when GLC is set; ssrc_dwords[0] is SBASE (a
     // pair, or a V# quad for the buffer forms) and ssrc_dwords[1] the SOFFSET register.
     Rdna2ScalarMemory smem = Rdna2ScalarMemory::None;
+    // How the instruction changes the PC. None for every row outside SOPP, s_setpc/s_swappc/s_rfe
+    // and s_call.
+    Rdna2ControlFlow control = Rdna2ControlFlow::None;
 
     bool known() const { return status == Rdna2EffectsStatus::Known; }
     bool describes_sources() const {

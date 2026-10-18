@@ -64,6 +64,11 @@ constexpr Rdna2InstructionEffects compare(const char* name, uint8_t s0, uint8_t 
 constexpr Rdna2InstructionEffects plain(const char* name) {
     return op(name, 0, 0, 0);
 }
+// The same row with its PC effect recorded.
+constexpr Rdna2InstructionEffects control(Rdna2InstructionEffects e, Rdna2ControlFlow flow) {
+    e.control = flow;
+    return e;
+}
 // One SMEM instruction: what SDATA receives, the SBASE width (a pair, or a V# quad) and the
 // SOFFSET register (one dword), when the instruction has them.
 constexpr Rdna2InstructionEffects smem(const char* name, Rdna2ScalarMemory kind, uint8_t dst,
@@ -225,9 +230,12 @@ constexpr Row kSop1[] = {
     {F::SOP1, 0x1d, alu("s_bitset1_b32", 1, 1, 0, false)},
     {F::SOP1, 0x1e, alu("s_bitset1_b64", 2, 1, 0, false)},
     {F::SOP1, 0x1f, alu("s_getpc_b64", 2, 0, 0, false)},   // D = PC + 4; no source
-    {F::SOP1, 0x20, alu("s_setpc_b64", 0, 2, 0, false)},   // PC = S0; D is not written
-    {F::SOP1, 0x21, alu("s_swappc_b64", 2, 2, 0, false)},   // D = PC + 4; PC = S0
-    {F::SOP1, 0x22, alu("s_rfe_b64", 0, 2, 0, false)},   // PC = S0 (trap return)
+    // PC = S0; D is not written
+    {F::SOP1, 0x20, control(alu("s_setpc_b64", 0, 2, 0, false), Rdna2ControlFlow::Indirect)},
+    // D = PC + 4; PC = S0
+    {F::SOP1, 0x21, control(alu("s_swappc_b64", 2, 2, 0, false), Rdna2ControlFlow::IndirectCall)},
+    // PC = S0 (trap return)
+    {F::SOP1, 0x22, control(alu("s_rfe_b64", 0, 2, 0, false), Rdna2ControlFlow::Indirect)},
     {F::SOP1, 0x24, saveexec("s_and_saveexec_b64", 2)},
     {F::SOP1, 0x25, saveexec("s_or_saveexec_b64", 2)},
     {F::SOP1, 0x26, saveexec("s_xor_saveexec_b64", 2)},
@@ -303,7 +311,8 @@ constexpr Row kSopk[] = {
     // a write to HW_REG_STATUS (which holds SCC) does; no guest has been observed doing it.
     {F::SOPK, 0x13, plain("s_setreg_b32")},
     {F::SOPK, 0x15, plain("s_setreg_imm32_b32")},
-    {F::SOPK, 0x16, alu("s_call_b64", 2, 0, 0, false)},   // D = PC + 4; PC += SIMM16 * 4 + 4
+    // D = PC + 4; PC += SIMM16 * 4 + 4
+    {F::SOPK, 0x16, control(alu("s_call_b64", 2, 0, 0, false), Rdna2ControlFlow::Call)},
     {F::SOPK, 0x17, plain("s_waitcnt_vscnt")},
     {F::SOPK, 0x18, plain("s_waitcnt_vmcnt")},
     {F::SOPK, 0x19, plain("s_waitcnt_expcnt")},
@@ -345,15 +354,20 @@ constexpr Row kSopc[] = {
 // ---- SOPP: ISA 12.5. No SOPP instruction writes an SGPR or SCC. CONFIDENCE: HIGH unless noted.
 constexpr Row kSopp[] = {
     {F::SOPP, 0x00, plain("s_nop")},
-    {F::SOPP, 0x01, plain("s_endpgm")},
-    {F::SOPP, 0x02, plain("s_branch")},
+    {F::SOPP, 0x01, control(plain("s_endpgm"), Rdna2ControlFlow::End)},
+    {F::SOPP, 0x02, control(plain("s_branch"), Rdna2ControlFlow::Jump)},
     {F::SOPP, 0x03, plain("s_wakeup")},
-    {F::SOPP, 0x04, op("s_cbranch_scc0", 0, 0, 0, kScc, 0, Rdna2SccRead::Branch)},
-    {F::SOPP, 0x05, op("s_cbranch_scc1", 0, 0, 0, kScc, 0, Rdna2SccRead::Branch)},
-    {F::SOPP, 0x06, op("s_cbranch_vccz", 0, 0, 0, kVcc)},
-    {F::SOPP, 0x07, op("s_cbranch_vccnz", 0, 0, 0, kVcc)},
-    {F::SOPP, 0x08, op("s_cbranch_execz", 0, 0, 0, kExec)},
-    {F::SOPP, 0x09, op("s_cbranch_execnz", 0, 0, 0, kExec)},
+    {F::SOPP, 0x04,
+     control(op("s_cbranch_scc0", 0, 0, 0, kScc, 0, Rdna2SccRead::Branch),
+             Rdna2ControlFlow::BranchScc0)},
+    {F::SOPP, 0x05,
+     control(op("s_cbranch_scc1", 0, 0, 0, kScc, 0, Rdna2SccRead::Branch),
+             Rdna2ControlFlow::BranchScc1)},
+    {F::SOPP, 0x06, control(op("s_cbranch_vccz", 0, 0, 0, kVcc), Rdna2ControlFlow::BranchVccz)},
+    {F::SOPP, 0x07, control(op("s_cbranch_vccnz", 0, 0, 0, kVcc), Rdna2ControlFlow::BranchVccnz)},
+    {F::SOPP, 0x08, control(op("s_cbranch_execz", 0, 0, 0, kExec), Rdna2ControlFlow::BranchExecz)},
+    {F::SOPP, 0x09,
+     control(op("s_cbranch_execnz", 0, 0, 0, kExec), Rdna2ControlFlow::BranchExecnz)},
     {F::SOPP, 0x0a, plain("s_barrier")},
     {F::SOPP, 0x0b, plain("s_setkill")},
     {F::SOPP, 0x0c, plain("s_waitcnt")},
@@ -365,18 +379,18 @@ constexpr Row kSopp[] = {
     // which depends on the message.
     {F::SOPP, 0x10, op("s_sendmsg", 0, 0, 0, kM0 | kExec)},
     {F::SOPP, 0x11, op("s_sendmsghalt", 0, 0, 0, kM0 | kExec)},
-    {F::SOPP, 0x12, plain("s_trap")},
+    {F::SOPP, 0x12, control(plain("s_trap"), Rdna2ControlFlow::Trap)},
     {F::SOPP, 0x13, plain("s_icache_inv")},
     {F::SOPP, 0x14, plain("s_incperflevel")},
     {F::SOPP, 0x15, plain("s_decperflevel")},
     {F::SOPP, 0x16, op("s_ttracedata", 0, 0, 0, kM0)},   // sends M0 to the thread trace
-    {F::SOPP, 0x17, plain("s_cbranch_cdbgsys")},
-    {F::SOPP, 0x18, plain("s_cbranch_cdbguser")},
-    {F::SOPP, 0x19, plain("s_cbranch_cdbgsys_or_user")},
-    {F::SOPP, 0x1a, plain("s_cbranch_cdbgsys_and_user")},
-    {F::SOPP, 0x1b, plain("s_endpgm_saved")},
-    {F::SOPP, 0x1e, plain("s_endpgm_ordered_ps_done")},
-    {F::SOPP, 0x1f, plain("s_code_end")},
+    {F::SOPP, 0x17, control(plain("s_cbranch_cdbgsys"), Rdna2ControlFlow::DebugBranch)},
+    {F::SOPP, 0x18, control(plain("s_cbranch_cdbguser"), Rdna2ControlFlow::DebugBranch)},
+    {F::SOPP, 0x19, control(plain("s_cbranch_cdbgsys_or_user"), Rdna2ControlFlow::DebugBranch)},
+    {F::SOPP, 0x1a, control(plain("s_cbranch_cdbgsys_and_user"), Rdna2ControlFlow::DebugBranch)},
+    {F::SOPP, 0x1b, control(plain("s_endpgm_saved"), Rdna2ControlFlow::End)},
+    {F::SOPP, 0x1e, control(plain("s_endpgm_ordered_ps_done"), Rdna2ControlFlow::End)},
+    {F::SOPP, 0x1f, control(plain("s_code_end"), Rdna2ControlFlow::End)},
     {F::SOPP, 0x20, plain("s_inst_prefetch")},
     {F::SOPP, 0x21, plain("s_clause")},
     // CONFIDENCE: MED -- llvm-mc disassembles 0x22 as s_wait_idle for gfx1030, but ISA 12.5 skips
