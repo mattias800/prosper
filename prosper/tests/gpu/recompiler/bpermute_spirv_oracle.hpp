@@ -938,6 +938,12 @@ struct Interpreter {
               l.v[a[1]] = boolean(l, a[2]) ? left : right;
       } else if (op == 166 || op == 167 || op == 164 || op == 165) {
           if (a.size() != 4 || ty(a[0]).op != 20) fail("logical result type mismatch");
+          const auto left = value(l, a[2]), right = value(l, a[3]);
+          if (left.type != a[0] || right.type != a[0]) fail("logical operand type mismatch");
+          if (!left.defined || !right.defined) {
+              set(l, a[1], a[0], {0}, false);
+              continue;
+          }
           const bool x = boolean(l, a[2]), y = boolean(l, a[3]);
           set(l, a[1], a[0],
               {uint32_t(op == 166   ? x || y
@@ -1024,7 +1030,10 @@ struct Interpreter {
               if (!v) fail("division by zero");
               r = op == 134 ? u / v : u % v;
           } else if (op == 194 || op == 196) {
-              if (v >= 32 * size(x.type)) fail("poison shift");
+              if (v >= 32 * size(x.type)) {
+                  set_unsigned(l, a[1], a[0], 0, false);
+                  continue;
+              }
               r = op == 194 ? u >> v : u << v;
           } else if (op == 197)
               r = u | v;
