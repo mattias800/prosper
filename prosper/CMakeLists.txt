@@ -3849,6 +3849,7 @@ if(TARGET prosper_core)
           ir_cfg_guest_cfg
           ir_cfg_region_tree
           ir_cfg_region_shadow
+          ir_cfg_structured_execution
           )
     prosper_add_gtest(test_${ir_test}
       SOURCES tests/gpu/recompiler/ir/test_${ir_test}.cpp
