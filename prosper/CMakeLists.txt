@@ -3849,6 +3849,7 @@ if(TARGET prosper_core)
           ir_vector_half_float_exact_e64_execution
           ir_cfg_guest_cfg
           ir_cfg_region_tree
+          ir_cfg_region_loops
           ir_cfg_region_shadow
           )
     prosper_add_gtest(test_${ir_test}

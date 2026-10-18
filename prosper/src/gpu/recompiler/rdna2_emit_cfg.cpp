@@ -5575,8 +5575,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             // prelude reaches it with full EXEC. Leave it in the emitted stream (emit_alu proves
             // full EXEC and otherwise rejects), but do not ask the pre-loop uniform-if detector to
             // model a region whose body deliberately extends beyond its artificial end marker.
-            if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x08 &&
-                branch_target(in) >= L.header_pc) continue;
+            if (counted_route_exec_guard(in, L)) continue;
             preloop.push_back(in);
         }
         preloop_end.pc = L.header_pc;

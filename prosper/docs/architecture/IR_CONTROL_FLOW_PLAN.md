@@ -462,6 +462,21 @@ truncated 64 KiB compute dump with no `s_endpgm`: `detect_forward_ifs`' forward 
 `end_pc`, which stays `UINT32_MAX` without one, so it admits an else merge outside the decoded
 stream, and the tree refuses it.
 
+**Step 4a result** (loops in the tree, shadow only; `region_loops.cpp`, contract in
+`ir/cfg/AGENTS.md`). The loops come from `GuestCfg`'s back edges and dominators; their admission
+calls the detectors' own rules, factored out of `detect_counted_loop` and `detect_divergent_loops`.
+The census now compares the 226 loop programs step 1 left out: 151 agree on divergent loops (471
+loops and 2,086 ifs equal at the pc level, breaks included; 100 programs hold more than one loop
+and 133 have ifs around or inside them), 42 agree on a counted loop, 32 agree on refusing, and 1
+disagrees. All 1,003 programs: 362 structured, 266 linear, 151 loops, 42 counted, 179 refused, 2
+disagree, 1 empty file. The new disagreement is `compute/cs_d9ed6de0de75c8778e229814.bin`, and
+it is the shadow's scope, not a structurer difference: the counted detector finds its loop, so the
+shadow compares only that loop, but `emit_body`'s counted route declines the program (its prelude
+scan refuses the VCC early-out at pc 41, whose region holds an `s_barrier`) and the general route
+then refuses it at the same branch. The tree refuses it too, first at an EXECZ if at pc 67 nested
+under that branch. Every route refuses; the shadow does not model the counted route's prelude
+decline. Step 4b consumes `Loop` in `emit_divloop` and `CountedLoop` in the counted route.
+
 **When the parked red tests become fixable:**
 
 - `indirect_pointer_descriptor_range` has two gaps (#5202). The first, charging a Wave32 lane-mask

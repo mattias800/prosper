@@ -1,5 +1,6 @@
-// test_ir_cfg_region_tree -- build_region_tree on synthetic streams: the region kinds step 1
-// builds, each RegionPolicy rule, and every refusal that leaves the program Unstructured.
+// test_ir_cfg_region_tree -- build_region_tree on synthetic streams: Seq, Block and the ifs, each
+// forward-if RegionPolicy rule, and every refusal that leaves the program Unstructured. Loops are
+// test_ir_cfg_region_loops.
 #include "gpu/recompiler/ir/cfg/region_tree.hpp"
 
 #include "gpu/recompiler/ir/cfg_streams.hpp"
@@ -169,12 +170,6 @@ TEST(IrRegionTree, StageWithoutVoteModelRefusesVccAndExec) {
 
 TEST(IrRegionTree, ForwardExecnzIsRefused) {
     expect_unstructured(build({sopp(kExecnz, 1), kVNop, kEndpgm}, graphics()), "unclaimed execnz");
-}
-
-TEST(IrRegionTree, BackwardBranchIsUnstructured) {
-    expect_unstructured(build({kVNop, sopp(kScc1, -2), kEndpgm}, graphics()), "nonforward");
-    expect_unstructured(build({kVNop, sopp(kBranch, -2), kEndpgm}, graphics()),
-                        "unclaimed s_branch");
 }
 
 TEST(IrRegionTree, UnclaimedForwardSBranchIsUnstructured) {

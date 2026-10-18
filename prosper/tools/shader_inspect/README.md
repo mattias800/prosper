@@ -77,21 +77,23 @@ control-flow shape may remain listed there even when the vertex/fragment structu
 `--stage vertex|fragment|compute` additionally runs the complete stage translator, which exposes contextual
 resource and structured-control-flow failures that per-instruction coverage cannot decide.
 
-## `--cfg-regions`: the IR region tree against `detect_forward_ifs`
+## `--cfg-regions`: the IR region tree against the structured detectors
 
 ```bash
 ./build-linux/shader_inspect ps_4f0c6ada077ed363b15bcf0a.bin --cfg-regions --stage fragment
-cfg-regions stage=fragment category=agree-structured blocks=3 detector-ifs=1 tree-ifs=1
+cfg-regions stage=fragment category=agree-structured blocks=3 detector-ifs=1 tree-ifs=1 detector-loops=0 tree-loops=0
 ```
 
-The step-1 shadow check of `docs/architecture/IR_CONTROL_FLOW_PLAN.md`
-(`src/gpu/recompiler/ir/cfg/region_shadow.hpp`). Both structurers get the same stream and the same
-admission inputs (`safe_execz_branches`, `waterfall_branches`, and for fragment the Wave64 mask
-tests), so a difference is a difference between the two structurers, not between stages. The
-category is `agree-structured`, `agree-linear` (no structured if), `agree-refused` (both refuse the
-program), `loops` (a recognized loop; not compared until plan step 4) or `disagree`, which adds the
-first difference and the tree's refusal reason. Run it over a corpus with one call per distinct
-program; it never recompiles.
+The shadow check of `docs/architecture/IR_CONTROL_FLOW_PLAN.md` steps 1 and 4
+(`src/gpu/recompiler/ir/cfg/region_shadow.hpp`): the region tree's ifs and loops against
+`detect_forward_ifs`, `detect_divergent_loops` and `detect_counted_loop`. Both sides get the same
+stream and the same admission inputs (`safe_execz_branches`, `waterfall_branches`, and for fragment
+the Wave64 mask tests), so a difference is a difference between the structurers, not between
+stages. The category is `agree-structured`, `agree-linear` (no structured if), `agree-loops` (equal
+divergent loops, and equal ifs around and inside them), `agree-counted` (equal counted loop; its
+prelude and postlude are not compared), `agree-refused` (both refuse the program) or `disagree`,
+which adds the first difference and the tree's refusal reason. Run it over a corpus with one call
+per distinct program; it never recompiles.
 
 ## `--skippable-mimg`: which image instructions scalar branches can skip
 
