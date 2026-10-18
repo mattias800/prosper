@@ -3844,6 +3844,9 @@ if(TARGET prosper_core)
           ir_buffer_format_execution
           ir_lower_vop3_half_float_exact
           ir_vector_half_float_exact_e64_execution
+          ir_cfg_guest_cfg
+          ir_cfg_region_tree
+          ir_cfg_region_shadow
           )
     prosper_add_gtest(test_${ir_test}
       SOURCES tests/gpu/recompiler/ir/test_${ir_test}.cpp

@@ -451,6 +451,17 @@ recipe. "Lead" means it needs judgment about reverse-engineered semantics or pro
 tree that every later step builds on, checked against the existing detector on the 266 acyclic
 programs the structured route compiles, with no output change.
 
+**Step 1 result** (`src/gpu/recompiler/ir/cfg/`, contract in its `AGENTS.md`). `shader_inspect
+--cfg-regions` over the 1,003 distinct corpus programs: 362 agree with structured ifs (1,931 ifs
+equal at the pc level; fragment 176, vertex 74, compute 112), 266 agree with none, 147 agree on
+refusing, 226 hold a recognized loop and are not compared, 1 disagrees, and one corpus file is
+empty. The fragment count equals the 176 in the route table above. The structured counts are
+larger for vertex and compute because the census compares the structurers whatever route
+`emit_body` then takes (compute sends most of them to the dispatcher). The disagreement is a
+truncated 64 KiB compute dump with no `s_endpgm`: `detect_forward_ifs`' forward bounds use
+`end_pc`, which stays `UINT32_MAX` without one, so it admits an else merge outside the decoded
+stream, and the tree refuses it.
+
 **When the parked red tests become fixable:**
 
 - `indirect_pointer_descriptor_range` has two gaps (#5202). The first, charging a Wave32 lane-mask

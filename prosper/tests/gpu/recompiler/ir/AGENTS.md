@@ -18,3 +18,7 @@ robustness arm runs on Vulkan: `test_ir_buffer_address_robustness` links Vulkan 
 beside `test_traversal_chase`, not in that list. It cannot run an image access at all, so
 `test_ir_image_coordinates_execution` runs its arms (`image_coordinates_cases.hpp`) on the live
 Vulkan compute backend, registered beside `test_ir_buffer_store_execution`.
+`test_ir_cfg_guest_cfg`, `test_ir_cfg_region_tree` and `test_ir_cfg_region_shadow` cover
+`src/gpu/recompiler/ir/cfg/` on synthetic streams (`cfg_streams.hpp` holds their encoders). The
+shadow test also runs every guest-program fixture in `tests/data` under each stage's rules and
+needs the region tree to agree with `detect_forward_ifs` at the pc level.
