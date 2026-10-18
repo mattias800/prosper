@@ -50,6 +50,23 @@ TEST(IrCfgStructuredExecution, ProgramsReachStructuredSelectionsWithoutSwitchDis
             EXPECT_EQ(switches, 0u);
         }
 }
+TEST(IrCfgStructuredExecution, InvalidBranchTargetIsRefusedWithAnOtherwiseIdenticalSibling) {
+    const auto valid = lane_program(cases::words({1, 1}), 64, 64, true, true);
+    EXPECT_FALSE(recompile_compute(valid.code.data(), valid.code.size(), &valid.table, valid.config)
+                     .empty());
+    auto invalid = valid;
+    bool changed = false;
+    for (auto& word : invalid.code)
+        if ((word & 0xffff0000u) == 0xbf840000u) {
+            word = 0xbf847fffu;
+            changed = true;
+            break;
+        }
+    ASSERT_TRUE(changed);
+    EXPECT_TRUE(
+        recompile_compute(invalid.code.data(), invalid.code.size(), &invalid.table, invalid.config)
+            .empty());
+}
 TEST(IrCfgStructuredWitness, ExportsEveryArmShapeAndWave) {
     namespace fs = std::filesystem;
     // NOLINTNEXTLINE(concurrency-mt-unsafe): immutable process launch configuration.

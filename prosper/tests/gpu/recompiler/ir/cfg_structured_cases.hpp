@@ -16,8 +16,9 @@ public:
     void move(uint32_t vgpr) { words.push_back(vop1(1, 1, 256u + vgpr)); }
     void choose(bool condition, const std::function<void()>& yes,
                 const std::function<void()>& no = {}) {
-        // Scalar buffer words0/1 are runtime0/1, so these conditions cannot fold away.
-        words.insert(words.end(), {0xf4200004u, 0xfa000000u | (condition ? 0u : 4u), 0xbf008000u});
+        // Scalar words in the read-only S2 array are runtime0/1; the output never aliases them.
+        words.insert(words.end(),
+                     {0xf4200004u, 0xfa000400u | (condition ? 0u : 4u), 0xbf8c0000u, 0xbf008000u});
         const auto branch = static_cast<uint32_t>(words.size());
         words.push_back(0);
         yes();
@@ -84,6 +85,8 @@ inline LaneInputs inputs(uint32_t mask) {
         if (mask == 0) in.active[lane] = true;
         if (mask == 2) in.active[lane] = false;
     }
+    in.s2[0] = 0;
+    in.s2[1] = 1;
     return in;
 }
 inline uint32_t expected(Case c, const LaneInputs& in, uint32_t lane) {
@@ -96,4 +99,4 @@ inline uint32_t expected(Case c, const LaneInputs& in, uint32_t lane) {
         default: return in.old_d[lane];
     }
 }
-} // namespace prosper::test::ir::cfg_structured
+}   // namespace prosper::test::ir::cfg_structured
