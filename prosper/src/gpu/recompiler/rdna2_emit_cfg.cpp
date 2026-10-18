@@ -488,6 +488,11 @@ bool emit_cfg_state_machine(
     // phase can publish its result before any invocation advances to the following guest instruction.
     std::set<uint32_t> start_set{ins.front().pc};
     quad_or.split(start_set, ins);
+    // Ends the block before ins[i] and after it (unless the next instruction lies past s_endpgm).
+    auto split_around = [&](size_t i) {
+        start_set.insert(ins[i].pc);
+        if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc) start_set.insert(ins[i + 1].pc);
+    };
     std::unordered_map<uint32_t, uint32_t> mbcnt_event_for_pc;
     std::unordered_map<uint32_t, uint32_t> append_event_for_pc;
     bool has_gds_append = false;
@@ -537,24 +542,18 @@ bool emit_cfg_state_machine(
             !mbcnt_has_intrinsic_numeric_source(in)) {
             mbcnt_event_for_pc.emplace(in.pc,
                 static_cast<uint32_t>(mbcnt_event_for_pc.size()));
-            start_set.insert(in.pc);
-            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
-                start_set.insert(ins[i + 1].pc);
+            split_around(i);
         }
         if (in.fmt == Rdna2Format::DS && (in.opcode == 0x3d || in.opcode == 0x3e)) {
             append_event_for_pc.emplace(in.pc,
                 static_cast<uint32_t>(append_event_for_pc.size()));
             if (in.ds_gds) has_gds_append = true;
             else has_lds_append = true;
-            start_set.insert(in.pc);
-            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
-                start_set.insert(ins[i + 1].pc);
+            split_around(i);
         }
         if (in.fmt == Rdna2Format::DS && in.opcode == 0x35) {
             swizzle_pcs.insert(in.pc);
-            start_set.insert(in.pc);
-            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
-                start_set.insert(ins[i + 1].pc);
+            split_around(i);
         }
         if (in.fmt == Rdna2Format::DS && in.opcode == kDsOpcodeBpermuteB32) {
             if (!b.is_compute || in.ds_gds ||
@@ -562,18 +561,14 @@ bool emit_cfg_state_machine(
                 return reject_cfg(in.pc, "ds-bpermute-native-wave-contract");
             bpermute_event_for_pc.emplace(
                 in.pc, static_cast<uint32_t>(bpermute_event_for_pc.size() + 1));
-            start_set.insert(in.pc);
-            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
-                start_set.insert(ins[i + 1].pc);
+            split_around(i);
         }
         if (fragment_dpp_min_row_shr(in)) {
             fragment_dpp_min_row_shr_pcs.insert(in.pc);
             fragment_dpp_min_event_for_pc.emplace(
                 in.pc, static_cast<uint32_t>(fragment_dpp_min_event_for_pc.size() + 1));
             fragment_dpp_min_row_shr_dsts.insert(in.dst.value);
-            start_set.insert(in.pc);
-            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
-                start_set.insert(ins[i + 1].pc);
+            split_around(i);
         }
         if (compute_dpp_row_shr(in)) {
             has_compute_dpp_row_maximum |= is_inplace_vmax_u32_dpp_row_shr(in);
@@ -582,9 +577,7 @@ bool emit_cfg_state_machine(
             compute_dpp_row_shr_pcs.insert(in.pc);
             compute_dpp_row_shr_event_for_pc.emplace(in.pc, next_compute_dpp_event++);
             compute_dpp_row_shr_dsts.insert(in.dst.value);
-            start_set.insert(in.pc);
-            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
-                start_set.insert(ins[i + 1].pc);
+            split_around(i);
         }
         if (compute_dpp_row_ror8(in)) {
             has_compute_dpp_row_fadd |= dpp_row_ror8_op(in) == DppRowRor8Op::AddF32;
@@ -592,43 +585,31 @@ bool emit_cfg_state_machine(
             compute_dpp_ror8_event_for_pc.emplace(
                 in.pc, next_compute_dpp_event++);
             compute_dpp_row_ror8_dsts.insert(in.dst.value);
-            start_set.insert(in.pc);
-            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
-                start_set.insert(ins[i + 1].pc);
+            split_around(i);
         }
         if (compute_dpp_add_row_mask(in)) {
             compute_dpp_add_row_mask_pcs.insert(in.pc);
-            start_set.insert(in.pc);
-            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
-                start_set.insert(ins[i + 1].pc);
+            split_around(i);
         }
-        if (packet_raw_masks.contains(in.pc)) {
-            start_set.insert(in.pc);
-            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc) start_set.insert(ins[i + 1].pc);
-        }
+        if (packet_raw_masks.contains(in.pc))
+            split_around(i);
         if (portable_mask_ffbh_candidate(in)) {
             portable_mask_ffbh_event_for_pc.emplace(
                 in.pc, static_cast<uint32_t>(portable_mask_ffbh_event_for_pc.size() + 1));
             portable_mask_ffbh_dsts.insert(in.dst.value);
-            start_set.insert(in.pc);
-            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
-                start_set.insert(ins[i + 1].pc);
+            split_around(i);
         }
         if (portable_mask_reduction_candidate(in)) {
             portable_mask_reduction_event_for_pc.emplace(
                 in.pc, static_cast<uint32_t>(portable_mask_reduction_event_for_pc.size() + 1));
             portable_mask_reduction_dsts.insert(in.dst.value);
-            start_set.insert(in.pc);
-            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
-                start_set.insert(ins[i + 1].pc);
+            split_around(i);
         }
         if (packet_wqm_candidate(in)) {
             packet_wqm_event_for_pc.emplace(
                 in.pc, static_cast<uint32_t>(packet_wqm_event_for_pc.size() + 1));
             packet_wqm_dsts.insert(in.dst.value);
-            start_set.insert(in.pc);
-            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
-                start_set.insert(ins[i + 1].pc);
+            split_around(i);
         }
         if (owned_or_portable_readfirstlane_enabled(b) && in.fmt == Rdna2Format::VOP1 &&
             in.opcode == 0x02) {
@@ -637,9 +618,7 @@ bool emit_cfg_state_machine(
             portable_readfirstlane_event_for_pc.emplace(
                 in.pc, static_cast<uint32_t>(portable_readfirstlane_event_for_pc.size() + 1));
             portable_readfirstlane_dsts.insert(in.dst.value);
-            start_set.insert(in.pc);
-            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
-                start_set.insert(ins[i + 1].pc);
+            split_around(i);
         }
         if (b.has_workgroup_execution() && !b.native_subgroup_size &&
             in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360 &&
@@ -647,18 +626,14 @@ bool emit_cfg_state_machine(
             portable_readlane_event_for_pc.emplace(
                 in.pc, static_cast<uint32_t>(portable_readlane_event_for_pc.size() + 1));
             portable_readlane_dsts.insert(in.dst.value);
-            start_set.insert(in.pc);
-            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
-                start_set.insert(ins[i + 1].pc);
+            split_around(i);
         }
         if (synchronize_lds_fminmax && b.atomicized_lds_store_pcs.contains(in.pc)) {
             if (!b.is_compute || in.fmt != Rdna2Format::DS || in.ds_gds ||
                 b.local_count > b.wave_size)
                 return reject_cfg(in.pc, "lds-store-common-phase-contract");
             synchronized_lds_store_pcs.insert(in.pc);
-            start_set.insert(in.pc);
-            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
-                start_set.insert(ins[i + 1].pc);
+            split_around(i);
         }
         if (synchronize_lds_fminmax && in.fmt == Rdna2Format::DS &&
             (in.opcode == kDsOpcodeMinF32 || in.opcode == kDsOpcodeMaxF32)) {
@@ -667,39 +642,20 @@ bool emit_cfg_state_machine(
                 b.compute_pgm_rsrc1 == UINT32_MAX)
                 return reject_cfg(in.pc, "lds-fminmax-common-phase-contract");
             lds_fminmax_pcs.insert(in.pc);
-            start_set.insert(in.pc);
-            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
-                start_set.insert(ins[i + 1].pc);
+            split_around(i);
         }
-        if (mask_zero_compare_candidate_source(in) >= 0) {
-            start_set.insert(in.pc);
-            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
-                start_set.insert(ins[i + 1].pc);
-        }
-        if (exec_saved_mask_compare_source(in) >= 0) {
-            start_set.insert(in.pc);
-            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
-                start_set.insert(ins[i + 1].pc);
-        }
-        if (saved_mask_pair_compare_sources(in)[0] >= 0) {
-            start_set.insert(in.pc);
-            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
-                start_set.insert(ins[i + 1].pc);
-        }
-        if (vopc_mask_zero_compare_source(in) >= 0) {
-            start_set.insert(in.pc);
-            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
-                start_set.insert(ins[i + 1].pc);
-        }
-        if (b64_mask_scc_vote_pcs.contains(in.pc)) {
-            start_set.insert(in.pc);
-            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
-                start_set.insert(ins[i + 1].pc);
-        }
+        if (mask_zero_compare_candidate_source(in) >= 0)
+            split_around(i);
+        if (exec_saved_mask_compare_source(in) >= 0)
+            split_around(i);
+        if (saved_mask_pair_compare_sources(in)[0] >= 0)
+            split_around(i);
+        if (vopc_mask_zero_compare_source(in) >= 0)
+            split_around(i);
+        if (b64_mask_scc_vote_pcs.contains(in.pc))
+            split_around(i);
         if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x12) {
-            start_set.insert(in.pc);
-            if (i + 1 < ins.size() && ins[i + 1].pc <= end_pc)
-                start_set.insert(ins[i + 1].pc);
+            split_around(i);
             continue;
         }
         if (linearized_branch(in) || in.fmt != Rdna2Format::SOPP ||
