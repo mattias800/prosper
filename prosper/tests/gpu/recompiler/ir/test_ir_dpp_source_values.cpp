@@ -9,10 +9,8 @@
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <gtest/gtest.h>
 #include <array>
-#include <cstddef>
 #include <cstdint>
 #include <optional>
-#include <utility>
 #include <vector>
 
 namespace {
@@ -39,6 +37,7 @@ Built build(bool row, uint32_t control, bool bound) {
 }
 std::vector<InvocationInputs> inputs(uint32_t lanes, uint32_t mask) {
     std::vector<InvocationInputs> out;
+    out.reserve(lanes);
     for (uint32_t lane = 0; lane < lanes; ++lane)
         out.push_back({0xa5000000u + lane * 0x101u,
                        uint32_t(mask == 0 || (mask == 1 && lane % 4 != 0)), 0xd0000000u + lane});

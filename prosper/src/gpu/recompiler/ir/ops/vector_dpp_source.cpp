@@ -1,5 +1,6 @@
 // Append in the native helpers' order: data shuffle precedes the source-EXEC shuffle.
 #include "gpu/recompiler/ir/ops/vector_dpp_source.hpp"
+#include "gpu/recompiler/ir/builder.hpp"
 
 namespace prosper::gpu::ir {
 DppRowSource dpp_row_shr_source(Builder& ir, Value source, Value active, uint32_t shift,

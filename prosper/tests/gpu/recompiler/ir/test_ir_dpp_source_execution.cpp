@@ -9,6 +9,9 @@
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <gtest/gtest.h>
 #include <optional>
+#include <cstddef>
+#include <cstdint>
+#include <vector>
 
 namespace {
 using namespace prosper::gpu;
@@ -19,7 +22,7 @@ void check(const cases::Case& c) {
     const auto module = recompile_compute(p.code.data(), p.code.size(), &p.table, p.config);
     ASSERT_FALSE(module.empty());
     bool shuffled = false;
-    for (size_t pc = 5; pc < module.size();) {
+    for (std::size_t pc = 5; pc < module.size();) {
         const uint32_t words = module[pc] >> 16u;
         ASSERT_NE(words, 0u);
         shuffled |= (module[pc] & 0xffffu) == Op_GroupNonUniformShuffle;
@@ -48,6 +51,7 @@ void check(const cases::Case& c) {
             transformed = ir::dpp_quad_source(builder, source, active, c.control);
         }
         std::vector<ir::InvocationInputs> inputs;
+        inputs.reserve(c.wave);
         for (uint32_t lane = 0; lane < c.wave; ++lane)
             inputs.push_back({in.s0[lane], uint32_t(in.active[lane])});
         const auto evaluated = ir::evaluate_lanes(block, inputs);

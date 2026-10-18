@@ -1,9 +1,10 @@
 // AMD 70648 Tables 90/91: DPP16 SRC0 values; EXEC is data, not a mask register here.
 #pragma once
-#include "gpu/recompiler/ir/builder.hpp"
+#include "gpu/recompiler/ir/ir.hpp"
 #include <cstdint>
 
 namespace prosper::gpu::ir {
+class Builder;
 struct DppRowSource {
     Value word;
     Value in_bounds;

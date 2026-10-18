@@ -1,6 +1,7 @@
 // Lower only the compute source value; reserved fragment/scratch paths keep their existing helpers.
 #include "gpu/recompiler/ir/lower/vector_dpp_source_lowering.hpp"
 #include "gpu/recompiler/ir/ops/vector_dpp_source.hpp"
+#include "gpu/recompiler/ir/builder.hpp"
 #include "gpu/recompiler/ir/emit/spirv_emitter.hpp"
 #include "gpu/recompiler/ir/ir.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
