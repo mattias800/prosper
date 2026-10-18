@@ -71,6 +71,8 @@ public:
     }
     Value f32add_no_contraction(Value a, Value b) { return u32(Opcode::F32AddNoContraction, a, b); }
     Value f32mul_no_contraction(Value a, Value b) { return u32(Opcode::F32MulNoContraction, a, b); }
+    Value f32min(Value a, Value b) { return u32(Opcode::F32Min, a, b); }
+    Value f32max(Value a, Value b) { return u32(Opcode::F32Max, a, b); }
     Value f32nmin(Value a, Value b) { return u32(Opcode::F32NMin, a, b); }
     Value f32nmax(Value a, Value b) { return u32(Opcode::F32NMax, a, b); }
     Value f32fract(Value a) { return block_.append({Opcode::F32Fract, Type::U32, 0, {a}}); }

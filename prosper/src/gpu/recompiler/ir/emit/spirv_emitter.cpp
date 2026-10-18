@@ -60,6 +60,8 @@ uint32_t emit_one(SpirvCompute& b, const Inst& inst, const uint32_t* x) {
         case Opcode::F32Fma: return b.fma(x[0], x[1], x[2]);
         case Opcode::F32AddNoContraction: return b.fbin_no_contraction(Op_FAdd, x[0], x[1]);
         case Opcode::F32MulNoContraction: return b.fbin_no_contraction(Op_FMul, x[0], x[1]);
+        case Opcode::F32Min: return b.fext2(Glsl_FMin, x[0], x[1]);
+        case Opcode::F32Max: return b.fext2(Glsl_FMax, x[0], x[1]);
         case Opcode::F32NMin: return b.fext2(Glsl_NMin, x[0], x[1]);
         case Opcode::F32NMax: return b.fext2(Glsl_NMax, x[0], x[1]);
         case Opcode::FfbhU32: return b.ffbh_u32(x[0]);
