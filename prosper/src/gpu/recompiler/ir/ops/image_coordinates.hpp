@@ -37,13 +37,13 @@ struct ImageCoordinateShape {
     // coordinate * (1 / extent). An axis whose extent is 0 has no such value; it is the constant 0
     // and the lowering refuses the instruction.
     bool normalize = false;
-    std::array<uint32_t, 3> extent{};                    // the T#'s width, height, depth
+    std::array<uint32_t, 3> extent{};   // the T#'s width, height, depth
 };
 
 struct ImageCoordinateBlock {
     Block block;
     std::vector<uint32_t> inputs;   // input slot -> the MIMG address slot it reads
-    std::array<Value, 3> coord;     // the first `axes` are valid
+    std::array<Value, 3> coord;   // the first `axes` are valid
 };
 
 // Builds the definition. Inputs and constants are appended where the pre-IR emitter read the
