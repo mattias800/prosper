@@ -3837,6 +3837,8 @@ if(TARGET prosper_core)
           ir_buffer_address_execution
           ir_lower_buffer_address
           ir_image_coordinates
+          ir_image_mip_clamp
+          ir_lower_image_mip_clamp
           ir_image_operand_coordinates
           ir_lower_image_operand_coordinates
           ir_lower_image_coordinates
