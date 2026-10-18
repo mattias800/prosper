@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -19,13 +20,14 @@ enum class CompilerChoice : uint32_t {
     NormalizeSamplerCoordinates,
     VertexTapPc,
     ForcePositionW,
+    Float32Rte,
 };
 // ADR 0006 / spec GPU-1: the values a recompile REQUEST carries for the switch-type choices. An entry
 // that is set answers its choice with no live read; an unset entry falls through to the choice's own
 // live read, which is what an entry point that has not migrated yet still does. Built from the
 // environment by the caller (gpu/execute), never by the recompiler.
 struct CompilerChoiceSet {
-    static constexpr size_t kCount = static_cast<size_t>(CompilerChoice::ForcePositionW) + 1;
+    static constexpr std::size_t kCount = static_cast<std::size_t>(CompilerChoice::Float32Rte) + 1;
     std::array<std::optional<int64_t>, kCount> value{};
     void set(CompilerChoice choice, int64_t v) { value[static_cast<size_t>(choice)] = v; }
     std::optional<int64_t> get(CompilerChoice choice) const {

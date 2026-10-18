@@ -1,3 +1,4 @@
+#include "gpu/recompiler/compiler_choices.hpp"
 #include "gpu/execute/shader_cache_internal.hpp"
 #include "gpu/execute/graphics_shader_compile.hpp"
 #include "build_revision.hpp"
@@ -15,6 +16,9 @@ compile_graphics_shader_actual(ShaderProgramStage stage, const ShaderCompileKey&
                                const ShaderResourceTable* resources, uint64_t program_address,
                                FragmentArithmeticObservation* arithmetic_observation,
                                std::shared_ptr<const FragmentCompileCase>* producer) {
+    CompilerChoiceSet rte32;
+    rte32.set(CompilerChoice::Float32Rte, key.float32_rte);
+    CompilerChoiceScope supplied_rte32(rte32);
     const uint32_t* code = !key.code || key.code->empty() ? nullptr : key.code->data();
     const size_t code_size = key.code ? key.code->size() : 0u;
     if (stage == ShaderProgramStage::Vertex)

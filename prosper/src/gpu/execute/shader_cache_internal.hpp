@@ -202,6 +202,7 @@ struct ShaderCompileKey {
     FragmentFloatMode fragment_float_mode{};
     GraphicsFloatMode vertex_float_mode{};
     FloatTransportConfig float_transport{};
+    bool float32_rte = false;
     FragmentFloatFlags fragment_float_flags{};
     FragmentLaunchRsrc1 fragment_launch_rsrc1{};
     // #4703: compressed-export unpack and integer outputs. Normalized, so a draw whose exports
@@ -277,7 +278,7 @@ struct ShaderCompileKey {
                system_inputs == other.system_inputs && fragment_wave32 == other.fragment_wave32 &&
                fragment_float_mode == other.fragment_float_mode &&
                vertex_float_mode == other.vertex_float_mode &&
-               float_transport == other.float_transport &&
+               float_transport == other.float_transport && float32_rte == other.float32_rte &&
                fragment_float_flags == other.fragment_float_flags &&
                fragment_launch_rsrc1 == other.fragment_launch_rsrc1 &&
                fragment_export_formats == other.fragment_export_formats &&
@@ -379,6 +380,7 @@ struct ShaderCompileKeyHash {
         hash = hash_mix(hash, key.vertex_float_mode.fp16_overflow.available);
         hash = hash_mix(hash, key.vertex_float_mode.fp16_overflow.saturate);
         hash = hash_mix(hash, static_cast<uint8_t>(key.float_transport.profile));
+        hash = hash_mix(hash, key.float32_rte);
         hash = hash_mix(hash, key.fragment_float_flags.available);
         hash = hash_mix(hash, key.fragment_float_flags.ieee_mode);
         hash = hash_mix(hash, key.fragment_float_flags.dx10_clamp);

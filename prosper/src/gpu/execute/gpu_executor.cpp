@@ -4,6 +4,7 @@
 // ONLY place the executor touches process-global state; execute_gpustate() itself (gpu_execute.hpp) stays
 // pure. No Vulkan here — the backend is a std::function injected by whoever owns a device (the runtime
 // binary at startup, or a test via render_runner.h), so prosper_core links this without Vulkan.
+#include "gpu/recompiler/compiler_choices.hpp"
 #include "gpu/resources/fold_control_plan.hpp"
 #include "build_revision.hpp"
 #include "gpu/capture/fold_capture.hpp"
@@ -55,6 +56,7 @@
 #include "host/memory/guest_memory_query.hpp"
 #include "host/memory/guest_write_watch.hpp"
 #include "gpu/execute/shader_cache_internal.hpp"
+#include "gpu/recompiler/float32_rte_support.hpp"
 #include "gpu/execute/graphics_shader_compile.hpp"
 #include <chrono>
 #include <cerrno>
@@ -1167,6 +1169,9 @@ ShaderCompileKey make_shader_compile_key(
     key.fragment_export_formats =
         stage == ShaderProgramStage::Fragment ? fragment_export_formats : FragmentExportFormats{};
     key.float_transport = compute_config ? compute_config->float_transport : float_transport;
+    key.float32_rte = compute_config ? compute_config->choices.get(CompilerChoice::Float32Rte)
+                                               .value_or(float32_rte_admitted()) == 1
+                                     : float32_rte_admitted();
     key.has_compute_config = stage == ShaderProgramStage::Compute && compute_config;
     if (key.has_compute_config) populate_compute_shader_key(key, *compute_config);
     // Reuse only the draw-local byte version; ordinary cold callers authenticate their range.
@@ -2011,6 +2016,9 @@ std::vector<uint32_t> recompile_compute_shader_cached(
     auto compile = [&] {
         const uint32_t* owned_code = !key.code || key.code->empty() ? nullptr : key.code->data();
         const size_t owned_dwords = key.code ? key.code->size() : 0u;
+        CompilerChoiceSet rte32;
+        rte32.set(CompilerChoice::Float32Rte, key.float32_rte);
+        CompilerChoiceScope supplied_rte32(rte32);
         return recompile_compute(owned_code, owned_dwords, resources, config, diagnostic);
     };
     auto& cache = shader_cache();
@@ -8890,6 +8898,7 @@ realize_compute_dispatches(const GpuState& st, uint64_t submit_no,
         // ADR 0006: the request carries the switch-type choices; the environment is read here, by the
         // caller, not inside the recompiler.
         config.choices = compiler_choices_from_environment();
+        config.choices.set(CompilerChoice::Float32Rte, float32_rte_admitted());
         // Keep the stored capture module portable by compiling capture-bound dispatches through
         // device-independent storage paths (raw uvec4 or exact packed R32ui), so optional format
         // support never becomes an artifact ABI. Capture v39 also retains the raw shader and

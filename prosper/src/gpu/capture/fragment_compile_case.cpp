@@ -1,3 +1,4 @@
+#include "gpu/recompiler/compiler_choices.hpp"
 #include "gpu/capture/fragment_compile_case.hpp"
 #include "build_revision.hpp"
 #include "gpu/capture/gpu_capture.hpp"
@@ -262,7 +263,7 @@ void validate_fragment_compile_case(const FragmentCompileCase& c) {
             valid_reference(c, refs.entries[e], r.table_entries[e].host_data_size, 0);
     }
     for (const auto& read : c.choices.reads) {
-        require(uint32_t(read.choice) <= uint32_t(CompilerChoice::ForcePositionW),
+        require(uint32_t(read.choice) <= uint32_t(CompilerChoice::Float32Rte),
                 "compile-case choice tag");
         if (read.choice == CompilerChoice::FragmentTapPc ||
             read.choice == CompilerChoice::VertexTapPc)

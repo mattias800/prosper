@@ -23,6 +23,8 @@
 // refused_graphics_inputs.hpp. Compute schema 4 appends the observed packet/register launch state;
 // legacy schema 1 remains readable with that state explicitly unknown. Schema 7 additionally
 // appends an independent producing FP16 overflow observation; schemas 1/4 keep it unknown.
+// Compute schema 8 additionally retains a supplied producing RTE32 capability verdict. Earlier
+// schemas leave it unspecified; replay then uses its own executing-device verdict.
 //
 // A diagnostic: written only beside a newly dumped refused program, never read by the live path.
 // Guest buffer bytes stay local, beside the dump; they are never part of the repository.
@@ -42,7 +44,7 @@ namespace prosper::gpu {
 // Guest buffer bytes kept per sidecar. Above it the table is still recorded in full, but buffer
 // contents become opaque and a replay that needs them reports INCOMPLETE.
 inline constexpr uint64_t kRefusedShaderInputsMaxPayloadBytes = 256ull * 1024ull;
-inline constexpr uint32_t kRefusedShaderInputsSchema = 7;
+inline constexpr uint32_t kRefusedShaderInputsSchema = 8;
 
 struct RefusedGraphicsInputs;
 struct RefusedShaderInputs {

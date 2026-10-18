@@ -4791,6 +4791,10 @@ endif()
     SOURCES tests/gpu/state/test_fragment_float_flags.cpp
     LIBRARIES prosper_core)
   # #3549: a storage-image or format-fetch DST_SEL is part of the compiled-shader key.
+  prosper_add_gtest(test_integer_float_rte_compile_state
+    SOURCES tests/gpu/execute/test_integer_float_rte_compile_state.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_shader_key_dst_sel
     SOURCES tests/gpu/execute/test_shader_key_dst_sel.cpp
     INCLUDES src
