@@ -3837,9 +3837,10 @@ if(TARGET prosper_core)
           ir_buffer_address_execution
           ir_lower_buffer_address
           ir_image_coordinates
-          ir_lower_image_coordinates
           ir_image_operand_coordinates
           ir_lower_image_operand_coordinates
+          ir_lower_image_coordinates
+          ir_lower_image_gather_layer
           ir_lower_buffer_format_values
           ir_lower_buffer_store_values
           ir_buffer_format_values
@@ -6267,6 +6268,12 @@ endif()
         SOURCES tests/gpu/recompiler/ir/test_ir_buffer_address_robustness.cpp
         INCLUDES tests
         LIBRARIES prosper_core Vulkan::Vulkan)
+
+      prosper_add_gtest(test_ir_image_gather_coordinates_execution
+        SOURCES tests/gpu/recompiler/ir/test_ir_image_gather_coordinates_execution.cpp
+        INCLUDES frontends src tests
+        LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan
+        PROPERTIES TIMEOUT 180)
 
       # The MIMG coordinate definition (ir/ops/image_coordinates.cpp) on the live Vulkan compute
       # backend: per-lane coordinates, partial EXEC, both wave sizes, and the out-of-range read
