@@ -7,6 +7,7 @@
 #include "gpu/recompiler/float32_rte_support.hpp"
 #include "gpu/recompiler/ir/cfg/dispatch_blocks.hpp"
 #include "gpu/recompiler/ir/cfg/region_shadow.hpp"
+#include "gpu/recompiler/ir/cfg/state_placement.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
@@ -365,6 +366,31 @@ int print_cfg_regions(const std::vector<Rdna2Inst>& instructions, const std::str
     return 0;
 }
 
+// --cfg-placement: the step-6 shadow census (state_placement.hpp). It observes whichever recompile
+// the other flags run and, when main returns, prints one `cfg-placement` line per guarded join the
+// structured emitter reached, then a `cfg-placement-end` summary (the sentinel a consumer needs to
+// tell an empty census from a run that died).
+struct PlacementCensusPrinter {
+    prosper::gpu::ir::cfg::StatePlacementCensus census;
+    ~PlacementCensusPrinter() {
+        using Verdict = prosper::gpu::ir::cfg::PlacementSiteRecord::Verdict;
+        size_t counts[3] = {};
+        for (const auto& site : census.sites()) {
+            const size_t verdict = static_cast<size_t>(site.verdict);
+            ++counts[verdict];
+            std::printf("cfg-placement site=%s pc=%u verdict=%s%s%s\n",
+                        prosper::gpu::ir::cfg::phi_site_name(site.site), site.pc,
+                        site.verdict == Verdict::Equal     ? "equal"
+                        : site.verdict == Verdict::Differs ? "differs"
+                                                           : "absent",
+                        site.difference.empty() ? "" : " ", site.difference.c_str());
+        }
+        std::printf("cfg-placement-end sites=%zu equal=%zu differs=%zu absent=%zu\n",
+                    census.sites().size(), counts[0], counts[1], counts[2]);
+        std::fflush(stdout);
+    }
+};
+
 // --cfg-dispatch-blocks: one line per CFG dispatcher region the recompile below builds, saying
 // whether its blocks and successors equal build_guest_cfg's (dispatch_blocks.hpp), then a sentinel.
 // Printed when main returns, whichever mode produced the recompile.
@@ -404,6 +430,7 @@ int main(int argc, char** argv) {
     bool wave64 = false;
     bool synthetic_table = false;
     bool cfg_regions = false;
+    bool cfg_placement = false;
     bool cfg_dispatch_blocks = false;
     std::string inputs_path;
     std::string spirv_out;
@@ -427,6 +454,8 @@ int main(int argc, char** argv) {
             synthetic_table = true;
         } else if (arg == "--cfg-regions") {
             cfg_regions = true;
+        } else if (arg == "--cfg-placement") {
+            cfg_placement = true;
         } else if (arg == "--cfg-dispatch-blocks") {
             cfg_dispatch_blocks = true;
         } else if (arg == "--inputs") {
@@ -459,6 +488,8 @@ int main(int argc, char** argv) {
           raw_wide_proof || synthetic_table)) ||
         (cfg_regions && (stage.empty() || mimg_sites || skippable_mimg || wave_reasons ||
                          raw_wide_proof || synthetic_table || !inputs_path.empty())) ||
+        (cfg_placement && ((stage.empty() && inputs_path.empty()) || mimg_sites || skippable_mimg ||
+                           wave_reasons || raw_wide_proof || cfg_regions)) ||
         (cfg_dispatch_blocks && ((stage.empty() && inputs_path.empty()) || cfg_regions)) ||
         (!stage.empty() && stage != "vertex" && stage != "fragment" && stage != "compute")) {
         std::fprintf(stderr, "usage: %s <raw-rdna2.bin> [--stage vertex|fragment|compute]\n", argv[0]);
@@ -474,6 +505,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "       %s <raw-rdna2.bin> --raw-wide-proof [--wave64]\n", argv[0]);
         std::fprintf(stderr,
                      "       %s <raw-rdna2.bin> --cfg-regions --stage vertex|fragment|compute\n",
+                     argv[0]);
+        std::fprintf(stderr,
+                     "       %s ... --cfg-placement (with --stage, --synthetic-table or "
+                     "--inputs)\n",
                      argv[0]);
         std::fprintf(stderr,
                      "       add --cfg-dispatch-blocks to a --stage or --inputs recompile\n");
@@ -527,6 +562,11 @@ int main(int argc, char** argv) {
             "agree-structured, agree-linear, agree-loops, agree-counted, agree-refused, disagree\n"
             "(with the first difference).\n"
             "\n"
+            "--cfg-placement adds, after whatever the recompile prints, one `cfg-placement` line\n"
+            "per loop header and if merge the structured emitter reached: its phi set from the\n"
+            "IR state placement compared with the emitter's own (equal, differs with the\n"
+            "registers, or absent when the region tree has no such region), then a\n"
+            "`cfg-placement-end` summary (IR_CONTROL_FLOW_PLAN step 6).\n"
             "--cfg-dispatch-blocks adds, after a --stage or --inputs recompile, one\n"
             "`cfg-dispatch-blocks` line per CFG dispatcher region it built: `equal` when the\n"
             "dispatcher's blocks and successors equal build_guest_cfg's service split\n"
@@ -551,6 +591,8 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    std::optional<PlacementCensusPrinter> placement_census;
+    if (cfg_placement) placement_census.emplace();
     std::ifstream input(input_path.c_str(), std::ios::binary);
     if (!input) {
         std::fprintf(stderr, "shader_inspect: cannot open %s\n", input_path.c_str());

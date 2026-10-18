@@ -1,4 +1,5 @@
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
+#include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
@@ -44,7 +45,7 @@ void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t 
                 // CONFIDENCE: HIGH — native P1 is a no-op, but every other native VINTRP
                 // lowering publishes VDST. Owned P1 also writes partial interpolation state.
                 // Omitting a real writer lets an arm-local SSA value escape without a phi.
-                if (owned_packet || in.opcode != 0) vregs.insert(in.dst.value);
+                if (owned_packet || !rdna2_vintrp_is_p1(in)) vregs.insert(in.dst.value);
                 break;
             case Rdna2Format::VOP1:
                 if (in.opcode == 0x02)
@@ -106,6 +107,29 @@ void loop_written_regs(const std::vector<Rdna2Inst>& ins, uint32_t lo, uint32_t 
             default: break;   // VOPC/SOPC write VCC/SCC, handled by their own phis
         }
     }
+}
+
+void if_join_regs(const std::vector<Rdna2Inst>& ins, const ForwardIf& F, uint32_t else_hi,
+                  const ir::cfg::StatePlacement& placement, std::set<int>& vgprs,
+                  std::set<int>& sgprs) {
+    loop_written_regs(ins, F.branch_pc + 1, F.has_else ? F.sb_pc : F.target_pc, vgprs, sgprs);
+    if (F.has_else) loop_written_regs(ins, F.target_pc, else_hi, vgprs, sgprs);
+    const ir::cfg::IfPlacement* placed = placement.if_at(F.branch_pc);
+    ir::cfg::take_placed_if_equal(placed ? &placed->merge : nullptr, ir::cfg::PhiSite::IfMerge,
+                                  F.branch_pc, vgprs, sgprs);
+}
+
+void loop_join_regs(const std::vector<Rdna2Inst>& ins, uint32_t header_pc, uint32_t backedge_pc,
+                    uint32_t exit_branch_pc, const ir::cfg::StatePlacement& placement,
+                    std::set<int>& cv, std::set<int>& cs, std::set<int>& condv,
+                    std::set<int>& conds) {
+    loop_written_regs(ins, header_pc, backedge_pc, cv, cs);
+    loop_written_regs(ins, header_pc, exit_branch_pc, condv, conds);
+    const ir::cfg::LoopPlacement* placed = placement.loop_at(header_pc);
+    ir::cfg::take_placed_if_equal(placed ? &placed->carried : nullptr,
+                                  ir::cfg::PhiSite::LoopCarried, header_pc, cv, cs);
+    ir::cfg::take_placed_if_equal(placed ? &placed->condition : nullptr,
+                                  ir::cfg::PhiSite::LoopCondition, header_pc, condv, conds);
 }
 
 // Scalar registers that MAY be overwritten while a loop executes. This is deliberately separate

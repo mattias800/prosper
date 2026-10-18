@@ -1,4 +1,5 @@
 #pragma once
+#include "gpu/recompiler/ir/cfg/state_placement.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include <algorithm>
@@ -29,6 +30,24 @@ void for_each_possible_vector_write(const Rdna2Inst& in, int max_observable_vgpr
 // so it must reload VDST for partial interpolation and inactive-word preservation.
 void loop_written_regs(const std::vector<Rdna2Inst>&, uint32_t lo, uint32_t hi,
                        std::set<int>& vgprs, std::set<int>& sgprs, bool owned_packet = false);
+// The structured emitter's join sets (IR_CONTROL_FLOW_PLAN step 6): loop_written_regs over the
+// join's ranges, then the state placement's sets in their place when the two are equal element for
+// element (ir/cfg/state_placement.hpp), so the output cannot change.
+struct ForwardIf;
+// An if merge: the then-arm [branch + 1, sb_pc or target) and, with an else, [target, else_hi).
+void if_join_regs(const std::vector<Rdna2Inst>&, const ForwardIf&, uint32_t else_hi,
+                  const ir::cfg::StatePlacement&, std::set<int>& vgprs, std::set<int>& sgprs);
+// A loop header: the carried set [header, back edge) and the condition set [header, exit test).
+void loop_join_regs(const std::vector<Rdna2Inst>&, uint32_t header_pc, uint32_t backedge_pc,
+                    uint32_t exit_branch_pc, const ir::cfg::StatePlacement&, std::set<int>& cv,
+                    std::set<int>& cs, std::set<int>& condv, std::set<int>& conds);
+template <typename Loop>   // DivLoop or CountedLoop
+void loop_join_regs(const std::vector<Rdna2Inst>& ins, const Loop& L,
+                    const ir::cfg::StatePlacement& placement, std::set<int>& cv, std::set<int>& cs,
+                    std::set<int>& condv, std::set<int>& conds) {
+    loop_join_regs(ins, L.header_pc, L.backedge_pc, L.exit_branch_pc, placement, cv, cs, condv,
+                   conds);
+}
 // Scalar registers that MAY be overwritten in [lo, hi), mask-pair destinations included.
 void loop_scalar_may_writes(const std::vector<Rdna2Inst>&, uint32_t lo, uint32_t hi,
                             std::set<int>& sgprs);

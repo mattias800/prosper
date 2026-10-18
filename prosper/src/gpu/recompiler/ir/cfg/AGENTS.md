@@ -1,6 +1,6 @@
 # `gpu/recompiler/ir/cfg` — the guest CFG and its region tree
 
-Steps 1, 2, 4 and 5 of `docs/architecture/IR_CONTROL_FLOW_PLAN.md`. One control-flow graph built once
+Steps 1, 2, 4, 5 and 6 of `docs/architecture/IR_CONTROL_FLOW_PLAN.md`. One control-flow graph built once
 from the decoded program (`guest_cfg`), and the structured regions derived from it
 (`region_tree`): ifs (step 1) and loops (step 4). Both are plain data: building them allocates no
 SPIR-V id and calls no `SpirvCompute`, so they cannot change an emitted byte. The shadow check
@@ -26,6 +26,7 @@ existing owners. A consumer switches over after its own shadow check agrees. The
 | `region_shadow.hpp/.cpp` | the pc-level comparison with the three detectors, shared by the test and the census |
 | `structured_loop_cursor.hpp/.cpp` | step 4b: the DivLoop cursor and the CountedLoop record `emit_body` consumes, from the tree when equal to the detector |
 | `dispatch_blocks.hpp/.cpp` | step 5: the dispatcher's `starts`/`successors` from the service split, the guard that adopts them only when identical, and `DispatchBlocksCapture` for the shadow test and census |
+| `state_placement.hpp/.cpp` | step 6: the phi sets of every if merge and loop header, the guard the emitter takes them through, and the census that observes it |
 
 Tests: `tests/gpu/recompiler/ir/test_ir_cfg_*.cpp`, one per source file.
 
@@ -210,3 +211,60 @@ The divergent cursor is built from emit_body's **final** `Ls`, after the compute
 `cf_rejected` clear, so a loop the compute guards dropped is `NoLoops` rather than a mismatch. The
 `RegionPolicy` is `structured_loop_policy`: the detectors' own inputs (`safe`, the stage, the
 fragment wave64 vote).
+
+## State placement (step 6)
+
+`place_state` walks the tree from its root and records, per if merge (keyed by the branch pc) and
+per loop header (keyed by the header pc), the state variables the structured emitter phis there:
+
+| Join | Set | Blocks |
+| --- | --- | --- |
+| IfThen, IfElse | `merge`: written in either arm | each arm child's `[first_block, end_block)` (an IfElse else-arm is clamped to the enclosing range, as the emitter's `else_hi` is) |
+| Loop, CountedLoop | `carried`: one header phi each | `[header, continue_block]` |
+| | `condition`: the check block's value leaves the loop | `[header, exit_branch]` |
+| | `lane_slots`: constant-lane V_WRITELANE `(vgpr, lane)` | `[header, continue_block]`, before the program's first `s_endpgm` |
+
+The block ranges hold one more instruction than the emitter's pc ranges (the then-arm's `s_branch`,
+the back edge, the exit test), and a branch writes nothing. VCC, SCC, EXEC and the saved lane
+masks (`sreg_bool`) are not in these sets: the emitter phis them from `RegState`. In the code,
+`then_written` is a copy of `RegState::sreg_written` (a fact, not a phi set); the phi sets are
+`written_v/written_s`, `ifv/ifs` and `wv/ws`.
+
+**The inventory** (`add_phi_writes`). The effects table and the shared width helpers answer; this
+folder still keeps no opcode list. It reproduces the emitter's scan (`loop_written_regs`, owned
+packet false), which is not the textbook "every register written":
+
+| Format | Charged | Against the textbook |
+| --- | --- | --- |
+| VOP1 | `v_readfirstlane` (`rdna2_lane_read_writes_sgpr`): its SGPR. The one row whose destination alone is M0-relative (`v_movreld`): every VGPR from VDST to the program's highest. Otherwise VDST | finer: a 64-bit result's second VGPR, `v_swap_b32`'s SRC0, `v_movrelsd`/`v_swaprel`'s relative target; coarser: `v_nop` and the other no-result rows charge their VDST field |
+| VOP2, VOP3P | VDST | carry-out VCC is VCC's own phi |
+| VOP3 | `v_readlane`: its SGPR. Otherwise the table's VDST width (`rdna2_vgpr_write_count`) | finer: VOP3 `v_readfirstlane` (width 0), the M0-relative forms (VDST only), VOP3B carry masks (mask domain) |
+| VINTRP | VDST, except P1 (`rdna2_vintrp_is_p1`: the native lowering folds it into P2) | - |
+| DS | `rdna2_vgpr_write_count` | - |
+| MUBUF, MTBUF, MIMG, FLAT | `rdna2_vgpr_write_count`, plus the TFE status VGPR | - |
+| SOP1 | the SDST field, one word | finer: `s_mov_b64` and every pair result charge the low word; coarser: rows that write nothing (`s_setpc_b64`) charge the field |
+| SOPK | the SDST word when the table says it writes one (or does not know) | - |
+| SOP2 | one word; the pair for a 64-bit scalar-data result; nothing for a 64-bit shift into EXEC | finer: a 64-bit bitwise op of two pairs (`s_and_b64`, ...) charges its low word: its value lives in the mask domain |
+| SMEM | what SDATA receives; one register for a reserved encoding | - |
+| VOPC, SOPC, SOPP, EXP | nothing | VCC, SCC and EXEC have their own phis |
+
+**Where the placement and the emitter's scan differ.** Only SOP2, because the scan names three
+opcodes (`s_cselect_b64`, `s_lshl_b64`, `s_lshr_b64`) and the table's rows for `s_lshl_b64`/`s_lshr_b64`
+equal those of `s_ashr_i64`/`s_bfe_u64`/`s_bfe_i64` field for field. Matching the scan would need
+an opcode list. The placement charges the pair for `s_ashr_i64`, `s_bfe_u64`, `s_bfe_i64` and
+`s_bfm_b64` (the scan charges the low word, although their lowerings write both), and nothing for
+`s_lshl_b64`, `s_ashr_i64` or `s_bfe_*` into EXEC (the scan charges one or two words). A join
+holding one of these keeps the emitter's set.
+
+**The guard** (`take_placed_if_equal`). The emitter computes its own set as before and takes the
+placement's only when the two are equal element for element; a missing placement or any
+difference keeps its own. So emission is byte-identical by construction, and the corpus gate
+reports `changes: none`. `if_join_regs` and `loop_join_regs` (`../../rdna2_cfg_registers.hpp`)
+and `LaneSlotLoopCarry::open` are the call sites. The dispatcher's sets, `loop_scalar_may_writes`,
+the PROSPER_DBG loop trace and `rdna2_vector_word_marks` still call `loop_written_regs` directly.
+
+**The census.** `StatePlacementCensus` (thread-local, RAII) records each guarded join: equal,
+differs (with the registers on each side) or absent (the tree has no such region). `shader_inspect
+--cfg-placement` prints it after any recompile (`--stage`, `--synthetic-table`, `--inputs`);
+`test_ir_cfg_state_placement` runs it over the committed fixtures, and its `withhold` mode
+compiles a differing program without the placement to show the guard keeps the module.

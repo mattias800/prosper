@@ -5384,6 +5384,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
     std::unordered_set<uint32_t> effective_safe = safe;
     const auto loop_policy =
         ir::cfg::structured_loop_policy(b.is_compute, b.is_fragment, &safe, code, dwords);
+    const auto placement = ir::cfg::place_state(ins, loop_policy);   // step 6: the join phi sets
     const CountedLoop L =
         ir::cfg::counted_loop_record(ins, detect_counted_loop(ins), loop_policy).loop;
     size_t idx = 0;
@@ -5643,9 +5644,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             std::set<int> written_v, written_s;
             const uint32_t then_end = F.has_else ? F.sb_pc : F.target_pc;
             const uint32_t merge_pc = F.has_else ? F.merge_pc : F.target_pc;
-            loop_written_regs(ins, F.branch_pc + 1, then_end, written_v, written_s);
-            if (F.has_else)
-                loop_written_regs(ins, F.target_pc, merge_pc, written_v, written_s);
+            if_join_regs(ins, F, merge_pc, placement, written_v, written_s);
             const uint32_t then_label = b.id(), else_label = b.id(), merge_label = b.id();
             b.emit_selmerge(merge_label);
             b.emit_condbranch(condition, then_label, else_label);
@@ -5737,8 +5736,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // always get a phi so any cross-iteration carry is valid SSA (defect C); they're recomputed each
         // iteration in practice, so the phi is usually dead — harmless.
         std::set<int> cv, cs, condv, conds, scalar_may_writes;
-        loop_written_regs(ins, L.header_pc, L.backedge_pc, cv, cs);
-        loop_written_regs(ins, L.header_pc, L.exit_branch_pc, condv, conds);
+        loop_join_regs(ins, L, placement, cv, cs, condv, conds);
         loop_scalar_may_writes(ins, L.header_pc, L.backedge_pc, scalar_may_writes);
         // Both refusals below used to return in silence, so a Wave32 counted loop that recycles a
         // live B32 mask register (VCC_LO after a compare) was refused with no reason at all.
@@ -5789,7 +5787,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         for (int r : cv) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, vget(r), preheader, p); rs.vreg[r] = ph; phis.push_back({r, 0, ph, p}); }
         LoopBlanketCheck blanket_check(rs, cs, L.header_pc);
         for (int r : cs) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, sget(r), preheader, p); rs.sreg[r] = ph; phis.push_back({r, 1, ph, p}); }
-        LaneSlotLoopCarry lane_slots(rs);   // notes the preheader marks, before the header's
+        LaneSlotLoopCarry lane_slots(rs,
+                                     placement);   // notes the preheader marks, before the header's
         mark_loop_carried(rs, cs, ins, L.header_pc, L.backedge_pc, blanket_check);
         // A poisoned (0) SCC live-in degrades to bfalse — the loop shapes re-produce SCC via their
         // in-loop s_cmp before any read, so the phi seed is dead in practice; 0 would be invalid SSA.
@@ -6396,8 +6395,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             const uint32_t loop_entry_exec = rs.exec;
             LoopExecSubset exec_proof(b, ins, L, rs);
             std::set<int> cv, cs, condv, conds, scalar_may_writes;
-            loop_written_regs(ins, L.header_pc, L.backedge_pc, cv, cs);
-            loop_written_regs(ins, L.header_pc, L.exit_branch_pc, condv, conds);
+            loop_join_regs(ins, L, placement, cv, cs, condv, conds);
             omit_promoted_scalar_phis(cs);
             omit_promoted_scalar_phis(conds);
             loop_scalar_may_writes(ins, L.header_pc, L.backedge_pc, scalar_may_writes);
@@ -6432,7 +6430,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             for (int r : cv) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, vget(r), preheader, p); rs.vreg[r] = ph; phis.push_back({r, 0, ph, p}); }
             LoopBlanketCheck blanket_check(rs, cs, L.header_pc, retry_gate(b, ins, L, exec_proof));
             for (int r : cs) { size_t p; uint32_t ph = b.emit_phi2(b.t_u32, sget(r), preheader, p); rs.sreg[r] = ph; phis.push_back({r, 1, ph, p}); }
-            LaneSlotLoopCarry lane_slots(rs);   // V_WRITELANE spill slots, as in the counted loop
+            LaneSlotLoopCarry lane_slots(
+                rs, placement);   // V_WRITELANE spill slots, as in the counted loop
             mark_loop_carried(rs, cs, ins, L.header_pc, L.backedge_pc, blanket_check);
             // A poisoned SCC live-in uses bfalse; loop headers reproduce SCC before any read.
             { size_t p; uint32_t ph = b.emit_phi2(b.t_bool, rs.scc ? rs.scc : b.bfalse(), preheader, p); rs.scc = ph; phis.push_back({0, 2, ph, p}); }
@@ -6689,7 +6688,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     const LaneSlotEdge pre_slots = LaneSlotEdge::of(rs, preblock);   // skipped edge
                     const auto pre_masks = structured_saved_mask_edge(b, rs);
                     std::set<int> ifv, ifs;
-                    loop_written_regs(ins, F.branch_pc + 1, F.target_pc, ifv, ifs);
+                    if_join_regs(ins, F, F.target_pc, placement, ifv, ifs);
                     omit_promoted_scalar_phis(ifs);
                     std::unordered_map<int,uint32_t> pre_v, pre_s;
                     for (int r : ifv) pre_v[r] = vget(r);
@@ -6789,8 +6788,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                     }
                     const RegState pre = rs;                // FULL snapshot: the else-arm re-runs from it
                     std::set<int> wv, ws;                   // regs written in EITHER arm
-                    loop_written_regs(ins, F.branch_pc + 1, F.sb_pc, wv, ws);
-                    loop_written_regs(ins, F.target_pc, else_hi, wv, ws);
+                    if_join_regs(ins, F, else_hi, placement, wv, ws);
                     omit_promoted_scalar_phis(ws);
                     uint32_t thenL = b.id(), elseL = b.id(), mergeL = b.id();
                     b.emit_selmerge(mergeL); b.emit_condbranch(exec_cond, thenL, elseL);

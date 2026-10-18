@@ -516,6 +516,12 @@ inline bool rdna2_lane_read_writes_sgpr(const Rdna2Inst& in) {
            (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360u);
 }
 
+// VINTRP's opcode field names the interpolation step: 0 is v_interp_p1_f32, 1 p2, 2 mov (ISA
+// 70648 12.13). The native lowering folds P1 into P2, so a native P1 publishes nothing.
+inline bool rdna2_vintrp_is_p1(const Rdna2Inst& in) {
+    return in.fmt == Rdna2Format::VINTRP && in.opcode == 0u;
+}
+
 // The subset an analysis cannot model through its operands alone: everything above except
 // s_movrels_b32. That one reads SGPR[src + M0] and writes the destination it names. Its write is
 // ordinary, and its read is modelled where reads matter: scalar_alu_source_words() charges it

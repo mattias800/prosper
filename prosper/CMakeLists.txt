@@ -3861,6 +3861,7 @@ if(TARGET prosper_core)
           ir_cfg_structured_cursor
           ir_cfg_structured_loop_cursor
           ir_cfg_structured_loop_execution
+          ir_cfg_state_placement
           ir_cfg_dispatch_blocks
           )
     prosper_add_gtest(test_${ir_test}
