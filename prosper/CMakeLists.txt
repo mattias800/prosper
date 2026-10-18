@@ -3838,6 +3838,8 @@ if(TARGET prosper_core)
           ir_lower_buffer_address
           ir_image_coordinates
           ir_lower_image_coordinates
+          ir_image_operand_coordinates
+          ir_lower_image_operand_coordinates
           ir_lower_buffer_format_values
           ir_lower_buffer_store_values
           ir_buffer_format_values
@@ -6263,6 +6265,12 @@ endif()
         INCLUDES frontends src tests
         LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan
         PROPERTIES TIMEOUT 60)
+
+      prosper_add_gtest(test_ir_image_operand_coordinates_execution
+        SOURCES tests/gpu/recompiler/ir/test_ir_image_operand_coordinates_execution.cpp
+        INCLUDES frontends src tests
+        LIBRARIES prosper_live_renderer prosper_core Vulkan::Vulkan
+        PROPERTIES TIMEOUT 180)
 
       prosper_add_gtest(test_ir_buffer_store_execution
         SOURCES tests/gpu/recompiler/ir/test_ir_buffer_store_execution.cpp

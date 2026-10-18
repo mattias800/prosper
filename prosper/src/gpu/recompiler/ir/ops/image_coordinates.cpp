@@ -26,6 +26,10 @@ Value normalized(Builder& ir, Value coordinate, uint32_t extent) {
 
 }   // namespace
 
+Value build_normalized_image_coordinate(Builder& ir, Value coordinate, uint32_t extent) {
+    return normalized(ir, coordinate, extent);
+}
+
 ImageCoordinateBlock build_image_coordinates(const ImageCoordinateShape& shape) {
     if (shape.axes < 2 || shape.axes > 3) malformed("axes must be 2 or 3");
     if (shape.form == ImageCoordinateForm::Packed16 && shape.axes != 2)
