@@ -3840,8 +3840,6 @@ if(TARGET prosper_core)
           ir_image_operand_coordinates
           ir_lower_image_operand_coordinates
           ir_lower_image_coordinates
-          ir_image_operand_coordinates
-          ir_lower_image_operand_coordinates
           ir_lower_image_gather_layer
           ir_lower_buffer_format_values
           ir_lower_buffer_store_values
