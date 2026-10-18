@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <utility>
@@ -29,7 +30,7 @@ struct Allocation {
 };
 
 std::vector<uint32_t> run(bool nsa, uint32_t levels, uint32_t wave, const LaneInputs& in,
-                          uint32_t width = cases::kWidth) {
+                          const cases::Geometry& g = cases::kAllTail64R32) {
     static std::vector<std::unique_ptr<Allocation>> allocations;
     auto allocation = std::make_unique<Allocation>();
     auto& buffer = allocation->buffer;
@@ -37,10 +38,10 @@ std::vector<uint32_t> run(bool nsa, uint32_t levels, uint32_t wave, const LaneIn
         buffer.insert(buffer.end(), array->begin(), array->end());
     for (bool active : in.active) buffer.push_back(active ? 1u : 0u);
     buffer.insert(buffer.end(), in.s2.begin(), in.s2.end());
-    allocation->image = cases::image_bytes(width);
+    allocation->image = cases::image_bytes(g);
     const LaneProgram p =
         cases::program(nsa, levels, wave, reinterpret_cast<uint64_t>(buffer.data()),
-                       reinterpret_cast<uint64_t>(allocation->image.data()), width);
+                       reinterpret_cast<uint64_t>(allocation->image.data()), g);
     const uint64_t address = lane_harness_address();
     ComputeItem item;
     item.spirv = recompile_compute(p.code.data(), p.code.size(), &p.table, p.config,
@@ -82,7 +83,7 @@ TEST(IrImageMipClampExecution, PerLaneUnsignedSelectorsAndPartialExec) {
 }
 
 // Independent geometry control: the same selectors, bytes per texel and expectations, with a
-// 256x256 level zero that is outside the shared tail. Keep the failing all-tail arm above intact.
+// 256x256 level zero that is outside the shared tail.
 TEST(IrImageMipClampExecution, NonTailBaseControl) {
     const LaneInputs in = cases::inputs();
     for (uint32_t wave : {64u, 32u})
@@ -90,11 +91,60 @@ TEST(IrImageMipClampExecution, NonTailBaseControl) {
             for (bool nsa : {false, true}) {
                 SCOPED_TRACE(testing::Message()
                              << "wave " << wave << " levels " << levels << " nsa " << nsa);
-                const auto out = run(nsa, levels, wave, in, 256u);
+                const auto out = run(nsa, levels, wave, in, cases::kNonTail256R32);
                 ASSERT_EQ(out.size(), cases::kLanes);
                 for (uint32_t lane = 0; lane < cases::kLanes; ++lane)
                     EXPECT_EQ(out[lane], cases::expected(in, lane, levels)) << "lane " << lane;
             }
+}
+
+// #5429: two more all-tail chains, so the tail path is not proven on one element size and one
+// extent. A 64x64 R16 chain (two-byte elements, a different in-tail origin for every level) and a
+// 32x32 R32 chain that stops at level 5 (six declared levels, so the last level differs too).
+TEST(IrImageMipClampExecution, AllTailChainsAcrossElementSizeAndExtent) {
+    const LaneInputs in = cases::inputs();
+    const struct {
+        const char* name;
+        cases::Geometry g;
+        uint32_t levels[2];
+    } shapes[] = {{"64x64 r16", cases::kAllTail64R16, {3u, 7u}},
+                  {"32x32 r32", cases::kAllTail32R32, {3u, 6u}}};
+    for (const auto& shape : shapes)
+        for (uint32_t wave : {64u, 32u})
+            for (uint32_t levels : shape.levels)
+                for (bool nsa : {false, true}) {
+                    SCOPED_TRACE(testing::Message() << shape.name << " wave " << wave
+                                                    << " levels " << levels << " nsa " << nsa);
+                    const auto out = run(nsa, levels, wave, in, shape.g);
+                    ASSERT_EQ(out.size(), cases::kLanes);
+                    for (uint32_t lane = 0; lane < cases::kLanes; ++lane)
+                        EXPECT_EQ(out[lane], cases::expected(in, lane, levels)) << "lane " << lane;
+                }
+}
+
+// #5429's root cause, pinned without a GPU: a tail-packed selected level keeps `gpu_addr` at the
+// allocation base and carries its in-block byte origin separately. The origin is hand-derived:
+// level zero is the FIRST tail level of a 64 KiB chain, i.e. tail slot m = 16 - 4 - 1 = 11, whose
+// byte origin is 16 << 11 = 0x8000 for every element size. A fixture that added that origin to
+// the base had the backend apply it twice and read foreign texels.
+TEST(IrImageMipClampCases, TailBasePlacementFollowsTheDescriptorContract) {
+    constexpr uint64_t kBase = 0x4000000000ull;
+    for (const cases::Geometry& g :
+         {cases::kAllTail64R32, cases::kAllTail64R16, cases::kAllTail32R32}) {
+        SCOPED_TRACE(testing::Message() << g.width << "x" << g.width << " bpe " << g.texel_bytes);
+        const ShaderResource t = cases::texture(g.max_mip + 1u, kBase, g);
+        EXPECT_TRUE(t.in_mip_tail);
+        EXPECT_EQ(t.gpu_addr, kBase);
+        EXPECT_EQ(t.mip_tail_offset, 0x8000u);
+        EXPECT_EQ(t.mip_tail_bytes, 0x10000u);
+    }
+    // The non-tail control is shifted onto its own disjoint level-zero range instead.
+    const ShaderResource control = cases::texture(7u, kBase, cases::kNonTail256R32);
+    EXPECT_FALSE(control.in_mip_tail);
+    EXPECT_EQ(control.gpu_addr,
+              kBase + tiled_mip_level_layout(256, 256, 4, cases::kTile, cases::kMaxMip, 0)
+                          .byte_offset);
+    EXPECT_GT(control.gpu_addr, kBase);
 }
 
 TEST(IrImageMipClampExecution, EmptyExecPreservesEveryOldWord) {
@@ -119,23 +169,36 @@ TEST(IrImageMipClampAdmission, MissingMaterializationStillRefuses) {
 }
 
 TEST(IrImageMipClampCases, TiledLevelsContainIndependentExpectedTexels) {
-    const auto bytes = cases::image_bytes();
-    for (uint32_t level = 0; level <= cases::kMaxMip; ++level) {
-        const auto layout = tiled_mip_level_layout(cases::kWidth, cases::kWidth, 4, cases::kTile,
-                                                   cases::kMaxMip, level);
-        ASSERT_TRUE(layout.supported);
-        const uint32_t width = cases::kWidth >> level;
-        std::vector<uint32_t> texels(size_t{width} * width, 0);
-        if (layout.in_tail)
-            detile_surface_level(reinterpret_cast<uint8_t*>(texels.data()), bytes.data(),
-                                 bytes.size(), width, width, cases::kTile, 4, layout.tail_x,
-                                 layout.tail_y);
-        else
-            detile_surface(reinterpret_cast<uint8_t*>(texels.data()),
-                           bytes.data() + layout.byte_offset, width, width, cases::kTile, 0, 4);
-        EXPECT_EQ(texels, std::vector<uint32_t>(size_t{width} * width, 0x7100u + level))
-            << "level " << level << " tail " << layout.in_tail << " x " << layout.tail_x << " y "
-            << layout.tail_y;
+    for (const cases::Geometry& g : {cases::kAllTail64R32, cases::kAllTail64R16,
+                                     cases::kAllTail32R32, cases::kNonTail256R32}) {
+        const auto bytes = cases::image_bytes(g);
+        const uint32_t bpe = g.texel_bytes;
+        for (uint32_t level = 0; level <= g.max_mip; ++level) {
+            const auto layout =
+                tiled_mip_level_layout(g.width, g.width, bpe, cases::kTile, g.max_mip, level);
+            ASSERT_TRUE(layout.supported);
+            // Every geometry but the control is tail-packed from level zero.
+            if (g.width != 256u)
+                EXPECT_TRUE(layout.in_tail) << "level " << level;
+            else if (level == 0u)
+                EXPECT_FALSE(layout.in_tail);
+            const uint32_t width = g.width >> level;
+            const size_t texels = size_t{width} * width;
+            std::vector<uint8_t> linear(texels * bpe, 0);
+            if (layout.in_tail)
+                detile_surface_level(linear.data(), bytes.data(), bytes.size(), width, width,
+                                     cases::kTile, bpe, layout.tail_x, layout.tail_y);
+            else
+                detile_surface(linear.data(), bytes.data() + layout.byte_offset, width, width,
+                               cases::kTile, 0, bpe);
+            for (size_t t = 0; t < texels; ++t) {
+                uint32_t value = 0;
+                std::memcpy(&value, linear.data() + t * bpe, bpe);
+                ASSERT_EQ(value, 0x7100u + level)
+                    << g.width << "x" << g.width << " bpe " << bpe << " level " << level
+                    << " texel " << t << " tail " << layout.in_tail;
+            }
+        }
     }
 }
 
