@@ -5,6 +5,10 @@
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 
 namespace prosper::gpu {
+// Number of consecutive scalar dwords consumed by one explicit ALU source. Operand decode names
+// only the first physical register, so every CFG/liveness user must share this opcode-aware width
+// rather than infer B64 from the register number. Unknown VOP3 operations stay conservative.
+
 uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
     switch (in.fmt) {
         case Rdna2Format::SOP1:
