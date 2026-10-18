@@ -447,7 +447,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "       %s <raw-rdna2.bin> --skippable-mimg\n", argv[0]);
         std::fprintf(stderr, "       %s <raw-rdna2.bin> --wave-reasons\n", argv[0]);
         std::fprintf(stderr, "       %s <raw-rdna2.bin> --raw-wide-proof [--wave64]\n", argv[0]);
-        std::fprintf(stderr, "       %s <raw-rdna2.bin> --cfg-regions --stage vertex|fragment|compute\n",
+        std::fprintf(stderr,
+                     "       %s <raw-rdna2.bin> --cfg-regions --stage vertex|fragment|compute\n",
                      argv[0]);
         std::fprintf(
             stderr,
@@ -490,7 +491,8 @@ int main(int argc, char** argv) {
             "For a table-accurate verdict use gpu_replay, which has the real descriptors:\n"
             "  gpu_replay <capture>.prgcap --inspect-only\n"
             "\n"
-            "--cfg-regions prints ONLY one `cfg-regions` line: the IR region tree's structured ifs\n"
+            "--cfg-regions prints ONLY one `cfg-regions` line: the IR region tree's structured "
+            "ifs\n"
             "compared with detect_forward_ifs' (IR_CONTROL_FLOW_PLAN step 1 shadow check). Both\n"
             "sides get the same stream and admission inputs; it compares the two structurers, not\n"
             "a stage entry's own branch sets. Categories: agree-structured, agree-linear,\n"

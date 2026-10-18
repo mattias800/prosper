@@ -3788,12 +3788,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     ok = false; return true;
                 }
                 // ir/ops/image_coordinates.cpp; the reader keeps the MIMG source proof per slot.
-                const auto coords3 = ir::lower_image_coordinates(
-                    b, ok,
-                    {3, ir::ImageCoordinateForm::Separate,
-                     !is_load && normalize_sampler_coordinates,
-                     {res->width, res->height, res->depth}},
-                    [&](uint32_t k) { return vread(cvg(k)); });
+                const auto coords3 =
+                    ir::lower_image_coordinates(b, ok,
+                                                {3,
+                                                 ir::ImageCoordinateForm::Separate,
+                                                 !is_load && normalize_sampler_coordinates,
+                                                 {res->width, res->height, res->depth}},
+                                                [&](uint32_t k) { return vread(cvg(k)); });
                 const uint32_t cu = coords3[0], cv = coords3[1], cw = coords3[2];
                 if (is_sample)      b.image_sample_3d(res->binding, cu, cv, cw, out);
                 else if (is_load)   b.image_fetch_3d(res->binding, cu, cv, cw, out);

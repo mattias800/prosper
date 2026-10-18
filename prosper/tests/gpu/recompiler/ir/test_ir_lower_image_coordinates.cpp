@@ -38,8 +38,8 @@ Lowered lower(const ImageCoordinateShape& shape) {
 TEST(IrLowerImageCoordinates, ReadsEachSlotOnceInOrder) {
     const Lowered three = lower({3, ImageCoordinateForm::Separate, false, {}});
     EXPECT_EQ(three.slots, (std::vector<uint32_t>{0, 1, 2}));
-    EXPECT_EQ(three.ids, (std::array<uint32_t, 3>{three.read_ids[0], three.read_ids[1],
-                                                   three.read_ids[2]}));
+    EXPECT_EQ(three.ids,
+              (std::array<uint32_t, 3>{three.read_ids[0], three.read_ids[1], three.read_ids[2]}));
     EXPECT_TRUE(three.ok);
     const Lowered packed = lower({2, ImageCoordinateForm::Packed16, false, {}});
     EXPECT_EQ(packed.slots, (std::vector<uint32_t>{0}));

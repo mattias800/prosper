@@ -25,7 +25,9 @@ constexpr ImageCoordinateShape kLoadA16{2, Form::Packed16, false, {}};
 constexpr ImageCoordinateShape kSample2dTexels{2, Form::Separate, true, {4, 8, 0}};
 constexpr ImageCoordinateShape kSample3dTexels{3, Form::Separate, true, {2, 4, 16}};
 
-uint32_t f(float x) { return std::bit_cast<uint32_t>(x); }
+uint32_t f(float x) {
+    return std::bit_cast<uint32_t>(x);
+}
 
 TEST(IrImageCoordinates, HandWorkedCoordinates) {
     using A = std::array<Known, 3>;
@@ -68,7 +70,8 @@ TEST(IrImageCoordinates, AnUnknownWordLeavesOnlyItsAxisUnknown) {
     EXPECT_FALSE(values[1].has_value());
     EXPECT_EQ(values[2], Known{4u});
     // A16 reads only slot 0: an unknown slot 1 cannot make it unknown.
-    EXPECT_EQ(eval_image_coordinates(kLoadA16, {0x00020001u, std::nullopt, std::nullopt})[1], Known{2u});
+    EXPECT_EQ(eval_image_coordinates(kLoadA16, {0x00020001u, std::nullopt, std::nullopt})[1],
+              Known{2u});
 }
 
 // Per lane: the shape's Block emitted through SpirvCompute with every input loaded from the input
@@ -83,6 +86,7 @@ std::vector<uint32_t> run_block(const ImageCoordinateShape& shape,
     b.diagnostic = {RecompileDiagnosticStage::Compute, next_address++};
     b.begin(slots, nullptr, n, 1u, 1u, n, 0u, true, true);
     std::vector<uint32_t> ids;
+    ids.reserve(slots);
     for (uint32_t slot = 0; slot < slots; ++slot) ids.push_back(b.load_input(slot));
     const auto emitted = emit_spirv(b, built.block, ids);
     for (uint32_t axis = 0; axis < shape.axes; ++axis)
@@ -91,9 +95,10 @@ std::vector<uint32_t> run_block(const ImageCoordinateShape& shape,
     for (const auto& lane : lanes)
         for (uint32_t slot = 0; slot < slots; ++slot) buffer.push_back(lane[built.inputs[slot]]);
     bpermute_oracle::Interpreter vm(b.finish());
-    auto out = vm.run_buffers(n, {{0u, buffer}, {1u, std::vector<uint32_t>(3 * n, 0u)}}, 1u);
+    const size_t output_words = size_t{3} * n;
+    auto out = vm.run_buffers(n, {{0u, buffer}, {1u, std::vector<uint32_t>(output_words, 0u)}}, 1u);
     EXPECT_TRUE(vm.error.empty()) << vm.error;
-    out.resize(3 * n);
+    out.resize(output_words);
     return out;
 }
 
@@ -103,15 +108,18 @@ TEST(IrImageCoordinates, EverySpirvShapeMatchesItsEvaluationPerLane) {
     const auto next = [&] { return seed = seed * 1664525u + 1013904223u; };
     // Finite texel-space values (a NaN product has no evaluation), with integer edges in the
     // first lanes for the integer shapes; the float shapes read the same words as f32 bits.
-    const uint32_t edges[] = {0u, 1u, 0xffffu, 0x10000u, 0x7f7fffffu, 0x3f800000u, 0xbf000000u,
-                              0x00800000u};
+    const uint32_t edges[] = {0u,          1u,          0xffffu,     0x10000u,
+                              0x7f7fffffu, 0x3f800000u, 0xbf000000u, 0x00800000u};
     for (uint32_t lane = 0; lane < 64; ++lane) {
-        if (lane < 8) lanes.push_back({edges[lane], edges[7 - lane], edges[(lane + 3) % 8]});
-        else lanes.push_back({f(float(next() % 100000u) / 7.0f), f(float(next() % 4096u) - 2048.0f),
-                              f(float(next() % 65536u) * 0.5f)});
+        if (lane < 8)
+            lanes.push_back({edges[lane], edges[7 - lane], edges[(lane + 3) % 8]});
+        else
+            lanes.push_back({f(float(next() % 100000u) / 7.0f), f(float(next() % 4096u) - 2048.0f),
+                             f(float(next() % 65536u) * 0.5f)});
     }
-    const ImageCoordinateShape shapes[] = {kLoad2d, kLoad3d, kLoadA16, kSample2dTexels,
-                                           kSample3dTexels, {2, Form::Separate, true, {3, 1920, 0}}};
+    const ImageCoordinateShape shapes[] = {
+        kLoad2d,         kLoad3d,         kLoadA16,
+        kSample2dTexels, kSample3dTexels, {2, Form::Separate, true, {3, 1920, 0}}};
     for (const auto& shape : shapes) {
         const auto out = run_block(shape, lanes);
         ASSERT_EQ(out.size(), 3 * lanes.size());
@@ -119,10 +127,14 @@ TEST(IrImageCoordinates, EverySpirvShapeMatchesItsEvaluationPerLane) {
             const auto& w = lanes[lane];
             const auto want = eval_image_coordinates(shape, {w[0], w[1], w[2]});
             for (uint32_t axis = 0; axis < shape.axes; ++axis) {
-                ASSERT_TRUE(want[axis].has_value()) << "lane " << lane << " axis " << axis;
-                EXPECT_EQ(out[3 * lane + axis], *want[axis])
-                    << "axes " << shape.axes << " form " << int(shape.form) << " normalize "
-                    << shape.normalize << " lane " << lane << " axis " << axis;
+                const auto expected = want[axis];
+                if (expected) {
+                    EXPECT_EQ(out[3 * lane + axis], *expected)
+                        << "axes " << shape.axes << " form " << int(shape.form) << " normalize "
+                        << shape.normalize << " lane " << lane << " axis " << axis;
+                } else {
+                    FAIL() << "lane " << lane << " axis " << axis << " has no expected value";
+                }
             }
         }
     }

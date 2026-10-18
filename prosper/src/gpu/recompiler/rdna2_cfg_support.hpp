@@ -1435,15 +1435,16 @@ inline bool compute_execz_region_admissible(const std::vector<Rdna2Inst>& ins, u
             // have a lever that can be shown to have moved, which a byte-identical module
             // has already cost this investigation once.
             const bool relax_vcc_scalar_data = compiler_choice(CompilerChoice::VccScalarMerge) != 0;
-            const ScalarMergeProof proof =
-                relax_vcc_scalar_data ? ScalarMergeProof::MaskDomainOnly : ScalarMergeProof::AnyRead;
+            const ScalarMergeProof proof = relax_vcc_scalar_data ? ScalarMergeProof::MaskDomainOnly
+                                                                 : ScalarMergeProof::AnyRead;
             ScalarMergeBlocker blocker;
             if (!sgpr_dead_at_merge(ins, region_end, vcc_half, proof, &blocker)) {
-                forward_if_refuse(why,
-                                  "execz pc=%u scalar write pc=%u leaves vcc-half s%d live at merge "
-                                  "pc=%u "
-                                  "blocked-by pc=%u kind=%s",
-                                  branch_pc, r.pc, vcc_half, region_end, blocker.pc, blocker.kind);
+                forward_if_refuse(
+                    why,
+                    "execz pc=%u scalar write pc=%u leaves vcc-half s%d live at merge "
+                    "pc=%u "
+                    "blocked-by pc=%u kind=%s",
+                    branch_pc, r.pc, vcc_half, region_end, blocker.pc, blocker.kind);
                 return false;
             }
         }
@@ -1463,8 +1464,8 @@ inline bool wave_vcc_region_admissible(const std::vector<Rdna2Inst>& ins, uint32
         if (r.is_end || r.pc >= region_end) break;
         if (r.pc <= branch_pc) continue;
         const bool ds_wave_collective =
-            r.fmt == Rdna2Format::DS && (r.opcode == 0x35 || r.opcode == 0x3d ||
-                                         r.opcode == 0x3e || r.opcode == kDsOpcodeBpermuteB32);
+            r.fmt == Rdna2Format::DS && (r.opcode == 0x35 || r.opcode == 0x3d || r.opcode == 0x3e ||
+                                         r.opcode == kDsOpcodeBpermuteB32);
         if ((r.fmt == Rdna2Format::SOPP && r.opcode == 0x0a) || ds_wave_collective ||
             (r.fmt == Rdna2Format::VOP3 && (r.opcode == 0x365 || r.opcode == 0x366))) {
             forward_if_refuse(why, "vcc branch pc=%u contains synchronized op pc=%u fmt=%d op=0x%x",
