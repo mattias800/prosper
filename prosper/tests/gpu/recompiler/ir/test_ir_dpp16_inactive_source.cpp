@@ -4,13 +4,17 @@
 #include "gpu/recompiler/ir/dpp16_source_cases.hpp"
 #include "gpu/recompiler/ir/vector_compare_harness.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/bpermute_spirv_oracle.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/diagnostics/refused_shader_inputs.hpp"
 #include <gtest/gtest.h>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <algorithm>
+#include <string>
+#include <vector>
+#include <system_error>
 #include <cstdint>
 #include <iostream>
 
@@ -27,6 +31,7 @@ LaneInputs inputs(uint32_t wave, bool partial) {
     return in;
 }
 std::filesystem::path stem_for(uint32_t ctrl, bool partial, uint32_t wave) {
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): the launch environment is immutable.
     const char* root = std::getenv("PROSPER_DPP_PREFLIGHT_ARTIFACTS");
     if (!root) return {};
     return std::filesystem::path(root) / ("w" + std::to_string(wave) + "-ctrl" +
