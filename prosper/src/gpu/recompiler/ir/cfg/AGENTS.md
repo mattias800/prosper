@@ -72,5 +72,7 @@ step 11.
 Known differences from the detector, both in the refusing direction (the tree refuses, the detector
 admits): an if in an if/else's then-arm whose target lies in the else-arm (the detector bounds it by
 the merge, not the arm), and a target or merge outside the decoded stream when the stream has no
-`s_endpgm` (the detector's bounds are then vacuous). The first is pinned by
-`test_ir_cfg_region_shadow`; the second is one truncated corpus dump.
+`s_endpgm` (the detector's bounds are then vacuous, #5415). The first is pinned by
+`test_ir_cfg_region_shadow`, and `emit_structured` refuses that program anyway (the vertex stage
+stops at the then-arm's `s_branch`), so the detector's admission is not a silent miscompile. The
+second is one truncated corpus dump.
