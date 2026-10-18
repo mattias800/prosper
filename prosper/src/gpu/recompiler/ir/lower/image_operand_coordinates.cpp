@@ -2,6 +2,7 @@
 #include "gpu/recompiler/ir/lower/image_operand_coordinates_lowering.hpp"
 #include "gpu/recompiler/ir/ops/image_operand_coordinates.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include <cstdint>
 namespace prosper::gpu::ir {
 uint32_t LegacyImageSpatialNormalizer::operator()(uint32_t coordinate, uint32_t extent) const {
     if (!normalize_sampler_coordinates) return coordinate;

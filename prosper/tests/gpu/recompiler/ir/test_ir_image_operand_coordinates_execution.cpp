@@ -89,6 +89,7 @@ TEST(IrImageOperandCoordinatesCases, SourceSlotsAndExpectedTexelsVaryIndependent
                       int(cases::address_reg(arm, slot)));
         auto in = cases::inputs(arm, 0);
         std::vector<uint32_t> seen;
+        seen.reserve(cases::kLanes);
         for (uint32_t lane = 0; lane < cases::kLanes; ++lane)
             seen.push_back(cases::expected(arm, in, lane));
         std::sort(seen.begin(), seen.end());

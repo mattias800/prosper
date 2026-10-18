@@ -1,7 +1,7 @@
 // A single spatial operand of a MIMG access. The caller keeps the read in its original
 // argument position; the definition only passes through or scales that already-read word.
 #pragma once
-#include "gpu/recompiler/ir/builder.hpp"
+#include "gpu/recompiler/ir/ir.hpp"
 #include "gpu/recompiler/ir/eval.hpp"
 #include <cstdint>
 namespace prosper::gpu {

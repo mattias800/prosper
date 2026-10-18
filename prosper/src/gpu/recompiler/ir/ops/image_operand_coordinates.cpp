@@ -4,6 +4,7 @@
 #include "gpu/recompiler/ir/ir.hpp"
 #include "gpu/recompiler/ir/builder.hpp"
 #include "gpu/recompiler/ir/eval.hpp"
+#include <cstdint>
 
 namespace prosper::gpu::ir {
 ImageOperandCoordinateBlock build_image_operand_coordinate(bool normalize, uint32_t extent) {
