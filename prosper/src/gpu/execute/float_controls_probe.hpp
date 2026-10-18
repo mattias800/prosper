@@ -25,6 +25,7 @@
 #pragma once
 
 #include "gpu/recompiler/float64_support.hpp"
+#include "gpu/recompiler/float32_rte_support.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 
 #include <vulkan/vulkan.h>
@@ -33,6 +34,13 @@
 #include <cstdio>
 
 namespace prosper::gpu {
+
+inline bool float32_rte_controls_compatible(const VkPhysicalDeviceFloatControlsProperties& p) {
+    // Runtime SPIR-V 06291/06292: RTE32 alone needs independent 32-bit rounding settings.
+    return p.shaderRoundingModeRTEFloat32 == VK_TRUE &&
+           (p.roundingModeIndependence == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_32_BIT_ONLY ||
+            p.roundingModeIndependence == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL);
+}
 
 // Measure `physical` and publish the verdict. `instance_api_version` is the VkApplicationInfo
 // apiVersion this device's instance was created with, and `float_controls_extension_enabled` is
@@ -55,6 +63,7 @@ inline bool publish_device_float_controls(const char* owner, VkPhysicalDevice ph
         effective >= VK_API_VERSION_1_2 || float_controls_extension_enabled;
 
     bool preserve_float32 = false;
+    bool rte32 = false, independent32 = false;
     if (permitted) {
         // Chain the struct only when the device can answer it. A pNext an implementation does not
         // recognize is skipped and leaves the struct as written — i.e. reads back as VK_FALSE — so
@@ -66,9 +75,12 @@ inline bool publish_device_float_controls(const char* owner, VkPhysicalDevice ph
         properties2.pNext = &float_controls;
         vkGetPhysicalDeviceProperties2(physical, &properties2);
         preserve_float32 = float_controls.shaderSignedZeroInfNanPreserveFloat32 == VK_TRUE;
+        rte32 = float_controls.shaderRoundingModeRTEFloat32 == VK_TRUE;
+        independent32 = float32_rte_controls_compatible(float_controls);
     }
 
     publish_float_controls_support(preserve_float32, permitted);
+    publish_float32_rte_support(rte32, independent32, permitted);
     const bool usable = preserve_float32 && permitted;
     // Both directions, as everywhere else in this family: a line that prints only on success makes
     // the failing case silent, and a silent failing case is how #3561's unmeasured claim survived a

@@ -42,6 +42,16 @@ void SpirvCompute::declare_float_controls(uint32_t entry) {
         put(exec, Op_ExecutionMode, {entry, EM_SignedZeroInfNanPreserve, 32});
     }
 
+    void SpirvCompute::declare_float32_rte() {
+        if (float32_rte_declared) return;
+        float32_rte_declared = true;
+        // SPV_KHR_float_controls: capability RoundingModeRTE (4467), execution mode (4462).
+        // Only the new known-RTE conversion route calls this, after its device check.
+        put(caps, Op_Capability, {4467});
+        declare_float_controls_extension();
+        put(exec, Op_ExecutionMode, {f_main, 4462, 32});
+    }
+
 void SpirvCompute::decorate_float_transport(uint32_t result) {
         if (!float_transport.explicit_nonfinite32()) {
             if (float_transport_warning) return;

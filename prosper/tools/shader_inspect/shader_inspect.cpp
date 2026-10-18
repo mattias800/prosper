@@ -4,6 +4,7 @@
 #include "gpu/recompiler/rdna2_launch_vgprs.hpp"
 #include "gpu/execute/skippable_instruction.hpp"
 #include "gpu/recompiler/float64_support.hpp"
+#include "gpu/recompiler/float32_rte_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
@@ -348,6 +349,8 @@ int main(int argc, char** argv) {
     // The corpus models a synthetic target with the complete F64 controls contract.
     // This is an offline target assumption, not a measured executing-device verdict.
     prosper::gpu::publish_float64_support(true, true, true);
+    // The same offline target promises independent RTE32; this does not measure a device.
+    prosper::gpu::publish_float32_rte_support(true, true, true);
     // Flags are parsed rather than positionally matched, so a mode can be added without the arity
     // of the previous one becoming load-bearing. `--mimg-sites` is exclusive: it replaces the
     // listing with a machine-readable census (see below), and combining it with a stage recompile
