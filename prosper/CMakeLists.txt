@@ -3822,6 +3822,7 @@ if(TARGET prosper_core)
           ir_lower_vop1_dpp_source
           ir_lower_vop2_dpp_routes
           ir_dpp_row_xor_execution
+          ir_dpp16_inactive_source
           ir_ds_shuffle_values
           ir_ds_address_values
           ir_lower_ds_address
