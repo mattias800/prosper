@@ -6,6 +6,7 @@
 #include "gpu/recompiler/float64_support.hpp"
 #include "gpu/recompiler/float32_rte_support.hpp"
 #include "gpu/recompiler/ir/cfg/dispatch_blocks.hpp"
+#include "gpu/recompiler/ir/cfg/exec_value_census.hpp"
 #include "gpu/recompiler/ir/cfg/region_shadow.hpp"
 #include "gpu/recompiler/ir/cfg/state_placement.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -409,6 +410,43 @@ struct DispatchBlocksReport {
     }
 };
 
+// --cfg-exec-values: the step-7a shadow census (exec_value_census.hpp). Every exec_within call and
+// complement read the recompile makes is answered again from the static EXEC relations. Printed
+// when main returns: one `cfg-exec-values weaker` line per static-weaker comparison (at most 200),
+// one `cfg-exec-values stronger` line per proof shape, then the `cfg-exec-values-end` sentinel.
+struct ExecValuesReport {
+    prosper::gpu::ir::cfg::ExecValueCensus census;
+    static void counts(const char* prefix, const prosper::gpu::ir::cfg::ExecCensusTally& t) {
+        using prosper::gpu::ir::cfg::ExecCompare;
+        std::printf(" %s=%zu %s-equal=%zu %s-static-stronger=%zu %s-static-weaker=%zu "
+                    "%s-unmapped=%zu %s-cross-context=%zu",
+                    prefix, t.total(), prefix, t.counts[size_t(ExecCompare::Equal)], prefix,
+                    t.counts[size_t(ExecCompare::StaticStronger)], prefix,
+                    t.counts[size_t(ExecCompare::StaticWeaker)], prefix,
+                    t.counts[size_t(ExecCompare::Unmapped)], prefix,
+                    t.counts[size_t(ExecCompare::CrossContext)]);
+    }
+    ~ExecValuesReport() {
+        for (const auto& c : census.weaker())
+            std::printf("cfg-exec-values weaker site=%s pc=%u %s\n", c.site, c.pc,
+                        c.detail.c_str());
+        for (const auto* t : {&census.within(), &census.complement()})
+            for (const auto& [shape, count] : t->stronger)
+                std::printf("cfg-exec-values stronger site=%s shape=%s count=%zu example=\"%s\"\n",
+                            t == &census.within() ? "within" : "complement", shape.c_str(), count,
+                            t->example.at(shape).c_str());
+        for (const auto& [side, count] : census.within().unmapped)
+            std::printf("cfg-exec-values unmapped site=within side=%s count=%zu example=\"%s\"\n",
+                        side.c_str(), count, census.within().example.at(side).c_str());
+        std::printf("cfg-exec-values-end programs=%zu aliases=%zu misses=%zu", census.programs(),
+                    census.aliases(), census.misses());
+        counts("within", census.within());
+        counts("complement", census.complement());
+        std::printf("\n");
+        std::fflush(stdout);
+    }
+};
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -432,6 +470,7 @@ int main(int argc, char** argv) {
     bool cfg_regions = false;
     bool cfg_placement = false;
     bool cfg_dispatch_blocks = false;
+    bool cfg_exec_values = false;
     std::string inputs_path;
     std::string spirv_out;
     bool bad_usage = false;
@@ -458,6 +497,8 @@ int main(int argc, char** argv) {
             cfg_placement = true;
         } else if (arg == "--cfg-dispatch-blocks") {
             cfg_dispatch_blocks = true;
+        } else if (arg == "--cfg-exec-values") {
+            cfg_exec_values = true;
         } else if (arg == "--inputs") {
             if (i + 1 >= argc)
                 bad_usage = true;
@@ -491,6 +532,7 @@ int main(int argc, char** argv) {
         (cfg_placement && ((stage.empty() && inputs_path.empty()) || mimg_sites || skippable_mimg ||
                            wave_reasons || raw_wide_proof || cfg_regions)) ||
         (cfg_dispatch_blocks && ((stage.empty() && inputs_path.empty()) || cfg_regions)) ||
+        (cfg_exec_values && ((stage.empty() && inputs_path.empty()) || cfg_regions)) ||
         (!stage.empty() && stage != "vertex" && stage != "fragment" && stage != "compute")) {
         std::fprintf(stderr, "usage: %s <raw-rdna2.bin> [--stage vertex|fragment|compute]\n", argv[0]);
         std::fprintf(stderr,
@@ -512,6 +554,7 @@ int main(int argc, char** argv) {
                      argv[0]);
         std::fprintf(stderr,
                      "       add --cfg-dispatch-blocks to a --stage or --inputs recompile\n");
+        std::fprintf(stderr, "       add --cfg-exec-values to a --stage or --inputs recompile\n");
         std::fprintf(
             stderr,
             "\n"
@@ -572,6 +615,11 @@ int main(int argc, char** argv) {
             "dispatcher's blocks and successors equal build_guest_cfg's service split\n"
             "(IR_CONTROL_FLOW_PLAN step 5), else `differ` with the first difference. A\n"
             "`cfg-dispatch-blocks-end regions=N` sentinel follows.\n"
+            "--cfg-exec-values adds, after a --stage or --inputs recompile, the step-7a census:\n"
+            "each exec_within answer and complement read compared with the static EXEC\n"
+            "relations (equal, static-stronger, static-weaker, unmapped, cross-context), one\n"
+            "`cfg-exec-values weaker` line per static-weaker case, the stronger proof shapes,\n"
+            "and a `cfg-exec-values-end` summary (IR_CONTROL_FLOW_PLAN step 7).\n"
             "\n"
             "--synthetic-table (vertex/fragment only) fabricates one descriptor per use so the\n"
             "recompile runs past descriptor resolution. It is a COMPILE PROBE: a pass shows only\n"
@@ -620,6 +668,8 @@ int main(int argc, char** argv) {
     std::memcpy(words.data(), bytes.data(), bytes.size());
     std::optional<DispatchBlocksReport> dispatch_blocks_report;
     if (cfg_dispatch_blocks) dispatch_blocks_report.emplace();
+    std::optional<ExecValuesReport> exec_values_report;
+    if (cfg_exec_values) exec_values_report.emplace();
     if (!inputs_path.empty())
         return replay_recorded_inputs(input_path, inputs_path, words, spirv_out);
     std::vector<Rdna2Inst> instructions;

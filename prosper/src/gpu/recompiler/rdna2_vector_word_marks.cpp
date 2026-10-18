@@ -1,4 +1,5 @@
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
+#include "gpu/recompiler/ir/cfg/exec_value_census.hpp"
 
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
@@ -89,7 +90,9 @@ bool memory_read_completes_active_word(const Rdna2Inst& in) {
 
 }   // namespace
 
-bool exec_within(const RegState& rs, uint32_t reader, uint32_t owner) {
+namespace {
+
+bool exec_within_by_id(const RegState& rs, uint32_t reader, uint32_t owner) {
     uint32_t current = reader;
     for (int hop = 0; hop < 64 && current != 0; ++hop) {
         if (current == owner) return true;
@@ -98,6 +101,14 @@ bool exec_within(const RegState& rs, uint32_t reader, uint32_t owner) {
         current = parent->second;
     }
     return false;
+}
+
+}   // namespace
+
+bool exec_within(const RegState& rs, uint32_t reader, uint32_t owner) {
+    const bool within = exec_within_by_id(rs, reader, owner);
+    ir::cfg::exec_census_within(rs, reader, owner, within);   // step 7a shadow; observes only
+    return within;
 }
 
 namespace {
@@ -670,6 +681,7 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
                 // part a proved subset of whole. An old word confined within part (its missing
                 // lanes lie outside a superset of part) misses no lane of part, and this write
                 // completes the rest of whole, so the result misses lanes only outside whole.
+                ir::cfg::exec_census_complement(rs, rs.exec);   // step 7a shadow; observes only
                 const auto partition = rs.exec_complement_in.find(rs.exec);
                 const bool completes_partition =
                     !keep_wider && old.hard && old.outside_exec != 0 &&
@@ -739,6 +751,7 @@ void confine_execz_skip_marks(const RegState& rs, VectorWordMarks& skipped,
     //    is #5172's partition rule for the join of the two arms: the second arm's empty EXEC
     //    is the case where the first arm's owner already covered the whole saved mask.
     // These facts relate immutable EXEC SSA values, so they hold on the skipped edge too.
+    ir::cfg::exec_census_complement(rs, empty_exec);   // step 7a shadow; observes only
     const auto partition = rs.exec_complement_in.find(empty_exec);
     for (auto& [reg, marks] : skipped) {
         if (!marks.placeholder || !marks.hard) continue;

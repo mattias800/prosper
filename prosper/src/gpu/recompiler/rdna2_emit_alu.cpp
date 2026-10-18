@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/ir/cfg/exec_value_census.hpp"
 #include "gpu/recompiler/ir/lower/buffer_address_lowering.hpp"
 #include "gpu/recompiler/ir/lower/smem_index_lowering.hpp"
 #include "gpu/recompiler/ir/lower/flat_window_lowering.hpp"
@@ -181,6 +182,7 @@ static bool instruction_reads_scc_as_scalar_data(const Rdna2Inst& in) {
 bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool allow_exec_update,
               const std::unordered_set<uint32_t>* safe_execz, bool allow_smem,
               const ShaderResourceTable* rt, bool allow_wave) {
+    const ir::cfg::ExecCensusObservation exec_census(b, rs, in);   // step 7a shadow; observes only
     rs.native_interpolation_publication = {};
     if (b.is_fragment && instruction_reads_scc_as_scalar_data(in))
         b.mark_fragment_wave_scalar_use(rs.scc);

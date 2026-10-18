@@ -1,6 +1,6 @@
 # `gpu/recompiler/ir/cfg` — the guest CFG and its region tree
 
-Steps 1, 2, 4, 5 and 6 of `docs/architecture/IR_CONTROL_FLOW_PLAN.md`. One control-flow graph built once
+Steps 1, 2, 4, 5, 6 and 7a of `docs/architecture/IR_CONTROL_FLOW_PLAN.md`. One control-flow graph built once
 from the decoded program (`guest_cfg`), and the structured regions derived from it
 (`region_tree`): ifs (step 1) and loops (step 4). Both are plain data: building them allocates no
 SPIR-V id and calls no `SpirvCompute`, so they cannot change an emitted byte. The shadow check
@@ -27,6 +27,8 @@ existing owners. A consumer switches over after its own shadow check agrees. The
 | `structured_loop_cursor.hpp/.cpp` | step 4b: the DivLoop cursor and the CountedLoop record `emit_body` consumes, from the tree when equal to the detector |
 | `dispatch_blocks.hpp/.cpp` | step 5: the dispatcher's `starts`/`successors` from the service split, the guard that adopts them only when identical, and `DispatchBlocksCapture` for the shadow test and census |
 | `state_placement.hpp/.cpp` | step 6: the phi sets of every if merge and loop header, the guard the emitter takes them through, and the census that observes it |
+| `exec_values.hpp/.cpp` | step 7a: a static identity for every EXEC value and the subset/complement relations between them; nothing in emission reads it |
+| `exec_value_census.hpp/.cpp` | step 7a: the shadow census, which answers every `exec_within` call and complement read again from `exec_values` |
 
 Tests: `tests/gpu/recompiler/ir/test_ir_cfg_*.cpp`, one per source file.
 
@@ -274,3 +276,42 @@ differs (with the registers on each side) or absent (the tree has no such region
 `test_ir_cfg_state_placement` runs it over the committed fixtures, drives the guard directly with
 a differing placement, and uses `withhold` mode to show that taking an equal placement keeps the
 module.
+
+## EXEC values (step 7a)
+
+`build_exec_values` walks a `GuestCfg` and gives every EXEC definition a value: `Entry`; a `Write`
+at each instruction that writes EXEC (`rdna2_instruction_may_change_exec` or a scalar write
+covering s126/s127, through `for_each_scalar_write`); a `Phi` at a block whose predecessors carry
+different values; and, with `dispatch_reloads` on a service-split graph, a `DispatchReload` at every
+block entry whose `same_as` is the value reaching that case. A copy into EXEC (`s_mov_b64`,
+`s_wqm_b64`) is a `Write` whose `same_as` is the copied value. Lane masks in VCC and SGPR pairs are
+values too (a compare's result, a 64-bit mask operation's), because they become EXEC through a copy;
+a SAVEEXEC's destination holds the old EXEC value itself. The step-6 placement keeps EXEC out of
+its sets (the emitter phis it from `RegState`), so the phis here come from the same rule over the
+same graph: a phi where reaching definitions differ, which at a structured if merge or loop header
+is where the emitter phis EXEC.
+
+**The relations are the emitter's recognisers, stated over values:**
+
+| Emitter | Relation | Where it reaches further |
+| --- | --- | --- |
+| `write_vopc_mask` (V_CMPX) | EXEC' within EXEC | - |
+| `exec_masked_predicate` (any other compare) | the mask within EXEC | also when EXEC is not narrowed (the emitter returns the compare unmasked then) |
+| `record_exec_mask_subset` from `s_and/s_or/s_andn2_b64 exec` and `s_and/s_or/s_andn2/s_andn1_saveexec_b64` | AND within the operand that was the previous EXEC (else the left one), ANDN2 within its left operand, OR within the wider operand when one is within the other; ANDN2 is the left operand's complement of the right one when the right one is within it | - |
+| `merge_exec_arm` | the phi within an incoming value every other incoming value is within | at every join, not only one-armed if merges |
+| `make_narrowing_loop_exec_phi` / `LoopExecSubset` | the header phi within its forward value, assumed and then checked at the back edges; a failed check refuses that header | at every loop, not only the admitted ones (see `CONFIDENCE` in `exec_values.cpp`) |
+
+The 32-bit forms record nothing in the emitter and nothing here. `within` follows `same_as` and
+`subset_of`, so a copy or a reload proves what its source proves.
+
+**The census.** `ExecValueCensus` (thread-local, RAII) is fed by hooks that only observe: the
+structured route's program from `place_state`, the dispatcher's from `adopt_guest_cfg_blocks`
+(`dispatch_reloads`), the SPIR-V ids in EXEC, VCC and the saved masks around every `emit_alu`
+(`ExecCensusObservation`), and every `exec_within` call and `exec_complement_in` read in
+`rdna2_vector_word_marks.cpp`. Each id maps to the static values it was seen holding; a comparison
+is `equal`, `static-stronger` (only the static relation proves it), `static-weaker` (only the SPIR-V
+one does: a defect here), `unmapped` (an id no hook saw) or `cross-context`. `recompile_coverage`'s
+linear walk suspends it (`ExecCensusSuspend`). `shader_inspect --cfg-exec-values` prints the
+weaker cases, the stronger proof shapes with one example each, the unmapped sides and a
+`cfg-exec-values-end` summary; `test_ir_cfg_exec_values` runs it over the committed fixtures and
+over table-backed programs that reach each recorder, and fails on any static-weaker comparison.

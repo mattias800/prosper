@@ -113,6 +113,24 @@ and the dispatcher kept its own. `services` counts the GuestCfg blocks that end 
 service. The `cfg-dispatch-blocks-end` sentinel separates "no dispatcher region" from a run that
 died before printing.
 
+## `--cfg-exec-values`: the static EXEC relations against the SPIR-V-id ones
+
+```bash
+./build-linux/shader_inspect cs_<key>.bin --inputs cs_<key>.inputs --cfg-exec-values
+cfg-exec-values stronger site=within shape=reload:write>write count=2 example="pc=... reader=... owner=..."
+cfg-exec-values-end programs=1 aliases=0 misses=0 within=40 within-equal=38 within-static-stronger=2 within-static-weaker=0 ...
+```
+
+The step 7a census of `docs/architecture/IR_CONTROL_FLOW_PLAN.md`
+(`src/gpu/recompiler/ir/cfg/exec_value_census.hpp`). A modifier like `--cfg-dispatch-blocks`: every
+`exec_within` answer and `exec_complement_in` read of the recompile is answered again from the
+static relations of `exec_values.hpp` and counted as equal, static-stronger, static-weaker,
+unmapped or cross-context. Each static-weaker comparison prints a `cfg-exec-values weaker` line
+with both ids, the static values they were seen holding and the SPIR-V chain; a static-weaker line
+is a defect of the static pass. `stronger` and `unmapped` lines give one example per proof shape or
+unmapped side. The `cfg-exec-values-end` sentinel separates "nothing compared" from a run that
+died before printing.
+
 ## `--skippable-mimg`: which image instructions scalar branches can skip
 
 ```bash

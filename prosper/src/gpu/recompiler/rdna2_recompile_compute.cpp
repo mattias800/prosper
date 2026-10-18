@@ -2,6 +2,7 @@
 #include <atomic>
 #include <cstdint>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/ir/cfg/exec_value_census.hpp"
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/recompiler/compiler_choices.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
@@ -1161,6 +1162,7 @@ recompile_compute_once(const uint32_t* code, size_t dwords, const ShaderResource
 
 RecompileCoverage recompile_coverage(const uint32_t* code, size_t dwords,
                                      std::vector<RecompileUnsupportedSite>* sites) {
+    const ir::cfg::ExecCensusSuspend exec_census;   // a linear walk, not an emission route
     if (sites) sites->clear();
     std::vector<Rdna2Inst> ins;
     rdna2_walk(code, dwords, ins);
