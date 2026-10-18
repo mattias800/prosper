@@ -9,6 +9,7 @@
 #include <gtest/gtest.h>
 #include <cstdint>
 #include <vector>
+#include <unordered_set>
 using namespace prosper::gpu;
 using namespace prosper::gpu::ir::cfg;
 namespace {
@@ -79,12 +80,16 @@ TEST(IrCfgStructuredCursor, TreePreorderConsumesEveryNestedAndSequentialRecord) 
                                                nullptr, &refused, compute);
             ASSERT_FALSE(refused);
             ASSERT_FALSE(fs.empty());
-            RegionPolicy policy;
-            policy.allow_vcc = !compute;
-            policy.compute_wave_branches = compute;
+            std::unordered_set<uint32_t> linearized;
+            auto policy = structured_if_policy(compute, &linearized, code.data(), code.size());
+            EXPECT_EQ(policy.allow_vcc, !compute);
+            EXPECT_EQ(policy.compute_wave_branches, compute);
+            EXPECT_EQ(policy.linearized, &linearized);
+            EXPECT_EQ(policy.code, code.data());
+            EXPECT_EQ(policy.dwords, code.size());
+            EXPECT_FALSE(policy.fragment_wave_breaks);
+            // The loop-only flag cannot change adoption of these acyclic stage policies.
             policy.fragment_wave_breaks = fragment;
-            policy.code = code.data();
-            policy.dwords = code.size();
             StructuredIfCursor cursor(ins, fs, policy, refused);
             ASSERT_TRUE(cursor.uses_tree()) << "stage=" << stage << " shape=" << shape;
             for (const auto& expected : fs) {
@@ -114,7 +119,7 @@ TEST(IrCfgStructuredCursor, ARecordMismatchRetainsTheEntireDetectorSequence) {
     const auto ins = walk(code);
     auto fs = detect_forward_ifs(ins, true, code.data(), code.size());
     ASSERT_EQ(fs.size(), 1u);
-    ++fs[0].target_pc; // a deliberately different authoritative sequence
+    ++fs[0].target_pc;   // a deliberately different authoritative sequence
     StructuredIfCursor cursor(ins, fs, {}, false);
     EXPECT_FALSE(cursor.uses_tree());
     EXPECT_EQ(cursor.route(), StructuredIfCursor::Route::Mismatch);

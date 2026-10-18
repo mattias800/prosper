@@ -6,10 +6,14 @@
 #include <cstdint>
 #include <cstddef>
 #include <vector>
+#include <unordered_set>
 namespace prosper::gpu {
 struct ForwardIf;
 }
 namespace prosper::gpu::ir::cfg {
+// Only if-consumer inputs; loop policy retains its default because back edges fall back.
+RegionPolicy structured_if_policy(bool compute, const std::unordered_set<uint32_t>* linearized,
+                                  const uint32_t* code, size_t dwords);
 class StructuredIfCursor {
 public:
     enum class Route { Tree, NoIfs, DetectorRefused, Loops, Unstructured, Mismatch };

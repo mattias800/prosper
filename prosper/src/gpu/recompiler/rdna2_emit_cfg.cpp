@@ -6368,15 +6368,9 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // in its existing order. CONFIDENCE: MED-HIGH, guarded by corpus/execution checks.
         auto vget = [&](int r) { return vreg_seed(b, rs, r); };
         auto sget = [&](int r) { return scalar_merge_seed(b, rs, r); };
-        // Named fields: RegionPolicy gains members as the tree learns new shapes. The loop-only
-        // fragment_wave_breaks stays false; the cursor falls back for any program with loops.
-        ir::cfg::RegionPolicy if_policy;
-        if_policy.allow_vcc = !b.is_compute;
-        if_policy.compute_wave_branches = b.is_compute;
-        if_policy.linearized = &safe;
-        if_policy.code = code;
-        if_policy.dwords = dwords;
-        ir::cfg::StructuredIfCursor if_cursor(ins, Fs, if_policy, cf_rejected);
+
+        ir::cfg::StructuredIfCursor if_cursor(
+            ins, Fs, ir::cfg::structured_if_policy(b.is_compute, &safe, code, dwords), cf_rejected);
         size_t li = 0;   // next unconsumed loop in Ls (pc order)
         const DivLoop* active_direct_wave_loop = nullptr;
         uint32_t* active_direct_wave_continue = nullptr;

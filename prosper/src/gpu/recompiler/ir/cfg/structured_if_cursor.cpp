@@ -6,10 +6,23 @@
 #include "gpu/recompiler/ir/cfg/region_tree.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include <vector>
+#include <unordered_set>
 #include <cstdint>
 #include <cstdlib>
 #include <tuple>
 namespace prosper::gpu::ir::cfg {
+RegionPolicy structured_if_policy(bool compute, const std::unordered_set<uint32_t>* linearized,
+                                  const uint32_t* code, size_t dwords) {
+    // Named fields: RegionPolicy gains members as the tree learns new shapes. The loop-only
+    // fragment_wave_breaks stays false; the cursor falls back for any program with loops.
+    ir::cfg::RegionPolicy if_policy;
+    if_policy.allow_vcc = !compute;
+    if_policy.compute_wave_branches = compute;
+    if_policy.linearized = linearized;
+    if_policy.code = code;
+    if_policy.dwords = dwords;
+    return if_policy;
+}
 namespace {
 bool same_if(const ForwardIf& a, const ForwardIf& b) {
     return std::tie(a.found, a.branch_pc, a.target_pc, a.on_scc0, a.on_vcc, a.on_exec, a.early_out,
