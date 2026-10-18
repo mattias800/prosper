@@ -10,6 +10,7 @@
 #include "gpu/recompiler/ir/lower/image_coordinates_lowering.hpp"
 #include "gpu/recompiler/ir/lower/image_operand_coordinates_lowering.hpp"
 #include "gpu/recompiler/ir/lower/image_gather_layer_lowering.hpp"
+#include "gpu/recompiler/ir/lower/image_store_values_lowering.hpp"
 #include "gpu/recompiler/ir/lower/buffer_format_values.hpp"
 #include "gpu/recompiler/ir/lower/buffer_store_values.hpp"
 #include "gpu/recompiler/ir/lower/ds_cross_lane_lowering.hpp"
@@ -3320,8 +3321,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     int channel[4]; uint32_t constant[4];
                     if (!storage_load_selects(res->swizzle, res->format, channel, constant)) { ok = false; return true; }
                     uint32_t routed_out[4];
-                    for (uint32_t k = 0; k < 4u; ++k)
-                        routed_out[k] = channel[k] >= 0 ? out[channel[k]] : b.uconst(constant[k]);
+                    ir::lower_image_storage_load_selects(b, out, channel, constant, routed_out);
                     if (!write_mimg_results(routed_out)) { ok = false; return true; }
                 } else if (is_st) {
                     // image_store: gather the VDATA VGPRs selected by dmask into an RGBA texel (channels
@@ -3338,8 +3338,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     int source[4];
                     if (!storage_store_sources(res->swizzle, components, source)) { ok = false; return true; }
                     uint32_t routed[4];
-                    for (uint32_t c = 0; c < 4u; ++c)
-                        routed[c] = source[c] >= 0 ? vals[source[c]] : b.uconst(0);
+                    ir::lower_image_storage_store_selects(b, vals, source, routed);
                     b.image_write(res->binding, dim, arrayed, ncoord, coords, routed, rs.exec_narrowed, rs.exec);
                 } else {
                     // IMAGE_ATOMIC_SWAP/ADD reads its operand from VDATA. GLC=1 overwrites that VGPR
