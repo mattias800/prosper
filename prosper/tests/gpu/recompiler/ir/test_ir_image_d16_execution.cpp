@@ -7,6 +7,7 @@
 #include "shared/live/live_compute.hpp"
 #include <gtest/gtest.h>
 #include <cstdint>
+#include <ios>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
