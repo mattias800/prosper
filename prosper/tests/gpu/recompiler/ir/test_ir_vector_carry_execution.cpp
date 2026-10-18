@@ -275,9 +275,8 @@ TEST(IrVectorCarryExecution, Wave32CarryInFromVccHiDataIsNotReadAsVccLo) {
     constexpr uint32_t kSMovVccHiAllOnes = 0xbeeb03c1u;   // s_mov_b32 vcc_hi, -1
     for (const VectorCarryDef* def : vop3_carry_in_defs()) {
         SCOPED_TRACE(effects_name(*def));
-        const auto program = concat({{kSMovVccHiAllOnes},
-                                     carry_from_s2(kVcc),
-                                     vop3_words(def->opcode, kCarryOut, kVccHi)});
+        const auto program = concat(
+            {{kSMovVccHiAllOnes}, carry_from_s2(kVcc), vop3_words(def->opcode, kCarryOut, kVccHi)});
         const LaneInputs in = mask_lane_inputs(0x5203u + def->opcode);
         size_t visible = 0;
         for (size_t lane = 0; lane < in.lanes(); ++lane) {

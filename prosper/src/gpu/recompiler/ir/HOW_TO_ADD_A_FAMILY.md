@@ -557,6 +557,10 @@ Witness: `PROSPER_IR_WITNESS_DIR=~/<slug>-witness/carry ./test_ir_vector_carry_e
 control is a neutral byte change in one definition: swapped IAdd operands for add, and a mirrored
 borrow `UGt(y, x)` for the subtractions.
 
+The table below records the original migration's controls, before #5202 expanded the carry
+witness from 60 programs to 72. Its counts apply to that historical 60-program set; they do not
+qualify the expanded witness. The exporter command above now emits 72 carry programs.
+
 | control | recorded corpus (1,442 modules) | carry witness (60) | cndmask witness (12) |
 | --- | --- | --- | --- |
 | the migration | none | none | none |

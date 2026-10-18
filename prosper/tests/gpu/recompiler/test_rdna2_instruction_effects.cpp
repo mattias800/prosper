@@ -1380,7 +1380,8 @@ TEST(Rdna2InstructionEffectsRegression, Wave32LaneMaskSourceIsOneSgpr) {
         const Rdna2Inst in = decode_vop3_sgpr(op);
         if (in.fmt != Rdna2Format::VOP3) continue;
         if (rdna2_instruction_effects(in).lane_mask_src2) ++lane_mask_rows;
-        EXPECT_FALSE(valu_lane_mask_source(in, 0) || valu_lane_mask_source(in, 1)) << std::hex << op;
+        EXPECT_FALSE(valu_lane_mask_source(in, 0) || valu_lane_mask_source(in, 1))
+            << std::hex << op;
     }
     EXPECT_EQ(lane_mask_rows, 4u);
     // The source marks keep VCC_LO's pair (the entry-VCC witness); VCC_HI and an SGPR narrow.
