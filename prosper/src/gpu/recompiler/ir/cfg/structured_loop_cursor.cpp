@@ -17,10 +17,10 @@ using Flag = BranchCondition::Flag;
 bool same_loop(const DivLoop& a, const DivLoop& b) {
     return std::tie(a.header_pc, a.exit_branch_pc, a.backedge_pc, a.exit_pc, a.break_pcs,
                     a.direct_exec_breaks, a.direct_wave_breaks, a.bottom_tested, a.condition,
-                    a.continue_on_set) ==
-           std::tie(b.header_pc, b.exit_branch_pc, b.backedge_pc, b.exit_pc, b.break_pcs,
-                    b.direct_exec_breaks, b.direct_wave_breaks, b.bottom_tested, b.condition,
-                    b.continue_on_set);
+                    a.continue_on_set) == std::tie(b.header_pc, b.exit_branch_pc, b.backedge_pc,
+                                                   b.exit_pc, b.break_pcs, b.direct_exec_breaks,
+                                                   b.direct_wave_breaks, b.bottom_tested,
+                                                   b.condition, b.continue_on_set);
 }
 
 bool same_counted(const CountedLoop& a, const CountedLoop& b) {
@@ -72,8 +72,7 @@ public:
     }
 
     bool read(const Region& r, CountedLoop* out) const {
-        if (!loop_blocks_ok(r) || r.condition.flag != Flag::Scc || !r.breaks.empty())
-            return false;
+        if (!loop_blocks_ok(r) || r.condition.flag != Flag::Scc || !r.breaks.empty()) return false;
         CountedLoop L;
         L.found = true;
         read_bounds(r, &L.header_pc, &L.exit_branch_pc, &L.backedge_pc, &L.exit_pc);

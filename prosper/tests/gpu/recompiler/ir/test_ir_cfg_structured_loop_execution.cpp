@@ -87,8 +87,8 @@ void expect_tree_route(const Case& c, uint32_t wave) {
     rdna2_walk(p.code.data(), p.code.size(), ins);
     std::unordered_set<uint32_t> safe = safe_execz_branches(ins);
     for (uint32_t pc : waterfall_branches(ins)) safe.insert(pc);
-    const auto policy = ir::cfg::structured_loop_policy(true, false, &safe, p.code.data(),
-                                                        p.code.size());
+    const auto policy =
+        ir::cfg::structured_loop_policy(true, false, &safe, p.code.data(), p.code.size());
     if (c.counted) {
         const CountedLoop detector = detect_counted_loop(ins);
         ASSERT_TRUE(detector.found);

@@ -62,8 +62,8 @@ void expect_sequence(StructuredLoopCursor& cursor, const std::vector<DivLoop>& e
 TEST(IrCfgStructuredLoopCursor, TreeRouteYieldsNestedLoopsInHeaderOrder) {
     // 0: s_mov; 1: execz -> 8; 2: v_nop; 3: execz -> 6; 4: v_nop; 5: s_branch -> 3;
     // 6: v_nop; 7: s_branch -> 1; 8: s_endpgm
-    const Program p({kSMovS0Zero, sopp(kExecz, 6), kVNop, sopp(kExecz, 2), kVNop,
-                     sopp(kBranch, -3), kVNop, sopp(kBranch, -7), kEndpgm});
+    const Program p({kSMovS0Zero, sopp(kExecz, 6), kVNop, sopp(kExecz, 2), kVNop, sopp(kBranch, -3),
+                     kVNop, sopp(kBranch, -7), kEndpgm});
     const auto loops = p.divergent();
     ASSERT_EQ(loops.size(), 2u);
     StructuredLoopCursor cursor(p.ins, loops, p.policy, false);
@@ -77,8 +77,8 @@ TEST(IrCfgStructuredLoopCursor, TreeRouteYieldsNestedLoopsInHeaderOrder) {
 TEST(IrCfgStructuredLoopCursor, TreeRouteYieldsSequentialLoopsAndBreaks) {
     // Loop 1 has a break. 0: s_mov; 1: execz -> 6; 2: v_nop; 3: execz -> 6 (break); 4: v_nop;
     // 5: execnz -> 1; 6: execz -> 9; 7: v_nop; 8: s_branch -> 6; 9: s_endpgm
-    const Program p({kSMovS0Zero, sopp(kExecz, 4), kVNop, sopp(kExecz, 2), kVNop,
-                     sopp(kExecnz, -5), sopp(kExecz, 2), kVNop, sopp(kBranch, -3), kEndpgm});
+    const Program p({kSMovS0Zero, sopp(kExecz, 4), kVNop, sopp(kExecz, 2), kVNop, sopp(kExecnz, -5),
+                     sopp(kExecz, 2), kVNop, sopp(kBranch, -3), kEndpgm});
     const auto loops = p.divergent();
     ASSERT_EQ(loops.size(), 2u);
     ASSERT_EQ(loops[0].break_pcs.size(), 1u);
@@ -135,8 +135,8 @@ TEST(IrCfgStructuredLoopCursor, ACountedTreeIsNotTheDivergentRoute) {
 
 // The mismatch guard: each field changed alone, plus a missing, an extra and a reordered loop.
 TEST(IrCfgStructuredLoopCursor, AnyDifferentFieldFallsBackToTheWholeDetectorSequence) {
-    const Program p({kSMovS0Zero, sopp(kExecz, 4), kVNop, sopp(kExecz, 2), kVNop,
-                     sopp(kExecnz, -5), sopp(kExecz, 2), kVNop, sopp(kBranch, -3), kEndpgm});
+    const Program p({kSMovS0Zero, sopp(kExecz, 4), kVNop, sopp(kExecz, 2), kVNop, sopp(kExecnz, -5),
+                     sopp(kExecz, 2), kVNop, sopp(kBranch, -3), kEndpgm});
     const auto base = p.divergent();
     ASSERT_EQ(base.size(), 2u);
     ASSERT_EQ(StructuredLoopCursor(p.ins, base, p.policy, false).route(), LoopRecordRoute::Tree);
@@ -172,9 +172,9 @@ TEST(IrCfgStructuredLoopCursor, AnyDifferentFieldFallsBackToTheWholeDetectorSequ
 
 TEST(IrCfgStructuredLoopCursor, CountedTreeRouteForTopTestedAndDoWhileLoops) {
     // 0: s_mov; 1: scc0 -> 3; 2: s_branch -> 0; 3: s_endpgm   and   0: v_nop; 1: scc0 -> 0; ...
-    for (const auto& words : {std::vector<uint32_t>{kSMovS0Zero, sopp(kScc0, 1),
-                                                    sopp(kBranch, -3), kEndpgm},
-                              std::vector<uint32_t>{kVNop, sopp(kScc0, -2), kEndpgm}}) {
+    for (const auto& words :
+         {std::vector<uint32_t>{kSMovS0Zero, sopp(kScc0, 1), sopp(kBranch, -3), kEndpgm},
+          std::vector<uint32_t>{kVNop, sopp(kScc0, -2), kEndpgm}}) {
         const Program p(words);
         const CountedLoop detector = detect_counted_loop(p.ins);
         ASSERT_TRUE(detector.found);
@@ -218,8 +218,10 @@ TEST(IrCfgStructuredLoopCursor, AnyDifferentCountedFieldKeepsTheDetectorRecord) 
     const CountedLoop base = detect_counted_loop(p.ins);
     ASSERT_EQ(counted_loop_record(p.ins, base, p.policy).route, LoopRecordRoute::Tree);
     const std::vector<std::function<void(CountedLoop&)>> mutations = {
-        [](auto& L) { ++L.header_pc; },     [](auto& L) { ++L.exit_branch_pc; },
-        [](auto& L) { ++L.backedge_pc; },   [](auto& L) { ++L.exit_pc; },
+        [](auto& L) { ++L.header_pc; },
+        [](auto& L) { ++L.exit_branch_pc; },
+        [](auto& L) { ++L.backedge_pc; },
+        [](auto& L) { ++L.exit_pc; },
         [](auto& L) { L.exit_on_scc0 = !L.exit_on_scc0; },
     };
     for (size_t i = 0; i < mutations.size(); ++i) {
