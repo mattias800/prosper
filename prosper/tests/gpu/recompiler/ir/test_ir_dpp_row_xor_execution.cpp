@@ -40,6 +40,7 @@ void definition(const cases::Case& c, const LaneInputs& in) {
     const auto d =
         dpp_row_xor_source(ir, source, active, c.control == 0x128 ? 8u : c.control - 0x160u);
     std::vector<InvocationInputs> rows;
+    rows.reserve(c.wave);
     for (uint32_t lane = 0; lane < c.wave; ++lane)
         rows.push_back({in.s0[lane], in.active[lane] ? 1u : 0u});
     const auto got = evaluate_lanes(block, rows);
