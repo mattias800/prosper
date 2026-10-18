@@ -261,9 +261,9 @@ TEST(IrVectorCompareClassF32Execution, EffectsDescribeOneClassDefinitionAndItsCm
     EXPECT_EQ(block.at(value).type, Type::Bool);
 }
 
-TEST(IrVectorCompareClassF32Execution, HalfAndDoubleClassRemainUnsupportedBesideSingleSuccess) {
+TEST(IrVectorCompareClassF32Execution, HalfClassRemainsUnsupportedBesideSingleSuccess) {
     check_class_run(class_inputs(0x5338), Form::VopcVcc, 64, compare_program(0x88, Form::VopcVcc));
-    for (const uint32_t op : {0x8fu, 0xa8u}) {
+    for (const uint32_t op : {0x8fu}) {
         EXPECT_EQ(find_vector_compare(op), nullptr);
         for (const Form form : kForms) {
             const auto lp = lane_program(compare_program(op, form), 64, 64);

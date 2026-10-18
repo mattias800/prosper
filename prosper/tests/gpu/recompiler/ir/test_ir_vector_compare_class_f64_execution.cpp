@@ -4,6 +4,8 @@
 #include "gpu/recompiler/float64_support.hpp"
 #include "gpu/recompiler/ir/eval.hpp"
 #include "gpu/recompiler/ir/ops/vector_compare.hpp"
+#include "gpu/recompiler/ir/lower/vector_alu_lowering.hpp"
+#include "gpu/recompiler/ir/lowering_fixture.hpp"
 #include "gpu/recompiler/ir/vector_compare_harness.hpp"
 #include "gpu/recompiler/ir/vector_lane_harness.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -278,6 +280,68 @@ TEST(IrVectorCompareClassF64Execution, HalfRemainsRefusedBesideDoubleClass) {
         const auto p = lane_program(compare_program(0x8f, form), 64, 64);
         EXPECT_TRUE(recompile_compute(p.code.data(), p.code.size(), &p.table, p.config).empty());
     }
+}
+TEST(IrVectorCompareClassF64Execution, ScalarPairsNeedBothGenuineUniformWords) {
+    for (int local : {-1, 30, 31, 34}) {
+        LoweringFixture t;
+        t.set_sgpr(30, 1);
+        t.set_sgpr(31, 0x7ff00000u);
+        t.set_sgpr(34, 0x3ff);
+        if (local >= 0) t.rs.lane_local_scalars.insert(t.rs.sreg.at(local));
+        const auto in = LoweringFixture::decode({0xd4a8006au, 30u | (34u << 9)});
+        ASSERT_TRUE(lower_vopc(t.b, t.rs, in, t.ok, false, true));
+        if (local < 0) {
+            EXPECT_TRUE(t.ok);
+            EXPECT_NE(t.rs.vcc, 0u);
+            EXPECT_EQ(t.rs.vcc_wave_uniform, t.rs.vcc);
+        } else {
+            EXPECT_FALSE(t.ok);
+            EXPECT_EQ(t.b.stage_reject_reason, local == 34 ? "class-f64-unproved-class-mask"
+                                                           : "class-f64-unproved-scalar-pair");
+            EXPECT_EQ(t.rs.vcc_wave_uniform, 0u);
+        }
+    }
+}
+TEST(IrVectorCompareClassF64Execution, SubdwordAndAmbiguousMaskFormsRefuseByName) {
+    for (int shape : {0, 1, 2, 3}) {
+        LoweringFixture t;
+        t.rs.vreg[kVsrc0] = t.b.uconst(0);
+        t.rs.vreg[kVsrc1] = t.b.uconst(0x3ff00000u);
+        t.rs.vreg[kVsrc2] = t.b.uconst(256);
+        auto in = LoweringFixture::decode(compare_program(0xa8, Form::Vop3Vcc, 0, 0, kVsrc2));
+        if (shape == 0) in.has_sdwa = true;
+        if (shape == 1) in.has_dpp = true;
+        if (shape == 2) in.src[1] = {OperandKind::InlineFloat, 242};
+        if (shape == 3) {
+            in.src[1] = {OperandKind::Special, 253};
+            t.rs.scc = t.b.btrue();
+        }
+        ASSERT_TRUE(lower_vopc(t.b, t.rs, in, t.ok, false, true));
+        EXPECT_FALSE(t.ok);
+        EXPECT_EQ(t.b.stage_reject_reason,
+                  shape < 2 ? "class-f64-sdwa-dpp" : "class-f64-class-mask-unsupported");
+    }
+    check(program(Form::Vop3Vcc, 64), data(1));
+}
+TEST(IrVectorCompareClassF64Execution, EffectsWidthsAgreeAndNoFloat64InstructionsAreDeclared) {
+    for (uint32_t op : {0xa8u, 0xb8u}) {
+        const auto& effect = rdna2_instruction_effects(Rdna2Format::VOPC, op);
+        EXPECT_EQ(effect.ssrc_dwords[0], 2u);
+        EXPECT_EQ(effect.ssrc_dwords[1], 1u);
+    }
+    reset_float64_support_for_test();
+    const auto lp = lane_program(compare_program(0xa8, Form::VopcVcc, 0, 0, kVsrc2), 64, 64, true);
+    const auto spv = recompile_compute(lp.code.data(), lp.code.size(), &lp.table, lp.config);
+    ASSERT_GT(spv.size(), 5u);
+    for (size_t at = 5; at < spv.size();) {
+        const uint32_t opcode = spv[at] & 0xffffu, count = spv[at] >> 16;
+        ASSERT_GT(count, 0u);
+        ASSERT_LE(at + count, spv.size());
+        if (opcode == 17 && count == 2) EXPECT_NE(spv[at + 1], 10u); // Capability Float64
+        if (opcode == 22 && count == 3) EXPECT_NE(spv[at + 2], 64u); // OpTypeFloat
+        at += count;
+    }
+    check(program(Form::VopcVcc, 64), data(1));
 }
 TEST(IrVectorCompareClassF64Execution, ExportsEveryAdmittedClassForm) {
     namespace fs = std::filesystem;

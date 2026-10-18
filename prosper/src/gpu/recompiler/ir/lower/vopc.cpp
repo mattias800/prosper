@@ -2,6 +2,7 @@
 // modifiers, the comparison value, then the shared lane-mask write.
 #include "gpu/recompiler/ir/lower/vopc_lowering_internal.hpp"
 #include "gpu/recompiler/ir/lower/vopc_mask_write.hpp"
+#include "gpu/recompiler/rdna2_instruction_effects.hpp"
 
 namespace prosper::gpu::ir {
 
@@ -25,6 +26,8 @@ bool VopcLowering::lower() {
         (eff >= 0xA1u && eff <= 0xA6u) ||
         (eff >= 0xE1u && eff <= 0xE6u);
     float64_compare = eff >= 0x20u && eff <= 0x2Fu;
+    const auto& effects = rdna2_instruction_effects(Rdna2Format::VOPC, eff);
+    const bool raw_class64 = effects.ssrc_dwords[0] == 2 && effects.ssrc_dwords[1] == 1;
     compare_wave_uniform =
         !is_cmpx && !rs.exec_narrowed &&
         (integer64_compare || float64_compare
@@ -46,7 +49,7 @@ bool VopcLowering::lower() {
              !in.sdwa_src0_sext && !in.sdwa_src1_sext));
     zero_compare();
     magnitude_compare();
-    if (!magnitude_cmp && !zero_cmp && !float64_compare) source_modifiers();
+    if (!magnitude_cmp && !zero_cmp && !float64_compare && !raw_class64) source_modifiers();
     integer_sdwa_sources();
     if (integer64_compare) {
         a64 = integer64_halves(in.src[0], ra);

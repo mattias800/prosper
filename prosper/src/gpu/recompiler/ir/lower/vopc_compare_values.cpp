@@ -21,6 +21,7 @@ uint32_t VopcLowering::compare_value() {
         case 0xCD:
         case 0xCE: return compare_f16();
         case 0x88: return compare_class_f32();
+        case 0xa8: return compare_class_f64();
         default: break;
     }
     // Opcodes with an ir/ops definition (ops/vector_compare_*.cpp). A 64-bit group reads the

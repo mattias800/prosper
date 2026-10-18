@@ -45,6 +45,8 @@ std::span<const VectorCompareDef> vector_compare_i16_u16_defs();
 std::span<const VectorCompareDef> vector_compare_f16_defs();
 // CLASS_F32 receives raw SRC0 after integer ABS/NEG and raw SRC1.
 std::span<const VectorCompareDef> vector_compare_class_f32_defs();
+// CLASS_F64 reads SRC0's raw pair and only the low word of SRC1 (the class mask).
+std::span<const VectorCompareDef> vector_compare_class_f64_defs();
 // I64/U64 definitions read both halves of each source (pair_sources).
 std::span<const VectorCompareDef> vector_compare_i64_u64_defs();
 // F64 definitions read both halves of each source as one binary64 word (pair_sources).
