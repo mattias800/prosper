@@ -12,15 +12,18 @@ namespace prosper::test::ir::image_d16 {
 inline constexpr uint32_t kLanes = 64, kW = 64, kH = 4;
 struct Example {
     uint32_t f32, f16;
+    uint32_t other = f16; // exact values have one result; inexact examples name both neighbours
 };
 // Worked in binary, independently of eval: 1+2^-11 ties down, 1+3*2^-11 ties up.
 inline constexpr std::array kExamples{
-    Example{0x00000000, 0x0000}, Example{0x80000000, 0x8000}, Example{0x3f800000, 0x3c00},
-    Example{0xc0000000, 0xc000}, Example{0x3f000000, 0x3800}, Example{0x477fe000, 0x7bff},
-    Example{0x38800000, 0x0400}, Example{0x33800000, 0x0001}, Example{0x387fc000, 0x03ff},
-    Example{0x3f801000, 0x3c00}, Example{0x3f803000, 0x3c02}, Example{0xbf803000, 0xbc02},
-    Example{0x7f800000, 0x7c00}, Example{0xff800000, 0xfc00}, Example{0x33000000, 0x0000},
-    Example{0xb3800000, 0x8001}};
+    Example{0x00000000, 0x0000},         Example{0x80000000, 0x8000},
+    Example{0x3f800000, 0x3c00},         Example{0xc0000000, 0xc000},
+    Example{0x3f000000, 0x3800},         Example{0x477fe000, 0x7bff},
+    Example{0x38800000, 0x0400},         Example{0x33800000, 0x0001},
+    Example{0x387fc000, 0x03ff},         Example{0x3f801000, 0x3c00, 0x3c01},
+    Example{0x3f803000, 0x3c02, 0x3c01}, Example{0xbf803000, 0xbc02, 0xbc01},
+    Example{0x7f800000, 0x7c00},         Example{0xff800000, 0xfc00},
+    Example{0x33000000, 0x0000, 0x0001}, Example{0xb3800000, 0x8001}};
 struct Arm {
     uint32_t opcode, dmask;
     bool nsa;
@@ -82,21 +85,19 @@ inline std::vector<uint32_t> texture_words() {
             for (uint32_t c = 0; c < 4; ++c) out.push_back(texel(xx, yy, c).f32);
     return out;
 }
-inline uint32_t expected(const Arm& a, const Data& in, uint32_t lane, uint32_t word) {
-    if (!in.active[lane]) return in.old[word][lane];
-    std::vector<uint32_t> half;
+// Expected source halves are worked from the texel table; no evaluator supplies this oracle.
+inline std::vector<Example> expected_halves(const Arm& a, uint32_t lane) {
+    std::vector<Example> half;
     if (gather(a)) {
         const uint32_t channel = uint32_t(std::countr_zero(a.dmask));
         constexpr std::array xx{0u, 1u, 1u, 0u}, yy{1u, 1u, 0u, 0u};
         for (uint32_t c = 0; c < 4; ++c)
-            half.push_back(texel(x(lane) - 1 + xx[c], y(lane) - 1 + yy[c], channel).f16);
+            half.push_back(texel(x(lane) - 1 + xx[c], y(lane) - 1 + yy[c], channel));
     } else {
         for (uint32_t c = 0; c < 4; ++c)
-            if (a.dmask & (1u << c)) half.push_back(texel(x(lane), y(lane), c).f16);
+            if (a.dmask & (1u << c)) half.push_back(texel(x(lane), y(lane), c));
     }
-    const std::size_t at = std::size_t{word} * 2;
-    if (at >= half.size()) return in.old[word][lane];
-    return half[at] | (at + 1 < half.size() ? half[at + 1] << 16 : 0u);
+    return half;
 }
 inline LaneProgram program(const Arm& a, uint32_t wave, uint64_t buffer = 0, uint64_t image = 0,
                            bool d16 = true, bool integer = false) {

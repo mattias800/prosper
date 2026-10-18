@@ -55,11 +55,31 @@ void execute(const cases::Arm& arm, uint32_t wave, uint32_t mask, uint32_t index
     item.launch.groups_x = item.launch.groups_y = item.launch.groups_z = 1;
     ASSERT_TRUE(prosper::frontend::execute_live_compute_items({item}));
     for (uint32_t c = 0; c < 4; ++c)
-        for (uint32_t lane = 0; lane < cases::kLanes; ++lane)
-            EXPECT_EQ(buffer[c * cases::kLanes + lane],
-                      (d16 ? cases::expected(arm, in, lane, c)
-                           : adjust(cases::texel(cases::x(lane), cases::y(lane), c).f32)))
-                << "lane=" << lane << " result=" << c;
+        for (uint32_t lane = 0; lane < cases::kLanes; ++lane) {
+            const uint32_t got = buffer[c * cases::kLanes + lane];
+            if (!d16) {
+                EXPECT_EQ(got, adjust(cases::texel(cases::x(lane), cases::y(lane), c).f32))
+                    << "lane=" << lane << " result=" << c;
+                continue;
+            }
+            const auto half = cases::expected_halves(arm, lane);
+            const size_t at = size_t{c} * 2u;
+            if (!in.active[lane] || at >= half.size()) {
+                EXPECT_EQ(got, in.old[c][lane]) << "lane=" << lane << " guard=" << c;
+                continue;
+            }
+            // #5420 revised contract: inexact conversions choose an adjacent half. Check BOTH
+            // halves even when the IR evaluator conservatively returns unknown for the word.
+            for (uint32_t part = 0; part < 2; ++part) {
+                const uint32_t bits = (got >> (part * 16u)) & 0xffffu;
+                const cases::Example want =
+                    at + part < half.size() ? half[at + part] : cases::Example{0, 0};
+                EXPECT_TRUE(bits == want.f16 || bits == want.other)
+                    << "lane=" << lane << " result=" << c << " half=" << part << std::hex
+                    << " source=" << adjust(want.f32) << " got=" << bits
+                    << " neighbours=" << want.f16 << "," << want.other;
+            }
+        }
 }
 TEST_F(IrImageD16Execution, DwordControlPreservesRoundingInputsBeforePacking) {
     uint32_t index = 3000;
@@ -70,9 +90,13 @@ TEST_F(IrImageD16Execution, DwordControlPreservesInputsJustPastTheTie) {
     uint32_t index = 4000;
     for (uint32_t wave : {32u, 64u}) execute({0, 15, false}, wave, 0, index++, false, true);
 }
-TEST_F(IrImageD16Execution, NonTieInputsJustPastTheTieAreComparedWithRte) {
+TEST_F(IrImageD16Execution, NonTieInputsJustPastTheTieLandOnAdjacentHalfNeighbours) {
     uint32_t index = 5000;
     for (uint32_t wave : {32u, 64u}) execute({0, 15, false}, wave, 0, index++, true, true);
+}
+TEST_F(IrImageD16Execution, TieInputsLandOnAdjacentHalfNeighbours) {
+    uint32_t index = 6000;
+    for (uint32_t wave : {32u, 64u}) execute({0, 15, false}, wave, 0, index++);
 }
 TEST_F(IrImageD16Execution, EveryMaskPacksHalvesAndPreservesFollowingRegisters) {
     uint32_t index = 1;
@@ -124,4 +148,4 @@ TEST(IrImageD16Witness, ExportsEveryExistingForm) {
         }
     EXPECT_EQ(count, 136u);
 }
-} // namespace
+}   // namespace
