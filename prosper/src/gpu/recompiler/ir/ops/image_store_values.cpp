@@ -4,6 +4,9 @@
 #include "gpu/recompiler/ir/builder.hpp"
 #include "gpu/recompiler/ir/emit/spirv_emitter.hpp"
 #include <cstdlib>
+#include <cstdint>
+#include <span>
+#include "gpu/recompiler/ir/ir.hpp"
 namespace prosper::gpu::ir {
 ImageStorageValue build_image_storage_word(ImageStorageWordKind kind, uint32_t half) {
     ImageStorageValue out;

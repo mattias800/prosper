@@ -3,6 +3,7 @@
 #include "gpu/recompiler/ir/ops/image_store_values.hpp"
 #include "gpu/recompiler/ir/image_store_values_cases.hpp"
 #include "gpu/recompiler/ir/builder.hpp"
+#include "gpu/recompiler/ir/ir.hpp"
 #include "gpu/recompiler/ir/emit/spirv_emitter.hpp"
 #include "gpu/recompiler/ir/eval.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
@@ -43,6 +44,7 @@ void check(ImageStorageValue graph, const std::vector<Row>& data,
     SpirvCompute b;
     b.begin(graph.block.input_count(), nullptr, lanes, 1, 1, lanes, 0, true, true);
     std::vector<uint32_t> inputs;
+    inputs.reserve(graph.block.input_count());
     for (uint32_t slot = 0; slot < graph.block.input_count(); ++slot)
         inputs.push_back(b.load_input(slot));
     const auto ids = emit_spirv(b, graph.block, inputs);
@@ -59,6 +61,7 @@ void check(ImageStorageValue graph, const std::vector<Row>& data,
     ASSERT_EQ(expected.size(), data.size());
     for (uint32_t lane = 0; lane < lanes; ++lane) {
         std::vector<Known> inputs_known;
+        inputs_known.reserve(graph.sources.size());
         for (uint32_t source : graph.sources) inputs_known.push_back(data[lane][source]);
         const uint32_t want = data[lane][4] ? expected[lane] : data[lane][5];
         EXPECT_EQ(evaluate(graph.block, inputs_known)[graph.value.index], Known(want)) << lane;
@@ -73,6 +76,7 @@ TEST(IrImageStoreValues, EveryWordDefinitionExecutesWithDistinctAndMaskedLanes) 
                 for (uint32_t half : {0u, 1u}) {
                     const auto data = rows(wave, mask, kind == ImageStorageWordKind::FloatHalf);
                     std::vector<uint32_t> expected;
+                    expected.reserve(wave);
                     for (uint32_t lane = 0; lane < wave; ++lane)
                         expected.push_back(kind == ImageStorageWordKind::Raw ? data[lane][0]
                                            : kind == ImageStorageWordKind::FloatHalf
@@ -88,6 +92,7 @@ TEST(IrImageStoreValues, EveryChannelAndConstantExecutesWithDistinctAndMaskedLan
                 for (uint32_t constant : {0u, 1u, 0x3f800000u}) {
                     const auto data = rows(wave, mask);
                     std::vector<uint32_t> expected;
+                    expected.reserve(wave);
                     for (const auto& row : data)
                         expected.push_back(source < 0 ? constant : row[source]);
                     check(build_image_storage_select(source, constant), data, expected);

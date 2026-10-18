@@ -49,7 +49,10 @@ void execute(const cases::Arm& arm, uint32_t wave, uint32_t mask, uint32_t index
     item.launch.local_x = item.launch.threads_x = cases::kLanes;
     item.launch.local_y = item.launch.local_z = item.launch.threads_y = item.launch.threads_z = 1;
     item.launch.groups_x = item.launch.groups_y = item.launch.groups_z = 1;
+    const auto cpu_fills = prosper::frontend::live_compute_cpu_fill_dispatches();
     ASSERT_TRUE(prosper::frontend::execute_live_compute_items({item}));
+    EXPECT_EQ(prosper::frontend::live_compute_cpu_fill_dispatches(), cpu_fills)
+        << "per-lane storage values must execute the emitted module";
     if (arm.load) {
         for (uint32_t c = 0; c < 4; ++c)
             for (uint32_t lane = 0; lane < cases::kLanes; ++lane)

@@ -3,6 +3,7 @@
 #include "gpu/recompiler/ir/ops/image_store_values.hpp"
 #include <array>
 #include <span>
+#include <cstdint>
 namespace prosper::gpu::ir {
 uint32_t lower_image_store_raw_word(SpirvCompute& builder, uint32_t word) {
     return emit_image_storage_value(builder, build_image_storage_word(ImageStorageWordKind::Raw, 0),
