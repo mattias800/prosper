@@ -1,6 +1,7 @@
 // vop2_dpp_routes.cpp — VOP2 DPP shapes: the in-place compute ROW_SHR, the partial-row v_add_nc_u32, and the SRC0 DPP transform.
 // Relocated verbatim from emit_alu's VOP2 case by tools/refactor/extract_case_routes.py (ADR 0012).
 #include "gpu/recompiler/ir/lower/vector_lowering_internal.hpp"
+#include "gpu/recompiler/ir/ops/vector_dpp_row_xor.hpp"
 
 namespace prosper::gpu::ir {
 
@@ -52,10 +53,8 @@ std::optional<bool> Vop2Lowering::stage_dpp_source() {
                 !b.native_subgroup_size) {
                 ok = false; return true;
             }
-            uint32_t valid_source = 0;
-            const uint32_t rotated =
-                b.subgroup_row_xor(a, rs.exec, row_xor, &valid_source);
-            a = b.sel(valid_source, rotated, b.uconst(0));
+            b.mark_subgroup_min16();
+            a = emit_dpp_row_xor_source(b, a, rs.exec, row_xor);
         } else if (row_shr) {
             if (b.is_vertex) {
                 if (!b.ngg_one_lane || in.opcode != 0x25 || !in.dpp_bound_ctrl) {

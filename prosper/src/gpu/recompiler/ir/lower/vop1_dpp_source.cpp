@@ -1,5 +1,6 @@
 // Relocated verbatim with extract_case_routes.py; only compute row-XOR values migrate here.
 #include "gpu/recompiler/ir/lower/vop1_dpp_source_lowering.hpp"
+#include "gpu/recompiler/ir/ops/vector_dpp_row_xor.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 namespace prosper::gpu::ir {
@@ -35,9 +36,8 @@ std::optional<bool> Vop1DppSourceLowering::stage_dpp_source() {
                 ok = false;
                 return true;
             }
-            uint32_t valid_source = 0;
-            const uint32_t rotated = b.subgroup_row_xor(a, rs.exec, row_xor, &valid_source);
-            a = b.sel(valid_source, rotated, b.uconst(0));
+            b.mark_subgroup_min16();
+            a = emit_dpp_row_xor_source(b, a, rs.exec, row_xor);
         } else if (row_shr) {
             // The portable NGG vertex shell represents the one live guest lane as lane 0.
             // Every non-zero row-right shift therefore addresses a lane before the start of
