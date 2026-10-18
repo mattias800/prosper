@@ -13,7 +13,6 @@
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <gtest/gtest.h>
-#include <vulkan/vulkan.h>
 #include <algorithm>
 #include <bit>
 #include <cstddef>
@@ -23,7 +22,6 @@
 #include <fstream>
 #include <initializer_list>
 #include <cstdio>
-#include <cstring>
 #include <string>
 #include <vector>
 using namespace prosper::gpu;

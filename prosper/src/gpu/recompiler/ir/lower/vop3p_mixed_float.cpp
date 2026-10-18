@@ -1,7 +1,8 @@
 // Mixed VOP3P source preparation and result publication, moved by extract_case_routes.py.
-// The mixed-half arithmetic is retained verbatim; this relocation adds no value definition.
+// F32 delegates to the shared IR Fma; mixed-half rounding remains the legacy #5225 gap.
 #include "gpu/recompiler/ir/lower/vop3p_mixed_float.hpp"
 #include "gpu/recompiler/ir/lower/lowering_context.hpp"
+#include "gpu/recompiler/ir/ops/vector_fma_float.hpp"
 
 namespace prosper::gpu::ir {
 namespace {
@@ -9,13 +10,15 @@ struct Vop3pMixedFloatLowering : LoweringContext {
     bool lower();
 };
 bool Vop3pMixedFloatLowering::lower() {
-    // Mixed-precision FMA family, trivial form only (all sources full f32 — the decoder set
-    // has_modifier for any opsel/neg/clamp bits, rejected above). v_fma_mix_f32 (0x20):
-    // d = s0*s1+s2. v_fma_mixlo/hi_f16 (0x21/0x22): the f32 result converts to f16 into the
-    // LOW/HIGH half of d, PRESERVING the other half (DOLL's box-blur PS packs its result
-    // this way, #273). VERIFIED(round-trip llvm-mc gfx1010: 0xcc210000 0x041600f2 ->
-    // v_fma_mixlo_f16 v0, 1.0, v0, v5 — the live blur bytes).
-    if (in.opcode != 0x20 && in.opcode != 0x21 && in.opcode != 0x22) { ok = false; return true; }
+    // ISA 70648 12.10: F32 FMA after independent full/half source expansion. GLSL Fma has
+    // MED hosted precision (#5225), as for the standard F32 forms; it is not a strict FMA
+    // feature or a correction of other guest MODE/nonfinite contracts. Mixed-half results
+    // retain their old arithmetic and preserve the other half of VDST; they need one final
+    // half rounding, which an F32 Fma followed by packing does not establish.
+    if (in.opcode != 0x20 && in.opcode != 0x21 && in.opcode != 0x22) {
+        ok = false;
+        return true;
+    }
     uint32_t old_d = vreg_old(b, rs, in.dst.value);
     // Per-source mix resolve (#273): OPSEL_HI[k] -> f16 half (OPSEL[k]: 0=lo,1=hi) converted
     // to f32; else full f32. An inline constant read at f16 width is the dword its width
@@ -38,12 +41,15 @@ bool Vop3pMixedFloatLowering::lower() {
         if (in.src_neg[k]) v = b.fneg(v);
         return v;
     };
-    uint32_t r = b.fbin(Op_FAdd, b.fbin(Op_FMul, mixv(0), mixv(1)), mixv(2));
+    uint32_t r = in.opcode == 0x20 ? emit_fused_mad_values(b, mixv(0), mixv(1), mixv(2))
+                                   : b.fbin(Op_FAdd, b.fbin(Op_FMul, mixv(0), mixv(1)), mixv(2));
     if (in.clamp) r = b.clamp01(r);
     uint32_t& d = rs.vreg[in.dst.value];
-    if (in.opcode == 0x20) d = r;
+    if (in.opcode == 0x20)
+        d = r;
     else if (in.opcode == 0x21)
-        d = b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)), b.pack_half_lo(r));
+        d = b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0xFFFF0000u)),
+                   b.pack_half_lo(r));
     else
         d = b.ibin(Op_BitwiseOr, b.ibin(Op_BitwiseAnd, old_d, b.uconst(0x0000FFFFu)),
                    b.ibin(Op_ShiftLeftLogical, b.pack_half_lo(r), b.uconst(16)));
@@ -53,7 +59,7 @@ bool Vop3pMixedFloatLowering::lower() {
 }   // namespace
 
 bool lower_vop3p_mixed_float(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok,
-                            bool allow_wave) {
+                             bool allow_wave) {
     return Vop3pMixedFloatLowering{{b, rs, in, ok, allow_wave}}.lower();
 }
 }   // namespace prosper::gpu::ir
