@@ -78,6 +78,9 @@ enum class Opcode : uint8_t {
     F32Mul,
     F32NMin,
     F32NMax,   // raw binary32 bits -> raw bits
+    // CUBE value helpers, outside the VOP float family range above.
+    F32Min,
+    F32Max,   // exact GLSL FMin/FMax; NaN operand selection is unspecified
     F32AddNoContraction,   // separate binary32 rounding; cannot contract with a product
     F32MulNoContraction,
     F32Fma,   // GLSL Fma intent; evaluation is a finite RTE reference, not a Vulkan accuracy promise

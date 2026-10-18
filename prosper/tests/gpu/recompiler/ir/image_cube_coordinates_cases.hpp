@@ -4,6 +4,7 @@
 #pragma once
 
 #include "gpu/recompiler/ir/vector_lane_harness.hpp"
+#include "gpu/resources/shader_resources.hpp"
 
 #include <array>
 #include <bit>

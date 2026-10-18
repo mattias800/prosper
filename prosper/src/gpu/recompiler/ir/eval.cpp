@@ -96,6 +96,17 @@ Known evaluate_op(Opcode op, uint32_t imm, uint32_t a, uint32_t b, uint32_t c) {
             if (!supported(d)) return std::nullopt;
             return std::bit_cast<uint32_t>(d);
         }
+        case Opcode::F32Min:
+        case Opcode::F32Max: {
+            const float x = std::bit_cast<float>(a), y = std::bit_cast<float>(b);
+            // GLSL.std.450 FMin/FMax: no NaN operand-selection guess. Keep the nominal
+            // evaluator finite-only and avoid authenticating a raw sign when both are zero.
+            // No guest constant-folder definition is added for these operations.
+            if (!std::isfinite(x) || !std::isfinite(y) || (x == 0.0f && y == 0.0f))
+                return std::nullopt;
+            return std::bit_cast<uint32_t>(op == Opcode::F32Min ? std::fmin(x, y)
+                                                                : std::fmax(x, y));
+        }
         case Opcode::F32AddNoContraction: return evaluate_op(Opcode::F32Add, imm, a, b, c);
         case Opcode::F32MulNoContraction: return evaluate_op(Opcode::F32Mul, imm, a, b, c);
         case Opcode::F32Add:
