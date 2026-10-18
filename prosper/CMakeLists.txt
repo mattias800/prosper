@@ -3800,6 +3800,7 @@ if(TARGET prosper_core)
           ir_vector_compare_i16_u16_execution
           ir_vector_compare_f16_execution
           ir_vector_compare_class_f32_execution
+          ir_vector_compare_class_f64_execution
           ir_vector_compare_i64_u64_execution
           ir_core_integer64
           ir_core_float64
