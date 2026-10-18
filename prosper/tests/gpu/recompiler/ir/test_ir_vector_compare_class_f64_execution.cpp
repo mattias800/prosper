@@ -85,10 +85,9 @@ Data data(uint32_t seed, uint32_t mask = 1) {
         const auto row = kClasses[(lane + seed) % std::size(kClasses)];
         out.in.s0[lane] = static_cast<uint32_t>(row.raw);
         out.in.s1[lane] = static_cast<uint32_t>(row.raw >> 32);
-        out.in.s2[lane] = lane % 4 == 0   ? row.bit
-                          : lane % 4 == 1 ? 0x3ffu
-                          : lane % 4 == 2 ? 0xfffffc00u
-                                          : 0u;
+        const uint32_t wrong = row.bit == 512u ? 1u : row.bit << 1u;
+        const std::array masks{row.bit, wrong, 0x3ffu, 0xfffffc00u, 0u, row.bit | 0xfffffc00u};
+        out.in.s2[lane] = masks[lane % masks.size()];
         out.in.active[lane] = mask == 0 || (mask == 1 && lane % 4 != 0);
         out.bits.push_back(row.bit);
     }
