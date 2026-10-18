@@ -3839,6 +3839,8 @@ if(TARGET prosper_core)
           ir_image_d16_values
           ir_lower_image_d16
           ir_image_coordinates
+          ir_image_mip_clamp
+          ir_lower_image_mip_clamp
           ir_image_cube_coordinates
           ir_image_operand_coordinates
           ir_lower_image_operand_coordinates
@@ -3861,6 +3863,7 @@ if(TARGET prosper_core)
           ir_cfg_structured_cursor
           ir_cfg_structured_loop_cursor
           ir_cfg_structured_loop_execution
+          ir_cfg_dispatch_blocks
           )
     prosper_add_gtest(test_${ir_test}
       SOURCES tests/gpu/recompiler/ir/test_${ir_test}.cpp

@@ -9,6 +9,7 @@
 #include "gpu/recompiler/ir/lower/ds_address_lowering.hpp"
 #include "gpu/recompiler/ir/lower/image_coordinates_lowering.hpp"
 #include "gpu/recompiler/ir/lower/image_d16_lowering.hpp"
+#include "gpu/recompiler/ir/lower/image_mip_clamp_lowering.hpp"
 #include "gpu/recompiler/ir/lower/image_cube_coordinates_lowering.hpp"
 #include "gpu/recompiler/ir/lower/image_operand_coordinates_lowering.hpp"
 #include "gpu/recompiler/ir/lower/image_gather_layer_lowering.hpp"
@@ -3988,26 +3989,13 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                     else if (is_sample_l)  b.image_sample_lod_2d(res->binding, cu, cv,
                         vread(cvg(in.mimg_dim == 5u && res->img_dim == 5u ? 3u : 2u)), out);
                     else if (dynamic_mip_load) {
-                        // Clamp the selector to the levels the host image actually has.
-                        //
-                        // The half that is certain: an out-of-range `Lod` operand is UNDEFINED in
-                        // SPIR-V, so some clamp is mandatory whatever the hardware does.
-                        //
-                        // The half that is inference: RDNA 2 ISA doc 70648 gives the image
-                        // descriptor BASE_LEVEL/LAST_LEVEL fields as the addressable level range,
-                        // and prosper reads `declared_mip_levels` off exactly that pair -- but the
-                        // guide's MIMG section does not spell out the saturating behaviour for an
-                        // out-of-range IMAGE_LOAD_MIP operand, and no live capture here exercises
-                        // one. Saturating to the last level is the reading consistent with the
-                        // field's purpose; returning zeros would be the other candidate.
-                        // CONFIDENCE: MED -- revisit if a title is measured issuing an
-                        // out-of-range mip.
+                        // See build_image_mip_clamp for the preserved value contract.
                         // The register the shape predicate itself identified, not a second
                         // derivation of it: for this packet family they are the same VGPR, and
                         // reading it from one place keeps them that way.
                         const uint32_t requested = vread(static_cast<int>(dynamic_mip_vgpr));
-                        const uint32_t lod = b.uext2(
-                            Glsl_UMin, requested, b.uconst(materialized_mip_levels - 1u));
+                        const uint32_t lod =
+                            ir::lower_image_mip_clamp(b, requested, materialized_mip_levels);
                         b.image_fetch_2d_lod(res->binding, cu, cv, lod, out);
                     }
                     else                   b.image_fetch_2d (res->binding, cu, cv, out);
