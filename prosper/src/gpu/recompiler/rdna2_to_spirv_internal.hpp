@@ -1119,7 +1119,7 @@ struct SpirvCompute {
         if (valid_lane) *valid_lane = valid;
         return sel(valid, rotated, value);
     }
-    uint32_t subgroup_quad_permute(uint32_t value, uint32_t ctrl);
+    uint32_t subgroup_quad_permute(uint32_t value, uint32_t ctrl, uint32_t active);
     bool ds_swizzle_source_lane(uint32_t offset, uint32_t* source_lane);
     uint32_t ds_bpermute_b32(uint32_t address, uint32_t value,
                              uint32_t active, uint32_t offset,

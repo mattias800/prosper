@@ -57,7 +57,12 @@ std::optional<bool> Vop1DppSourceLowering::stage_dpp_source() {
                 const uint32_t source_lane =
                     b.sel(dpp_active, b.ibin(Op_ISub, lane, b.uconst(shift)), lane);
                 const uint32_t shuffled = b.subgroup_shuffle(a, source_lane);
-                a = in.dpp_bound_ctrl ? b.sel(dpp_active, shuffled, b.uconst(0)) : shuffled;
+                // FI0 zeroes an inactive source; only row bounds disable a BC0 write.
+                const uint32_t source_active =
+                    b.subgroup_shuffle(b.sel(rs.exec, b.uconst(1), b.uconst(0)), source_lane);
+                const uint32_t source =
+                    b.sel(b.ucmp(Op_INotEqual, source_active, b.uconst(0)), shuffled, b.uconst(0));
+                a = in.dpp_bound_ctrl ? b.sel(dpp_active, source, b.uconst(0)) : source;
             } else {
                 a = b.uconst(0);
             }
@@ -75,7 +80,7 @@ std::optional<bool> Vop1DppSourceLowering::stage_dpp_source() {
                     ok = false;
                     return true;
                 }
-                a = b.subgroup_quad_permute(a, in.dpp_ctrl);
+                a = b.subgroup_quad_permute(a, in.dpp_ctrl, rs.exec);
             } else {
                 ok = false;
                 return true;

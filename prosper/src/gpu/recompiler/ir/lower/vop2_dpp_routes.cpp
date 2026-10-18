@@ -108,8 +108,12 @@ std::optional<bool> Vop2Lowering::stage_dpp_source() {
                 const uint32_t source_lane = b.sel(
                     dpp_active, b.ibin(Op_ISub, lane, b.uconst(shift)), lane);
                 const uint32_t shuffled = b.subgroup_shuffle(a, source_lane);
-                a = in.dpp_bound_ctrl ? b.sel(dpp_active, shuffled, b.uconst(0))
-                                      : shuffled;
+                // FI0 applies before the ALU operation; keep BC0's row predicate independent.
+                const uint32_t source_active =
+                    b.subgroup_shuffle(b.sel(rs.exec, b.uconst(1), b.uconst(0)), source_lane);
+                const uint32_t source =
+                    b.sel(b.ucmp(Op_INotEqual, source_active, b.uconst(0)), shuffled, b.uconst(0));
+                a = in.dpp_bound_ctrl ? b.sel(dpp_active, source, b.uconst(0)) : source;
             }
         } else {
             if (!fop) { ok = false; return true; }
@@ -118,7 +122,7 @@ std::optional<bool> Vop2Lowering::stage_dpp_source() {
             } else if (b.is_compute) {
                 // DPP transforms src0 only; src1 remains in this lane. A general shuffle covers
                 // all 256 architectural quad_perm tables, including broadcasts and duplicates.
-                a = b.subgroup_quad_permute(a, in.dpp_ctrl);
+                a = b.subgroup_quad_permute(a, in.dpp_ctrl, rs.exec);
             } else {
                 ok = false; return true;
             }
