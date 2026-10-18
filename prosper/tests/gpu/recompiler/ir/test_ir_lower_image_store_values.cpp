@@ -38,6 +38,14 @@ TEST(IrLowerImageStoreValues, StoreSelectsReuseIdsAndZeroAnAbsentSource) {
     EXPECT_EQ(result[3], input[1]);
     EXPECT_EQ(b.code.size(), before);
 }
+TEST(IrLowerImageStoreValues, RawStoreWordIsTheExistingIdWithoutExtraEmission) {
+    SpirvCompute b;
+    b.begin(1, nullptr, 1, 1, 1, 1, 0, true, true);
+    const uint32_t word = b.load_input(0);
+    const auto before = b.code.size();
+    EXPECT_EQ(lower_image_store_raw_word(b, word), word);
+    EXPECT_EQ(b.code.size(), before);
+}
 TEST(IrLowerImageStoreValues, HalfWordsKeepUnsignedAndFloatingInterpretationsDistinct) {
     for (bool integer : {false, true})
         for (uint32_t half : {0u, 1u}) {

@@ -4,6 +4,7 @@
 namespace prosper::gpu {
 struct SpirvCompute;
 namespace ir {
+uint32_t lower_image_store_raw_word(SpirvCompute& builder, uint32_t word);
 uint32_t lower_image_store_d16_word(SpirvCompute& builder, uint32_t packed, uint32_t half,
                                     bool unsigned_data);
 void lower_image_storage_load_selects(SpirvCompute& b, const uint32_t out[4], const int channel[4],

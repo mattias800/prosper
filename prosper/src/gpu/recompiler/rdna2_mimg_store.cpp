@@ -16,6 +16,10 @@ bool unsigned_d16_store_supported(const Rdna2Inst& instruction) {
            !instruction.mimg_reserved && !instruction.has_modifier;
 }
 
+uint32_t mimg_dword_store_component(SpirvCompute& builder, uint32_t word) {
+    return ir::lower_image_store_raw_word(builder, word);
+}
+
 uint32_t mimg_d16_store_component(SpirvCompute& builder, uint32_t packed, uint32_t half,
                                   bool unsigned_data) {
     return ir::lower_image_store_d16_word(builder, packed, half, unsigned_data);

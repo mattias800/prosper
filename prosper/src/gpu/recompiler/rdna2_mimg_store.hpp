@@ -10,6 +10,7 @@ struct SpirvCompute;
 // Only the newly admitted unsigned D16 form is restricted here. Existing float/normalized
 // stores keep their established channel routing, including sparse masks.
 bool unsigned_d16_store_supported(const Rdna2Inst& instruction);
+uint32_t mimg_dword_store_component(SpirvCompute& builder, uint32_t word);
 uint32_t mimg_d16_store_component(SpirvCompute& builder, uint32_t packed, uint32_t half,
                                   bool unsigned_data);
 
@@ -26,7 +27,7 @@ bool mimg_store_components(SpirvCompute& builder, const Rdna2Inst& instruction, 
             instruction.dst.value + static_cast<int>(instruction.mimg_d16 ? rank / 2 : rank);
         values[channel] = instruction.mimg_d16 ? mimg_d16_store_component(builder, read(word),
                                                                           rank & 1u, unsigned_data)
-                                               : read(word);
+                                               : mimg_dword_store_component(builder, read(word));
         ++rank;
     }
     return true;
