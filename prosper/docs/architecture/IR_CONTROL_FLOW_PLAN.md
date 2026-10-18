@@ -477,6 +477,19 @@ then refuses it at the same branch. The tree refuses it too, first at an EXECZ i
 under that branch. Every route refuses; the shadow does not model the counted route's prelude
 decline. Step 4b consumes `Loop` in `emit_divloop` and `CountedLoop` in the counted route.
 
+**Step 4b result** (`ir/cfg/structured_loop_cursor`, contract in `ir/cfg/AGENTS.md`). `emit_body`'s
+divergent-loop cursor and the counted route's `CountedLoop` read the tree's records when the whole
+sequence equals the detector's field for field, and the detector's otherwise. The corpus gate
+against `fac83c577` reports `changes: none` (4,000 entries, 1,444 SPIR-V modules compared). A
+temporary instrument (not committed) counted the routes over the 1,003 distinct programs, once per
+`emit_body` call that reached the decision: the divergent cursor took the tree in all 64 calls that
+held loops (compute 21, fragment 33, vertex 10) and had no loops in 274; the counted record took the
+tree in 40 calls (compute 16, fragment 5, vertex 19) and fell back in 1. That one,
+`compute/cs_05e14dc59e6261dada40eac5.bin`, has a bottom-tested EXEC loop before its counted loop:
+the tree takes the general route (two divergent loops), so the records differ, and `emit_body`'s
+prelude scan declines the counted route as well. No call was `Unstructured` or `DetectorRefused`;
+the latter cannot occur at the cursor today, because `cf_rejected` clears `Ls` first.
+
 **When the parked red tests become fixable:**
 
 - `indirect_pointer_descriptor_range` has two gaps (#5202). The first, charging a Wave32 lane-mask
