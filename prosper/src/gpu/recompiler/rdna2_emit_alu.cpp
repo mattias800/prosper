@@ -10,6 +10,7 @@
 #include "gpu/recompiler/ir/lower/image_coordinates_lowering.hpp"
 #include "gpu/recompiler/ir/lower/image_operand_coordinates_lowering.hpp"
 #include "gpu/recompiler/ir/lower/image_gather_layer_lowering.hpp"
+#include "gpu/recompiler/ir/lower/image_operand_coordinates_lowering.hpp"
 #include "gpu/recompiler/ir/lower/buffer_format_values.hpp"
 #include "gpu/recompiler/ir/lower/buffer_store_values.hpp"
 #include "gpu/recompiler/ir/lower/ds_cross_lane_lowering.hpp"
@@ -3893,20 +3894,17 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
                 // Floating-point arrays carry an independent layer after the spatial
                 // coordinates. cvg preserves both consecutive and NSA address layouts. The
                 // gather's signed spatial offset must not translate or normalize that layer.
+                ir::ImageOperandCoordinateNormalizer coord{b, ok, normalize_sampler_coordinates};
                 const uint32_t layer =
                     ir::lower_image_gather_layer(b, float_array_gather, is_gather_lz_o,
                                                  [&](uint32_t slot) { return vread(cvg(slot)); });
                 if (is_gather_lz_o)   // vaddr order: [packed offset, u, v, optional layer]
-                    b.image_gather_offset_2d(
-                        res->binding,
-                        normalized_spatial(vread(cvg(1)), res->width),
-                        normalized_spatial(vread(cvg(2)), res->height),
-                        comp, vread(cvg(0)), out, layer);
+                    b.image_gather_offset_2d(res->binding, coord(vread(cvg(1)), res->width),
+                                             coord(vread(cvg(2)), res->height), comp, vread(cvg(0)),
+                                             out, layer);
                 else
-                    b.image_gather_2d(
-                        res->binding,
-                        normalized_spatial(vread(cvg(0)), res->width),
-                        normalized_spatial(vread(cvg(1)), res->height), comp, out, layer);
+                    b.image_gather_2d(res->binding, coord(vread(cvg(0)), res->width),
+                                      coord(vread(cvg(1)), res->height), comp, out, layer);
                 int vd = in.dst.value;
                 if (in.mimg_d16) {
                     if (!d16_float_resource) { ok = false; return true; }
