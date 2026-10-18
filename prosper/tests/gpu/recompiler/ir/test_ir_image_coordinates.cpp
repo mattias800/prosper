@@ -128,10 +128,13 @@ TEST(IrImageCoordinates, EverySpirvShapeMatchesItsEvaluationPerLane) {
             const auto want = eval_image_coordinates(shape, {w[0], w[1], w[2]});
             for (uint32_t axis = 0; axis < shape.axes; ++axis) {
                 const auto expected = want[axis];
-                ASSERT_TRUE(expected.has_value()) << "lane " << lane << " axis " << axis;
-                EXPECT_EQ(out[3 * lane + axis], *expected)
-                    << "axes " << shape.axes << " form " << int(shape.form) << " normalize "
-                    << shape.normalize << " lane " << lane << " axis " << axis;
+                if (expected) {
+                    EXPECT_EQ(out[3 * lane + axis], *expected)
+                        << "axes " << shape.axes << " form " << int(shape.form) << " normalize "
+                        << shape.normalize << " lane " << lane << " axis " << axis;
+                } else {
+                    FAIL() << "lane " << lane << " axis " << axis << " has no expected value";
+                }
             }
         }
     }
