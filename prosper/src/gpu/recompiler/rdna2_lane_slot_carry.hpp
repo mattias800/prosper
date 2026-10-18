@@ -32,6 +32,7 @@
 //
 // CONFIDENCE: HIGH for loops (the header phi is the standard loop-carried form, and the merge value
 // is the one that reaches the exit). HIGH for if merges with the placeholder caveat above.
+#include "gpu/recompiler/ir/cfg/state_placement.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 
@@ -79,6 +80,9 @@ public:
     // Constructed BEFORE mark_loop_carried(): records which slots were fabricated-marked on the
     // preheader edge.
     explicit LaneSlotLoopCarry(const RegState& rs);
+    // The structured emitter's form: open() takes the loop's slot set from the state placement
+    // when it equals the scan's set element for element (IR_CONTROL_FLOW_PLAN step 6).
+    LaneSlotLoopCarry(const RegState& rs, const ir::cfg::StatePlacement& placement);
     // Existing ADDTID slots also get header phis; their source proof must hold on the back edge.
     // At the header label, after the other header phis: one phi per slot written in
     // [header_pc, backedge_pc), seeded from the preheader (a placeholder when it is unwritten there).
@@ -128,6 +132,7 @@ private:
     std::set<std::pair<int, int>> preheader_marks_;
     std::set<std::pair<int, int>> read_in_loop_;   // constant-lane V_READLANEs in the loop
     uint32_t header_pc_ = 0;
+    const ir::cfg::StatePlacement* placement_ = nullptr;
 };
 
 }   // namespace prosper::gpu

@@ -219,7 +219,15 @@ void LaneSlotLoopCarry::open(SpirvCompute& b, RegState& rs, const std::vector<Rd
         const auto [it, inserted] = statically_mask.emplace(key, mask);
         if (!inserted) it->second = it->second && mask;
     }
-    for (const auto& [key, mask_guess] : statically_mask) {
+    ir::cfg::LaneSlotSet keys;
+    for (const auto& entry : statically_mask) keys.insert(entry.first);
+    if (placement_) {
+        const ir::cfg::LoopPlacement* placed = placement_->loop_at(header_pc);
+        ir::cfg::take_placed_if_equal(placed ? &placed->lane_slots : nullptr, header_pc, keys);
+    }
+    for (const auto& key : keys) {
+        const auto guess = statically_mask.find(key);
+        const bool mask_guess = guess != statically_mask.end() && guess->second;
         const auto [vgpr, lane] = key;
         const uint32_t* data = find_slot(rs.vgpr_lane_slots, vgpr, lane);
         const uint32_t* mask = find_slot(rs.vgpr_lane_mask_slots, vgpr, lane);
@@ -297,6 +305,9 @@ bool LaneSlotLoopCarry::patch_backedge(SpirvCompute& b, const RegState& rs, uint
 
 LaneSlotLoopCarry::LaneSlotLoopCarry(const RegState& rs)
     : preheader_marks_(rs.lane_slot_merge_placeholder) {}
+
+LaneSlotLoopCarry::LaneSlotLoopCarry(const RegState& rs, const ir::cfg::StatePlacement& placement)
+    : preheader_marks_(rs.lane_slot_merge_placeholder), placement_(&placement) {}
 
 void LaneSlotLoopCarry::refine_exit_marks(RegState& rs) const {
     for (const Slot& slot : slots_) {

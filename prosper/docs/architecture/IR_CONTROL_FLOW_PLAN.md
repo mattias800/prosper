@@ -477,6 +477,20 @@ then refuses it at the same branch. The tree refuses it too, first at an EXECZ i
 under that branch. Every route refuses; the shadow does not model the counted route's prelude
 decline. Step 4b consumes `Loop` in `emit_divloop` and `CountedLoop` in the counted route.
 
+**Step 6 result** (`ir/cfg/state_placement`, contract in `ir/cfg/AGENTS.md`). One pass over the
+region tree gives each if merge its phi set and each loop header its carried, condition and
+lane-slot sets, with the writes taken from the instruction-effects table. The emitter computes its
+own sets as before and takes the placement's only when they are equal element for element, so the
+corpus gate reports `changes: none`. `shader_inspect --cfg-placement` over the 4,000 corpus entries
+(raw, synthetic-table and `--inputs` recompiles): 2,245 entries reach a guarded join. Per entry
+that is 10,155 if merges and 737 loop headers, each header with three sets: 12,366 sets compared.
+All are equal except 12 if merges in 8 entries, and no join lacks a placement. Each of the 12 is the high
+SGPR of an `s_bfe_u64` (seven vertex programs) or of an `s_bfm_b64` into EXEC (one compute
+program): the emitter's scan names three 64-bit SOP2 opcodes and charges the low word for the rest,
+and the table cannot tell those rows apart, so the placement charges the pair. That is an existing
+defect, #5436. Over the committed fixtures, the 104 ifs and 9 loops the detectors find are all
+equal, and every fixture instruction's inventory equals the scan's.
+
 **Step 4b result** (`ir/cfg/structured_loop_cursor`, contract in `ir/cfg/AGENTS.md`). `emit_body`'s
 divergent-loop cursor and the counted route's `CountedLoop` read the tree's records when the whole
 sequence equals the detector's field for field, and the detector's otherwise. The corpus gate

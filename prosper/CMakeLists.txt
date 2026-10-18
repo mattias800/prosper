@@ -3859,6 +3859,7 @@ if(TARGET prosper_core)
           ir_cfg_structured_cursor
           ir_cfg_structured_loop_cursor
           ir_cfg_structured_loop_execution
+          ir_cfg_state_placement
           )
     prosper_add_gtest(test_${ir_test}
       SOURCES tests/gpu/recompiler/ir/test_${ir_test}.cpp
