@@ -11,7 +11,7 @@
 // here from the ISA's pseudo-code (RDNA2 ISA 70648, SOP2 and SOP1), not from the recompiler's
 // helpers.
 #include "bpermute_spirv_oracle.hpp"
-#include "fixtures/sop1_phi_witness.hpp"
+#include "sop1_phi_witness.hpp"
 #include "fixtures/test_scratch.h"
 #include "gpu/diagnostics/refused_shader_inputs.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
