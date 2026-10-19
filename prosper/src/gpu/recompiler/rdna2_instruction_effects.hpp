@@ -13,7 +13,7 @@
 // which the decoder still accepts because it only splits fields). `test_rdna2_instruction_effects`
 // fails if a decodable opcode has neither. A VALU row describes its sources, its vector result
 // (which lanes and VGPRs it writes, from what) and its implicit reads; see Rdna2EffectsStatus::Valu.
-// Other formats have no per-opcode entries yet; the question helpers below answer the questions
+// Memory/EXP/VINTRP rows expose their facts separately in `memory`; legacy helpers answer the questions
 // whose answer is a property of the whole format (no VALU or memory instruction touches SCC) and
 // report Unknown otherwise. An opcode with no entry is never a silent "no effect": its status is
 // Unknown and every helper says so.
@@ -25,6 +25,7 @@
 #pragma once
 
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/ir/effects/operand_effects.hpp"
 
 #include <cstdint>
 #include <span>
@@ -38,9 +39,11 @@ enum class Rdna2EffectsStatus : uint8_t {
     Known,
     // A VALU instruction (VOP1, VOP2, VOPC, VOP3, VOP3P). Its name, source widths, vector-result fields
     // (lane_flow, vdst_dwords, vdst_half, accumulates, m0_relative) and implicit VCC/EXEC/M0 READS
-    // are facts. Its scalar destination and implicit writes are NOT described and read as zero, so
+    // are facts. Legacy scalar-ALU fields stay zero; scalar_result describes scalar writes, so
     // known() stays false: ask describes_sources() / describes_vector_result() instead.
     Valu,
+    Memory,   // memory/EXP/VINTRP facts in memory only; legacy queries remain conservative
+    Unmodeled,   // LLVM recognizes it, but ISA 70648 does not specify its operand effects
 };
 
 // Architectural registers an instruction reads or writes WITHOUT naming them in an operand.
@@ -121,7 +124,7 @@ enum class Rdna2ControlFlow : uint8_t {
 
 struct Rdna2InstructionEffects {
     Rdna2EffectsStatus status = Rdna2EffectsStatus::Unknown;
-    const char* name = nullptr;   // the llvm-mc mnemonic; nullptr unless Known
+    const char* name = nullptr;   // mnemonic; nullptr for Unknown and Reserved
     Rdna2SccRead scc_read = Rdna2SccRead::None;
     uint8_t implicit_reads = kRdna2ImplicitNone;   // Rdna2ImplicitRegister bits; includes SCC
     uint8_t implicit_writes = kRdna2ImplicitNone;   // whenever scc_read != None / SCC is written
@@ -167,6 +170,12 @@ struct Rdna2InstructionEffects {
     // and s_call.
     Rdna2ControlFlow control = Rdna2ControlFlow::None;
 
+    // New facts only (ADR 0038 step 8a). No production consumer reads these fields yet. The
+    // legacy scalar-ALU fields above stay unchanged for VALU, and memory rows do not become
+    // Known/Valu: old helpers retain their previous answers.
+    Rdna2ScalarResult scalar_result{};
+    Rdna2MemoryEffects memory{};
+
     bool known() const { return status == Rdna2EffectsStatus::Known; }
     bool describes_sources() const {
         return status == Rdna2EffectsStatus::Known || status == Rdna2EffectsStatus::Valu;
@@ -183,7 +192,8 @@ inline const Rdna2InstructionEffects& rdna2_instruction_effects(const Rdna2Inst&
 
 // Formats whose whole decodable opcode space has entries: the scalar ALU formats with full
 // effects and SMEM (status Known), and VOP1, VOP2, VOPC, VOP3 and VOP3P with the VALU facts
-// (status Valu).
+// (status Valu). Memory/EXP/VINTRP have Memory rows, with Unmodeled for LLVM-only forms
+// absent from ISA 70648. These new statuses do not alter legacy question helpers.
 bool rdna2_effects_format_is_tabulated(Rdna2Format fmt);
 // The opcodes [first, end) the decoder can produce in a tabulated format: the opcode field minus
 // the encodings another format claims first (SOP2 0x60-0x7F are SOPK/SOP1/SOPC/SOPP, SOPK

@@ -6,6 +6,7 @@
 // was silent -- a missed SCC reader drops the wave vote a consumer needs, and an under-counted
 // destination lets an analysis believe a clobbered register still holds its old value.
 //
+// Family table fragments share one translation unit; the tests pin their public lookup.
 // What is pinned here:
 //   * COVERAGE: every opcode the decoder can produce in a tabulated format has an entry, named or
 //     explicitly reserved. A new decodable opcode without an entry turns this red; so does deleting
@@ -892,6 +893,13 @@ TEST(Rdna2InstructionEffects, RowsAreUniqueAndWellFormed) {
                 EXPECT_TRUE(e.lane_flow == Rdna2LaneFlow::Swap ||
                             e.lane_flow == Rdna2LaneFlow::Relative)
                     << e.name;
+        } else if (e.status == Rdna2EffectsStatus::Memory ||
+                   e.status == Rdna2EffectsStatus::Unmodeled) {
+            EXPECT_NE(e.name, nullptr);
+            EXPECT_FALSE(e.known());
+            EXPECT_FALSE(e.describes_sources());
+            EXPECT_FALSE(e.describes_vector_result());
+            EXPECT_EQ(e.memory.described, e.status == Rdna2EffectsStatus::Memory);
         } else {
             EXPECT_EQ(e.status, Rdna2EffectsStatus::Reserved);
             EXPECT_EQ(e.name, nullptr);
@@ -923,8 +931,10 @@ TEST(Rdna2InstructionEffects, NamedOpcodesAreExactlyLlvmGfx1030) {
     }
 }
 
-TEST(Rdna2InstructionEffects, UntabulatedLookupsAreUnknownNotNoEffect) {
-    EXPECT_EQ(rdna2_instruction_effects(Rdna2Format::DS, 0x10).status, Rdna2EffectsStatus::Unknown);
+TEST(Rdna2InstructionEffects, UnknownLookupsAndLegacyQueriesStayConservative) {
+    // DS now has new memory-only facts. It still does not answer legacy scalar-ALU queries.
+    EXPECT_EQ(rdna2_instruction_effects(Rdna2Format::DS, 0x10).status, Rdna2EffectsStatus::Memory);
+    EXPECT_FALSE(rdna2_instruction_effects(Rdna2Format::DS, 0x10).known());
     // VOP3 0x000-0x0FF decode as VOPC, so they are not VOP3 entries.
     EXPECT_EQ(rdna2_instruction_effects(Rdna2Format::VOP3, 0x50).status,
               Rdna2EffectsStatus::Unknown);
