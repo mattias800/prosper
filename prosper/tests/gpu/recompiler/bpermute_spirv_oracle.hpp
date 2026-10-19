@@ -1034,7 +1034,7 @@ struct Interpreter {
               r = op == 134 ? u / v : u % v;
           } else if (op == 194 || op == 196) {
               // A dead poison result is permitted; live storage and branch consumers still fail.
-              if (v >= 32 * size(x.type)) {
+              if (v >= uint64_t{32} * size(x.type)) {
                   if (!defer_dead_u32_shifts || size(x.type) != 1) fail("poison shift");
                   set_unsigned(l, a[1], a[0], 0, false);
                   continue;
