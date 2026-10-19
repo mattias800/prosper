@@ -222,6 +222,7 @@ void expect_merge(const PairCase& c, bool has_else, uint32_t selector) {
     }
     bpermute_oracle::Interpreter vm(module);
     vm.native_subgroup_width = 64;
+    vm.defer_dead_u32_shifts = c.then_arm == sop1(kQuadmaskB64, 6, 126);
     const auto actual = vm.run_buffers(64u, {{1u, std::vector<uint32_t>(128u, 0xdeadbeefu)}}, 1u);
     ASSERT_TRUE(vm.error.empty()) << vm.error;
     ASSERT_EQ(actual.size(), 128u);
@@ -310,20 +311,25 @@ TEST(Sop1PhiWitness, RuntimeBranchReplaysAndKeepsBothWordsWithPartialExec) {
 }
 
 TEST(Sop1PhiWitness, DeadShiftPoisonIsTrackedAndCannotReachStorage) {
-    for (uint32_t live : {0u, 1u, 2u}) {
-        SpirvCompute b;
-        b.begin(4, nullptr, 64, 1, 1, 64, 0, true, true);
-        const auto shift = b.ibin(Op_ShiftRightLogical, b.uconst(1), b.uconst(32));
-        const auto condition = b.land(b.bfalse(), b.ucmp(Op_INotEqual, shift, b.uconst(0)));
-        const auto selected = b.sel(condition, b.uconst(1), b.uconst(2));
-        b.store_output_word(live == 1 ? shift : live == 2 ? selected : b.uconst(7), 1, 0);
-        bpermute_oracle::Interpreter vm(b.finish());
-        const auto actual = vm.run_buffers(64, {{1, std::vector<uint32_t>(64)}}, 1);
-        if (live)
-            EXPECT_EQ(vm.error, "poison live storage write") << "live=" << live;
-        else {
-            ASSERT_TRUE(vm.error.empty()) << vm.error;
-            EXPECT_EQ(actual, std::vector<uint32_t>(64, 7));
+    for (bool defer : {false, true}) {
+        for (uint32_t live : {0u, 1u, 2u}) {
+            SpirvCompute b;
+            b.begin(4, nullptr, 64, 1, 1, 64, 0, true, true);
+            const auto shift = b.ibin(Op_ShiftRightLogical, b.uconst(1), b.uconst(32));
+            const auto condition = b.land(b.bfalse(), b.ucmp(Op_INotEqual, shift, b.uconst(0)));
+            const auto selected = b.sel(condition, b.uconst(1), b.uconst(2));
+            b.store_output_word(live == 1 ? shift : live == 2 ? selected : b.uconst(7), 1, 0);
+            bpermute_oracle::Interpreter vm(b.finish());
+            vm.defer_dead_u32_shifts = defer;
+            const auto actual = vm.run_buffers(64, {{1, std::vector<uint32_t>(64)}}, 1);
+            if (!defer)
+                EXPECT_EQ(vm.error, "poison shift");
+            else if (live)
+                EXPECT_EQ(vm.error, "poison live storage write") << "live=" << live;
+            else {
+                ASSERT_TRUE(vm.error.empty()) << vm.error;
+                EXPECT_EQ(actual, std::vector<uint32_t>(64, 7));
+            }
         }
     }
 }
