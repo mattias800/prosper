@@ -3,6 +3,10 @@
 #include "gpu/recompiler/ir/lower/vop3p_mixed_float.hpp"
 #include "gpu/recompiler/ir/lower/lowering_context.hpp"
 #include "gpu/recompiler/ir/ops/vector_fma_float.hpp"
+#include "gpu/recompiler/rdna2_alu_support.hpp"
+#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+
+#include <cstdint>
 
 namespace prosper::gpu::ir {
 namespace {

@@ -6,6 +6,7 @@
 #include "fixtures/mixed_f32_fma.hpp"
 #include "fixtures/test_scratch.h"
 #include "gpu/diagnostics/refused_shader_inputs.hpp"
+#include "gpu/recompiler/ir/vector_lane_harness.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 
 #include <gtest/gtest.h>
@@ -18,6 +19,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <ios>
 #include <string>
 #include <vector>
 
