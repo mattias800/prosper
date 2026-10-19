@@ -38,6 +38,12 @@ constexpr uint32_t net_error(FreeBsdErrno e) {
 constexpr FreeBsdErrno kOfflineConnectErrno = FreeBsdErrno::ENetUnreach;
 constexpr uint32_t kNetErrorNetUnreach = net_error(FreeBsdErrno::ENetUnreach);   // 0x80410133
 
+// A full id table: sceNetSocket, sceNetEpollCreate and sceNetResolverCreate answer EMFILE
+// (errno 24) through hle_net.cpp's net_id_fail once every id is handed out. CONFIDENCE: LOW on
+// which errno the real library answers here -- the constant is named for what it encodes, not
+// asserted to be the library's choice.
+constexpr uint32_t kNetErrorMFile = net_error(FreeBsdErrno::EMFile);   // 0x80410118
+
 // libSceNet socket family (hle_net.cpp). These answer the same offline question, so they share
 // the facility rule above rather than repeating the literal:
 // - BadF: an operation naming a socket id prosper never handed out (EBADF, 9).
@@ -72,6 +78,7 @@ static_assert(net_error(FreeBsdErrno::EInProgress) == 0x80410124u, "EINPROGRESS 
 static_assert(net_error(FreeBsdErrno::EConnRefused) == 0x8041013du, "ECONNREFUSED (title classifier)");
 static_assert(net_error(FreeBsdErrno::EHostDown) == 0x80410140u, "EHOSTDOWN (title classifier)");
 static_assert(kNetErrorNetUnreach == 0x80410133u, "ENETUNREACH");
+static_assert(kNetErrorMFile == 0x80410118u, "EMFILE, a full net id table");
 static_assert(kNetErrorBadF == 0x80410109u, "EBADF");
 static_assert(kNetErrorInval == 0x80410116u, "EINVAL");
 static_assert(kNetErrorNoSpc == 0x8041011cu, "ENOSPC");
