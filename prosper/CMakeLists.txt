@@ -4216,6 +4216,7 @@ if(TARGET prosper_core)
 
   prosper_add_gtest(test_if_merge_scalar_pair_writes
     SOURCES tests/gpu/recompiler/test_if_merge_scalar_pair_writes.cpp
+    INCLUDES tests
     LIBRARIES prosper_core)
 
   prosper_add_gtest(test_literal_b64_mask

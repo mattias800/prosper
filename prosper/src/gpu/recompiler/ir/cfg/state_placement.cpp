@@ -5,6 +5,7 @@
 #include "gpu/recompiler/ir/cfg/exec_value_census.hpp"
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
+#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
 #include <algorithm>
 #include <span>
@@ -222,9 +223,10 @@ uint32_t sop2_phi_words(const Rdna2Inst& in) {
 //   words (sop1_data_routes.cpp); s_getpc_b64 retires both.
 // - The mask domain (the low word, as SOP2's 64-bit bitwise ops of two pairs): the SAVEEXEC and
 //   WREXEC families (D = a lane mask; both words are retired, the value lives in sreg_bool), and
-//   the SCC-writing unary ops of a pair, s_not_b64, s_wqm_b64 and s_quadmask_b64. s_not_b64 is
-//   mask-only; the numeric s_wqm_b64 route and s_quadmask_b64 also write both data words, which
-//   this charge does not see (ir/cfg/AGENTS.md records the exception; #5441).
+//   the mask-only s_not_b64 and mask-domain s_wqm_b64. The lowering's own classification
+//   distinguishes intrinsic numeric WQM and QUADMASK, which publish both data words (#5441).
+//   Structured arms disable scalar_presence_has_no_placeholders, so WQM's state-dependent
+//   SGPR numeric route cannot apply here; no source-domain analysis is needed by this scan.
 // - Into EXEC: the low word. s_mov_b64 and s_bitreplicate_b64_b32 into EXEC write rs.exec only.
 // An M0-relative destination (s_movreld_b64, refused) charges the SDST field. An encoding the
 // table does not know, and every one-word or no-word row, charges one word, as before.
@@ -239,7 +241,7 @@ uint32_t sop1_phi_words(const Rdna2Inst& in) {
         return 1;
     const bool mask_unary =
         (effects.implicit_writes & kRdna2ImplicitScc) != 0 && effects.ssrc_dwords[0] == 2;
-    if (mask_unary) return 1;
+    if (mask_unary) return scalar_write_is_b64_mask(in, in.dst.value) ? 1u : 2u;
     return in.dst.value == 126 || in.dst.value == 127 ? 1u : 2u;
 }
 

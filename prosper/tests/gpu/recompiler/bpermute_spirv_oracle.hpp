@@ -82,8 +82,11 @@ struct Interpreter {
     std::string error;
   // An explicit fixture contract, never inferred from a declared native builtin or vote.
     uint32_t native_subgroup_width = 0;
-  // Fixture-supplied dispatch extent. Nonzero opts into exact (32,1,1) workgroups;
-  // the module's own entrypoint LocalSize must agree before any builtin is supplied.
+    // Data-only QUADMASK witnesses may discard an undefined Bool projection. Existing fixtures
+    // retain immediate shift rejection; this opt-in tracks U32 logical-shift poison to live sinks.
+    bool defer_dead_u32_shifts = false;
+    // Fixture-supplied dispatch extent. Nonzero opts into exact (32,1,1) workgroups;
+    // the module's own entrypoint LocalSize must agree before any builtin is supplied.
     uint32_t native32_workgroup_count = 0;
   // Opt-in, store-only evaluation of one native32 subgroup in an actual Local64 workgroup.
   // No shared memory, barriers, atomics or storage reads: the other subgroup cannot affect it.
@@ -938,6 +941,12 @@ struct Interpreter {
               l.v[a[1]] = boolean(l, a[2]) ? left : right;
       } else if (op == 166 || op == 167 || op == 164 || op == 165) {
           if (a.size() != 4 || ty(a[0]).op != 20) fail("logical result type mismatch");
+          const auto left = value(l, a[2]), right = value(l, a[3]);
+          if (left.type != a[0] || right.type != a[0]) fail("logical operand type mismatch");
+          if (defer_dead_u32_shifts && (!left.defined || !right.defined)) {
+              set(l, a[1], a[0], {0}, false);
+              continue;
+          }
           const bool x = boolean(l, a[2]), y = boolean(l, a[3]);
           set(l, a[1], a[0],
               {uint32_t(op == 166   ? x || y
@@ -1024,7 +1033,12 @@ struct Interpreter {
               if (!v) fail("division by zero");
               r = op == 134 ? u / v : u % v;
           } else if (op == 194 || op == 196) {
-              if (v >= 32 * size(x.type)) fail("poison shift");
+              // A dead poison result is permitted; live storage and branch consumers still fail.
+              if (v >= uint64_t{32} * size(x.type)) {
+                  if (!defer_dead_u32_shifts || size(x.type) != 1) fail("poison shift");
+                  set_unsigned(l, a[1], a[0], 0, false);
+                  continue;
+              }
               r = op == 194 ? u >> v : u << v;
           } else if (op == 197)
               r = u | v;
