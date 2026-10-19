@@ -1595,6 +1595,12 @@ TEST(BuildShaderResources, VolumeTailDetileMechanism) {
         << "out-of-block translation refuses";
 }
 
+// UNPROVEN general SW_64KB_S thick-3D chain derivation (issue #4842 R3 remainder).
+// The helper below is carve-unproven versus hardware and is never wired into
+// image_base_level_view, the backend, or the recompiler: it pins the derivation's own
+// consistency plus its agreement with the proven all-in-tail path, so a future carve
+// has exact numbers to confirm or falsify. A wrong offset binds silent wrong texels,
+// so the all-in-tail arms carry hand-derived values, not just self-agreement.
 // A 3D tail view must not bind as STORAGE: the seed reads whole-block bytes and the
 // writeback writes them, neither through the tail origin, so either direction would
 // address sibling texels. The same words in the read-only category bind (control),
@@ -1728,4 +1734,215 @@ TEST(BuildShaderResources, VolumeTailDetileMechanism8Bpe) {
         detile_volume_tail_level(one.data(), spot.data(), spot.size(), 1, 1, 1, 9, 8, 16, 0))
         << "8BPE tail detile admits the translated origin";
     EXPECT_EQ(one[0], 0xD3) << "translated origin (16,0,0) reads byte 32768";
+}
+
+// The UNPROVEN chain agrees with the proven all-in-tail path on the 32^3 R8 pyramid.
+// Hand-derived (mipOffset walk with firstMipInTail 0, R8 micro-depth 8 over depth 32,
+// aligned depth 4): L0 offset 8192*4=32768 at (32,0), L1 4096*4=16384 at (0,16),
+// L5 1024*4=4096 at (0,8). A shared transcription slip in both helpers breaks these;
+// the carve breaks a shared tail-coordinate slip.
+TEST(BuildShaderResources, VolumeChainUnprovenAllInTailAgreement) {
+    const auto chain = tiled_volume_chain_layout_unproven(32, 32, 32, 1, 9, 5);
+    ASSERT_EQ(chain.size(), 6u) << "six-level pyramid yields six entries";
+    constexpr uint32_t kTailX[6] = {32, 0, 16, 8, 0, 0};
+    constexpr uint32_t kTailY[6] = {0, 16, 0, 8, 12, 8};
+    for (uint32_t level = 0; level < 6; ++level) {
+        const TiledVolumeTailLayout proven = tiled_volume_tail_layout(32, 32, 32, 1, 9, 5, level);
+        ASSERT_TRUE(proven.supported) << "proven path admits level " << level;
+        EXPECT_TRUE(chain[level].supported) << "unproven path admits level " << level;
+        EXPECT_TRUE(chain[level].in_tail) << "all-in-tail chain has no non-tail level";
+        EXPECT_EQ(chain[level].tail_x, proven.tail_x) << "tail_x agrees at " << level;
+        EXPECT_EQ(chain[level].tail_y, proven.tail_y) << "tail_y agrees at " << level;
+        EXPECT_EQ(chain[level].byte_offset, proven.byte_offset)
+            << "in-block origin agrees at " << level;
+        EXPECT_EQ(chain[level].tail_x, kTailX[level]) << "hand tail_x at " << level;
+        EXPECT_EQ(chain[level].tail_y, kTailY[level]) << "hand tail_y at " << level;
+    }
+    EXPECT_EQ(chain[0].byte_offset, 32768u) << "hand L0 in-block origin";
+    EXPECT_EQ(chain[1].byte_offset, 16384u) << "hand L1 in-block origin";
+    EXPECT_EQ(chain[5].byte_offset, 4096u) << "hand L5 in-block origin";
+}
+
+// Non-tail offsets on a hand-derived chain: 128x32x32 R8, three levels. Tail dims for
+// R8 are (32,32,32), so L0 (128 wide) and L1 (64 wide) miss while L2 (32x8x8) hits:
+// first_tail 2. Padded macroblocks: L1 64x16x16 is one block (65536 B), L0 128x32x32
+// is two blocks (131072 B). GFX10 smallest-first after the 64 KiB tail gives L1 at
+// 65536 and L0 at 131072. A GFX9 largest-first transcription swaps those two.
+TEST(BuildShaderResources, VolumeChainUnprovenNonTailOffsets) {
+    const auto chain = tiled_volume_chain_layout_unproven(128, 32, 32, 1, 9, 2);
+    ASSERT_EQ(chain.size(), 3u) << "three-level chain yields three entries";
+    ASSERT_TRUE(chain[0].supported && chain[1].supported && chain[2].supported)
+        << "every level places";
+    EXPECT_FALSE(chain[0].in_tail) << "L0 misses the tail dims";
+    EXPECT_FALSE(chain[1].in_tail) << "L1 misses the tail dims";
+    EXPECT_TRUE(chain[2].in_tail) << "L2 is the first tail level";
+    EXPECT_EQ(chain[1].byte_offset, 65536u) << "hand smallest non-tail offset";
+    EXPECT_EQ(chain[1].level_bytes, 65536u) << "hand L1 padded bytes";
+    EXPECT_EQ(chain[0].byte_offset, 131072u) << "hand largest non-tail offset";
+    EXPECT_EQ(chain[0].level_bytes, 131072u) << "hand L0 padded bytes";
+    // Monotonic non-overlapping non-tail ranges, smallest-first.
+    EXPECT_LT(chain[1].byte_offset, chain[0].byte_offset) << "smallest-first order";
+    EXPECT_LE(chain[1].byte_offset + chain[1].level_bytes, chain[0].byte_offset)
+        << "non-tail ranges do not overlap";
+    EXPECT_LE(chain[0].byte_offset + chain[0].level_bytes,
+              tiled_volume_chain_bytes_unproven(128, 32, 32, 1, 9, 2))
+        << "largest level ends inside the span";
+    for (const auto& e : chain)
+        if (!e.in_tail) EXPECT_GE(e.byte_offset, 65536u) << "non-tail sits past the tail";
+    // Second hand shape: a single 64^3 level misses (64 > 32), so no tail at all.
+    const auto single = tiled_volume_chain_layout_unproven(64, 64, 64, 1, 9, 0);
+    ASSERT_EQ(single.size(), 1u) << "single-level chain yields one entry";
+    EXPECT_FALSE(single[0].in_tail) << "64-wide level zero is not in the tail";
+    EXPECT_EQ(single[0].byte_offset, 0u) << "hand tail-less offset starts at zero";
+    // 64x64x64 at 1 B is two 32-slice depth slabs (block 64x32x32): AddrLib repeats a
+    // one-level chain per slab, so one slab holds 1x2 blocks and the whole level is two of them.
+    EXPECT_EQ(single[0].level_bytes, 131072u) << "hand 1x2 blocks of 64 KiB per depth slab";
+    EXPECT_EQ(single[0].slab_count, 2u) << "64 slices over a 32-slice block depth";
+    EXPECT_EQ(single[0].slab_stride, 131072u) << "one slab chain is the one level";
+}
+
+// Depth slabs, against AddrLib's own answers (Mesa 26.2.0 Addr2ComputeSurfaceInfo and
+// Addr2ComputeSurfaceAddrFromCoord, SW_64KB_S 3D, the PS5's 16-pipe Navi10 config, run
+// 2026-10-13). A chain deeper than the block depth repeats once per block-depth slab, with the
+// tail block first, the smaller levels next and level 0's blocks last in each copy. These are the
+// model's numbers, not hardware's: they keep the derivation from drifting off AddrLib.
+TEST(BuildShaderResources, VolumeChainUnprovenDepthSlabsMatchAddrLib) {
+    struct Level {
+        size_t offset;
+        size_t bytes;   // per slab; 0 for a tail level
+    };
+    struct Shape {
+        uint32_t w, h, d, bpe, max_mip;
+        size_t slabs, stride, total;
+        std::vector<Level> levels;   // non-tail levels from level 0 upward
+        uint32_t first_tail;
+    };
+    const Shape shapes[] = {
+        // 128^3 at 1 B: block 64x32x32, four slabs; L2 (32^3) opens the tail.
+        {128, 128, 128, 1, 7, 4, 0xb0000, 0x2c0000, {{0x30000, 0x80000}, {0x10000, 0x20000}}, 2},
+        // 256x64x64 at 1 B: two slabs; L3 (32x32x8) opens the tail.
+        {256,
+         64,
+         64,
+         1,
+         5,
+         2,
+         0xc0000,
+         0x180000,
+         {{0x40000, 0x80000}, {0x20000, 0x20000}, {0x10000, 0x10000}},
+         3},
+        // 64^3 at 8 B: block 32x16x16, four slabs; L2 (16^3) opens the tail.
+        {64, 64, 64, 8, 6, 4, 0xb0000, 0x2c0000, {{0x30000, 0x80000}, {0x10000, 0x20000}}, 2},
+        // 32^3 at 8 B: two 16-slice slabs; L1 (16^3) opens the tail.
+        {32, 32, 32, 8, 5, 2, 0x30000, 0x60000, {{0x10000, 0x20000}}, 1},
+    };
+    for (const auto& s : shapes) {
+        SCOPED_TRACE(testing::Message() << s.w << "x" << s.h << "x" << s.d << " bpe " << s.bpe);
+        const auto chain = tiled_volume_chain_layout_unproven(s.w, s.h, s.d, s.bpe, 9, s.max_mip);
+        ASSERT_EQ(chain.size(), size_t{s.max_mip} + 1u);
+        for (uint32_t level = 0; level < chain.size(); ++level) {
+            EXPECT_EQ(chain[level].in_tail, level >= s.first_tail) << "level " << level;
+            EXPECT_EQ(chain[level].slab_count, s.slabs) << "level " << level;
+            EXPECT_EQ(chain[level].slab_stride, s.stride) << "level " << level;
+        }
+        for (size_t level = 0; level < s.levels.size(); ++level) {
+            EXPECT_EQ(chain[level].byte_offset, s.levels[level].offset) << "level " << level;
+            EXPECT_EQ(chain[level].level_bytes, s.levels[level].bytes) << "level " << level;
+        }
+        EXPECT_EQ(tiled_volume_chain_bytes_unproven(s.w, s.h, s.d, s.bpe, 9, s.max_mip), s.total);
+    }
+    // AddrLib's texel addresses for the 128^3 / 1 B chain: slab index * stride + level offset.
+    // L0 (0,0,32) = 0xe0000 and (0,0,64) = 0x190000; L1 (0,0,32) = 0xc0000.
+    const auto c = tiled_volume_chain_layout_unproven(128, 128, 128, 1, 9, 7);
+    ASSERT_GE(c.size(), 2u);
+    EXPECT_EQ((32u / 32u) * c[0].slab_stride + c[0].byte_offset, 0xe0000u);
+    EXPECT_EQ((64u / 32u) * c[0].slab_stride + c[0].byte_offset, 0x190000u);
+    EXPECT_EQ((32u / 32u) * c[1].slab_stride + c[1].byte_offset, 0xc0000u);
+}
+
+// Span accounting is verified against hand totals, not against the helper itself:
+// 128x32x32 is 65536 (tail) + 65536 (L1) + 131072 (L0) = 262144; the 32^3 pyramid
+// shares one block; invalid shapes span zero bytes.
+TEST(BuildShaderResources, VolumeChainUnprovenSpanAccounting) {
+    EXPECT_EQ(tiled_volume_chain_bytes_unproven(128, 32, 32, 1, 9, 2), 262144u)
+        << "hand tail plus non-tail total";
+    EXPECT_EQ(tiled_volume_chain_bytes_unproven(32, 32, 32, 1, 9, 5), 65536u)
+        << "all-in-tail chain spans exactly the shared block";
+    EXPECT_EQ(tiled_volume_chain_bytes_unproven(64, 64, 64, 1, 9, 0), 262144u)
+        << "hand tail-less single level total";
+    const auto chain = tiled_volume_chain_layout_unproven(128, 32, 32, 1, 9, 2);
+    size_t max_end = 0;
+    for (const auto& e : chain) {
+        ASSERT_TRUE(e.supported) << "span walk sees only placed levels";
+        const size_t span = e.in_tail ? 65536u : e.level_bytes;
+        if (!e.in_tail) max_end = std::max(max_end, e.byte_offset + span);
+    }
+    max_end = std::max(max_end, size_t{65536});
+    EXPECT_EQ(max_end, tiled_volume_chain_bytes_unproven(128, 32, 32, 1, 9, 2))
+        << "span is the largest range end";
+    EXPECT_EQ(tiled_volume_chain_bytes_unproven(32, 32, 32, 1, 5, 5), 0u)
+        << "unmodelled tile mode spans nothing";
+    EXPECT_EQ(tiled_volume_chain_bytes_unproven(32, 32, 32, 3, 9, 5), 0u)
+        << "unmodelled element size spans nothing";
+    EXPECT_TRUE(tiled_volume_chain_layout_unproven(32, 32, 32, 1, 5, 5).empty())
+        << "unmodelled tile mode yields no levels";
+}
+
+// Every level geometry round-trips through the proven S3 copy, and the non-tail
+// ranges hold distinct patterns without aliasing, so the offsets are usable.
+TEST(BuildShaderResources, VolumeChainUnprovenRoundTripPerLevel) {
+    const auto chain = tiled_volume_chain_layout_unproven(128, 32, 32, 1, 9, 2);
+    ASSERT_EQ(chain.size(), 3u) << "three-level chain yields three entries";
+    for (uint32_t level = 0; level < 3; ++level) {
+        const uint32_t wl = std::max(128u >> level, 1u);
+        const uint32_t hl = std::max(32u >> level, 1u);
+        const uint32_t dl = std::max(32u >> level, 1u);
+        const size_t linear = size_t{wl} * hl * dl;
+        std::vector<uint8_t> src(linear);
+        for (size_t i = 0; i < linear; ++i) src[i] = uint8_t((i * 31u + level * 17u) & 255u);
+        const size_t need = tiled_volume_bytes(wl, hl, dl, 9, 1);
+        ASSERT_GT(need, 0u) << "level " << level << " has a padded size";
+        std::vector<uint8_t> tiled(need, 0), back(linear, 0);
+        ASSERT_TRUE(tile_volume(tiled.data(), tiled.size(), src.data(), wl, hl, dl, 9, 1))
+            << "level " << level << " tiles";
+        ASSERT_TRUE(detile_volume(back.data(), tiled.data(), tiled.size(), wl, hl, dl, 9, 1))
+            << "level " << level << " detiles";
+        EXPECT_EQ(back, src) << "level " << level << " round-trips";
+    }
+    const size_t span = tiled_volume_chain_bytes_unproven(128, 32, 32, 1, 9, 2);
+    ASSERT_EQ(span, 262144u) << "chain buffer uses the hand total";
+    std::vector<uint8_t> allocation(span, 0);
+    for (uint32_t level = 0; level < 2; ++level) {
+        const auto& e = chain[level];
+        ASSERT_FALSE(e.in_tail) << "level " << level << " is the non-tail population";
+        ASSERT_LE(e.byte_offset + e.level_bytes, allocation.size()) << "range in span";
+        std::memset(allocation.data() + e.byte_offset, uint8_t(level + 1), e.level_bytes);
+    }
+    EXPECT_EQ(allocation[chain[1].byte_offset], 2u) << "L1 range keeps its pattern";
+    EXPECT_EQ(allocation[chain[0].byte_offset], 1u) << "L0 range keeps its pattern";
+}
+
+// Admission still refuses the non-tail shape: a 128x32x32 single-level view at
+// BASE_LEVEL 1 (whose chain level zero misses the tail) stays unsupported, while the
+// same words at BASE_LEVEL 0 keep the historical unshifted whole-volume admission.
+// The control is what makes the refusal arm load-bearing on the level, not the extent.
+TEST(BuildShaderResources, VolumeChainUnprovenAdmissionStillRefuses) {
+    Gen5ImageFormatInfo fi;
+    ASSERT_TRUE(gen5_image_format(1, &fi)) << "R8 fixture format maps";
+    uint32_t t[8];
+    make_tsharp(t, 0x12000000ull, 128, 32, /*fmt*/ 1, /*tile*/ 9, /*type 3D*/ 10,
+                /*depth*/ 32);
+    t[3] |= (1u << 12) | (1u << 16);
+    t[5] |= 2u << 4;
+    const DecodedImageDescriptor d = decode_image_descriptor(t);
+    ASSERT_EQ(d.base_level, 1u) << "fixture selects the non-tail level";
+    ASSERT_EQ(d.max_mip, 2u) << "fixture chain carries the non-tail level zero";
+    EXPECT_FALSE(image_base_level_view(d, fi).supported)
+        << "non-zero level of a non-tail chain stays refused";
+    uint32_t t0[8];
+    make_tsharp(t0, 0x12000000ull, 128, 32, /*fmt*/ 1, /*tile*/ 9, /*type 3D*/ 10,
+                /*depth*/ 32);
+    t0[5] |= 2u << 4;
+    const DecodedImageView v0 = image_base_level_view(decode_image_descriptor(t0), fi);
+    EXPECT_TRUE(v0.supported) << "level zero keeps the unshifted admission (control)";
 }
