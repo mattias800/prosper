@@ -165,4 +165,3 @@ bool never_touches_scc(Rdna2Format fmt) {
         default: return false;
     }
 }
-

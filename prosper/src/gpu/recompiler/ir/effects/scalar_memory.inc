@@ -115,4 +115,3 @@ constexpr Row kSmem[] = {
     {F::SMEM, 0xab, smem("s_atomic_inc_x2", Rdna2ScalarMemory::Atomic, 2, 2, 1)},   // gfx1013
     {F::SMEM, 0xac, smem("s_atomic_dec_x2", Rdna2ScalarMemory::Atomic, 2, 2, 1)},   // gfx1013
 };
-

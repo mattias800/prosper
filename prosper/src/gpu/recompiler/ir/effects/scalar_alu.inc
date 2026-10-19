@@ -258,4 +258,3 @@ constexpr Row kSopp[] = {
     {F::SOPP, 0x25, plain("s_denorm_mode")},
     {F::SOPP, 0x28, plain("s_ttracedata_imm")},
 };
-

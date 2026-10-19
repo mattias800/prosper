@@ -238,4 +238,3 @@ constexpr Row kVop3[] = {
     {F::VOP3, 0x378, flow(valu("v_permlanex16_b32", 1, 1, 1), Rdna2LaneFlow::CrossLane)},
     {F::VOP3, 0x37f, valu("v_add_nc_i32", 1, 1, 0)},
 };
-

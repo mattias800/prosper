@@ -34,4 +34,3 @@ constexpr Row kVop3p[] = {
     {F::VOP3P, 0x021, half(valu("v_fma_mixlo_f16", 1, 1, 1))},
     {F::VOP3P, 0x022, half(valu("v_fma_mixhi_f16", 1, 1, 1))},
 };
-
