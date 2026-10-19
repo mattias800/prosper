@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <ios>
 #include <ostream>
 #include <string>
 #include <vector>

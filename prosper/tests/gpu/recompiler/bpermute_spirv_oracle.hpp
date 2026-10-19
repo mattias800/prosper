@@ -1030,6 +1030,7 @@ struct Interpreter {
               if (!v) fail("division by zero");
               r = op == 134 ? u / v : u % v;
           } else if (op == 194 || op == 196) {
+              // A dead poison result is permitted; live storage and branch consumers still fail.
               if (v >= 32 * size(x.type)) {
                   set_unsigned(l, a[1], a[0], 0, false);
                   continue;
