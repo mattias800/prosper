@@ -645,6 +645,26 @@ TEST(ServiceGetters, Contract) {
         }
     }
 
+    // sceNetPoolCreate(name, size, flags) refuses a null name or a non-positive size with
+    // SCE_NET_ERROR_EINVAL (0x80410100 | BSD EINVAL 22), not 0x80410118 (EMFILE), which the shipped
+    // libSceNet never encodes (#3300). The size is an int: 0xFFFFFFFF is -1, not a huge pool.
+    {
+        auto pool = Hle::lookup("dgJBaeJnGpo");
+        CHECK(pool != nullptr, "sceNetPoolCreate registered");
+        if (pool) {
+            const char name[] = "ProsperTestPool";
+            const uint64_t name_ptr = (uint64_t)(uintptr_t)name;
+            CHECK(pool(0, 0x8000, 0, 0, 0, 0) == 0x80410116ull,
+                  "sceNetPoolCreate rejects a null name with SCE_NET_ERROR_EINVAL");
+            CHECK(pool(name_ptr, 0, 0, 0, 0, 0) == 0x80410116ull,
+                  "sceNetPoolCreate rejects a zero size with SCE_NET_ERROR_EINVAL");
+            CHECK(pool(name_ptr, 0xFFFFFFFFull, 0, 0, 0, 0) == 0x80410116ull,
+                  "sceNetPoolCreate rejects a negative size with SCE_NET_ERROR_EINVAL");
+            CHECK((int32_t)pool(name_ptr, 0x8000, 0, 0, 0, 0) > 0,
+                  "sceNetPoolCreate with a valid name and size returns a positive pool id");
+        }
+    }
+
     // Sonic's last two startup imports have no output parameters. Keep the required input and
     // return contract explicit so they cannot regress to the generic success stub unnoticed.
     {

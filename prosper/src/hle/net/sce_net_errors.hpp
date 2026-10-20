@@ -38,16 +38,24 @@ constexpr uint32_t net_error(FreeBsdErrno e) {
 constexpr FreeBsdErrno kOfflineConnectErrno = FreeBsdErrno::ENetUnreach;
 constexpr uint32_t kNetErrorNetUnreach = net_error(FreeBsdErrno::ENetUnreach);   // 0x80410133
 
-// sceNetPoolCreate's refusal of a null name or a non-positive size. The value 0x80410118 predates
-// this header and is unchanged; note it is errno 24, EMFILE, although its call site used to label it
-// ENFILE (errno 23, which would be 0x80410117). CONFIDENCE: LOW on which errno the real library
-// answers here -- the constant is named for what it encodes, not asserted to be the library's choice.
+// A full id table: sceNetSocket, sceNetEpollCreate and sceNetResolverCreate answer EMFILE
+// (errno 24) through hle_net.cpp's net_id_fail once every id is handed out. CONFIDENCE: LOW on
+// which errno the real library answers here -- the constant is named for what it encodes, not
+// asserted to be the library's choice.
 constexpr uint32_t kNetErrorMFile = net_error(FreeBsdErrno::EMFile);   // 0x80410118
 
 // libSceNet socket family (hle_net.cpp). These answer the same offline question, so they share
 // the facility rule above rather than repeating the literal:
 // - BadF: an operation naming a socket id prosper never handed out (EBADF, 9).
-// - Inval: a null source pointer to sceNetInetPton (EINVAL, 22; module 0x6aa0).
+// - Inval: a null source pointer to sceNetInetPton (EINVAL, 22; module 0x6aa0), and
+//   sceNetPoolCreate's refusal of a null name or a non-positive size (hle_service.cpp, #3300).
+//   That refusal used to answer 0x80410118 (EMFILE, 24), a value the shipped libSceNet never
+//   encodes: no 4-byte 0x80410118 occurs anywhere in the module, while 0x80410116 is the family's
+//   most frequent errno (85 occurrences; only the non-errno 0x804101c8, 200, occurs more, 111
+//   times). The real sceNetPoolCreate (module 0x16e0) delegates argument checking to an inner call
+//   and maps that call's low byte, so which errno it answers for this exact condition is not read
+//   off the prologue -- EINVAL is the invalid-argument errno the module actually uses, not an
+//   observed answer (#3316 review).
 // - NoSpc: sceNetInetNtop with a null pointer or a buffer too small for the text (ENOSPC, 28;
 //   module 0x63c0).
 // - OpNotSupp: setsockopt/getsockopt for an option prosper models none of, and a socket type
@@ -70,7 +78,7 @@ static_assert(net_error(FreeBsdErrno::EInProgress) == 0x80410124u, "EINPROGRESS 
 static_assert(net_error(FreeBsdErrno::EConnRefused) == 0x8041013du, "ECONNREFUSED (title classifier)");
 static_assert(net_error(FreeBsdErrno::EHostDown) == 0x80410140u, "EHOSTDOWN (title classifier)");
 static_assert(kNetErrorNetUnreach == 0x80410133u, "ENETUNREACH");
-static_assert(kNetErrorMFile == 0x80410118u, "EMFILE, sceNetPoolCreate's historic value");
+static_assert(kNetErrorMFile == 0x80410118u, "EMFILE, a full net id table");
 static_assert(kNetErrorBadF == 0x80410109u, "EBADF");
 static_assert(kNetErrorInval == 0x80410116u, "EINVAL");
 static_assert(kNetErrorNoSpc == 0x8041011cu, "ENOSPC");

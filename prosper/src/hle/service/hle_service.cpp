@@ -260,7 +260,8 @@ std::atomic<int32_t> g_ssl_context_id{1};
 }
 HLE(s_net_pool_create) {
     svc_log("sceNetPoolCreate", a0,a1,a2,a3,a4,a5);
-    if (!svc_ptrish(a0) || (int32_t)a1 <= 0) return prosper::net::kNetErrorMFile; // errno 24 (EMFILE); see sce_net_errors.hpp
+    if (!svc_ptrish(a0) || (int32_t)a1 <= 0)
+        return prosper::net::kNetErrorInval;   // errno 22 (EINVAL); see sce_net_errors.hpp
     return (uint64_t)(uint32_t)g_net_pool_id.fetch_add(1);
 }
 HLE(s_ssl_init) {
