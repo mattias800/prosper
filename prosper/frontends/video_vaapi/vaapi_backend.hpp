@@ -4,7 +4,16 @@
 
 #include <memory>
 
+struct AVFrame;
+
 namespace prosper::video {
+
+namespace detail {
+// Pack a decoded/downloaded FFmpeg frame into caller-owned NV12. Reports the same geometry on
+// FrameTooSmall without touching the destination. The caller keeps the source frame stable.
+VideoBackend::AuResult copy_au_picture(const AVFrame* pic, bool hardware, uint8_t* dst,
+                                       uint64_t dst_bytes, VideoBackend::AuPicture& out);
+} // namespace detail
 
 // Native Linux AvPlayer backend. FFmpeg handles MP4 demux and audio conversion while decoded
 // video must come from its VA-API hardware-device path. Hardware surfaces are transferred and

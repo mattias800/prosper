@@ -1065,6 +1065,57 @@ void copy_yuv420p_as_nv12(const AVFrame* src, uint8_t* dst, uint32_t w, uint32_t
 
 }  // namespace
 
+VideoBackend::AuResult detail::copy_au_picture(const AVFrame* pic, bool hardware, uint8_t* dst,
+                                               uint64_t dst_bytes, VideoBackend::AuPicture& out) {
+    // A decoder that reports a zero-size picture has produced no picture, whatever it says. Refuse
+    // it here rather than let it become a well-formed "here is your frame" over nothing -- the exact
+    // shape #2270 exists to remove, and it costs a line to keep out of the new success path.
+    // (#2571 review N8; the HLE guards it independently, because this one only covers this backend.)
+    if (pic->width <= 0 || pic->height <= 0) {
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) < 8)
+            fprintf(stderr,
+                    "[vdec2] decoder returned a %dx%d picture -- refusing it rather than "
+                    "reporting an empty frame as a decode (#2270)\n",
+                    pic->width, pic->height);
+        return VideoBackend::AuResult::NoPicture;
+    }
+
+    out.width = static_cast<uint32_t>(pic->width);
+    out.height = static_cast<uint32_t>(pic->height);
+    out.y_stride = out.width;
+    // Chroma stores a complete U/V pair even for the last pixel of an odd-width row.
+    out.uv_stride = 2 * ((out.width + 1) / 2);
+    out.nv12_bytes = nv12_bytes(out.width, out.height);
+    // Reported alongside the geometry rather than only on success, so a FrameTooSmall refusal still
+    // says which path produced the picture it is refusing to copy.
+    out.hardware = hardware;
+
+    // Report the size mismatch as its OWN outcome. Collapsed into "no picture" it would read as a
+    // decoder warming up, which is the benign case it most resembles and the one that hides it.
+    if (!dst || dst_bytes < out.nv12_bytes) return VideoBackend::AuResult::FrameTooSmall;
+
+    if (pic->format == AV_PIX_FMT_NV12) {
+        copy_nv12(pic, dst, out.width, out.height);
+    } else if (pic->format == AV_PIX_FMT_YUV420P) {
+        // SOFTWARE fallback only. This is the per-frame CPU chroma interleave the hardware path
+        // exists to avoid -- 12.4 MB per frame at 3840x2160 -- so it is a correctness net, not a
+        // design. If a host ever runs here permanently, that is a bug to chase, not a tradeoff.
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) == 0)
+            fprintf(stderr, "[vdec2] software decode path: paying a per-frame YUV420P->NV12 CPU "
+                            "interleave; VA-API was unavailable (#2270)\n");
+        copy_yuv420p_as_nv12(pic, dst, out.width, out.height);
+    } else {
+        static std::atomic<int> warned{0};
+        if (warned.fetch_add(1) < 8)
+            fprintf(stderr, "[vdec2] unexpected decoded pixel format %d; no picture\n",
+                    pic->format);
+        return VideoBackend::AuResult::NoPicture;
+    }
+    return VideoBackend::AuResult::Decoded;
+}
+
 int VaapiBackend::open_decoder(uint32_t codec) {
     // codec==1 is AVC/H.264: measured on two titles as codec=1 profile=100, and profile_idc 100 is
     // H.264 High Profile. 1920x1088 / 3840x2160 corroborate it -- 1088 is 1080 rounded up to an
@@ -1258,51 +1309,7 @@ VideoBackend::AuResult VaapiBackend::decode_au(int id, const uint8_t* au, size_t
         pic = d.sw_frame;
     }
 
-    // A decoder that reports a zero-size picture has produced no picture, whatever it says. Refuse
-    // it here rather than let it become a well-formed "here is your frame" over nothing -- the exact
-    // shape #2270 exists to remove, and it costs a line to keep out of the new success path.
-    // (#2571 review N8; the HLE guards it independently, because this one only covers this backend.)
-    if (pic->width <= 0 || pic->height <= 0) {
-        static std::atomic<int> warned{0};
-        if (warned.fetch_add(1) < 8)
-            fprintf(stderr, "[vdec2] decoder returned a %dx%d picture -- refusing it rather than "
-                            "reporting an empty frame as a decode (#2270)\n",
-                    pic->width, pic->height);
-        return AuResult::NoPicture;
-    }
-
-    out.width = static_cast<uint32_t>(pic->width);
-    out.height = static_cast<uint32_t>(pic->height);
-    out.y_stride = out.width;
-    out.uv_stride = out.width;
-    out.nv12_bytes = nv12_bytes(out.width, out.height);
-    // Reported alongside the geometry rather than only on success, so a FrameTooSmall refusal still
-    // says which path produced the picture it is refusing to copy.
-    out.hardware = hardware;
-
-    // Report the size mismatch as its OWN outcome. Collapsed into "no picture" it would read as a
-    // decoder warming up, which is the benign case it most resembles and the one that hides it.
-    if (!dst || dst_bytes < out.nv12_bytes) return AuResult::FrameTooSmall;
-
-    if (pic->format == AV_PIX_FMT_NV12) {
-        copy_nv12(pic, dst, out.width, out.height);
-    } else if (pic->format == AV_PIX_FMT_YUV420P) {
-        // SOFTWARE fallback only. This is the per-frame CPU chroma interleave the hardware path
-        // exists to avoid -- 12.4 MB per frame at 3840x2160 -- so it is a correctness net, not a
-        // design. If a host ever runs here permanently, that is a bug to chase, not a tradeoff.
-        static std::atomic<int> warned{0};
-        if (warned.fetch_add(1) == 0)
-            fprintf(stderr, "[vdec2] software decode path: paying a per-frame YUV420P->NV12 CPU "
-                            "interleave; VA-API was unavailable (#2270)\n");
-        copy_yuv420p_as_nv12(pic, dst, out.width, out.height);
-    } else {
-        static std::atomic<int> warned{0};
-        if (warned.fetch_add(1) < 8)
-            fprintf(stderr, "[vdec2] unexpected decoded pixel format %d; no picture\n",
-                    pic->format);
-        return AuResult::NoPicture;
-    }
-    return AuResult::Decoded;
+    return detail::copy_au_picture(pic, hardware, dst, dst_bytes, out);
 }
 
 // sceVideodec2Reset: discard the buffered state, keep the decoder (#2585).
