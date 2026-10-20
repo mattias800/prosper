@@ -568,9 +568,54 @@ def test_control_decodes_to_six_instructions():
     ]
 
 
+@pytest.mark.parametrize("opcode", [0x00, 0x20, 0x80, 0xA2])
+@pytest.mark.parametrize("extra_dwords", range(4))
+def test_mimg_opcode_high_bit_is_independent_of_nsa_length(opcode, extra_dwords):
+    """ISA 70648 Table 100: bit 0 is OP[7]; NSA[2:1] counts extra dwords."""
+    header = 0xF2000100 | ((opcode & 0x7F) << 18) | (opcode >> 7) | (extra_dwords << 1)
+    # Payload words resemble instructions: they must not become extra decoded records.
+    image = [header, 0, *([0xBF810000] * extra_dwords)]
+    insns, err = D.decode_program(code(sopp(0), image, END))
+    assert err is None
+    assert [(i.pc, i.size, i.fmt) for i in insns] == [
+        (0, 4, "SOPP"),
+        (4, 8 + 4 * extra_dwords, "MIMG"),
+        (12 + 4 * extra_dwords, 4, "SOPP"),
+    ]
+    assert insns[1].op == opcode
+    assert insns[1].words == tuple(image)
+    assert insns[1].name is None  # Boundary decoding does not add execution semantics.
+    assert insns[-1].name == "S_ENDPGM"
+
+
+@pytest.mark.parametrize("extra_dwords", range(4))
+def test_mimg_truncated_address_payload_is_rejected(extra_dwords):
+    """The encoded total length, including all NSA dwords, must fit in the stream."""
+    image = [0xF0000101 | (extra_dwords << 1), 0, *([0] * extra_dwords)]
+    insns, err = D.decode_program(code(sopp(0), image)[:-4])
+    assert [(i.pc, i.name) for i in insns] == [(0, "S_NOP")]
+    assert err == "truncated MIMG at 0x4"
+
+
 needs_llvm = pytest.mark.skipif(
     not L.llvm_available(), reason="needs llvm-mc/llvm-objdump on PATH, or WSL Ubuntu"
 )
+
+
+@needs_llvm
+def test_mimg_boundaries_match_independent_llvm_disassembly():
+    """Known LLVM gfx1030 encodings exercise bit 0 alone and NSA without bit 0."""
+    data = code([0xF0000131, 4], [0xF000010A, 1, 3], END)
+    decoded, err = D.decode_program(data)
+    assert err is None
+    llvm = L.run_llvm(data)
+    assert llvm.invalid == 0
+    assert [(i.offset, i.size, i.mnemonic) for i in llvm.insns] == [
+        (0, 8, "image_msaa_load"),
+        (8, 12, "image_load"),
+        (20, 4, "s_endpgm"),
+    ]
+    assert [(i.pc, i.size) for i in decoded] == [(i.offset, i.size) for i in llvm.insns]
 
 
 def test_run_llvm_without_toolchain_raises(monkeypatch):
