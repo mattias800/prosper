@@ -3874,6 +3874,7 @@ if(TARGET prosper_core)
           ir_cfg_structured_loop_execution
           ir_cfg_state_placement
           ir_cfg_dispatch_blocks
+          ir_cfg_service_nodes
           ir_cfg_exec_values
           ir_cfg_exec_relation_consumer
           )

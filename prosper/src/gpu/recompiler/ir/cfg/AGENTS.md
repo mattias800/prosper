@@ -30,6 +30,8 @@ existing owners. A consumer switches over after its own shadow check agrees. The
 | `exec_values.hpp/.cpp` | step 7a: a static identity for every EXEC value and the subset/complement relations between them |
 | `exec_value_census.hpp/.cpp` | step 7a: the shadow census, which answers every `exec_within` call and complement read again from `exec_values` |
 | `exec_relation_consumer.hpp/.cpp` | step 7b part 1: scoped id-to-value mapping and equality-guarded answers, with id-based fallback |
+| `service_nodes.hpp/.cpp` | step 11 groundwork: the 21 selected service kinds as pure nodes at CFG block ends, preserving dispatcher group identity and order; no consumer |
+| `service_census.hpp/.cpp` | observes existing per-block selections and checks their node projection against the separate dispatch-group tail selections |
 
 Tests: `tests/gpu/recompiler/ir/test_ir_cfg_*.cpp`, one per source file.
 
@@ -335,3 +337,33 @@ Every disagreement retains the existing answer, so this stage cannot extend loop
 admitted loops or strengthen the MED-confidence WQM-as-copy model. Chain relations retain their
 existing behavior. `ExecRelationCapture` observes equal/differing/unmapped answers; its withhold
 and corrupt modes exercise the fallback through real recompiles without an environment switch.
+
+## Selected service nodes (step 11 groundwork, shadow only)
+
+`ServiceNode` records a `ServiceKind`, guest pc, CFG block and existing dispatcher group. The 21
+kinds are the dispatcher's existing block-ending selections: MBCNT, append/consume, synchronized
+LDS store and float min/max, swizzle, bpermute, five DPP row/quad shapes, mask FFBH/reduction,
+packet WQM, readlane/readfirstlane, and five mask compare/vote forms. `build_service_nodes` projects
+the selected events onto service-split `GuestCfg` block ends. The walk preserves observed group
+order, which can differ from pc order when the native dispatcher fuses forward chains.
+
+Selection remains entirely with `emit_cfg_state_machine`: its recognizers and lifetime decisions
+run where they did before. An observe-only hook reads its selected `block_*` pointers, and a
+separate hook reads the outer pointers after the dispatch group's existing tail assignments.
+`ServiceObservation` compares the node walk with that separate event stream: same pc, kind,
+group and order, with no dropped/extra events. It reads no `RegState`, marks, proofs, `load_state`
+or MUST/MAY analysis. There is no new instruction-recognition list or static semantic classifier.
+Nothing in emission reads the nodes, capture records or comparison answer.
+
+The node set represents **selected services**, not every syntactic split candidate. A mask or
+readlane candidate can use ordinary ALU emission when its current lifetime is numeric. The
+auxiliary `PacketRawMasks` publication has no block-ending selection pointer; its site count is
+reported separately, not invented as a 22nd kind. A refusal before the case walk reaches every
+group leaves a partial region; completed groups are compared and selections whose group never
+reached its tail are counted as pending. Early refusals before block discovery have no record.
+
+`ServiceCapture` is thread-local and nestable. `shader_inspect --cfg-services` prints equal/differ
+counts, complete/partial coverage, split/selected/auxiliary counts and the selected kinds. The
+committed-fixture gtest compares modules with capture off/on, and independent hand-built missing,
+extra, wrong-pc, wrong-kind, wrong-group and reordered events must be detected. This is structural
+groundwork; it does not lower dispatcher regions from the tree or change service admission.

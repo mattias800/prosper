@@ -68,6 +68,7 @@
 #include "gpu/recompiler/rdna2_structured_mask_reductions.hpp"
 #include "gpu/recompiler/rdna2_structured_saved_masks.hpp"
 #include "gpu/recompiler/ir/cfg/dispatch_blocks.hpp"
+#include "gpu/recompiler/ir/cfg/service_census.hpp"
 
 namespace prosper::gpu {
 
@@ -865,6 +866,8 @@ bool emit_cfg_state_machine(
         // Identical by the guard, so block_for_pc and the vectors above stay valid.
         ir::cfg::adopt_guest_cfg_blocks(ins, split_policy, starts, successors);
     }
+    ir::cfg::ServiceObservation service_observation(
+        ins, {true, &service_pcs, graphics ? &safe : nullptr}, packet_raw_masks.sites.size());
 
     // #3133's `entry_m0_may_hold` is a WHOLE-STREAM MAY set, and `load_state` stamps it at EVERY
     // dispatcher block entry -- the program's own ENTRY block included. Its comment predicted the
@@ -3298,6 +3301,16 @@ bool emit_cfg_state_machine(
                     state.scc = b.native_wave_any(result->second);
                 }
             }
+            service_observation.block(
+                dispatch, starts[block],
+                ir::cfg::selected_service_pointers(
+                    block_mbcnt, block_append, block_synchronized_lds_store, block_lds_fminmax,
+                    block_swizzle, block_bpermute, block_dpp_min_row_shr, block_dpp_row_shr,
+                    block_dpp_row_ror8, block_dpp_quad_or, block_dpp_add_row_mask, block_mask_ffbh,
+                    block_mask_reduction, block_packet_wqm, block_readlane, block_readfirstlane,
+                    block_mask_compare, block_exec_saved_mask_compare,
+                    block_saved_mask_pair_compare, block_vopc_mask_compare,
+                    block_b64_mask_scc_vote));
             const bool last = member + 1 == dispatch_blocks[dispatch].size();
             if (!last) {
                 // Group construction admits only one-successor plain blocks before the tail.
@@ -3337,6 +3350,13 @@ bool emit_cfg_state_machine(
             vopc_mask_compare = block_vopc_mask_compare;
             b64_mask_scc_vote = block_b64_mask_scc_vote;
         }
+        service_observation.group(
+            dispatch, ir::cfg::selected_service_pointers(
+                          mbcnt, append, synchronized_lds_store, lds_fminmax, swizzle, bpermute,
+                          dpp_min_row_shr, dpp_row_shr, dpp_row_ror8, dpp_quad_or, dpp_add_row_mask,
+                          mask_ffbh, mask_reduction, packet_wqm, readlane, readfirstlane,
+                          mask_compare, exec_saved_mask_compare, saved_mask_pair_compare,
+                          vopc_mask_compare, b64_mask_scc_vote));
         if (packet_wqm) {
             // Snapshot before any destination invalidation, including EXEC/VCC and SGPR aliases.
             const auto& source = packet_wqm->src[0];
@@ -4259,6 +4279,7 @@ bool emit_cfg_state_machine(
         }
         b.emit_branch(switch_merge);
     }
+    service_observation.complete();
     b.emit_label(fallback);
     b.store_function(active_var, no);
     b.emit_branch(switch_merge);
