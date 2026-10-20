@@ -1,8 +1,8 @@
 // exec_value_census.hpp -- the shadow check of IR_CONTROL_FLOW_PLAN.md step 7a: the static EXEC
 // relations (exec_values.hpp) against the SPIR-V-id relations the emitter uses today.
 //
-// While a census is active on this thread, the emitter's hooks report three things, and do nothing
-// otherwise:
+// While a census is active on this thread, the emitter's hooks report three things to it
+// (the same hooks independently feed the guarded consumer):
 //   - the program each route is about to emit (place_state for the structured route,
 //     adopt_guest_cfg_blocks for the dispatcher, whose blocks are its cases), for which the census
 //     builds the static values;
@@ -112,7 +112,7 @@ private:
     ExecValueCensus* previous_ = nullptr;
 };
 
-// The emitter's hooks. Each returns at once unless a census is active on this thread.
+// The emitter's hooks. They also feed the guarded step-7b consumer when an emission scope exists.
 void exec_census_program(const GuestCfg& cfg, std::span<const Rdna2Inst> ins, bool dispatcher);
 void exec_census_within(const RegState& rs, uint32_t reader, uint32_t owner, bool spirv);
 void exec_census_complement(const RegState& rs, uint32_t value);

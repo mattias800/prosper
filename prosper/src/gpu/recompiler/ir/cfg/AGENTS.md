@@ -27,8 +27,9 @@ existing owners. A consumer switches over after its own shadow check agrees. The
 | `structured_loop_cursor.hpp/.cpp` | step 4b: the DivLoop cursor and the CountedLoop record `emit_body` consumes, from the tree when equal to the detector |
 | `dispatch_blocks.hpp/.cpp` | step 5: the dispatcher's `starts`/`successors` from the service split, the guard that adopts them only when identical, and `DispatchBlocksCapture` for the shadow test and census |
 | `state_placement.hpp/.cpp` | step 6: the phi sets of every if merge and loop header, the guard the emitter takes them through, and the census that observes it |
-| `exec_values.hpp/.cpp` | step 7a: a static identity for every EXEC value and the subset/complement relations between them; nothing in emission reads it |
+| `exec_values.hpp/.cpp` | step 7a: a static identity for every EXEC value and the subset/complement relations between them |
 | `exec_value_census.hpp/.cpp` | step 7a: the shadow census, which answers every `exec_within` call and complement read again from `exec_values` |
+| `exec_relation_consumer.hpp/.cpp` | step 7b part 1: scoped id-to-value mapping and equality-guarded answers, with id-based fallback |
 
 Tests: `tests/gpu/recompiler/ir/test_ir_cfg_*.cpp`, one per source file.
 
@@ -319,3 +320,18 @@ linear walk suspends it (`ExecCensusSuspend`). `shader_inspect --cfg-exec-values
 weaker cases, the stronger proof shapes with one example each, the unmapped sides and a
 `cfg-exec-values-end` summary; `test_ir_cfg_exec_values` runs it over the committed fixtures and
 over table-backed programs that reach each recorder, and fails on any static-weaker comparison.
+
+
+## Guarded EXEC consumer (step 7b, part 1)
+
+`ExecRelationScope` owns the mapping for one `emit_body` or dispatcher emission. The existing
+program and instruction hooks feed it independently of the optional shadow census. Nested routes
+restore their caller's map; a new program clears the map, and conflicting observations permanently
+invalidate that id for the program. Unmapped or foreign-builder observations grant no answer.
+
+`exec_within` and both complement reads take a static answer only when it equals the id-based
+answer. A complement must name the same two SPIR-V endpoints, not just report a relation present.
+Every disagreement retains the existing answer, so this stage cannot extend loop induction beyond
+admitted loops or strengthen the MED-confidence WQM-as-copy model. Chain relations retain their
+existing behavior. `ExecRelationCapture` observes equal/differing/unmapped answers; its withhold
+and corrupt modes exercise the fallback through real recompiles without an environment switch.

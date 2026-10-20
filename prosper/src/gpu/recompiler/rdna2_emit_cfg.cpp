@@ -1,3 +1,4 @@
+#include "gpu/recompiler/ir/cfg/exec_relation_consumer.hpp"
 #include "gpu/recompiler/ir/cfg/structured_if_cursor.hpp"
 // rdna2_emit_cfg.cpp — the divergent-control-flow state machine and emit_body, split out of
 // rdna2_to_spirv.cpp. Shared state lives in gpu/recompiler/rdna2_to_spirv_internal.hpp.
@@ -80,6 +81,7 @@ bool emit_cfg_state_machine(
     const std::function<int(RegState&, const Rdna2Inst&)>& packet_instruction,
     PacketVgprDefinedness* packet_definedness, const FragmentPacketMaskRequirements* packet_masks,
     NativeBarrierHalfProof* barrier_halves) {
+    ir::cfg::ExecRelationScope exec_relations(b);
     prepare_ngg_row_source_proof(b, initial, ins);
     PortableMaskHalfEntryScope half_entry_scope(b, initial_active);
     PortableMaskHalfBodyScope half_scope(b, initial, ins);
@@ -5142,6 +5144,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                bool force_lds_fminmax_dispatcher) {
     // code/dwords: raw stream for forward-if target checks; inherited_dead_masks keeps
     // whole-shader liveness valid when a barrier-separated body is compiled in phases.
+    ir::cfg::ExecRelationScope exec_relations(b);
     prepare_ngg_row_source_proof(b, rs, ins);
     SavedMaskCopyBodyScope copy_scope(b, rs, ins, code, dwords, initial_dispatch_active);
     PortableMaskHalfBodyScope half_scope(b, rs, ins);
