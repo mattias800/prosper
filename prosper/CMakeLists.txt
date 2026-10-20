@@ -3693,6 +3693,7 @@ if(TARGET prosper_core)
           ir_float_mad_rounding
           ir_float_fma_rounding
           ir_mixed_f32_fma
+          ir_mixed_half_fma
           ir_scalar_alu_execution
           ir_scalar_fold
           ir_lower_vop3_exact_integer_float
@@ -3992,6 +3993,11 @@ if(TARGET prosper_core)
       INCLUDES tests
       LIBRARIES prosper_core Vulkan::Vulkan
       PROPERTIES TIMEOUT 300)
+    prosper_add_gtest(test_compute_mixed_half_fma
+      SOURCES tests/gpu/execute/test_compute_mixed_half_fma.cpp
+      INCLUDES tests
+      LIBRARIES prosper_core Vulkan::Vulkan
+      PROPERTIES TIMEOUT 120)
     prosper_add_gtest(test_compute_dpp_row_fadd_execution
       SOURCES tests/gpu/execute/test_compute_dpp_row_fadd.cpp
       INCLUDES tests

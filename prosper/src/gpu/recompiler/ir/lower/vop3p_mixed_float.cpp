@@ -1,5 +1,5 @@
 // Mixed VOP3P source preparation and result publication, moved by extract_case_routes.py.
-// F32 delegates to the shared IR Fma; mixed-half rounding remains the legacy #5225 gap.
+// Full-width sources delegate to shared F32 Fma; direct half rounding remains a #5225 gap.
 #include "gpu/recompiler/ir/lower/vop3p_mixed_float.hpp"
 #include "gpu/recompiler/ir/lower/lowering_context.hpp"
 #include "gpu/recompiler/ir/ops/vector_fma_float.hpp"
@@ -17,8 +17,9 @@ bool Vop3pMixedFloatLowering::lower() {
     // ISA 70648 12.10: F32 FMA after independent full/half source expansion. GLSL Fma has
     // MED hosted precision (#5225), as for the standard F32 forms; it is not a strict FMA
     // feature or a correction of other guest MODE/nonfinite contracts. Mixed-half results
-    // retain their old arithmetic and preserve the other half of VDST; they need one final
-    // half rounding, which an F32 Fma followed by packing does not establish.
+    // use it when a source is full F32, removing the intermediate product rounding.
+    // CONFIDENCE: MED: F32 Fma followed by a half pack still has known double rounding;
+    // it does not establish direct single rounding to F16. All-half arithmetic stays as before.
     if (in.opcode != 0x20 && in.opcode != 0x21 && in.opcode != 0x22) {
         ok = false;
         return true;
@@ -45,8 +46,9 @@ bool Vop3pMixedFloatLowering::lower() {
         if (in.src_neg[k]) v = b.fneg(v);
         return v;
     };
-    uint32_t r = in.opcode == 0x20 ? emit_fused_mad_values(b, mixv(0), mixv(1), mixv(2))
-                                   : b.fbin(Op_FAdd, b.fbin(Op_FMul, mixv(0), mixv(1)), mixv(2));
+    uint32_t r = in.opcode == 0x20 || in.vop3p_opsel_hi != 7
+                     ? emit_fused_mad_values(b, mixv(0), mixv(1), mixv(2))
+                     : b.fbin(Op_FAdd, b.fbin(Op_FMul, mixv(0), mixv(1)), mixv(2));
     if (in.clamp) r = b.clamp01(r);
     uint32_t& d = rs.vreg[in.dst.value];
     if (in.opcode == 0x20)
