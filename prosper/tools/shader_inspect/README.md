@@ -113,6 +113,30 @@ and the dispatcher kept its own. `services` counts the GuestCfg blocks that end 
 service. The `cfg-dispatch-blocks-end` sentinel separates "no dispatcher region" from a run that
 died before printing.
 
+## `--cfg-services`: typed selected-service nodes, shadow only
+
+```bash
+./build-linux/shader_inspect cs_<key>.bin --inputs cs_<key>.inputs --cfg-services
+```
+
+The step 11 groundwork census observes the dispatcher's existing per-block service selections,
+projects them onto service-split CFG block ends, and compares the resulting node walk with the
+separate dispatch-group tail selections. `cfg-services` reports `equal` or `differ` per region
+(pc, kind, group and order), plus blocks/groups reached, syntactic split candidates, selected
+nodes/events, pending selections and auxiliary raw-mask sites. `cfg-services-kind` counts each
+kind, including explicit zero observations. `cfg-services-end` reports equal/differ and
+complete/partial region totals and separates no dispatcher region from a run that failed to print
+its census.
+
+The dispatcher still owns recognition, lifetime decisions and emission. A syntactic candidate can
+be ordinary ALU rather than a selected service. A refusal before the end of case selection leaves
+a partial region: only completed groups are compared; any selected pending tail is counted
+separately. Early refusals before block discovery have no record. Auxiliary packet raw-mask
+publication is reported separately from the 21 block-ending kinds. Nothing consumes the new data;
+capture on/off must produce identical modules. The gtest over committed fixtures also exercises
+independent missing/wrong/reordered event controls. See
+`prosper/src/gpu/recompiler/ir/cfg/AGENTS.md` for the boundary.
+
 ## `--cfg-exec-values`: the static EXEC relations against the SPIR-V-id ones
 
 ```bash

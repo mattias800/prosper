@@ -11,3 +11,6 @@ from a hand-built file without opening the test.
   and GS main of a merged ES+GS NGG program, the 32-slice 3D LUT producer captured from *Kena:
   Bridge of Spirits* (`PPSA01802`, program `0x5009440000`). Linked, they are the guest code of the
   #3135 subgroup-shell execution tests. Byte-identical to the `strip_layer_*.bin` fixtures of #3857.
+- `rdna2_cfg_services.hex` (5 dwords): project-owned synthetic two-site unsigned DPP row maximum,
+  exactly `dpp_row_max_program({1, 2})` from `tests/fixtures/dpp_row_max.hpp`. The service-node shadow
+  test uses the existing row-service test's three-input VALU dispatcher profile; it is not a capture.

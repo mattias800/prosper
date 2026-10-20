@@ -12,6 +12,7 @@
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
+#include "cfg_services_report.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -471,6 +472,7 @@ int main(int argc, char** argv) {
     bool cfg_placement = false;
     bool cfg_dispatch_blocks = false;
     bool cfg_exec_values = false;
+    bool cfg_services = false;
     std::string inputs_path;
     std::string spirv_out;
     bool bad_usage = false;
@@ -499,6 +501,8 @@ int main(int argc, char** argv) {
             cfg_dispatch_blocks = true;
         } else if (arg == "--cfg-exec-values") {
             cfg_exec_values = true;
+        } else if (arg == "--cfg-services") {
+            cfg_services = true;
         } else if (arg == "--inputs") {
             if (i + 1 >= argc)
                 bad_usage = true;
@@ -533,6 +537,7 @@ int main(int argc, char** argv) {
                            wave_reasons || raw_wide_proof || cfg_regions)) ||
         (cfg_dispatch_blocks && ((stage.empty() && inputs_path.empty()) || cfg_regions)) ||
         (cfg_exec_values && ((stage.empty() && inputs_path.empty()) || cfg_regions)) ||
+        (cfg_services && ((stage.empty() && inputs_path.empty()) || cfg_regions)) ||
         (!stage.empty() && stage != "vertex" && stage != "fragment" && stage != "compute")) {
         std::fprintf(stderr, "usage: %s <raw-rdna2.bin> [--stage vertex|fragment|compute]\n", argv[0]);
         std::fprintf(stderr,
@@ -555,6 +560,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
                      "       add --cfg-dispatch-blocks to a --stage or --inputs recompile\n");
         std::fprintf(stderr, "       add --cfg-exec-values to a --stage or --inputs recompile\n");
+        std::fprintf(stderr, "       add --cfg-services to a --stage or --inputs recompile\n");
         std::fprintf(
             stderr,
             "\n"
@@ -615,6 +621,9 @@ int main(int argc, char** argv) {
             "dispatcher's blocks and successors equal build_guest_cfg's service split\n"
             "(IR_CONTROL_FLOW_PLAN step 5), else `differ` with the first difference. A\n"
             "`cfg-dispatch-blocks-end regions=N` sentinel follows.\n"
+            "--cfg-services adds an observation-only step-11 census of typed service nodes\n"
+            "at CFG block ends against the dispatcher's separate service-tail selections.\n"
+            "It reports pc/kind/group/order differences, partial regions and per-kind counts.\n"
             "--cfg-exec-values adds, after a --stage or --inputs recompile, the step-7a census:\n"
             "each exec_within answer and complement read compared with the static EXEC\n"
             "relations (equal, static-stronger, static-weaker, unmapped, cross-context), one\n"
@@ -670,6 +679,8 @@ int main(int argc, char** argv) {
     if (cfg_dispatch_blocks) dispatch_blocks_report.emplace();
     std::optional<ExecValuesReport> exec_values_report;
     if (cfg_exec_values) exec_values_report.emplace();
+    std::optional<prosper::tools::CfgServicesReport> services_report;
+    if (cfg_services) services_report.emplace();
     if (!inputs_path.empty())
         return replay_recorded_inputs(input_path, inputs_path, words, spirv_out);
     std::vector<Rdna2Inst> instructions;
