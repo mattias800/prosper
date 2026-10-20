@@ -10,6 +10,7 @@
 #include "gpu/state/vk_translate.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include "host/memory/guest_write_watch.hpp"
+#include "fixtures/agc_shader_blob.hpp"
 #include "fixtures/render_runner.h"
 #include "fixtures/test_scratch.h"
 
@@ -189,16 +190,10 @@ int main() {
         mixed.draws.push_back(mixed.draws[0]);
         mixed.draws[1].command_order = 300;
         auto create_shader = prosper::Hle::lookup("f3dg2CSgRKY");
-        static ShaderReg ordered_compute_registers[2] = {
-            {P::COMPUTE_PGM_LO, 0}, {P::COMPUTE_PGM_HI, 0},
-        };
-        static AgcShaderHeader ordered_compute_header{};
-        ordered_compute_header.file_header = 0x34333231u;
-        ordered_compute_header.version = 0x18;
-        ordered_compute_header.sh_registers = ordered_compute_registers;
-        ordered_compute_header.shader_size = sizeof(kOrderedNoopCs);
-        ordered_compute_header.type = 0;
-        ordered_compute_header.num_sh_registers = 2;
+        static prosper::test::AgcShaderBlob<2> ordered_compute_blob;
+        ordered_compute_blob.reset({{{P::COMPUTE_PGM_LO, 0}, {P::COMPUTE_PGM_HI, 0}}},
+                                   sizeof(kOrderedNoopCs));
+        auto& ordered_compute_header = ordered_compute_blob.header;
         void* registered_shader = nullptr;
         const bool registered = create_shader &&
             create_shader(reinterpret_cast<uint64_t>(&registered_shader),
