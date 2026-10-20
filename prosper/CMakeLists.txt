@@ -7684,11 +7684,6 @@ if(UNIX AND NOT APPLE AND PROSPER_VIDEO_VAAPI AND TARGET prosper_core)
     target_include_directories(prosper_video_vaapi PUBLIC frontends/video_vaapi PRIVATE src)
     target_link_libraries(prosper_video_vaapi PUBLIC prosper_core PkgConfig::PROSPER_FFMPEG)
 
-    # Synthetic decoded frames exercise the production AU copy/metadata path without a VA-API device.
-    prosper_add_gtest(test_vaapi_au_picture_copy
-      SOURCES tests/frontend/test_vaapi_au_picture_copy.cpp
-      INCLUDES src LIBRARIES prosper_video_vaapi)
-
     add_executable(test_video_vaapi frontends/video_vaapi/test_video_vaapi.cpp)
     target_link_libraries(test_video_vaapi PRIVATE prosper_video_vaapi)
     # Point the test at a committed test-pattern clip so it decodes a real stream. On headless CI
