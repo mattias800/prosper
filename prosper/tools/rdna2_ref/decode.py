@@ -844,10 +844,12 @@ def decode_one(data: bytes, off: int) -> Insn:
     }
     if enc6 in other:
         fmt = other[enc6]
-        if fmt == "MIMG" and _bits(w0, 0, 0):
-            # Non-sequential-address MIMG appends address dwords whose count depends on
-            # the dimension; this decoder refuses to guess the length.
-            raise DecodeError(f"MIMG NSA at {off:#x}: length not modelled")
+        if fmt == "MIMG":
+            # ISA 70648 Table 100: NSA[2:1] counts 0-3 additional address dwords;
+            # bit 0 is the high opcode bit, independent of the instruction length.
+            nsa = _bits(w0, 2, 1)
+            op = (_bits(w0, 0, 0) << 7) | _bits(w0, 24, 18)
+            return mk(fmt, op, None, 8 + 4 * nsa, {})
         if fmt == "VOP3P":
             w1 = need2()
             lit = any(_bits(w1, hi, lo) == 255 for hi, lo in ((8, 0), (17, 9), (26, 18)))
