@@ -3791,6 +3791,7 @@ if(TARGET prosper_core)
           ir_lower_vop3p_packed_integer
           ir_vector_packed_integer_execution
           ir_lower_vop3p_packed_float
+          ir_lower_vop3p_packed_values
           ir_vector_packed_float_execution
           ir_lower_vop3p_integer_dot
           ir_vector_integer_dot_execution
