@@ -3875,6 +3875,7 @@ if(TARGET prosper_core)
           ir_cfg_state_placement
           ir_cfg_dispatch_blocks
           ir_cfg_exec_values
+          ir_cfg_exec_relation_consumer
           )
     prosper_add_gtest(test_${ir_test}
       SOURCES tests/gpu/recompiler/ir/test_${ir_test}.cpp

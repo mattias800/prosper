@@ -9,8 +9,8 @@
 // exec_masked_predicate, write_vopc_mask, merge_exec_arm, the narrowing loop header), stated over
 // those identities. The rules, and where they reach further than the emitter, are in AGENTS.md.
 //
-// Plain data: building it allocates no SPIR-V id. Nothing in emission reads it yet (step 7a); the
-// shadow census (exec_value_census.hpp) compares it with the SPIR-V-id relations.
+// Plain data: building it allocates no SPIR-V id. The shadow census (exec_value_census.hpp)
+// compares it with SPIR-V-id relations; exec_relation_consumer consumes equal answers only.
 #pragma once
 
 #include "gpu/recompiler/ir/cfg/guest_cfg.hpp"

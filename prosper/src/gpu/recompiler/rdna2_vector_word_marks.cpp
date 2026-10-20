@@ -1,5 +1,6 @@
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include "gpu/recompiler/ir/cfg/exec_value_census.hpp"
+#include "gpu/recompiler/ir/cfg/exec_relation_consumer.hpp"
 
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
@@ -108,10 +109,19 @@ bool exec_within_by_id(const RegState& rs, uint32_t reader, uint32_t owner) {
 bool exec_within(const RegState& rs, uint32_t reader, uint32_t owner) {
     const bool within = exec_within_by_id(rs, reader, owner);
     ir::cfg::exec_census_within(rs, reader, owner, within);   // step 7a shadow; observes only
-    return within;
+    return ir::cfg::guarded_exec_within(reader, owner, within);
 }
 
 namespace {
+
+ir::cfg::ExecPartition exec_partition(const RegState& rs, uint32_t value) {
+    ir::cfg::exec_census_complement(rs, value);
+    const auto found = rs.exec_complement_in.find(value);
+    const ir::cfg::ExecPartition by_id = found == rs.exec_complement_in.end()
+                                             ? ir::cfg::ExecPartition{}
+                                             : ir::cfg::ExecPartition{found->second};
+    return ir::cfg::guarded_exec_complement(value, by_id);
+}
 
 // CONFIDENCE: MED -- the arbitrary property of a meet (#5185, decision on the issue): a meet
 // is hard exactly when one of its inputs is. It is the same for the inputs one instruction reads
@@ -681,14 +691,12 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
                 // part a proved subset of whole. An old word confined within part (its missing
                 // lanes lie outside a superset of part) misses no lane of part, and this write
                 // completes the rest of whole, so the result misses lanes only outside whole.
-                ir::cfg::exec_census_complement(rs, rs.exec);   // step 7a shadow; observes only
-                const auto partition = rs.exec_complement_in.find(rs.exec);
+                const auto partition = exec_partition(rs, rs.exec);
                 const bool completes_partition =
-                    !keep_wider && old.hard && old.outside_exec != 0 &&
-                    partition != rs.exec_complement_in.end() &&
-                    exec_within(rs, partition->second.second, old.outside_exec);
+                    !keep_wider && old.hard && old.outside_exec != 0 && partition.has_value() &&
+                    exec_within(rs, partition->second, old.outside_exec);
                 if (keep_wider || completes_partition) {
-                    result.outside_exec = keep_wider ? old.outside_exec : partition->second.first;
+                    result.outside_exec = keep_wider ? old.outside_exec : partition->first;
                     result.blanket_roots.insert(old.blanket_roots.begin(), old.blanket_roots.end());
                 }
                 // CONFIDENCE: HIGH -- every lane inside EXEC is written here from defined
@@ -751,15 +759,13 @@ void confine_execz_skip_marks(const RegState& rs, VectorWordMarks& skipped,
     //    is #5172's partition rule for the join of the two arms: the second arm's empty EXEC
     //    is the case where the first arm's owner already covered the whole saved mask.
     // These facts relate immutable EXEC SSA values, so they hold on the skipped edge too.
-    ir::cfg::exec_census_complement(rs, empty_exec);   // step 7a shadow; observes only
-    const auto partition = rs.exec_complement_in.find(empty_exec);
+    const auto partition = exec_partition(rs, empty_exec);
     for (auto& [reg, marks] : skipped) {
         if (!marks.placeholder || !marks.hard) continue;
         const uint32_t prior = marks.outside_exec;
         std::vector<uint32_t> owners;
-        if (partition != rs.exec_complement_in.end() && prior &&
-            exec_within(rs, partition->second.second, prior))
-            owners.push_back(partition->second.first);
+        if (partition.has_value() && prior && exec_within(rs, partition->second, prior))
+            owners.push_back(partition->first);
         if (prior) owners.push_back(prior);
         owners.push_back(empty_exec);
         const auto found = taken.find(reg);

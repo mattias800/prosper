@@ -1,6 +1,7 @@
 // exec_value_census.cpp -- the step-7a shadow census; see exec_value_census.hpp and the "EXEC
 // values" section of AGENTS.md.
 #include "gpu/recompiler/ir/cfg/exec_value_census.hpp"
+#include "gpu/recompiler/ir/cfg/exec_relation_consumer.hpp"
 
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
@@ -282,6 +283,7 @@ void ExecValueCensus::compare_complement(const RegState& rs, uint32_t value) {
 }
 
 void exec_census_program(const GuestCfg& cfg, std::span<const Rdna2Inst> ins, bool dispatcher) {
+    if (auto* consumer = ExecRelationScope::active()) consumer->begin_program(cfg, ins, dispatcher);
     if (g_census) g_census->begin_program(cfg, ins, dispatcher);
 }
 
@@ -304,10 +306,12 @@ ExecCensusSuspend::~ExecCensusSuspend() {
 ExecCensusObservation::ExecCensusObservation(const SpirvCompute& b, const RegState& rs,
                                              const Rdna2Inst& in)
     : b_(b), rs_(rs), in_(in), active_(g_census != nullptr) {
+    if (auto* consumer = ExecRelationScope::active()) consumer->observe(b_, rs_, in_, false);
     if (active_) g_census->observe(b_, rs_, in_, false);
 }
 
 ExecCensusObservation::~ExecCensusObservation() {
+    if (auto* consumer = ExecRelationScope::active()) consumer->observe(b_, rs_, in_, true);
     if (active_ && g_census) g_census->observe(b_, rs_, in_, true);
 }
 
