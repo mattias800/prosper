@@ -19,5 +19,9 @@ address arithmetic.
 It borrows the parent operand and modifier callbacks; the parent retains their setup, CLAMP check
 and destination predication. Its tail methods preserve the original else-chain order.
 
+`vop1_case_routes.*` owns the remaining VOP1 orchestration and early, SDWA and residual-switch
+routes. It borrows the original operand callback and register map; source setup, route order and
+final destination predication remain together in this family.
+
 Keep extracted files at most 500 lines and functions around 80 lines. Use the refactor tools for
 moves, preserve emission order, and qualify relocations with token read-back and the corpus gate.

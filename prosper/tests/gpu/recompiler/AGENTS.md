@@ -52,6 +52,13 @@ The existing [region-loop fixtures](ir/test_ir_cfg_region_loops.cpp) and
 [structured-loop execution fixtures](ir/test_ir_cfg_structured_loop_execution.cpp) cover its
 refusals and admitted shapes through the unchanged CFG umbrella.
 
+The remaining VOP1 direct routes live in
+[`vop1_case_routes.cpp`](../../../src/gpu/recompiler/ir/lower/vop1_case_routes.cpp).
+The existing [structural shader fixtures](../test_rdna2_spirv_struct.cpp) cover emitted forms;
+[`test_readfirstlane_uniformity.cpp`](test_readfirstlane_uniformity.cpp) retains the separate
+READFIRSTLANE uniformity-proof checks. Operand selection and destination predication stay with the
+relocated VOP1 family.
+
 The remaining DS case routes live in
 [`ds_case_lowering.cpp`](../../../src/gpu/recompiler/ir/lower/ds_case_lowering.cpp).
 Their [address execution fixtures](ir/test_ir_ds_address_execution.cpp) cover real LDS accesses;
