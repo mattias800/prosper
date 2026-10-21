@@ -119,10 +119,13 @@ getenv|prosper/src/gpu/execute/shader_decode_cache.cpp 1
 getenv|prosper/src/gpu/pm4/command_processor.cpp 59
 getenv|prosper/src/gpu/present/videoout_present.cpp 1
 getenv|prosper/src/gpu/recompiler/gta5/rdna2_gta5_compute_contracts.cpp 6
+getenv|prosper/src/gpu/recompiler/ir/lower/ds_case_lowering.cpp 1  # note: unchanged oversized-LDS diagnostic read transferred from rdna2_emit_alu.cpp; net zero.
 getenv|prosper/src/gpu/recompiler/ir/lower/image_storage_routes.cpp 1  # note: existing cached single-layer-array storage diagnostic choice moved from rdna2_emit_alu.cpp; net zero.
+getenv|prosper/src/gpu/recompiler/ir/lower/smem_memory_route.cpp 9  # note: nine unchanged diagnostic reads moved out of rdna2_emit_alu.cpp; no new reads or caching policy.
+getenv|prosper/src/gpu/recompiler/ir/lower/smem_resolved_routes.cpp 1  # note: unchanged graphics-disabled diagnostic read moved out of rdna2_emit_alu.cpp; net zero with the lowered source row.
 getenv|prosper/src/gpu/recompiler/rdna2_alu_support.hpp 1
 getenv|prosper/src/gpu/recompiler/rdna2_cfg_support.hpp 6
-getenv|prosper/src/gpu/recompiler/rdna2_emit_alu.cpp 17  # note: one existing cached storage-image choice transferred unchanged to image_storage_routes.cpp; net zero.
+getenv|prosper/src/gpu/recompiler/rdna2_emit_alu.cpp 6  # note: ten SMEM (#5460), one DS (#5461) and one storage-image (#5462) read transferred unchanged to their route files; net zero.
 getenv|prosper/src/gpu/recompiler/rdna2_emit_cfg.cpp 17
 getenv|prosper/src/gpu/recompiler/rdna2_recompile_compute.cpp 1
 getenv|prosper/src/gpu/recompiler/rdna2_recompile_fragment.cpp 2
