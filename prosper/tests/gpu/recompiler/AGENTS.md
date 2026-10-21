@@ -21,6 +21,12 @@ and its PC-relative/dynamic-index routes; owned backing and VCC lifetime coverag
 [`test_raw_wide_mask_lifetime.cpp`](test_raw_wide_mask_lifetime.cpp).
 The provenance definitions retain their existing owners outside these relocated callers.
 
+The MUBUF/MTBUF access tail lives in
+[`buffer_access_routes.cpp`](../../../src/gpu/recompiler/ir/lower/buffer_access_routes.cpp).
+Its [format execution fixtures](ir/test_ir_buffer_format_execution.cpp) and
+[store execution fixtures](ir/test_ir_buffer_store_execution.cpp) continue through the real compiler.
+Descriptor/proof resolution and the diagnostic logger retain their original parent-case ownership.
+
 **Prefer a small binary over another arm in a big one, whenever rejects are the subject.** Most
 tests here return at their first `[FAIL]`, which is fine for a suite that should be all-green but
 useless the moment you want to know *which* assertions moved: a mutation run reports the first
