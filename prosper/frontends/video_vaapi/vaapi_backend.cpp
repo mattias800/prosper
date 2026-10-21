@@ -1274,7 +1274,7 @@ VideoBackend::AuResult VaapiBackend::decode_au(int id, const uint8_t* au, size_t
     out.width = static_cast<uint32_t>(pic->width);
     out.height = static_cast<uint32_t>(pic->height);
     out.y_stride = out.width;
-    out.uv_stride = out.width;
+    out.uv_stride = 2 * ((out.width + 1) / 2);
     out.nv12_bytes = nv12_bytes(out.width, out.height);
     // Reported alongside the geometry rather than only on success, so a FrameTooSmall refusal still
     // says which path produced the picture it is refusing to copy.
