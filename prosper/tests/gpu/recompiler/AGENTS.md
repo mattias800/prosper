@@ -21,6 +21,13 @@ and its PC-relative/dynamic-index routes; owned backing and VCC lifetime coverag
 [`test_raw_wide_mask_lifetime.cpp`](test_raw_wide_mask_lifetime.cpp).
 The provenance definitions retain their existing owners outside these relocated callers.
 
+Counted-loop detection and its shared branch helpers live in
+[`rdna2_cfg_counted_loop.hpp`](../../../src/gpu/recompiler/rdna2_cfg_counted_loop.hpp) and
+[`rdna2_cfg_branch_helpers.hpp`](../../../src/gpu/recompiler/rdna2_cfg_branch_helpers.hpp).
+The existing [region-loop fixtures](ir/test_ir_cfg_region_loops.cpp) and
+[structured-loop execution fixtures](ir/test_ir_cfg_structured_loop_execution.cpp) exercise their
+admission and emitted behavior through the unchanged umbrella header.
+
 The remaining DS case routes live in
 [`ds_case_lowering.cpp`](../../../src/gpu/recompiler/ir/lower/ds_case_lowering.cpp).
 Their [address execution fixtures](ir/test_ir_ds_address_execution.cpp) cover real LDS accesses;

@@ -22,6 +22,10 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   older helpers.
 - `rdna2_to_spirv` (+ `_internal`, `emit_alu`, `emit_cfg`, `alu_support`, `cfg_support`) — the
   translator: register state, control-flow structurization, and per-instruction lowering.
+- `rdna2_cfg_counted_loop` — counted-loop shapes and their admission rules, shared by the
+  structured emitter and IR region tree. `rdna2_cfg_branch_helpers` holds the common branch target,
+  waterfall and bottom-tested SCC-condition helpers. Their bodies compile in sources;
+  `rdna2_cfg_support.hpp` includes their declarations for existing callers.
 - `ngg_subgroup_shell` / `ngg_subgroup_abi` / `ngg_export_record` — the merged ES+GS NGG subgroup
   shell (#3135 P2): one Vulkan workgroup per guest subgroup, launch values and an export record
   buffer in descriptor set 2, GS_ALLOC_REQ captured into a per-subgroup header. `ngg_subgroup_abi`
