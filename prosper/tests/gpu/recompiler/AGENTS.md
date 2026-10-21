@@ -28,6 +28,12 @@ The existing [region-loop fixtures](ir/test_ir_cfg_region_loops.cpp) and
 [structured-loop execution fixtures](ir/test_ir_cfg_structured_loop_execution.cpp) exercise their
 admission and emitted behavior through the unchanged umbrella header.
 
+FLAT access routes live in
+[`flat_case_routes.hpp`](../../../src/gpu/recompiler/ir/lower/flat_case_routes.hpp).
+The [window execution fixtures](ir/test_ir_flat_window_execution.cpp) exercise real compiler loads;
+[`test_flat_active_word.cpp`](test_flat_active_word.cpp) covers access-source admission. Address
+arithmetic remains covered by the existing window value and lowering fixtures.
+
 The remaining DS case routes live in
 [`ds_case_lowering.cpp`](../../../src/gpu/recompiler/ir/lower/ds_case_lowering.cpp).
 Their [address execution fixtures](ir/test_ir_ds_address_execution.cpp) cover real LDS accesses;
