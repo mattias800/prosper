@@ -64,3 +64,6 @@ over 80 lines today because they were moved verbatim; splitting them is a behavi
 Tests: `tests/gpu/recompiler/ir/`, one file per piece. `test_ir_scalar_alu_execution` and
 `test_ir_vector_alu_execution` (through `vector_lane_harness.hpp`, per lane with a partial EXEC) run
 every definition's SPIR-V in the integer interpreter against its own evaluation.
+
+The remaining direct VOP3 dispatch, cube coordinates and MBCNT routes live in
+[`lower/vop3_case_routes.cpp`](lower/vop3_case_routes.cpp), borrowing the parent modifier callbacks.
