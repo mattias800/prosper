@@ -119,9 +119,11 @@ getenv|prosper/src/gpu/execute/shader_decode_cache.cpp 1
 getenv|prosper/src/gpu/pm4/command_processor.cpp 59
 getenv|prosper/src/gpu/present/videoout_present.cpp 1
 getenv|prosper/src/gpu/recompiler/gta5/rdna2_gta5_compute_contracts.cpp 6
+getenv|prosper/src/gpu/recompiler/ir/lower/smem_memory_route.cpp 9  # note: nine unchanged diagnostic reads moved out of rdna2_emit_alu.cpp; no new reads or caching policy.
+getenv|prosper/src/gpu/recompiler/ir/lower/smem_resolved_routes.cpp 1  # note: unchanged graphics-disabled diagnostic read moved out of rdna2_emit_alu.cpp; net zero with the lowered source row.
 getenv|prosper/src/gpu/recompiler/rdna2_alu_support.hpp 1
 getenv|prosper/src/gpu/recompiler/rdna2_cfg_support.hpp 6
-getenv|prosper/src/gpu/recompiler/rdna2_emit_alu.cpp 18
+getenv|prosper/src/gpu/recompiler/rdna2_emit_alu.cpp 8  # note: ten existing SMEM diagnostic reads transferred to smem_memory_route.cpp (nine) and smem_resolved_routes.cpp (one); net zero.
 getenv|prosper/src/gpu/recompiler/rdna2_emit_cfg.cpp 17
 getenv|prosper/src/gpu/recompiler/rdna2_recompile_compute.cpp 1
 getenv|prosper/src/gpu/recompiler/rdna2_recompile_fragment.cpp 2
