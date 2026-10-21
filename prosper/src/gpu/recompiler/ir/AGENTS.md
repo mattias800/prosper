@@ -22,6 +22,9 @@ FORCE_UNNORMALIZED scale. The T#/S# resolution, the MIMG source proof (emit_alu 
 (`HOW_TO_ADD_A_FAMILY.md`, "Image instructions (MIMG)").
 Everything here is private to `gpu/recompiler`.
 
+`lower/flat_case_routes.*` owns FLAT access and proof bookkeeping, including resolved windows and
+per-invocation scratch. Its address arithmetic remains in `lower/flat_window*`.
+
 | path | role |
 | --- | --- |
 | `ir.hpp`, `ir.cpp` | the IR core: `Type` (U32, Bool, and the 64-bit word U64, which the F64 relations read as binary64), `Value`, `Opcode`, `Inst`, `Block` and the rules a Block enforces |
