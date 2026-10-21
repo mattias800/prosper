@@ -1339,7 +1339,9 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code_changed != 'false' }}
     runs-on: macos-latest
-    timeout-minutes: 90
+    # The full Rosetta suite plus its build exceeded the former 90-minute job budget (#5471).
+    # Keep individual CTest timeouts so a stalled case still fails within its existing limit.
+    timeout-minutes: 120
     env:
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache
