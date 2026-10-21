@@ -2516,6 +2516,15 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/test_agc_shader.cpp
     LIBRARIES prosper_core)
 
+  # Linux non-PIE fixture regression: claim low/high pages without replacing any mapping.
+  # The portable blob is also exercised by gpu_execute on every Vulkan-enabled platform.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    prosper_add_gtest(test_agc_shader_blob_fixture
+      SOURCES tests/gpu/agc/test_agc_shader_blob_fixture.cpp
+      INCLUDES tests
+      LIBRARIES prosper_core)
+  endif()
+
   prosper_add_gtest(test_tile
     SOURCES tests/gpu/texture/test_tile.cpp
     LIBRARIES prosper_core)
