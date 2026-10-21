@@ -137,6 +137,27 @@ capture on/off must produce identical modules. The gtest over committed fixtures
 independent missing/wrong/reordered event controls. See
 `prosper/src/gpu/recompiler/ir/cfg/AGENTS.md` for the boundary.
 
+`test_cfg_service_inspect` adds eleven project-owned witnesses for the kinds absent from the
+recorded corpus. Their programs and GoogleTests live in `tests/gpu/recompiler/ir/`; this developer
+adapter lives with the tools. Nine compute profiles and one native fragment profile use the normal
+sidecar codecs. The owned-packet WQM witness has a fixed, versioned test profile with explicit
+logical slots, masks and quad topology; its code must match exactly. It carries no live raster
+packing authority. Table-less adapter calls report missing profile inputs, not missing opcodes.
+
+```sh
+cmake --build build-linux --target test_cfg_service_inspect test_ir_cfg_service_witnesses
+build-linux/test_cfg_service_inspect --export-corpus <NEW_SOURCE>
+python3 tools/shader_inspect/recompile_corpus.py harvest <NEW_CORPUS> --root <NEW_SOURCE>
+build-linux/test_cfg_service_inspect <PROGRAM.bin> --inputs <PROGRAM.inputs> --cfg-services
+python3 tools/shader_inspect/recompile_corpus.py compare <NEW_CORPUS> \
+  --base <MAIN_ADAPTER> --candidate build-linux/test_cfg_service_inspect --out-dir <NEW_REPORT>
+```
+
+Build the same adapter source against each build's core. The gtests check instruction-effects-table
+coverage, exact selected pc/kind/group against the independent dispatcher events, a missing actual
+node control, and byte-identical modules with capture on/off. These are service-selection witnesses;
+numeric and raster semantics have their separate tests.
+
 ## `--cfg-exec-values`: the static EXEC relations against the SPIR-V-id ones
 
 ```bash
