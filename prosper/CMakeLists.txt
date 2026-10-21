@@ -3438,12 +3438,13 @@ if(TARGET prosper_core)
   target_link_libraries(test_recompile_coverage PRIVATE prosper_core)
   add_test(NAME recompile_coverage COMMAND test_recompile_coverage)
 
-  # Pure CFG proof regression: compile only the decoder, so adversarial barrier-uniformity
+  # Pure CFG proof regression: compile the decoder/proof helpers, so adversarial barrier-uniformity
   # cases can be checked without a renderer/core build or a potentially unsafe GPU dispatch.
   prosper_add_gtest(test_workgroup_uniformity
     SOURCES tests/gpu/test_workgroup_uniformity.cpp src/gpu/recompiler/rdna2_decode.cpp
             src/gpu/recompiler/rdna2_instruction_effects.cpp
             src/gpu/recompiler/rdna2_scalar_source_words.cpp
+            src/gpu/recompiler/rdna2_cfg_branch_helpers.cpp
     INCLUDES src)
 
   # ADR 0028: compute cross-lane operation inventory and Wave64 route selection (CPU only).
@@ -4280,6 +4281,7 @@ if(TARGET prosper_core)
             src/gpu/recompiler/rdna2_instruction_effects.cpp
             src/gpu/recompiler/rdna2_scalar_source_words.cpp
             src/gpu/recompiler/rdna2_raw_wide_data.cpp
+            src/gpu/recompiler/rdna2_cfg_branch_helpers.cpp
     INCLUDES src)
   prosper_add_gtest(test_raw_wide_vop3_source_width
     SOURCES tests/gpu/recompiler/test_raw_wide_vop3_source_width.cpp
@@ -4287,6 +4289,7 @@ if(TARGET prosper_core)
             src/gpu/recompiler/rdna2_instruction_effects.cpp
             src/gpu/recompiler/rdna2_scalar_source_words.cpp
             src/gpu/recompiler/rdna2_raw_wide_data.cpp
+            src/gpu/recompiler/rdna2_cfg_branch_helpers.cpp
     INCLUDES src)
   prosper_add_gtest(test_raw_wide_replayed_load
     SOURCES tests/gpu/recompiler/test_raw_wide_replayed_load.cpp
@@ -4294,6 +4297,7 @@ if(TARGET prosper_core)
             src/gpu/recompiler/rdna2_instruction_effects.cpp
             src/gpu/recompiler/rdna2_scalar_source_words.cpp
             src/gpu/recompiler/rdna2_raw_wide_data.cpp
+            src/gpu/recompiler/rdna2_cfg_branch_helpers.cpp
     INCLUDES src)
   prosper_add_gtest(test_raw_wide_disjoint_paths
     SOURCES tests/gpu/recompiler/test_raw_wide_disjoint_paths.cpp
@@ -4304,6 +4308,7 @@ if(TARGET prosper_core)
             src/gpu/recompiler/rdna2_instruction_effects.cpp
             src/gpu/recompiler/rdna2_scalar_source_words.cpp
             src/gpu/recompiler/rdna2_raw_wide_data.cpp
+            src/gpu/recompiler/rdna2_cfg_branch_helpers.cpp
     INCLUDES src)
   prosper_add_gtest(test_graphics_raw_register_wide_data
     SOURCES tests/gpu/recompiler/test_graphics_raw_register_wide_data.cpp
