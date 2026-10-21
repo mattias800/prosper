@@ -14,6 +14,12 @@ recompiler tests also live one level up in `tests/gpu/` for historical reasons â
 `test_rdna2_spirv_struct.cpp` (structural module validation) and `test_recompile_coverage.cpp` â€”
 and new work usually belongs in this folder instead.
 
+The MIMG storage-image arm lives in
+[`image_storage_routes.cpp`](../../../src/gpu/recompiler/ir/lower/image_storage_routes.cpp).
+The [storage-image copy and selector fixtures](../test_storage_image_copy.cpp) run its load/store
+paths on Vulkan. Coordinate source proofs and the shared result writer remain at the original
+MIMG call site; sampled-texture routes retain their own fixtures.
+
 **Prefer a small binary over another arm in a big one, whenever rejects are the subject.** Most
 tests here return at their first `[FAIL]`, which is fine for a suite that should be all-green but
 useless the moment you want to know *which* assertions moved: a mutation run reports the first
