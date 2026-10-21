@@ -46,6 +46,12 @@ The existing [structural shader fixtures](../test_rdna2_spirv_struct.cpp) cover 
 [numeric MBCNT fixtures](../execute/test_numeric_mbcnt.cpp) exercise the numeric-source route.
 Modifier setup, CLAMP admission and destination predication retain their parent ownership.
 
+Divergent-loop interior and final-shape admission lives in
+[`rdna2_cfg_loop_admission.hpp`](../../../src/gpu/recompiler/rdna2_cfg_loop_admission.hpp).
+The existing [region-loop fixtures](ir/test_ir_cfg_region_loops.cpp) and
+[structured-loop execution fixtures](ir/test_ir_cfg_structured_loop_execution.cpp) cover its
+refusals and admitted shapes through the unchanged CFG umbrella.
+
 The remaining DS case routes live in
 [`ds_case_lowering.cpp`](../../../src/gpu/recompiler/ir/lower/ds_case_lowering.cpp).
 Their [address execution fixtures](ir/test_ir_ds_address_execution.cpp) cover real LDS accesses;
