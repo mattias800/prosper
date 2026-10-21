@@ -27,6 +27,12 @@ Their [address execution fixtures](ir/test_ir_ds_address_execution.cpp) cover re
 [cross-lane fixtures](ir/test_ir_ds_shuffle_execution.cpp) retain the separate shuffle definition
 coverage. The relocation changes the caller's home, not either operation contract.
 
+The MIMG storage-image arm lives in
+[`image_storage_routes.cpp`](../../../src/gpu/recompiler/ir/lower/image_storage_routes.cpp).
+The [storage-image copy and selector fixtures](../test_storage_image_copy.cpp) run its load/store
+paths on Vulkan. Coordinate source proofs and the shared result writer remain at the original
+MIMG call site; sampled-texture routes retain their own fixtures.
+
 **Prefer a small binary over another arm in a big one, whenever rejects are the subject.** Most
 tests here return at their first `[FAIL]`, which is fine for a suite that should be all-green but
 useless the moment you want to know *which* assertions moved: a mutation run reports the first
