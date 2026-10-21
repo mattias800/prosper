@@ -15,5 +15,9 @@ lowerings from resource resolution and access routes. In particular, `flat_case_
 access and proof bookkeeping, resolved windows and per-invocation scratch; `flat_window*` owns its
 address arithmetic.
 
+`vop3_case_routes.*` holds the remaining VOP3 dispatch chain, cube coordinates and MBCNT routes.
+It borrows the parent operand and modifier callbacks; the parent retains their setup, CLAMP check
+and destination predication. Its tail methods preserve the original else-chain order.
+
 Keep extracted files at most 500 lines and functions around 80 lines. Use the refactor tools for
 moves, preserve emission order, and qualify relocations with token read-back and the corpus gate.
