@@ -1,3 +1,5 @@
+// Pin service selection and independent dispatcher observations for the missing census kinds.
+// Missing or mismatched events would make coverage claims unsound; capture must preserve SPIR-V.
 #include "gpu/recompiler/ir/cfg_service_witness_corpus.hpp"
 #include "gpu/recompiler/ir/cfg_service_witnesses.hpp"
 #include "gpu/recompiler/ir/cfg/service_census.hpp"
