@@ -21,6 +21,18 @@ and its PC-relative/dynamic-index routes; owned backing and VCC lifetime coverag
 [`test_raw_wide_mask_lifetime.cpp`](test_raw_wide_mask_lifetime.cpp).
 The provenance definitions retain their existing owners outside these relocated callers.
 
+The remaining DS case routes live in
+[`ds_case_lowering.cpp`](../../../src/gpu/recompiler/ir/lower/ds_case_lowering.cpp).
+Their [address execution fixtures](ir/test_ir_ds_address_execution.cpp) cover real LDS accesses;
+[cross-lane fixtures](ir/test_ir_ds_shuffle_execution.cpp) retain the separate shuffle definition
+coverage. The relocation changes the caller's home, not either operation contract.
+
+The MIMG storage-image arm lives in
+[`image_storage_routes.cpp`](../../../src/gpu/recompiler/ir/lower/image_storage_routes.cpp).
+The [storage-image copy and selector fixtures](../test_storage_image_copy.cpp) run its load/store
+paths on Vulkan. Coordinate source proofs and the shared result writer remain at the original
+MIMG call site; sampled-texture routes retain their own fixtures.
+
 The MUBUF/MTBUF access tail lives in
 [`buffer_access_routes.cpp`](../../../src/gpu/recompiler/ir/lower/buffer_access_routes.cpp).
 Its [format execution fixtures](ir/test_ir_buffer_format_execution.cpp) and
