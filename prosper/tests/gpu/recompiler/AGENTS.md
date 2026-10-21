@@ -21,6 +21,12 @@ and its PC-relative/dynamic-index routes; owned backing and VCC lifetime coverag
 [`test_raw_wide_mask_lifetime.cpp`](test_raw_wide_mask_lifetime.cpp).
 The provenance definitions retain their existing owners outside these relocated callers.
 
+The remaining DS case routes live in
+[`ds_case_lowering.cpp`](../../../src/gpu/recompiler/ir/lower/ds_case_lowering.cpp).
+Their [address execution fixtures](ir/test_ir_ds_address_execution.cpp) cover real LDS accesses;
+[cross-lane fixtures](ir/test_ir_ds_shuffle_execution.cpp) retain the separate shuffle definition
+coverage. The relocation changes the caller's home, not either operation contract.
+
 **Prefer a small binary over another arm in a big one, whenever rejects are the subject.** Most
 tests here return at their first `[FAIL]`, which is fine for a suite that should be all-green but
 useless the moment you want to know *which* assertions moved: a mutation run reports the first
