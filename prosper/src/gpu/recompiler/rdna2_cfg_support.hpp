@@ -38,6 +38,7 @@
 #include <vector>
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
+#include "gpu/recompiler/rdna2_cfg_divergent_shapes.hpp" // IWYU pragma: export
 
 namespace prosper::gpu {
 
@@ -410,43 +411,6 @@ bool vcc_branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint32_t
 // Same proof, applied to a scalar branch's SCC instead of a VCC lane mask (#3713).
 bool scc_branch_is_workgroup_uniform(const std::vector<Rdna2Inst>& ins, uint32_t branch_pc);
 
-// MULTI-LOOP EXEC/VCC/SCC EXITS (#273/#615/#1554 — post-process and light-accumulation PSes,
-// title-composite content producers, and compute histogram loops). The divergent compiled shape:
-//     header: <exec recompute: v_cmpx_.. counter,bound  |  v_cmp..;s_andn2_b64 exec,exec,vcc>
-//             s_cbranch_execz EXIT                      ; leave when no lane remains
-//     body:   ... (nested forward-execz if regions, saveexec/restore, scalar counter++) ...
-//             s_branch header                           ; backward unconditional back-edge
-//     EXIT:   s_mov_b64 exec, <saved>
-// Fragment semantics are exact: a forced 64-lane native subgroup vote keeps the complete guest wave
-// in the loop until every EXEC/VCC bit clears. Cleared lanes remain synchronization participants while
-// EXEC predicates their vector writes, so scalar state advances exactly as on RDNA2. Vertex and the
-// narrow structured-compute path retain the older per-invocation lowering and its uniformity guards.
-//
-// A second flavor (DOLL's scalar-indexed unroll): the back-edge is a backward s_cbranch_EXECNZ and
-// the header IS the execz exit (empty condition region); the body may carry an extra forward
-// vccz/execz BREAK to the exit. A break lowers as a plain forward IF over the remainder of the body
-// (skip-to-backedge): the broken lane's EXEC bit is already clear (the compiled break condition
-// mirrors the exec recompute), so the next header check exits it. Fragment wave64 additionally
-// supports a VCCZ break with an unconditional back-edge by carrying the uniform continue vote to the
-// loop latch and branching the complete wave directly to the loop merge.
-struct DivLoop {
-    enum class Condition : uint8_t { Exec, Vcc, Scc };
-    uint32_t header_pc = 0;   // back-edge target; condition region = [header_pc, exit_branch_pc)
-    uint32_t exit_branch_pc =
-        0;   // canonical forward execz/vccz/scc branch whose target is exit_pc
-    uint32_t backedge_pc = 0;   // backward s_branch, s_cbranch_execnz or s_cbranch_scc0/scc1
-    uint32_t exit_pc = 0;   // backedge_pc + its length (first pc after the loop)
-    std::vector<uint32_t> break_pcs;   // extra forward vccz/execz -> exit_pc (lowered as body ifs)
-    bool direct_exec_breaks = false;   // unconditional back-edge: an interior execz exits directly
-    bool direct_wave_breaks = false;   // fragment wave64: an interior vccz exits the complete wave
-    bool bottom_tested = false;   // the execnz/scc back-edge is the condition (do-while)
-    Condition condition = Condition::Exec;
-    // EXECZ/VCCZ and SCC0 all continue while their represented predicate is set. SCC1 is the one
-    // admitted opposite-polarity canonical exit: it leaves the loop while SCC is set. A bottom-tested
-    // SCC loop reads its back-edge instead: scc1 continues while SCC is set, scc0 while it is clear.
-    bool continue_on_set = true;
-};
-
 // The header EXEC is a subset of its preheader only when every possible iteration preserves or
 // narrows EXEC. This code-only certificate does not authenticate any carried register's data.
 bool structured_loop_only_narrows_exec(const std::vector<Rdna2Inst>& ins, const DivLoop& loop);
@@ -669,94 +633,6 @@ inline bool vcc_exit_is_wave_uniform(const std::vector<Rdna2Inst>& ins, uint32_t
         if (!uniform_operand_at(compare->src[i], compare->pc)) return false;
     return compare->n_src != 0;
 }
-
-// ---- detect_divergent_loops' admission rules, shared with the IR region tree ---------------
-// ir/cfg/region_loops.cpp collects back-edges from the CFG instead of a pc scan and validates
-// them with these, so each rule lives here once. A refusal names the detector's reason and pc;
-// the detector reports it through its PROSPER_DBG reporter, the region tree as its Unstructured
-// reason. None of these log.
-struct DivLoopRefusal {
-    const char* why = nullptr;   // nullptr: admitted
-    uint32_t pc = 0;
-};
-// Pass 1's candidate back-edge: each backward s_branch / s_cbranch_execnz / s_cbranch_scc0/scc1
-// that is not linearized. A backward SCC branch closes a bottom-tested do-while unless it is a
-// waterfall's once-through branch, which the linearizer consumes (`waterfalls` is
-// waterfall_branches(ins)).
-inline bool div_loop_backedge_candidate(const Rdna2Inst& in,
-                                        const std::unordered_set<uint32_t>& safe,
-                                        const std::unordered_set<uint32_t>& waterfalls) {
-    if (in.fmt != Rdna2Format::SOPP) return false;
-    const bool scc_backedge = in.opcode == 0x04 || in.opcode == 0x05;
-    if ((in.opcode != 0x02 && in.opcode != 0x09 && !scc_backedge) || in.simm16 >= 0) return false;
-    if (safe.count(in.pc)) return false;
-    if (scc_backedge && waterfalls.count(in.pc)) return false;
-    return true;
-}
-// The loop a candidate back-edge `in` closes: its header, back-edge and exit pcs.
-inline DivLoopRefusal div_loop_from_backedge(const std::vector<Rdna2Inst>& ins, const Rdna2Inst& in,
-                                             uint32_t end_pc, DivLoop* out) {
-    DivLoop L;
-    L.header_pc = branch_target(in);
-    L.backedge_pc = in.pc;
-    L.exit_pc = in.pc + in.len_dwords;
-    if (L.header_pc >= L.backedge_pc) return DivLoopRefusal{"degenerate-loop-bounds", L.header_pc};
-    if (L.exit_pc > end_pc) return DivLoopRefusal{"exit-past-end-of-program", L.header_pc};
-    bool hdr_ok = false;
-    for (const auto& h : ins) {
-        if (h.pc == L.header_pc) {
-            hdr_ok = true;
-            break;
-        }
-        if (h.pc > L.header_pc) break;
-    }
-    if (!hdr_ok) return DivLoopRefusal{"header-pc-is-not-an-instruction", L.header_pc};
-    *out = L;
-    return {};
-}
-// Re-sorts the candidates (and their back-edge opcodes) into header-pc order.
-inline void sort_div_loops_by_header(std::vector<DivLoop>& out,
-                                     std::vector<uint32_t>& backedge_op) {
-    // Loops may be strictly DISJOINT (sequential) or PROPERLY NESTED (#590 — DOLL's post-process
-    // kernel iterates an inner table loop inside an outer row loop). Pass 1 collected loops in
-    // BACK-EDGE pc order (an inner back-edge precedes its outer's); re-sort by header so the list is
-    // in emission order — emit_structured consumes loops by header pc, and emitting an outer body
-    // recursively reaches the inner loop first because its header lies inside that range. Then
-    // validate every pair as either disjoint-in-order or properly nested; partial overlap (an
-    // unstructured region) still rejects loudly.
-    {
-        std::vector<size_t> order(out.size());
-        for (size_t i = 0; i < order.size(); i++) order[i] = i;
-        std::sort(order.begin(), order.end(),
-                  [&](size_t a, size_t c) { return out[a].header_pc < out[c].header_pc; });
-        std::vector<DivLoop> sorted_loops;
-        std::vector<uint32_t> sorted_op;
-        sorted_loops.reserve(out.size());
-        sorted_op.reserve(out.size());
-        for (size_t i : order) {
-            sorted_loops.push_back(out[i]);
-            sorted_op.push_back(backedge_op[i]);
-        }
-        out.swap(sorted_loops);
-        backedge_op.swap(sorted_op);
-    }
-}
-// Every pair is either disjoint-in-order or properly nested.
-inline DivLoopRefusal div_loop_pairs_refusal(const std::vector<DivLoop>& out) {
-    for (size_t i = 0; i < out.size(); i++)
-        for (size_t j = i + 1; j < out.size(); j++) {
-            const DivLoop& A = out[i];
-            const DivLoop& B = out[j];   // A.header_pc <= B.header_pc
-            if (A.header_pc == B.header_pc)
-                return DivLoopRefusal{"shared-header", A.header_pc};   // shared header: not modeled
-            const bool disjoint = B.header_pc >= A.exit_pc;
-            const bool nested = B.exit_pc <= A.backedge_pc;   // B entirely inside A's body
-            if (!disjoint && !nested)
-                return DivLoopRefusal{"partial-overlap",
-                                      B.header_pc};   // partial overlap: unstructured
-        }
-    return {};
-}
 // Pass 2 for loop `li` (`backedge_op_li` is its back-edge opcode): validates its interior
 // branches and fills its canonical exit, breaks, condition and shape flags.
 inline DivLoopRefusal admit_div_loop(const std::vector<Rdna2Inst>& ins,
@@ -908,48 +784,6 @@ inline DivLoopRefusal admit_div_loop(const std::vector<Rdna2Inst>& ins,
     if (execnz && !L.bottom_tested && L.exit_branch_pc != L.header_pc)
         return DivLoopRefusal{"execnz-nonempty-condition-region", L.header_pc};
     return {};
-}
-inline DivLoopRefusal div_loop_children_refusal(const std::vector<DivLoop>& out) {
-    // A nested child must lie entirely within its parent's BODY: after the parent's canonical exit
-    // test (the condition region [header, exit_branch) stays branch-free) and before its back-edge.
-    for (size_t i = 0; i < out.size(); i++)
-        for (size_t j = i + 1; j < out.size(); j++)
-            if (out[j].exit_pc <= out[i].backedge_pc &&   // nested per the classification above
-                !out[i].bottom_tested && out[j].header_pc <= out[i].exit_branch_pc)
-                return DivLoopRefusal{"child-header-inside-parent-condition-region",
-                                      out[j].header_pc};
-    return {};
-}
-inline DivLoopRefusal div_loop_entry_edge_refusal(const std::vector<Rdna2Inst>& ins,
-                                                  const std::vector<DivLoop>& out) {
-    // Pass 3: no branch from OUTSIDE a loop may target its interior (an unstructured entry edge).
-    for (const auto& in : ins) {
-        if (in.is_end) break;
-        if (in.fmt != Rdna2Format::SOPP) continue;
-        if (in.opcode < 0x02 || in.opcode > 0x09 || in.opcode == 0x03) continue;
-        uint32_t tgt = branch_target(in);
-        for (const auto& L : out) {
-            const bool inside_br = in.pc >= L.header_pc && in.pc <= L.backedge_pc;
-            const bool inside_tgt = tgt > L.header_pc && tgt < L.exit_pc;
-            if (!inside_br && inside_tgt)
-                return DivLoopRefusal{"entry-edge-from-outside-loop", in.pc};
-        }
-    }
-    return {};
-}
-// Everything after pass 1, over candidates already in header-pc order.
-inline DivLoopRefusal validate_div_loops(const std::vector<Rdna2Inst>& ins,
-                                         const std::unordered_set<uint32_t>& safe,
-                                         bool exact_fragment_wave_breaks, std::vector<DivLoop>& out,
-                                         const std::vector<uint32_t>& backedge_op) {
-    if (const DivLoopRefusal r = div_loop_pairs_refusal(out); r.why) return r;
-    for (size_t li = 0; li < out.size(); li++)
-        if (const DivLoopRefusal r =
-                admit_div_loop(ins, safe, exact_fragment_wave_breaks, out, li, backedge_op[li]);
-            r.why)
-            return r;
-    if (const DivLoopRefusal r = div_loop_children_refusal(out); r.why) return r;
-    return div_loop_entry_edge_refusal(ins, out);
 }
 // Returns the loops in header-pc order, or {} when any backward branch doesn't fit the shape.
 // `safe` carries the linearized branches (waterfalls etc.) which are not loop back-edges.

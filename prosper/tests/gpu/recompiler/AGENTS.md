@@ -34,6 +34,12 @@ The [window execution fixtures](ir/test_ir_flat_window_execution.cpp) exercise r
 [`test_flat_active_word.cpp`](test_flat_active_word.cpp) covers access-source admission. Address
 arithmetic remains covered by the existing window value and lowering fixtures.
 
+Divergent-loop shape and validation helpers live in
+[`rdna2_cfg_divergent_shapes.hpp`](../../../src/gpu/recompiler/rdna2_cfg_divergent_shapes.hpp).
+The existing [region-loop fixtures](ir/test_ir_cfg_region_loops.cpp) and
+[structured-loop execution fixtures](ir/test_ir_cfg_structured_loop_execution.cpp) exercise the
+relocated helpers through the unchanged CFG umbrella.
+
 The remaining DS case routes live in
 [`ds_case_lowering.cpp`](../../../src/gpu/recompiler/ir/lower/ds_case_lowering.cpp).
 Their [address execution fixtures](ir/test_ir_ds_address_execution.cpp) cover real LDS accesses;
