@@ -14,6 +14,13 @@ recompiler tests also live one level up in `tests/gpu/` for historical reasons â
 `test_rdna2_spirv_struct.cpp` (structural module validation) and `test_recompile_coverage.cpp` â€”
 and new work usually belongs in this folder instead.
 
+SMEM's relocated route callers live in
+[`smem_case_routes.hpp`](../../../src/gpu/recompiler/ir/lower/smem_case_routes.hpp).
+The [SMEM index execution fixtures](ir/test_ir_smem_index_execution.cpp) exercise the real compiler
+and its PC-relative/dynamic-index routes; owned backing and VCC lifetime coverage remains in
+[`test_raw_wide_mask_lifetime.cpp`](test_raw_wide_mask_lifetime.cpp).
+The provenance definitions retain their existing owners outside these relocated callers.
+
 The remaining DS case routes live in
 [`ds_case_lowering.cpp`](../../../src/gpu/recompiler/ir/lower/ds_case_lowering.cpp).
 Their [address execution fixtures](ir/test_ir_ds_address_execution.cpp) cover real LDS accesses;
