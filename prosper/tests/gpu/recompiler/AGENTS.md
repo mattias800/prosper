@@ -59,6 +59,12 @@ The existing [structural shader fixtures](../test_rdna2_spirv_struct.cpp) cover 
 READFIRSTLANE uniformity-proof checks. Operand selection and destination predication stay with the
 relocated VOP1 family.
 
+Divergent-loop detection and its bounded rejection reporter live in
+[`rdna2_cfg_divergent_detector.hpp`](../../../src/gpu/recompiler/rdna2_cfg_divergent_detector.hpp).
+The existing [region-loop fixtures](ir/test_ir_cfg_region_loops.cpp) and
+[structured-loop execution fixtures](ir/test_ir_cfg_structured_loop_execution.cpp) exercise the
+relocated detector through the unchanged CFG umbrella.
+
 The remaining DS case routes live in
 [`ds_case_lowering.cpp`](../../../src/gpu/recompiler/ir/lower/ds_case_lowering.cpp).
 Their [address execution fixtures](ir/test_ir_ds_address_execution.cpp) cover real LDS accesses;
