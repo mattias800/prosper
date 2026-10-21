@@ -5,6 +5,7 @@
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/ir/cfg/exec_value_census.hpp"
 #include "gpu/recompiler/ir/lower/buffer_address_lowering.hpp"
+#include "gpu/recompiler/ir/lower/buffer_opcode_case_routes.hpp"
 #include "gpu/recompiler/ir/lower/smem_index_lowering.hpp"
 #include "gpu/recompiler/ir/lower/smem_case_routes.hpp"
 #include "gpu/recompiler/ir/lower/flat_case_routes.hpp"
@@ -371,68 +372,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             uint32_t atomic_x2_record_count = 0;
             bool raw_subword = false, raw_signed = false;
             uint32_t raw_bits = 32;
-            switch (in.opcode) {
-                case 0x8: n = 1; raw_subword = true; raw_bits = 8; break;   // buffer_load_ubyte
-                case 0x9: n = 1; raw_subword = true; raw_signed = true; raw_bits = 8; break; // sbyte
-                case 0xA: n = 1; raw_subword = true; raw_bits = 16; break;  // buffer_load_ushort
-                case 0xB: n = 1; raw_subword = true; raw_signed = true; raw_bits = 16; break; // sshort
-                case kMubufOpcodeLoadDword:   n = 1; break;
-                case kMubufOpcodeLoadDwordX2: n = 2; break;
-                case kMubufOpcodeLoadDwordX4: n = 4; break;
-                case kMubufOpcodeLoadDwordX3: n = 3; break; // x3 sorts after x4 (llvm-mc gfx1010)
-                case 0x0: n = 1; is_format = true; break;   // buffer_load_format_x  (vertex fetch)
-                case 0x1: n = 2; is_format = true; break;   // buffer_load_format_xy
-                case 0x2: n = 3; is_format = true; break;   // buffer_load_format_xyz
-                case 0x3: n = 4; is_format = true; break;   // buffer_load_format_xyzw
-                case kMubufOpcodeStoreDword: n = 1; is_store = true; break;
-                case kMubufOpcodeStoreDwordX2: n = 2; is_store = true; break;
-                case kMubufOpcodeStoreDwordX4: n = 4; is_store = true; break;
-                case kMubufOpcodeStoreDwordX3: n = 3; is_store = true; break;
-                case 0x4: n = 1; is_format = true; is_store = true; break;   // buffer_store_format_x
-                case 0x5: n = 2; is_format = true; is_store = true; break;   // buffer_store_format_xy
-                case 0x6: n = 3; is_format = true; is_store = true; break;   // buffer_store_format_xyz
-                case 0x7: n = 4; is_format = true; is_store = true; break;   // buffer_store_format_xyzw
-                // 32-bit atomic RMW family (RDNA2 MUBUF opcodes 0x30..0x3b). Each does
-                // mem = mem OP VDATA and returns the PRE-op value in VDATA. They all share the generic
-                // OpAtomic<Op>(ptr, Device, AcqRel, value) shape emitted by cbuf_atomic_rtn. VDATA is one
-                // dword. CMPSWAP (0x31, two-operand), CSUB (0x34, conditional-subtract), INC/DEC
-                // (0x3c/0x3d, wrap semantics), and most x2 64-bit variants stay deferred
-                // (fail-visible) via the default case below. Opcodes 0x50/0x5a have separately
-                // guarded GTA V lowerings: one true qword RMW, never two ordinary 32-bit atomics.
-                case kMubufOpcodeAtomicSwap:
-                    n = 1; is_atomic = true; atomic_op = Op_AtomicExchange; break;
-                case kMubufOpcodeAtomicAdd:
-                    n = 1; is_atomic = true; atomic_op = Op_AtomicIAdd; break;
-                case kMubufOpcodeAtomicSub:
-                    n = 1; is_atomic = true; atomic_op = Op_AtomicISub; break;
-                case kMubufOpcodeAtomicSmin:
-                    n = 1; is_atomic = true; atomic_op = Op_AtomicSMin; break;
-                case kMubufOpcodeAtomicUmin:
-                    n = 1; is_atomic = true; atomic_op = Op_AtomicUMin; break;
-                case kMubufOpcodeAtomicSmax:
-                    n = 1; is_atomic = true; atomic_op = Op_AtomicSMax; break;
-                case kMubufOpcodeAtomicUmax:
-                    n = 1; is_atomic = true; atomic_op = Op_AtomicUMax; break;
-                case kMubufOpcodeAtomicAnd:
-                    n = 1; is_atomic = true; atomic_op = Op_AtomicAnd; break;
-                case kMubufOpcodeAtomicOr:
-                    n = 1; is_atomic = true; atomic_op = Op_AtomicOr; break;
-                case kMubufOpcodeAtomicXor:
-                    n = 1; is_atomic = true; atomic_op = Op_AtomicXor; break;
-                case kMubufOpcodeAtomicFmin:
-                    n = 1; is_atomic = true; is_atomic_fminmax = true;
-                    atomic_fmin = true; break;
-                case kMubufOpcodeAtomicFmax:
-                    n = 1; is_atomic = true; is_atomic_fminmax = true;
-                    atomic_fmin = false; break;
-                case kMubufOpcodeAtomicSwapX2:
-                    n = 2; is_atomic = true; is_atomic_x2 = true;
-                    atomic_op = Op_AtomicExchange; break;
-                case kMubufOpcodeAtomicOrX2:
-                    n = 2; is_atomic = true; is_atomic_x2 = true;
-                    atomic_op = Op_AtomicOr; break;
-                default: ok = false; return true;           // remaining typed/atomic opcodes deferred
-            }
+            if (auto routed =
+                    ir::BufferOpcodeCaseRoutes{in, n, raw_subword, raw_bits, raw_signed, is_format,
+                                               is_store, is_atomic, atomic_op, is_atomic_fminmax,
+                                               atomic_fmin, is_atomic_x2, ok}
+                        .classify())
+                return *routed;
             // Per-instruction buffer-op disposition (PROSPER_DBG). A buffer op whose V# decodes to
             // NUM_RECORDS=0 — or that matches one of the no-backing markers below — is folded away:
             // loads become a constant, stores are dropped, and no backing buffer is declared. That is
