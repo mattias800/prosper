@@ -28,7 +28,11 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   `rdna2_cfg_support.hpp` includes their declarations for existing callers.
 - `rdna2_cfg_divergent_shapes` — divergent-loop shape data, candidate bounds, nesting/entry-edge
   validation and candidate ordering. Their non-template bodies compile in a source; the CFG umbrella
-  keeps the detector and interior-admission implementation and includes these declarations.
+  includes their declarations for existing callers.
+
+- `rdna2_cfg_loop_admission` — divergent-loop interior exits and final condition-shape admission.
+  It returns the shared refusal records; its non-template bodies compile in a source, while
+  `rdna2_cfg_support.hpp` retains the detector and exposes these declarations to existing callers.
 - `ngg_subgroup_shell` / `ngg_subgroup_abi` / `ngg_export_record` — the merged ES+GS NGG subgroup
   shell (#3135 P2): one Vulkan workgroup per guest subgroup, launch values and an export record
   buffer in descriptor set 2, GS_ALLOC_REQ captured into a per-subgroup header. `ngg_subgroup_abi`
