@@ -67,3 +67,7 @@ every definition's SPIR-V in the integer interpreter against its own evaluation.
 
 The remaining direct VOP3 dispatch, cube coordinates and MBCNT routes live in
 [`lower/vop3_case_routes.cpp`](lower/vop3_case_routes.cpp), borrowing the parent modifier callbacks.
+
+The remaining VOP1 orchestration and direct routes live in
+[`lower/vop1_case_routes.cpp`](lower/vop1_case_routes.cpp), borrowing the original operand callback
+and register map while retaining source setup and final destination predication in the same family.
