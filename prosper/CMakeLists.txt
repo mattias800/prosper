@@ -3886,6 +3886,7 @@ if(TARGET prosper_core)
           ir_cfg_state_placement
           ir_cfg_dispatch_blocks
           ir_cfg_service_nodes
+          ir_cfg_service_witnesses
           ir_cfg_exec_values
           ir_cfg_exec_relation_consumer
           )
@@ -3894,6 +3895,12 @@ if(TARGET prosper_core)
       INCLUDES tests
       LIBRARIES prosper_core)
   endforeach()
+
+  # Native sidecar replay plus an explicit test-owned packet profile (not a live sidecar schema).
+  # Reuse the ordinary corpus comparator and selected-service census reporter.
+  add_executable(test_cfg_service_inspect tools/shader_inspect/cfg_service_witness_inspect.cpp)
+  target_include_directories(test_cfg_service_inspect PRIVATE tests tools)
+  target_link_libraries(test_cfg_service_inspect PRIVATE prosper_core)
 
   # Link only the helper and its table dependency: another core object must not accidentally
   # supply a weak inline copy of the declaration-only ALU helper (#5153).
