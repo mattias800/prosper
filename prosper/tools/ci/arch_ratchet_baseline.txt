@@ -119,9 +119,10 @@ getenv|prosper/src/gpu/execute/shader_decode_cache.cpp 1
 getenv|prosper/src/gpu/pm4/command_processor.cpp 59
 getenv|prosper/src/gpu/present/videoout_present.cpp 1
 getenv|prosper/src/gpu/recompiler/gta5/rdna2_gta5_compute_contracts.cpp 6
+getenv|prosper/src/gpu/recompiler/ir/lower/ds_case_lowering.cpp 1  # note: unchanged oversized-LDS diagnostic read transferred from rdna2_emit_alu.cpp; net zero.
 getenv|prosper/src/gpu/recompiler/rdna2_alu_support.hpp 1
 getenv|prosper/src/gpu/recompiler/rdna2_cfg_support.hpp 6
-getenv|prosper/src/gpu/recompiler/rdna2_emit_alu.cpp 18
+getenv|prosper/src/gpu/recompiler/rdna2_emit_alu.cpp 17  # note: one existing DS diagnostic read transferred unchanged to ds_case_lowering.cpp; net zero.
 getenv|prosper/src/gpu/recompiler/rdna2_emit_cfg.cpp 17
 getenv|prosper/src/gpu/recompiler/rdna2_recompile_compute.cpp 1
 getenv|prosper/src/gpu/recompiler/rdna2_recompile_fragment.cpp 2

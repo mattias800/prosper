@@ -14,6 +14,12 @@ recompiler tests also live one level up in `tests/gpu/` for historical reasons â
 `test_rdna2_spirv_struct.cpp` (structural module validation) and `test_recompile_coverage.cpp` â€”
 and new work usually belongs in this folder instead.
 
+The remaining DS case routes live in
+[`ds_case_lowering.cpp`](../../../src/gpu/recompiler/ir/lower/ds_case_lowering.cpp).
+Their [address execution fixtures](ir/test_ir_ds_address_execution.cpp) cover real LDS accesses;
+[cross-lane fixtures](ir/test_ir_ds_shuffle_execution.cpp) retain the separate shuffle definition
+coverage. The relocation changes the caller's home, not either operation contract.
+
 **Prefer a small binary over another arm in a big one, whenever rejects are the subject.** Most
 tests here return at their first `[FAIL]`, which is fine for a suite that should be all-green but
 useless the moment you want to know *which* assertions moved: a mutation run reports the first
