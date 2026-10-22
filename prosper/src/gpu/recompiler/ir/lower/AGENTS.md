@@ -29,3 +29,11 @@ moves, preserve emission order, and qualify relocations with token read-back and
 `buffer_opcode_case_routes.*` classifies the existing MUBUF/MTBUF opcode groups using references
 to the emitter's original locals. Descriptor resolution, access and disposition reporting remain
 in `emit_alu`; the classifier preserves the original unsupported-opcode refusal.
+
+`bvh_case_routes.*` owns the existing MIMG BVH branch, including guarded node loads, triangle
+and box calculations, sorting and destination predication. Its continuation methods keep original
+local declarations alive while later stages borrow their references and existing callbacks.
+
+`image_resolution_routes.*` owns the existing unresolved-MIMG reports and diagnostic branch.
+It borrows the parent lookup helpers and resolution state; reporting keys, static deduplication,
+diagnostic selection and refusal order remain together, while descriptor lookup stays in `emit_alu`.

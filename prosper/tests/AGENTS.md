@@ -84,3 +84,13 @@ outcome (see its own `AGENTS.md`).
 CI's `Contribution shape` job checks allowed new-file locations and requires a new
 `prosper/src/**/*.cpp` to touch `prosper/tests/`. Review checks the behavioral contracts above;
 report relevant red-without-fix evidence, test counts and execution limits without inventing results.
+
+The existing BVH recompiler fixtures continue through the relocated MIMG branch in
+`src/gpu/recompiler/ir/lower/bvh_case_routes.*`. This mechanical split uses their existing coverage,
+complete token read-back with deliberate controls and the corpus comparison; no behavior is added.
+
+`test_compute_request_choices` retains request-selected unresolved-image diagnostic coverage;
+`test_image_descriptor_class_lookup` covers class-aware descriptor acceptance and refusal.
+Their existing assertions remain when the report/diagnostic branch moves to
+`src/gpu/recompiler/ir/lower/image_resolution_routes.*`; token controls and the corpus gate qualify
+the mechanical relocation.
