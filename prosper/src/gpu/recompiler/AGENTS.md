@@ -41,6 +41,15 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
 - `rdna2_cfg_pcrel_tables` — embedded-table facts, scalar propagation and descriptor shape checks.
   `rdna2_cfg_pcrel_loads` holds the format-specific table-folding proofs. The original detector
   owns their borrowed closures; the CFG umbrella exports the public declarations.
+
+- `rdna2_cfg_forward_admission` — forward-if shapes, branch classification, target resolution and
+  region admission. `rdna2_cfg_forward_detector` owns the original detector closures; its private
+  passes collect and validate regions. Their bodies compile in sources, and the CFG umbrella
+  exposes the declarations to existing callers.
+
+- `rdna2_cfg_uniform_branch` / `rdna2_cfg_uniform_inputs` — workgroup-uniform VCC/SCC branch proofs
+  and their recursive operand/definition slices. The original closures retain their state and borrow
+  through the private parts header; the CFG umbrella includes the public proof declarations.
 - `ngg_subgroup_shell` / `ngg_subgroup_abi` / `ngg_export_record` — the merged ES+GS NGG subgroup
   shell (#3135 P2): one Vulkan workgroup per guest subgroup, launch values and an export record
   buffer in descriptor set 2, GS_ALLOC_REQ captured into a per-subgroup header. `ngg_subgroup_abi`

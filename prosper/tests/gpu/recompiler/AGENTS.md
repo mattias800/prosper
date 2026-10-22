@@ -65,6 +65,12 @@ The existing [region-loop fixtures](ir/test_ir_cfg_region_loops.cpp) and
 [structured-loop execution fixtures](ir/test_ir_cfg_structured_loop_execution.cpp) exercise the
 relocated detector through the unchanged CFG umbrella.
 
+Workgroup-uniform VCC/SCC branch proofs live in
+[`rdna2_cfg_uniform_branch.hpp`](../../../src/gpu/recompiler/rdna2_cfg_uniform_branch.hpp), with their
+operand and definition bodies in the companion source. The existing CPU-only
+[workgroup-uniformity fixtures](../test_workgroup_uniformity.cpp) compile both sources directly and
+retain their current admission/refusal expectations through the unchanged CFG umbrella.
+
 The remaining DS case routes live in
 [`ds_case_lowering.cpp`](../../../src/gpu/recompiler/ir/lower/ds_case_lowering.cpp).
 Their [address execution fixtures](ir/test_ir_ds_address_execution.cpp) cover real LDS accesses;
