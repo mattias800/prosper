@@ -22,19 +22,16 @@ import pathlib
 import re
 import sys
 
-HEADER = pathlib.Path(__file__).resolve().parents[3] / "src/gpu/recompiler/rdna2_to_spirv_internal.hpp"
+HEADER = pathlib.Path(__file__).resolve().parents[3] / "src/gpu/recompiler/rdna2_spirv_compute.inl"
 CLASS = "SpirvCompute"
 LARGE = 40          # a body over this is implementation, not an accessor
 
-# Eight bodies over LARGE are still inline, and all eight are ones outline_methods.py REFUSES to
-# move: `static` methods and methods with a default argument, both of which carry a keyword that
-# belongs on the declaration only. The bound is therefore on the COUNT, not on the length -- a
-# length bound would have to be set above the 297-line worst case, which would let a new 200-line
-# method in without a word.
+# All bodies over LARGE now live in source files. Expand the class's member fragments so a new
+# large body in any section is still counted, including without libclang or a compile database.
 #
 # This is a RATCHET. It may only go down. If those categories are taught to the tool, or a large
 # method is written out-of-line by hand, lower it in the same change.
-MAX_LARGE_BODIES = 8
+MAX_LARGE_BODIES = 0
 
 fails = 0
 
@@ -91,12 +88,24 @@ def method_bodies(lines, start, end):
     return out
 
 
+def header_lines(path):
+    """Read the class and its included member sections in their declaration order."""
+    lines = []
+    for line in path.read_text().splitlines():
+        include = re.match(r'\s*#include "gpu/recompiler/([^"/]+\.inl)"', line)
+        if include:
+            lines.extend(header_lines(path.parent / include[1]))
+        else:
+            lines.append(line)
+    return lines
+
+
 def main() -> int:
     print("== test_spirv_compute_header_shape ==")
     if not HEADER.exists():
         print(f"  [FAIL] header not found: {HEADER}")
         return 1
-    lines = HEADER.read_text().splitlines()
+    lines = header_lines(HEADER)
     start, end = class_span(lines)
     bodies = method_bodies(lines, start, end)
 
@@ -113,9 +122,7 @@ def main() -> int:
         print("         New large inline bodies: "
               + ", ".join(f"line {ln} ({n}L)" for ln, n in over[MAX_LARGE_BODIES:][:5]))
         print("         Move it to src/gpu/recompiler/spirv/:")
-        print("           python3 prosper/tools/refactor/outline_methods.py \\")
-        print("             --header src/gpu/recompiler/rdna2_to_spirv_internal.hpp \\")
-        print(f"             --class {CLASS} --group src/gpu/recompiler/spirv/<facility>.cpp=<pattern> --apply")
+        print("         Follow prosper/tools/refactor/README.md for a tool-driven move.")
 
     # Ratchet: if the count has DROPPED, the bound is stale and should be lowered with the change
     # that dropped it, or it silently stops guarding what it claims to.
