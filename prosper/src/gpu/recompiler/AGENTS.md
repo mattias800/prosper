@@ -20,6 +20,9 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   gfx1013. Ask it; do not add a private opcode list beside it. `test_rdna2_instruction_effects`
   fails when a decodable opcode has no entry. Other questions and formats are still answered by
   older helpers.
+- `rdna2_cfg_scalar_merge` — scalar CFG merge-deadness, physical mask-write widths and VCC liveness scans.
+  The control, ALU and memory sources retain the existing instruction proofs; the private routes
+  header holds borrowed worklist variables. The CFG umbrella exports the public proof API.
 - `rdna2_to_spirv` (+ `_internal`, `emit_alu`, `emit_cfg`, `alu_support`, `cfg_support`) — the
   translator: register state, control-flow structurization, and per-instruction lowering.
 - `rdna2_cfg_counted_loop` — counted-loop shapes and their admission rules, shared by the
@@ -50,6 +53,11 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
 - `rdna2_cfg_uniform_branch` / `rdna2_cfg_uniform_inputs` — workgroup-uniform VCC/SCC branch proofs
   and their recursive operand/definition slices. The original closures retain their state and borrow
   through the private parts header; the CFG umbrella includes the public proof declarations.
+
+- `rdna2_cfg_scalar_sources` — source-mark propagation and saved-mask snapshots. Its source-private
+  word helper borrows the original mark state; the CFG umbrella exposes the declarations.
+  `rdna2_cfg_scalar_source_reads` compiles the pure instruction-read predicates separately for
+  standalone CPU proofs. Shared source widths stay in `rdna2_scalar_source_words`.
 - `ngg_subgroup_shell` / `ngg_subgroup_abi` / `ngg_export_record` — the merged ES+GS NGG subgroup
   shell (#3135 P2): one Vulkan workgroup per guest subgroup, launch values and an export record
   buffer in descriptor set 2, GS_ALLOC_REQ captured into a per-subgroup header. `ngg_subgroup_abi`

@@ -3444,6 +3444,7 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/test_workgroup_uniformity.cpp src/gpu/recompiler/rdna2_decode.cpp
             src/gpu/recompiler/rdna2_instruction_effects.cpp
             src/gpu/recompiler/rdna2_scalar_source_words.cpp
+            src/gpu/recompiler/rdna2_cfg_scalar_source_reads.cpp
             src/gpu/recompiler/rdna2_cfg_branch_helpers.cpp
             src/gpu/recompiler/rdna2_cfg_uniform_branch.cpp
             src/gpu/recompiler/rdna2_cfg_uniform_inputs.cpp
@@ -4282,6 +4283,7 @@ if(TARGET prosper_core)
             src/gpu/recompiler/rdna2_decode.cpp
             src/gpu/recompiler/rdna2_instruction_effects.cpp
             src/gpu/recompiler/rdna2_scalar_source_words.cpp
+            src/gpu/recompiler/rdna2_cfg_scalar_source_reads.cpp
             src/gpu/recompiler/rdna2_raw_wide_data.cpp
             src/gpu/recompiler/rdna2_cfg_branch_helpers.cpp
     INCLUDES src)
@@ -4290,6 +4292,7 @@ if(TARGET prosper_core)
             src/gpu/recompiler/rdna2_decode.cpp
             src/gpu/recompiler/rdna2_instruction_effects.cpp
             src/gpu/recompiler/rdna2_scalar_source_words.cpp
+            src/gpu/recompiler/rdna2_cfg_scalar_source_reads.cpp
             src/gpu/recompiler/rdna2_raw_wide_data.cpp
             src/gpu/recompiler/rdna2_cfg_branch_helpers.cpp
     INCLUDES src)
@@ -4298,6 +4301,7 @@ if(TARGET prosper_core)
             src/gpu/recompiler/rdna2_decode.cpp
             src/gpu/recompiler/rdna2_instruction_effects.cpp
             src/gpu/recompiler/rdna2_scalar_source_words.cpp
+            src/gpu/recompiler/rdna2_cfg_scalar_source_reads.cpp
             src/gpu/recompiler/rdna2_raw_wide_data.cpp
             src/gpu/recompiler/rdna2_cfg_branch_helpers.cpp
     INCLUDES src)
@@ -4309,6 +4313,7 @@ if(TARGET prosper_core)
             src/gpu/recompiler/rdna2_decode.cpp
             src/gpu/recompiler/rdna2_instruction_effects.cpp
             src/gpu/recompiler/rdna2_scalar_source_words.cpp
+            src/gpu/recompiler/rdna2_cfg_scalar_source_reads.cpp
             src/gpu/recompiler/rdna2_raw_wide_data.cpp
             src/gpu/recompiler/rdna2_cfg_branch_helpers.cpp
     INCLUDES src)
