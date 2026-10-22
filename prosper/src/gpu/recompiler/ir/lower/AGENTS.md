@@ -26,6 +26,10 @@ final destination predication remain together in this family.
 Keep extracted files at most 500 lines and functions around 80 lines. Use the refactor tools for
 moves, preserve emission order, and qualify relocations with token read-back and the corpus gate.
 
+`sopp_case_routes.*` owns the existing SOPP opcode switch, including branch refusals, hint handling,
+the allocation callback and barrier emission. It borrows the original emitter state and safe-branch
+set; the relocation preserves the direct-emission path.
+
 `buffer_opcode_case_routes.*` classifies the existing MUBUF/MTBUF opcode groups using references
 to the emitter's original locals. Descriptor resolution, access and disposition reporting remain
 in `emit_alu`; the classifier preserves the original unsupported-opcode refusal.

@@ -117,6 +117,11 @@ platform-independent — the file also has `if(WIN32)`/`if(UNIX)` branches, and 
 the wrong one silently never runs while ctest stays green. Verify by name with `ctest -N`, never by
 the total count.
 
+The direct SOPP opcode switch lives in
+[`sopp_case_routes.cpp`](../../../src/gpu/recompiler/ir/lower/sopp_case_routes.cpp).
+Existing structural shader and branch fixtures keep their compiler entry points when this switch
+moves; the complete token read-back and corpus comparison qualify the mechanical relocation.
+
 `test_raw_wide_mask_lifetime` separates a fresh emitted Bool mask from a possible surviving
 physical high-word dependency of an earlier raw x4 load. Numeric negatives assert the actual raw
 load's PC/op in addition to classification and an empty stage module; a later unrelated refusal
