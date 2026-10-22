@@ -23,3 +23,8 @@ Vulkan compute backend, registered beside `test_ir_buffer_store_execution`.
 (`cfg_streams.hpp` holds their encoders). The shadow test also runs every guest-program fixture in
 `tests/data` under each stage's rules and needs the region tree's ifs and loops to agree with
 `detect_forward_ifs`, `detect_divergent_loops` and `detect_counted_loop` at the pc level.
+
+The buffer address, format, store and PC-relative bounds execution fixtures continue through
+`recompile_compute` after opcode classification moves to `lower/buffer_opcode_case_routes.*`.
+That mechanical move adds no semantic assertions; token read-back controls and the full corpus
+comparison qualify relocation, alongside these existing execution cases.
