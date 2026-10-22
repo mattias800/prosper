@@ -31,9 +31,7 @@ void scalar_source_word_marks(const RegState& rs, ScalarSourceMarks& marks, int&
 }
 }   // namespace
 
-// The input marks of one instruction (#4706; RegState::sreg_merge_placeholder). Defined here, not
-// in rdna2_to_spirv_internal.hpp, because it reads the two width inventories above; every caller
-// of snapshot_saved_b64_masks() includes this header.
+// The input marks of one instruction (#4706; RegState::sreg_merge_placeholder).
 ScalarSourceMarks scalar_source_marks(const RegState& rs, const Rdna2Inst& in) {
     ScalarSourceMarks marks = vector_source_marks(rs, in);
     const auto word = [&](int r) { scalar_source_word_marks(rs, marks, r); };
