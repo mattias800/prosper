@@ -66,6 +66,10 @@ Older tests are standalone executables registered with `add_test` and a local `C
 
 ## Where things go
 
+Embedded-table and typed-buffer folding fixtures exercise `rdna2_cfg_pcrel_tables` and its private
+load passes through the CFG umbrella. Preserve the existing typed and untyped admission predicates
+and entry-soundness coverage when moving these format proofs.
+
 A new test file goes in the subfolder matching the subsystem it exercises (`hle/`, `gpu/`,
 `loader/`, `self/`, …), registered in `prosper/CMakeLists.txt` (`prosper_add_gtest`, or `add_test` for legacy tests). `fixtures/` holds
 inputs and machinery under test; `support/` holds helpers that can never change an assertion's
