@@ -71,6 +71,12 @@ operand and definition bodies in the companion source. The existing CPU-only
 [workgroup-uniformity fixtures](../test_workgroup_uniformity.cpp) compile both sources directly and
 retain their current admission/refusal expectations through the unchanged CFG umbrella.
 
+Scalar merge-deadness and its VCC liveness scans live in
+[`rdna2_cfg_scalar_merge.hpp`](../../../src/gpu/recompiler/rdna2_cfg_scalar_merge.hpp).
+The existing [VINTRP scalar-liveness fixtures](test_vintrp_scalar_liveness.cpp) and
+[compare-kill fixtures](test_fragment_compare_kill.cpp) exercise its reads, physical half-width
+inputs and path termination through the original proof and compiler entry points.
+
 The remaining DS case routes live in
 [`ds_case_lowering.cpp`](../../../src/gpu/recompiler/ir/lower/ds_case_lowering.cpp).
 Their [address execution fixtures](ir/test_ir_ds_address_execution.cpp) cover real LDS accesses;
