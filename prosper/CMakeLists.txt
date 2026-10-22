@@ -4284,6 +4284,7 @@ if(TARGET prosper_core)
             src/gpu/recompiler/rdna2_instruction_effects.cpp
             src/gpu/recompiler/rdna2_scalar_source_words.cpp
             src/gpu/recompiler/rdna2_cfg_scalar_source_reads.cpp
+            src/gpu/recompiler/rdna2_cfg_wave_uniform.cpp
             src/gpu/recompiler/rdna2_raw_wide_data.cpp
             src/gpu/recompiler/rdna2_cfg_branch_helpers.cpp
     INCLUDES src)
@@ -4293,6 +4294,7 @@ if(TARGET prosper_core)
             src/gpu/recompiler/rdna2_instruction_effects.cpp
             src/gpu/recompiler/rdna2_scalar_source_words.cpp
             src/gpu/recompiler/rdna2_cfg_scalar_source_reads.cpp
+            src/gpu/recompiler/rdna2_cfg_wave_uniform.cpp
             src/gpu/recompiler/rdna2_raw_wide_data.cpp
             src/gpu/recompiler/rdna2_cfg_branch_helpers.cpp
     INCLUDES src)
@@ -4302,6 +4304,7 @@ if(TARGET prosper_core)
             src/gpu/recompiler/rdna2_instruction_effects.cpp
             src/gpu/recompiler/rdna2_scalar_source_words.cpp
             src/gpu/recompiler/rdna2_cfg_scalar_source_reads.cpp
+            src/gpu/recompiler/rdna2_cfg_wave_uniform.cpp
             src/gpu/recompiler/rdna2_raw_wide_data.cpp
             src/gpu/recompiler/rdna2_cfg_branch_helpers.cpp
     INCLUDES src)
@@ -4314,6 +4317,7 @@ if(TARGET prosper_core)
             src/gpu/recompiler/rdna2_instruction_effects.cpp
             src/gpu/recompiler/rdna2_scalar_source_words.cpp
             src/gpu/recompiler/rdna2_cfg_scalar_source_reads.cpp
+            src/gpu/recompiler/rdna2_cfg_wave_uniform.cpp
             src/gpu/recompiler/rdna2_raw_wide_data.cpp
             src/gpu/recompiler/rdna2_cfg_branch_helpers.cpp
     INCLUDES src)
