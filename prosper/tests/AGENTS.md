@@ -77,6 +77,8 @@ exercise these sources through the CFG umbrella. A mechanical move adds no behav
 Scalar-source mark and saved-mask fixtures exercise `rdna2_cfg_scalar_sources` through the CFG
 umbrella. Preserve the existing fabricated-word domains, address-root ordering and both snapshot
 overloads when moving this bookkeeping; the mechanical split adds no behavioral assertion.
+The workgroup-uniformity CPU fixture compiles the pure instruction-read predicates in
+`rdna2_cfg_scalar_source_reads.cpp` directly, without linking the builder or renderer.
 
 A new test file goes in the subfolder matching the subsystem it exercises (`hle/`, `gpu/`,
 `loader/`, `self/`, …), registered in `prosper/CMakeLists.txt` (`prosper_add_gtest`, or `add_test` for legacy tests). `fixtures/` holds

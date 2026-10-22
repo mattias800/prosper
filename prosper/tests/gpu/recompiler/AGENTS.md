@@ -68,7 +68,8 @@ relocated detector through the unchanged CFG umbrella.
 Workgroup-uniform VCC/SCC branch proofs live in
 [`rdna2_cfg_uniform_branch.hpp`](../../../src/gpu/recompiler/rdna2_cfg_uniform_branch.hpp), with their
 operand and definition bodies in the companion source. The existing CPU-only
-[workgroup-uniformity fixtures](../test_workgroup_uniformity.cpp) compile both sources directly and
+[workgroup-uniformity fixtures](../test_workgroup_uniformity.cpp) compile both proof sources and
+the pure scalar instruction-read predicates directly and
 retain their current admission/refusal expectations through the unchanged CFG umbrella.
 
 Scalar merge-deadness and its VCC liveness scans live in
