@@ -10,6 +10,7 @@
 #include "gpu/diagnostics/refused_shader_inputs.hpp"
 #include "fixtures/test_scratch.h"
 #include <gtest/gtest.h>
+#include <tuple>
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -168,76 +169,76 @@ TEST(IrVectorCubeAxisExecution, InlineAndLiteralFormsKeepAllThreeSources) {
         for (uint32_t mode = 1; mode <= 7; ++mode)
             for (uint32_t wave : {64u, 32u}) compare(def, inputs(37 + mode), wave, mode);
 }
-TEST(IrVectorCubeAxisExecution, SourceAbsNegThenOutputModifiersRemainWithTheCaller) {
+// Keep each CTest bounded while retaining the complete modifier Cartesian product.
+class IrVectorCubeAxisModifiers : public testing::TestWithParam<std::tuple<uint32_t, uint32_t>> {};
+TEST_P(IrVectorCubeAxisModifiers, SourceAbsNegThenOutputModifiersRemainWithTheCaller) {
     // Explicit ISA arms: scaling enabled, output denorms preserved, or IEEE enabled.
-    for (uint32_t rsrc1 : {0u, 0x30u << 12, 1u << 23}) {
-        for (const auto& def : vector_cube_axis_defs())
-            for (uint32_t abs = 0; abs < 8; ++abs)
-                for (uint32_t neg = 0; neg < 8; ++neg)
-                    for (uint32_t omod = 0; omod < 4; ++omod)
-                        for (bool clamp : {false, true})
-                            for (uint32_t wave : {64u, 32u}) {
-                                auto in = inputs(43);
-                                for (size_t lane = 0; lane < in.lanes(); ++lane) {
-                                    in.s0[lane] = (in.s0[lane] & 0x807fffffu) |
-                                                  ((lane % 3 == 0 ? 128u : 126u) << 23);
-                                    in.s1[lane] = (in.s1[lane] & 0x807fffffu) |
-                                                  ((lane % 3 == 1 ? 128u : 126u) << 23);
-                                    in.s2[lane] = (in.s2[lane] & 0x807fffffu) |
-                                                  ((lane % 3 == 2 ? 128u : 126u) << 23);
+    const auto [rsrc1, abs] = GetParam();
+    for (const auto& def : vector_cube_axis_defs())
+        for (uint32_t neg = 0; neg < 8; ++neg)
+            for (uint32_t omod = 0; omod < 4; ++omod)
+                for (bool clamp : {false, true})
+                    for (uint32_t wave : {64u, 32u}) {
+                        auto in = inputs(43);
+                        for (size_t lane = 0; lane < in.lanes(); ++lane) {
+                            in.s0[lane] =
+                                (in.s0[lane] & 0x807fffffu) | ((lane % 3 == 0 ? 128u : 126u) << 23);
+                            in.s1[lane] =
+                                (in.s1[lane] & 0x807fffffu) | ((lane % 3 == 1 ? 128u : 126u) << 23);
+                            in.s2[lane] =
+                                (in.s2[lane] & 0x807fffffu) | ((lane % 3 == 2 ? 128u : 126u) << 23);
+                        }
+                        // The VM deliberately refuses NMax(+0,+0)'s unspecified zero sign.
+                        // Keep clamp-ID comparisons on nonzero faces; X/face0 remains covered
+                        // by every unclamped source/result form and the explicit VM-limit arm.
+                        if (clamp && def.opcode == 0x144)
+                            for (size_t lane = 0; lane < in.lanes(); ++lane)
+                                if (lane % 3 == 0) {
+                                    in.s0[lane] = (in.s0[lane] & 0x807fffffu) | (126u << 23);
+                                    in.s1[lane] = (in.s1[lane] & 0x807fffffu) | (128u << 23);
                                 }
-                                // The VM deliberately refuses NMax(+0,+0)'s unspecified zero sign.
-                                // Keep clamp-ID comparisons on nonzero faces; X/face0 remains covered
-                                // by every unclamped source/result form and the explicit VM-limit arm.
-                                if (clamp && def.opcode == 0x144)
-                                    for (size_t lane = 0; lane < in.lanes(); ++lane)
-                                        if (lane % 3 == 0) {
-                                            in.s0[lane] =
-                                                (in.s0[lane] & 0x807fffffu) | (126u << 23);
-                                            in.s1[lane] =
-                                                (in.s1[lane] & 0x807fffffu) | (128u << 23);
-                                        }
-                                const auto run = run_vector_op_per_lane(
-                                    words(def.opcode, 0, abs, neg, omod, clamp), in, wave, false,
-                                    rsrc1);
-                                ASSERT_TRUE(run.error.empty()) << run.error;
-                                for (size_t lane = 0; lane < in.lanes(); ++lane) {
-                                    std::array<uint32_t, 3> raw = {in.s0[lane], in.s1[lane],
-                                                                   in.s2[lane]};
-                                    for (size_t k = 0; k < 3; ++k) {
-                                        uint32_t value = raw[k];
-                                        if (abs & (1u << k)) value &= 0x7fffffffu;
-                                        if (neg & (1u << k)) value ^= 0x80000000u;
-                                        raw[k] = value;
-                                    }
-                                    auto want =
-                                        eval_ternary_integer_op(def, {raw[0], raw[1], raw[2]});
-                                    if (!want) {
-                                        ADD_FAILURE() << "unexpected unknown cube modifier result";
-                                        return;
-                                    }
-                                    if (omod && rsrc1 == 0)
-                                        want = evaluate_op(Opcode::F32Mul, 0, *want,
-                                                           omod == 1   ? 0x40000000u
-                                                           : omod == 2 ? 0x40800000u
-                                                                       : 0x3f000000u,
-                                                           0);
-                                    if (!want) {
-                                        ADD_FAILURE() << "unexpected unknown cube modifier result";
-                                        return;
-                                    }
-                                    if (clamp)
-                                        want = evaluate_op(Opcode::F32Clamp01, 0, *want, 0, 0);
-                                    if (!want) {
-                                        ADD_FAILURE() << "unexpected unknown cube modifier result";
-                                        return;
-                                    }
-                                    ASSERT_EQ(run.d[lane],
-                                              in.active[lane] ? *want : in.old_d[lane]);
-                                }
+                        const auto run = run_vector_op_per_lane(
+                            words(def.opcode, 0, abs, neg, omod, clamp), in, wave, false, rsrc1);
+                        ASSERT_TRUE(run.error.empty()) << run.error;
+                        for (size_t lane = 0; lane < in.lanes(); ++lane) {
+                            std::array<uint32_t, 3> raw = {in.s0[lane], in.s1[lane], in.s2[lane]};
+                            for (size_t k = 0; k < 3; ++k) {
+                                uint32_t value = raw[k];
+                                if (abs & (1u << k)) value &= 0x7fffffffu;
+                                if (neg & (1u << k)) value ^= 0x80000000u;
+                                raw[k] = value;
                             }
-    }
+                            auto want = eval_ternary_integer_op(def, {raw[0], raw[1], raw[2]});
+                            if (!want) {
+                                ADD_FAILURE() << "unexpected unknown cube modifier result";
+                                return;
+                            }
+                            if (omod && rsrc1 == 0)
+                                want = evaluate_op(Opcode::F32Mul, 0, *want,
+                                                   omod == 1   ? 0x40000000u
+                                                   : omod == 2 ? 0x40800000u
+                                                               : 0x3f000000u,
+                                                   0);
+                            if (!want) {
+                                ADD_FAILURE() << "unexpected unknown cube modifier result";
+                                return;
+                            }
+                            if (clamp) want = evaluate_op(Opcode::F32Clamp01, 0, *want, 0, 0);
+                            if (!want) {
+                                ADD_FAILURE() << "unexpected unknown cube modifier result";
+                                return;
+                            }
+                            ASSERT_EQ(run.d[lane], in.active[lane] ? *want : in.old_d[lane]);
+                        }
+                    }
 }
+INSTANTIATE_TEST_SUITE_P(Rsrc1AndAbs, IrVectorCubeAxisModifiers,
+                         testing::Combine(testing::Values(0u, 0x30u << 12, 1u << 23),
+                                          testing::Range(0u, 8u)),
+                         [](const auto& info) {
+                             return "Rsrc1" + std::to_string(std::get<0>(info.param)) + "Abs" +
+                                    std::to_string(std::get<1>(info.param));
+                         });
 TEST(IrVectorCubeAxisExecution, ZeroClampKeepsTheReferenceVmLimitWithAnUnclampedControl) {
     auto in = inputs(47);
     std::fill(in.s0.begin(), in.s0.end(), 0x40400000u);
