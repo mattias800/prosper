@@ -25,6 +25,8 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   header holds borrowed worklist variables. The CFG umbrella exports the public proof API.
 - `rdna2_to_spirv` (+ `_internal`, `emit_alu`, `emit_cfg`, `alu_support`, `cfg_support`) — the
   translator: register state, control-flow structurization, and per-instruction lowering.
+  The existing SOPP opcode switch lives in `ir/lower/sopp_case_routes`, borrowing the original
+  emitter state and safe-branch set without changing branch or barrier admission.
 - `rdna2_cfg_counted_loop` — counted-loop shapes and their admission rules, shared by the
   structured emitter and IR region tree. `rdna2_cfg_branch_helpers` holds the common branch target,
   waterfall and bottom-tested SCC-condition helpers. Their bodies compile in sources;
