@@ -68,6 +68,14 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   The original recursive closure stays with the analysis; `rdna2_cfg_barrier_proof_parts` holds
   its delegated bodies and scalar-prefix check. The CFG umbrella exports the public declarations.
 
+
+- `rdna2_cfg_trip_settings` — CFG trip-bound selector parsing, its parse counter and the per-thread
+  operation pin. The bodies compile in a source; the CFG umbrella includes their declarations, while
+  the public operation scope and witness-emission helpers retain their existing owners.
+- `rdna2_cfg_must_dataflow` — the templated must-fact walk and full-EXEC-mask predicate used by
+  workgroup branch proofs. The template stays in its responsibility header; the predicate compiles
+  in a source. The CFG umbrella exposes these declarations to existing callers.
+
 - `ngg_subgroup_shell` / `ngg_subgroup_abi` / `ngg_export_record` — the merged ES+GS NGG subgroup
   shell (#3135 P2): one Vulkan workgroup per guest subgroup, launch values and an export record
   buffer in descriptor set 2, GS_ALLOC_REQ captured into a per-subgroup header. `ngg_subgroup_abi`

@@ -212,3 +212,15 @@ arm reaches derived provenance. The one-arm compare targets the MUST mask meet a
   the original spill after the relay also emptied the alias map and disabled that local guard.
   Retain original per-PC ownership across all phases and full EXEC at each barrier boundary, with
   relay-before/after/no-barrier negatives and usable genuine row-result replacements (#4959).
+
+
+CFG trip-bound selector parsing and operation-pin storage live in
+[`rdna2_cfg_trip_settings.hpp`](../../../src/gpu/recompiler/rdna2_cfg_trip_settings.hpp).
+The existing [operation-scope fixtures](../execute/test_trip_bound_operation.cpp) cover coherent sampling
+and nested restoration; the [dispatcher diagnostic fixtures](../../shared/diagnostics/test_cfg_trip_bound.cpp)
+retain the arm/compile/disarm/compile coverage.
+
+The workgroup branch proofs' must-fact walk and full-EXEC predicate live in
+[`rdna2_cfg_must_dataflow.hpp`](../../../src/gpu/recompiler/rdna2_cfg_must_dataflow.hpp).
+The existing CPU-only [workgroup-uniformity fixtures](../test_workgroup_uniformity.cpp) compile the
+predicate's source directly and exercise the proofs through the unchanged CFG umbrella.
