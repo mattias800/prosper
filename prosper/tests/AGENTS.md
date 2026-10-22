@@ -70,6 +70,10 @@ Embedded-table and typed-buffer folding fixtures exercise `rdna2_cfg_pcrel_table
 load passes through the CFG umbrella. Preserve the existing typed and untyped admission predicates
 and entry-soundness coverage when moving these format proofs.
 
+Forward-if shapes and admission live in `rdna2_cfg_forward_admission`; detector passes live beside
+`rdna2_cfg_forward_detector`. Existing region-tree, structured-branch and compute-branch fixtures
+exercise these sources through the CFG umbrella. A mechanical move adds no behavioral assertion.
+
 A new test file goes in the subfolder matching the subsystem it exercises (`hle/`, `gpu/`,
 `loader/`, `self/`, …), registered in `prosper/CMakeLists.txt` (`prosper_add_gtest`, or `add_test` for legacy tests). `fixtures/` holds
 inputs and machinery under test; `support/` holds helpers that can never change an assertion's

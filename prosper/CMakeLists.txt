@@ -3445,6 +3445,8 @@ if(TARGET prosper_core)
             src/gpu/recompiler/rdna2_instruction_effects.cpp
             src/gpu/recompiler/rdna2_scalar_source_words.cpp
             src/gpu/recompiler/rdna2_cfg_branch_helpers.cpp
+            src/gpu/recompiler/rdna2_cfg_uniform_branch.cpp
+            src/gpu/recompiler/rdna2_cfg_uniform_inputs.cpp
     INCLUDES src)
 
   # ADR 0028: compute cross-lane operation inventory and Wave64 route selection (CPU only).
