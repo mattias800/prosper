@@ -59,15 +59,20 @@ def load_bundle(path: str | Path) -> dict:
     return record
 
 
+def display_text(value: str) -> str:
+    """Keep untrusted metadata on one terminal line, with controls visibly escaped."""
+    return json.dumps(value, ensure_ascii=True)[1:-1]
+
+
 def triage_lines(record: dict) -> list[str]:
     """One human line per bundle section a triager reads first."""
     switches = record["switches"]
     return [
-        f"tool: {record['tool']}",
-        f"build: {record['build_revision'][:12]} (source identity present: "
+        f"tool: {display_text(record['tool'])}",
+        f"build: {display_text(record['build_revision'][:12])} (source identity present: "
         f"{bool(record['build_source_identity'])})",
-        f"os: {record['os']}",
-        f"title: {record['title_id'] or '(no title identity)'}",
+        f"os: {display_text(record['os'])}",
+        f"title: {display_text(record['title_id']) or '(no title identity)'}",
         f"switches: {len(switches)} PROSPER_* in force",
     ]
 

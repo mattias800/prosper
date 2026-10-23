@@ -34,8 +34,13 @@ def write_bundle(tmp_path, record):
 def test_valid_bundle_loads_and_triages(tmp_path):
     record = rb.load_bundle(write_bundle(tmp_path, bundle()))
     lines = rb.triage_lines(record)
-    assert any("prosper-app" in line for line in lines)
-    assert any("PPSA00000" in line for line in lines)
+    assert lines == [
+        "tool: prosper-app",
+        "build: aaaaaaaaaaaa (source identity present: True)",
+        "os: linux",
+        "title: PPSA00000",
+        "switches: 0 PROSPER_* in force",
+    ]
 
 
 def test_empty_title_and_switches_are_reported_not_defaulted(tmp_path):
@@ -98,3 +103,38 @@ def test_invalid_utf8_refuses_without_a_traceback(tmp_path, capsys):
     path.write_bytes(b'{"type":"report","tool":"\xff"}')
     assert rb.main([str(path)]) == 2
     assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("tool", "\x1b]52;c;payload\x07\nspoof", "tool: \\u001b]52;c;payload\\u0007\\nspoof"),
+        ("tool", "x\r\ty\x7f\x9b", "tool: x\\r\\ty\\u007f\\u009b"),
+        ("tool", "name\u2028\u202e", "tool: name\\u2028\\u202e"),
+        (
+            "build_revision",
+            "\x1b[31mforged\nignored",
+            "build: \\u001b[31mforged\\n (source identity present: True)",
+        ),
+        (
+            "build_revision",
+            "x\r\ty\x7f\x9b",
+            "build: x\\r\\ty\\u007f\\u009b (source identity present: True)",
+        ),
+        (
+            "build_revision",
+            "name\u2028\u202e",
+            "build: name\\u2028\\u202e (source identity present: True)",
+        ),
+    ],
+)
+def test_cli_displays_untrusted_metadata_without_terminal_controls(
+    tmp_path, capsys, field, value, expected
+):
+    # A shared report is untrusted input. OSC/CSI, newlines and Unicode formatting must be
+    # visible data, never terminal commands or an extra triage line.
+    path = write_bundle(tmp_path, bundle(**{field: value}))
+    assert rb.main([path]) == 0
+    output = capsys.readouterr().out
+    assert len(output.splitlines()) == 5
+    assert expected in output.splitlines()
