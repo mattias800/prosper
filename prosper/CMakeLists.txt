@@ -3446,6 +3446,7 @@ if(TARGET prosper_core)
             src/gpu/recompiler/rdna2_scalar_source_words.cpp
             src/gpu/recompiler/rdna2_cfg_scalar_source_reads.cpp
             src/gpu/recompiler/rdna2_cfg_branch_helpers.cpp
+            src/gpu/recompiler/rdna2_cfg_must_dataflow.cpp
             src/gpu/recompiler/rdna2_cfg_uniform_branch.cpp
             src/gpu/recompiler/rdna2_cfg_uniform_inputs.cpp
     INCLUDES src)
