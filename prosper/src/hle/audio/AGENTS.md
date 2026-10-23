@@ -29,6 +29,9 @@ title may use several at once:
   CalcWaveformBlock, SystemResetOption) as pure functions; `hle_audio.cpp` keeps only their traced
   entry points. They follow **`libSceNgs2.native.sprx`**, the module PS5 titles actually bind, which
   differs from the plain `libSceNgs2.sprx` in error family and struct sizes.
+- **`audio_pcm_contracts.cpp`** — the stateless format decoding, channel-volume, queue-slot,
+  nonzero-sample, stamp-verdict and stereo fold-down helpers declared in `audio.hpp`. Port/sink
+  ownership, guest handlers and registration stay in `hle_audio.cpp`.
 
 ## The two seams out of the core
 
