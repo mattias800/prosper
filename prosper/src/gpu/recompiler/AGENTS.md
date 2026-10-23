@@ -60,6 +60,14 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   word helper borrows the original mark state; the CFG umbrella exposes the declarations.
   `rdna2_cfg_scalar_source_reads` compiles the pure instruction-read predicates separately for
   standalone CPU proofs. Shared source widths stay in `rdna2_scalar_source_words`.
+- `rdna2_cfg_wave_uniform` — VCC-preserving instruction scans and the recursive proof that one
+  guest wave agrees on an exit condition. Its private scalar/VGPR slices borrow the original
+  recursion object. Workgroup branch admission additionally proves agreement across waves.
+
+- `rdna2_cfg_barrier_phases` — existing barrier-phase recognition and terminal-SCC guard proof.
+  The original recursive closure stays with the analysis; `rdna2_cfg_barrier_proof_parts` holds
+  its delegated bodies and scalar-prefix check. The CFG umbrella exports the public declarations.
+
 - `ngg_subgroup_shell` / `ngg_subgroup_abi` / `ngg_export_record` — the merged ES+GS NGG subgroup
   shell (#3135 P2): one Vulkan workgroup per guest subgroup, launch values and an export record
   buffer in descriptor set 2, GS_ALLOC_REQ captured into a per-subgroup header. `ngg_subgroup_abi`

@@ -80,6 +80,16 @@ overloads when moving this bookkeeping; the mechanical split adds no behavioral 
 The workgroup-uniformity and four raw-wide CPU fixtures compile the pure instruction-read predicates in
 `rdna2_cfg_scalar_source_reads.cpp` directly, without linking the builder or renderer.
 
+Existing READFIRSTLANE-uniformity and structured-branch fixtures exercise `rdna2_cfg_wave_uniform`
+through the CFG umbrella. Preserve the READFIRSTLANE checks on scalar and Special operands, the
+VCC-preservation scan and the recursive VGPR slice when moving these wave-level proofs.
+The four raw-wide CPU fixtures compile `rdna2_cfg_wave_uniform.cpp` directly for the moved
+VCC-write predicate; their existing decoder and register-effect sources remain explicit.
+
+Existing compute-phase and terminal-guard fixtures exercise `rdna2_cfg_barrier_phases` and its
+private proof parts through the CFG umbrella. Moving these admission bodies adds no behavior;
+retain the full branch and barrier execution coverage when changing their ownership.
+
 A new test file goes in the subfolder matching the subsystem it exercises (`hle/`, `gpu/`,
 `loader/`, `self/`, …), registered in `prosper/CMakeLists.txt` (`prosper_add_gtest`, or `add_test` for legacy tests). `fixtures/` holds
 inputs and machinery under test; `support/` holds helpers that can never change an assertion's
