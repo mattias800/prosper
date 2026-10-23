@@ -332,9 +332,96 @@ a transfer, so read that as an upper bound.
   Validity depends on the path and on the EXEC owner at the read, which a value's type cannot
   express without a dataflow fact. Typed masks help the mask-domain part (`Domain`). They do not
   replace the analysis.
+- **Prove less: carry the uncertainty in the shader instead** (added 2026-10-23, not yet decided).
+  See the next section.
+
+### The prove-less alternative (2026-10-23)
+
+This section records a comparison made after the decision above was written. It may shrink the
+decision, so it comes before acceptance.
+
+**Where it came from.** Another PS5 recompiler, KytyPS5, was read as a cross-check. Nothing was
+taken from it; the point is that it is a working design with no validity analysis and no static
+mask-domain proofs. Read before comparing, because the first guess was wrong: **its execution model
+is the same as prosper's.** Both branch on a wave vote (a subgroup any/all over the per-lane
+predicate) and both write VGPRs through `select(exec, new, old)`. The difference is not control flow.
+It is two policies:
+
+1. **A word nobody supplied reads as a value, not as a refusal.** Its SSA construction starts every
+   register at zero. Prosper calls such a word a *placeholder* and refuses any read it cannot prove
+   is confined to lanes that are never observed (`fresh_mask_sources_defined`,
+   `vector_word_defined_in_exec`, the loop-carried fabricated check).
+2. **Whether an SGPR holds a lane mask is a runtime value, not a proof.** Each SGPR carries an
+   SSA-tracked "holds a mask" bit next to its value. A mask read selects between the per-lane bit
+   and the bit decoded from the integer at the lane index, and constant propagation removes most of
+   those selects. Prosper proves the domain statically (`Domain`, the mask-half and spill-slot
+   domain analyses) and refuses when the proof fails.
+
+**What those two policies cost prosper today.**
+
+- *Kena*, `prosper-app` on `main` at `4204ef669`, default launch, 130 s: four refused programs.
+  Three are policy 1:
+  - fragment `0x500aed0000`, `fabricated-fresh-mask-source`, which accounts for **all 329** dropped
+    draws in the run;
+  - compute `0x50071e0000`, `fabricated-fresh-mask-source`;
+  - compute `0x500a540000`, loop-carried `v0` fabricated on the back edge.
+
+  The two compute programs account for the 659 `shader-recompile` skipped dispatches. The fourth
+  program (vertex `0x5009400000`, `mbcnt-cross-lane`) is unrelated. So the zero-dropped-shaders goal
+  for this title is, today, a question about policy 1.
+- **Corpus**, 4,000 entries (about 1,003 distinct programs), excluding refusals caused by the
+  synthetic resource table. 1,755 entries are refused for a recompiler reason:
+  - **597** `fabricated-fresh-mask-source` (519 fragment, 78 compute) and **45** loop-carried
+    fabricated: policy 1;
+  - **523** `structured-saved-mask-domain-missing-edge` (522 fragment): policy 2.
+
+  That is **1,165 of 1,755 (66%)**. These are entries, not distinct programs. `CONFIDENCE: MED` that
+  the synthetic-table filter separates every artefact.
+
+**Why prosper refuses, and where that is right.** Admitting policy 1 blindly gives up exactly the
+failure ADR 0038 exists to prevent: a placeholder that stands for a real input prosper failed to
+supply (a launch VGPR missing from the launch inventory, a spill prosper did not track) would be
+read as zero, silently. For a word the hardware does not load, the value really is arbitrary, and
+reading zero is what #5174/#5180 already allow. So the honest version of policy 1 is the existing
+rule applied everywhere: **a placeholder is Arbitrary when prosper can name why hardware holds no
+meaningful value there, and Hard only when it is a real input prosper does not model.** Nothing
+here has measured how many of the 642 policy-1 refusals are which.
+
+Policy 2 does not touch validity at all. It replaces proofs about representation with a runtime bit
+and a select. Its cost is one extra boolean per SGPR in the SSA state and a select per mask read
+that constant propagation cannot fold. It needs the integer form of a mask to exist, which a native
+64-lane subgroup gives; the Wave64-on-narrower-host routes of ADR 0028 would need checking.
+
+**What it would change in this ADR.**
+
+- If policy 2 holds up, `WordFact::domain` and the mask-half and spill-slot domain analyses are not
+  needed. That is the largest part of steps 9 and 10.
+- If most policy-1 placeholders turn out to be Arbitrary, the admission checks that refuse them
+  become census lines (a logged count) instead of refusals. The analysis still has a job, because it
+  is where a placeholder's origin gets named. But its result decides less, and a wrong answer costs
+  a diagnostic instead of a dropped shader.
+- One model still beats two, so Decision 1 to 4 survive either way. What shrinks is the lattice and
+  what consumes it.
+
+**Measurement before acceptance.**
+
+1. **Kena's three programs.** For each fabricated word, name its origin: never written, a launch
+   input missing from `rdna2_launch_vgprs`, or an untracked spill. A missing input is a
+   launch-inventory bug, fixed on its own. A word hardware does not load is Arbitrary under the
+   existing #5180 rule, and admitting it needs an execution witness.
+2. **Corpus census of policy 1.** The same classification over the 642 entries, reported by
+   origin.
+3. **Policy-2 prototype** behind a switch, on the 523 domain-missing entries: verdict flips,
+   `spirv-val`, and one execution witness per flip shape.
+
+The three results decide whether this ADR is accepted as written, accepted without `Domain`, or
+rewritten around a smaller analysis.
 
 ## Approval
 
 Only the project owner can accept this ADR. Acceptance unblocks plan step 8b and adds `GPU-6` as
 policy. Step 8a (the effects-table extension) is #5146 step 4 and needs no acceptance. Step 7 is
 covered by ADR 0012. Steps 9 and 10 additionally need a census with no open contradiction.
+
+**Held (2026-10-23):** acceptance waits for the three measurements in *The prove-less
+alternative*, because they decide how large the lattice in Decision 1 needs to be.
