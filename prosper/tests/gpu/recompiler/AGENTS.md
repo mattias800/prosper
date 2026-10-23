@@ -224,3 +224,9 @@ The workgroup branch proofs' must-fact walk and full-EXEC predicate live in
 [`rdna2_cfg_must_dataflow.hpp`](../../../src/gpu/recompiler/rdna2_cfg_must_dataflow.hpp).
 The existing CPU-only [workgroup-uniformity fixtures](../test_workgroup_uniformity.cpp) compile the
 predicate's source directly and exercise the proofs through the unchanged CFG umbrella.
+
+Register-state data and shared mark helpers live in
+[`rdna2_reg_state.hpp`](../../../src/gpu/recompiler/rdna2_reg_state.hpp).
+The existing [portable mask-half fixtures](test_portable_mask_half.cpp) cover half replacement
+and [launch-word fixtures](test_unloaded_launch_vgpr.cpp) cover definedness through the real compiler.
+Their umbrella include remains available to existing callers.
