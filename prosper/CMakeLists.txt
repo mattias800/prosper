@@ -4225,6 +4225,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_native_cfg_saved_mask_data.cpp
     INCLUDES tests tests/gpu/recompiler
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_native_loop_carry_mask
+    SOURCES tests/gpu/recompiler/test_native_loop_carry_mask.cpp
+    INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_native_numeric_vcc_move
     SOURCES tests/gpu/recompiler/test_native_numeric_vcc_move.cpp
     INCLUDES tests tests/gpu/recompiler
