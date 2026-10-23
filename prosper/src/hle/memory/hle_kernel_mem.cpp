@@ -3,15 +3,7 @@
 // an opaque offset, then map it (or flexible memory) into VA. We back it with host
 // native VM primitives and TRACK every mapping so VirtualQuery is truthful and so we can
 // log/debug the guest's address-space construction.
-#ifdef _WIN32
-// Must precede EVERY header — including <thread>/<mutex>/<atomic>, which pull in MinGW's _mingw.h and
-// default _WIN32_WINNT to 0x0601 (Windows 7). A later `#ifndef _WIN32_WINNT` is then a silent no-op, and
-// GetCurrentThreadStackLimits / WaitOnAddress / WakeByAddress* (all >= 0x0602, Win8) go undeclared.
-// Same placement rule as hle_kernel.cpp and exec_image_win.cpp.
-#ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x0A00
-#endif
-#endif
+#include "hle/memory/ampr_command_buffer_internal.hpp"
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/kernel/apr_submission.hpp"
 #include "hle/kernel/apr_event_dialect.hpp"   // AprDialect, stored on each binding
@@ -43,7 +35,6 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
-#include "hle/memory/ampr_command_buffer_internal.hpp"
 
 namespace prosper {
 // #312/#946 huge-reserve redirect threshold, shared by the Linux and Windows reserve paths (one

@@ -22,6 +22,8 @@ happens without being tracked is a mapping the rest of prosper cannot see.
   storage state stay private there, while `ampr_command_buffer_internal.hpp` declares the helpers
   both platform arms call. Completion bookkeeping remains above the platform split in
   `hle_kernel_mem.cpp`.
+  Include the private accounting header first in both sources: it retains the original Windows
+  feature-level guard before any system header.
 * `hle/kernel/` owns the event queues an APR completion is posted to.
 
 ## What a newcomer gets wrong here
