@@ -1,10 +1,10 @@
 # `prosper/tests/fixtures/` — shared harnesses and hand-built inputs
 
-Header-only material that more than one test needs: the Vulkan/compute execution harnesses, and
+Shared material that more than one test needs: the Vulkan/compute execution harnesses, and
 hand-constructed binary inputs (a synthetic PRX, an ATRAC9 vector, captured GTA V shader words) that
 would otherwise be pasted into each test that wants them. Nothing here is a test itself — every file
-is included by tests in the sibling directories, which is why it is all headers with `inline`
-definitions and no translation unit of its own.
+is consumed by tests in the sibling directories. Most helpers remain inline; renderer resource
+validation compiles once in `render_resource_contracts.cpp` and links through `prosper_render_resources`.
 
 Two kinds live here and they are worth telling apart:
 
@@ -25,6 +25,8 @@ Two kinds live here and they are worth telling apart:
   NGG draws that call cannot run (P5). `backend_color_formats.h` holds `render_runner.h`'s
   guest-to-host colour/texture format tables (host format, bytes per texel, numeric class); extend
   a format there, not inline in the runner.
+  `render_resource_contracts.h` holds the frame-resource and attachment contracts; its source owns
+  their shape, span and numeric-class validation. The renderer umbrella exports the same API.
 - **Fixtures proper** — `at9_testvec.h`, `handmade_prx.h`, `synth_prx.h`, `spirv_*.h`, `test_data.h`,
   `gta5_*_fixture.hpp`. These are data, frozen at a known-good state so an assertion has something
   stable to compare against.
