@@ -9,6 +9,9 @@ save data the platform layers on top of it.
 - `guest_fopen_mode` — the guest's `fopen` mode grammar (Dinkumware `_Foprep`, read from the
   shipped libc.prx), re-spelled for the host C library; on Windows a verbatim mode opened guest
   binary files in text mode. Only titles that ship no libc.prx reach it.
+- `guest_path_lexical` — the path resolver's lexical normalization, mount-boundary and dot-component
+  helpers. They do no host I/O and own no mount state; mapping and namespace policy stay in
+  `hle_file.cpp`. The private header declares the shared helpers without inline bodies.
 - `guest_devices` — the device nodes the guest namespace serves itself: `/dev/urandom` and
   `/dev/random`, read by every IL2CPP title's crypto provider. Reads come from the host CSPRNG on a
   descriptor backed by the host null device; the guest's spelling never reaches the host. Nothing

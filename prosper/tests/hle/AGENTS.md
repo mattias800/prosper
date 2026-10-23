@@ -15,3 +15,7 @@ destruction canary and immortal-registry checks retain their lifetime contracts.
 The existing AMPR offset, AMM buffer and gather/scatter fixtures exercise the shared
 `ampr_command_buffer.cpp` accounting through the registered guest APIs and retained test seam.
 The capacity/cursor and attached-storage state have one owner shared by both platform arms.
+
+`test_translate_sandbox` exercises the real filesystem resolver and its lexical path helpers in
+`src/hle/fs/guest_path_lexical.cpp`. Mount ownership and guest namespace policy remain in the
+registered filesystem entry points; the extracted helpers retain the same lexical decisions.
