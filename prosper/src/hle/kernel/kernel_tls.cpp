@@ -16,7 +16,9 @@
 namespace prosper {
 // clang-format off: preserve the byte-identical moved definitions.
 namespace {
+// NOLINTNEXTLINE(bugprone-throwing-static-initialization): preserve the existing process-lifetime Immortal holder.
 Immortal<std::vector<TlsModuleDesc>> g_tls_mods;
+// NOLINTNEXTLINE(bugprone-throwing-static-initialization): preserve the existing process-lifetime Immortal holder.
 Immortal<std::mutex> g_tls_mods_mx;   // guards g_tls_mods: a runtime sceKernelLoadStartModule re-runs
                             // set_tls_modules (assign, may realloc) while a worker is in k_tls_get_addr (#344).
 // Per-thread DTV (thread -> module id -> TLS block). MUST NOT use a host `thread_local`: guest threads
@@ -29,7 +31,9 @@ Immortal<std::mutex> g_tls_mods_mx;   // guards g_tls_mods: a runtime sceKernelL
 // scePthreadExit/pthread_exit) via tls_dtv_purge_current_thread(): glibc recycles pthread ids, so a
 // stale entry would hand a NEW thread the dead thread's dirty TLS blocks instead of the fresh
 // zero/tdata-initialized state the ABI guarantees — and the blocks would leak per thread churn (#68).
+// NOLINTNEXTLINE(bugprone-throwing-static-initialization): preserve the existing process-lifetime Immortal holder.
 Immortal<std::mutex> g_dtv_mx;
+// NOLINTNEXTLINE(bugprone-throwing-static-initialization): preserve the existing process-lifetime Immortal holder.
 Immortal<std::unordered_map<std::thread::id, std::unordered_map<uint64_t, void*>>> g_dtv;
 static_assert(std::is_trivially_destructible_v<decltype(g_tls_mods)> &&
               std::is_trivially_destructible_v<decltype(g_tls_mods_mx)> &&
@@ -54,6 +58,7 @@ size_t tls_dtv_thread_count() {   // test/diagnostic introspection: threads with
 }
 void set_tls_modules(const TlsModuleDesc* descs, size_t count) {
     { std::lock_guard<std::mutex> lk(*g_tls_mods_mx); g_tls_mods->assign(descs, descs + count); }
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): preserve the existing per-publication diagnostic read.
     if (getenv("PROSPER_TLSLOG"))
         for (size_t i = 0; i < count; i++)
             fprintf(stderr, "[tls] module %zu: init_va=0x%llx filesz=0x%llx memsz=0x%llx\n", i,

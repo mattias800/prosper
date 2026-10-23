@@ -10,6 +10,8 @@
 #endif
 #endif
 #include "hle/dispatch/dispatch.hpp"
+#include <stddef.h>
+#include <stdint.h>
 
 namespace prosper {
 void tls_dtv_purge_current_thread();
