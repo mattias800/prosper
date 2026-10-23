@@ -62,7 +62,7 @@ struct AudioStereoGain { float left = 0.0f, right = 0.0f; };
 // CONFIDENCE: HIGH that the bed's first two channels are the front pair; **MED for which of a pair
 // is the LEFT one** — prosper's live measurement groups channels by side but cannot orient the
 // groups (correlation is symmetric under a swap), so orientation rests on the index-0 = FrontLeft
-// convention rather than on evidence. See hle_audio.cpp for the measurement and the experiment that
+// convention rather than on evidence. See audio_pcm_contracts.cpp for the measurement and the experiment that
 // would settle it. MED for the 3..8 placements; 9..16 places only its first eight.
 constexpr unsigned kAudioMaxBedChannels = 16;
 unsigned audio_stereo_downmix(unsigned channels, AudioStereoGain* out, unsigned out_capacity);
