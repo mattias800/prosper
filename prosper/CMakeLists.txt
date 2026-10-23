@@ -8411,3 +8411,5 @@ if(WIN32 AND TARGET test_windows_guest_window)
   target_include_directories(test_windows_guest_window PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/generated/windows_guest_host/$<CONFIG>")
 endif()
+
+include(cmake/ProsperRenderResources.cmake)
