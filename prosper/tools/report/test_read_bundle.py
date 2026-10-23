@@ -105,6 +105,30 @@ def test_invalid_utf8_refuses_without_a_traceback(tmp_path, capsys):
     assert capsys.readouterr().out == ""
 
 
+@pytest.mark.parametrize(
+    ("filename", "displayed"),
+    [
+        (
+            "missing-\x1b]52;c;payload\x07\nforged.json",
+            "missing-\\u001b]52;c;payload\\u0007\\nforged.json",
+        ),
+        ("missing-\r\t\x7f\x9b.json", "missing-\\r\\t\\u007f\\u009b.json"),
+        ("missing-\u2028\u202e.json", "missing-\\u2028\\u202e.json"),
+    ],
+)
+def test_cli_refusal_displays_untrusted_filename_without_terminal_controls(
+    tmp_path, capsys, filename, displayed
+):
+    # Missing files still carry their supplied name in the refusal diagnostic. A report
+    # filename must not execute terminal commands or forge another diagnostic line.
+    assert rb.main([str(tmp_path / filename)]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("refused:")
+    assert len(captured.err.splitlines()) == 1
+    assert displayed in captured.err
+
+
 def test_deeply_nested_switch_value_refuses_without_a_traceback(tmp_path, capsys):
     # Some supported runtimes reach the JSON decoder's recursion limit first; others can
     # parse this depth and reject the non-string switch value. Both must refuse cleanly.

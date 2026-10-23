@@ -87,7 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         record = load_bundle(args[0])
     except BundleError as error:
-        print(f"refused: {error}", file=sys.stderr)
+        print(f"refused: {display_text(str(error))}", file=sys.stderr)
         return 2
     for line in triage_lines(record):
         print(line)
