@@ -1830,11 +1830,10 @@ int main(int argc, char** argv) {
         } else if (a == "--list-games")
             listGames = true;   // print the library and exit (headless)
         else if (a == "--report") {
-            if (i + 1 >= argc || argv[i + 1][0] == '\0') {
+            if (!prosper::frontend::parse_report_directory(i, argc, argv, reportDir)) {
                 std::fprintf(stderr, "prosper-app: --report requires a directory\n");
                 return 2;
             }
-            reportDir = argv[++i];
         } else if (a == "--set-games-dir") {   // persist and exit
             if (i + 1 >= argc) {
                 fprintf(stderr, "prosper-app: --set-games-dir requires a path (\"\" clears it)\n");

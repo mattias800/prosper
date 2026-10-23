@@ -26,6 +26,15 @@
 
 namespace prosper::frontend {
 
+// Consume the directory only after validation so a missing value cannot swallow another
+// option. A relative path starting with '-' can be written with a './' prefix.
+inline bool parse_report_directory(int& index, int argc, const char* const* argv,
+                                   std::string& directory) {
+    if (index + 1 >= argc || argv[index + 1][0] == '\0' || argv[index + 1][0] == '-') return false;
+    directory = argv[++index];
+    return true;
+}
+
 // Bundle format version. Bump when a section is added; readers accept any version they know
 // and must fail loudly on one they do not, never by guessing.
 inline constexpr int kReportBundleSchema = 1;

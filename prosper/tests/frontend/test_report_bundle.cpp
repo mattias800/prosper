@@ -21,6 +21,36 @@ using prosper::frontend::report_host_os;
 using prosper::frontend::report_json_escape;
 using prosper::frontend::ReportBundle;
 
+TEST(ReportArguments, ConsumesOnlyTheDirectoryAndPreservesFollowingOptions) {
+    for (const char* path : {"reports", "./-reports", "/tmp/reports", "reports with spaces"}) {
+        const char* argv[] = {"prosper-app", "--report", path, "--fps"};
+        int index = 1;
+        std::string directory;
+        ASSERT_TRUE(prosper::frontend::parse_report_directory(index, 4, argv, directory));
+        EXPECT_EQ(index, 2);
+        EXPECT_EQ(directory, path);
+        EXPECT_STREQ(argv[index + 1], "--fps");
+    }
+}
+
+TEST(ReportArguments, MissingEmptyAndOptionValuesRefuseWithoutConsumingArguments) {
+    const char* missing[] = {"prosper-app", "--report"};
+    int index = 1;
+    std::string directory = "previous";
+    EXPECT_FALSE(prosper::frontend::parse_report_directory(index, 2, missing, directory));
+    EXPECT_EQ(index, 1);
+    EXPECT_EQ(directory, "previous");
+    for (const char* value : {"", "--list-games", "--report", "--fps", "-x"}) {
+        SCOPED_TRACE(value);
+        const char* argv[] = {"prosper-app", "--report", value};
+        EXPECT_FALSE(prosper::frontend::parse_report_directory(index, 3, argv, directory));
+        EXPECT_EQ(index, 1) << "the next option must remain available to the parser";
+        EXPECT_EQ(directory, "previous") << "a refused value must never become an output path";
+        index = 1;
+        directory = "previous";
+    }
+}
+
 TEST(ReportBundle, NamesItsTypeAndSchema) {
     EXPECT_NE(report_bundle_json(ReportBundle{}).find("\"type\":\"report\""), std::string::npos)
         << "a reader that cannot see the type cannot route the file";

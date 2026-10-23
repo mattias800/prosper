@@ -240,8 +240,9 @@ tuning one; leave it unset for normal use.
 - `--report <dir>` — write one versioned bug-report bundle (`report.json`: tool, build revision +
   source identity, host OS, title id, switches) and exit, with no window, no Vulkan and
   no guest. Path-bearing switch values are replaced by `<redacted-path>`; this static report
-  does not carry complete reproduction configuration. A missing or empty directory is an error
-  (exit 2). The previous report remains intact if writing, closing or installing its replacement
+  does not carry complete reproduction configuration. A missing, empty or option-looking directory
+  is an error (exit 2); use `./-name` for a relative directory starting with a hyphen.
+  The previous report remains intact if writing, closing or installing its replacement
   fails. Static slice of proposed ADR 0021; perf-alarm
   summary, unimplemented NIDs, log tail and fault backtraces arrive as later sections.
 - **Exit status.** 0 clean; 1 `--frames N` not reached; 3 the guest faulted (entry thread ended with a
