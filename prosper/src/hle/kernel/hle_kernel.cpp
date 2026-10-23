@@ -2,19 +2,9 @@
 // pthreads (guest ABI == host SysV ABI). Sony pthread types are opaque pointer
 // handles: scePthreadMutexInit(&handle, &attr, name) allocates the object and stores
 // the pointer through the caller's handle slot, returning 0 on success.
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE   // pthread_getattr_np
-#endif
-#ifdef _WIN32
-// Must precede any header that transitively includes windows.h (e.g. winpthreads <pthread.h>) so
-// GetCurrentThreadStackLimits (needs _WIN32_WINNT >= 0x0602 / Win8) is declared.
-#ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x0A00
-#endif
-#endif
+#include "hle/kernel/kernel_tls_internal.hpp"
 #include "hle/kernel/exc_pending.hpp"   // macOS raise payload table (#4324)
 #include "hle/dispatch/dispatch.hpp"
-#include "hle/kernel/kernel_tls_internal.hpp"
 #include "hle/dispatch/nid.hpp"
 #include "hle/kernel/guest_thread_handle.hpp"   // Windows: guest-readable ScePthread objects
 #include "hle/kernel/sce_errno.hpp"
