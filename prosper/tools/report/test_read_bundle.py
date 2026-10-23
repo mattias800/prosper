@@ -105,6 +105,20 @@ def test_invalid_utf8_refuses_without_a_traceback(tmp_path, capsys):
     assert capsys.readouterr().out == ""
 
 
+def test_deeply_nested_switch_value_refuses_without_a_traceback(tmp_path, capsys):
+    # Some supported runtimes reach the JSON decoder's recursion limit first; others can
+    # parse this depth and reject the non-string switch value. Both must refuse cleanly.
+    nested_value = "[" * 20000 + "0" + "]" * 20000
+    record = json.dumps(bundle(switches={}))[:-2]
+    path = tmp_path / "report.json"
+    path.write_text(record + '"PROSPER_NESTED":' + nested_value + "}}", encoding="utf-8")
+    assert rb.main([str(path)]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("refused:")
+    assert "Traceback" not in captured.err
+
+
 @pytest.mark.parametrize(
     ("field", "value", "expected"),
     [

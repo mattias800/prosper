@@ -31,6 +31,8 @@ def load_bundle(path: str | Path) -> dict:
         raise BundleError(f"{path}: not readable UTF-8") from error
     try:
         record = json.loads(text)
+    except RecursionError as error:
+        raise BundleError(f"{path}: JSON nesting exceeds this reader's limit") from error
     except ValueError as error:
         raise BundleError(f"{path}: not valid JSON ({error})") from error
     if not isinstance(record, dict):
