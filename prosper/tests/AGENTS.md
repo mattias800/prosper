@@ -66,6 +66,10 @@ Older tests are standalone executables registered with `add_test` and a local `C
 
 ## Where things go
 
+Compute address-watch and convention-binding fixtures retain their umbrella entry points after
+the stateless matchers and binding-row contracts move to `gpu/diagnostics/compute_binding_watch`.
+The existing tests exercise those compiled bodies; this mechanical move adds no behavioral assertion.
+
 Embedded-table and typed-buffer folding fixtures exercise `rdna2_cfg_pcrel_tables` and its private
 load passes through the CFG umbrella. Preserve the existing typed and untyped admission predicates
 and entry-soundness coverage when moving these format proofs.

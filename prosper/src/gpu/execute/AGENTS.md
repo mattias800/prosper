@@ -45,6 +45,8 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
 - `draw_index_width` — the byte fingerprints for an unannounced 32-bit index buffer.
   `draw_index_source` owns the shared index-source rule and the indexed NGG fetch that consumes it.
   The executor umbrella exports both contracts.
+- `diagnostics/compute_binding_watch` — the address-watch matcher and binding-row value contracts
+  exported by the executor umbrella. Its stateless bodies compile separately from executor consumers.
 - `ngg_subgroup_plan` — partitions a merged ES+GS NGG draw into guest subgroups and computes the
   launch SGPR s3 and VGPRs v0..v8 each wave receives (#3135 phase P1). Partition choices the public
   sources do not settle are an explicit, documented policy; anything unmodelled is a refusal.
