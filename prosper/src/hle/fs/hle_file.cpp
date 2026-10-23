@@ -4,6 +4,7 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE   // pthread_getattr_np (bound the PREADLOG/DEEPTRACE stack walk to the real stack)
 #endif
+#include "hle/fs/guest_path_lexical_internal.hpp"
 #include "hle/fs/save_capacity.hpp"   // allocation record + usage for GetMountInfo (#3654)
 #include "hle/dispatch/dispatch.hpp"
 #include "hle/fs/save_paths.hpp"
@@ -667,56 +668,6 @@ namespace {
             if (lower.find(sub) != std::string::npos) return true;
         return false;
     }
-    // Lexically normalize a virtual sub-path (the part AFTER a /app0|/temp0|/savedata0 root),
-    // treating both '/' and '\\' as separators. Collapses "." and applies ".." within the sub-path.
-    // Returns the normalized sub-path (leading '/', e.g. "/a/../b" -> "/b", "" for the root itself) if
-    // it stays AT OR BELOW the root, or std::nullopt if a ".." climbs above it (a sandbox escape).
-    // Purely lexical — no filesystem access. Only invoked when the sub-path contains "..", so a normal
-    // path never reaches it and is composed byte-for-byte as before. CONFIDENCE: HIGH (pure string op).
-    std::optional<std::string> sandbox_normalize_subpath(const std::string& sub) {
-        std::vector<std::string> stack;
-        size_t i = 0;
-        auto is_sep = [](char c) { return c == '/' || c == '\\'; };
-        while (i < sub.size()) {
-            while (i < sub.size() && is_sep(sub[i])) i++;
-            size_t j = i; while (j < sub.size() && !is_sep(sub[j])) j++;
-            std::string comp = sub.substr(i, j - i);
-            i = j;
-            if (comp.empty() || comp == ".") continue;
-            if (comp == "..") { if (stack.empty()) return std::nullopt; stack.pop_back(); continue; }
-            stack.push_back(comp);
-        }
-        std::string out;
-        for (const auto& c : stack) { out += '/'; out += c; }
-        return out;
-    }
-    // Clamp-normalize a RELATIVE guest path (#1226): same lexical walk as sandbox_normalize_subpath,
-    // but a ".." with nothing left to pop is dropped (the POSIX "/.." == "/" rule at the virtual
-    // root) instead of failing. Only for rootless relative spellings — an ABSOLUTE guest path that
-    // climbs above its mount stays a denied sandbox escape (#1205). Returns the normalized path
-    // with no leading separator ("a/../../b/c" -> "b/c").
-    std::string clamp_normalize_relative(const std::string& sub) {
-        std::vector<std::string> stack;
-        size_t i = 0;
-        auto is_sep = [](char c) { return c == '/' || c == '\\'; };
-        while (i < sub.size()) {
-            while (i < sub.size() && is_sep(sub[i])) i++;
-            size_t j = i; while (j < sub.size() && !is_sep(sub[j])) j++;
-            std::string comp = sub.substr(i, j - i);
-            i = j;
-            if (comp.empty() || comp == ".") continue;
-            if (comp == "..") { if (!stack.empty()) stack.pop_back(); continue; }
-            stack.push_back(std::move(comp));
-        }
-        std::string out;
-        for (const auto& c : stack) { if (!out.empty()) out += '/'; out += c; }
-        return out;
-    }
-    bool mount_path_matches(const std::string& path, const char* mount) {
-        const size_t len = std::strlen(mount);
-        return path.compare(0, len, mount) == 0 &&
-               (path.size() == len || path[len] == '/' || path[len] == '\\');
-    }
     // ---- The guest filesystem namespace (#4782) ------------------------------------------------
     // Every path-taking entry point resolves its guest path through resolve_guest() below, and only
     // a Mapped result carries a host path. A guest path that no served mount owns never reaches a
@@ -769,20 +720,6 @@ namespace {
     uint64_t refuse_errno(int error) {
         errno = error;
         return (uint64_t)(int64_t)-1;
-    }
-    // A path component that is "." or "..", split on either guest separator.
-    bool has_dot_component(const std::string& p) {
-        size_t i = 0;
-        while (i < p.size()) {
-            while (i < p.size() && (p[i] == '/' || p[i] == '\\')) ++i;
-            size_t j = i;
-            while (j < p.size() && p[j] != '/' && p[j] != '\\') ++j;
-            const size_t len = j - i;
-            if ((len == 1 && p[i] == '.') || (len == 2 && p[i] == '.' && p[i + 1] == '.'))
-                return true;
-            i = j;
-        }
-        return false;
     }
     // The POSIX-name refusal: -1 with the guest namespace's errno. The k_* wrappers re-encode it.
     uint64_t refuse_unmapped(const GuestPath& g, GuestPathOp op) {
