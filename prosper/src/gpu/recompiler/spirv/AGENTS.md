@@ -8,11 +8,20 @@ name you can guess.
 
 | file | the RDNA2 facility it emits for |
 | --- | --- |
-| `image` | **MIMG** — sample, fetch, gather, LOD query, resinfo, image atomics, and the coordinate/tap setup they share |
+| `image` / `texture_types` | **MIMG** — sampled-image types and texture declarations, sample, fetch, gather, LOD query, resinfo, image atomics, and shared coordinate/tap setup |
+| `storage_image_access` | storage-image declarations, reads and predicated writes |
+| `image_compare_manual` | manual 2D comparison sampling, including address selection and nearest/linear tap mixing |
 | `buffer` | **SMEM / MUBUF** — constant and storage buffer access, binding resolution, coherence marking |
-| `lds_gds` | **DS** and **GDS** — shared and global data share, including their atomics |
+| `buffer_access` | buffer element selection and ordinary load/store emission |
+| `buffer_declarations` | **SMEM / MUBUF** — storage-buffer Block types, table-contract checks and descriptor binding declarations |
+| `lds_gds` / `lds_gds_access` | **DS** and **GDS** — shared and global data share, including atomics, storage declarations, predicated stores and scratch-wave append |
 | `wave` | subgroup and wave-level operations — ballot, votes, `mbcnt`, DPP, swizzle, lane and invocation ids |
+| `wave_lane_ops` | native subgroup row shift/XOR and 32-lane BPERMUTE emission |
 | `shader_io` | **EXP** plus stage interface — exports, fragment interpolation, vertex and fragment inputs/outputs |
+| `geometry_setup` | interpolation geometry entry, interface declarations and input loading |
+| `geometry_vertices` | interpolation geometry parameter planes, rectangle selection and vertex emission |
+| `stage_entry` | fragment and vertex entry declarations and function setup |
+| `compute_entry` | compute module entry, storage interfaces and guest invocation coordinates |
 | `control_flow` | phi placement and patching, switches, barriers, `discard`, invocation guards |
 | `numeric` | packing, unpacking, conversion, 64-bit arithmetic and the integer helpers the ALU emitters call |
 | `guest_memory` | guest scratch, pointer relocation and descriptor capture — the parts that reach into guest address space |
@@ -20,9 +29,12 @@ name you can guess.
 
 ## What is NOT here
 
-`SpirvCompute` itself — the class, its fields and the small accessors — stays in
-`../rdna2_to_spirv_internal.hpp`. These files hold its method *definitions*, which is why every one
-of them is `SpirvCompute::` qualified and none declares anything.
+`SpirvCompute` itself — the class, its fields and small accessors — is exposed by
+`../rdna2_to_spirv_internal.hpp` through the adjacent `rdna2_spirv_compute*.inl` class sections.
+The sections preserve member order and are included only at that class scope. These source files
+hold method *definitions*, each `SpirvCompute::` qualified.
+Direct section includes redirect through the umbrella; declaration/member scope guards keep
+the original payload at its original class site.
 
 The **decision** to emit lives in the `rdna2_emit_*` files. If you are asking "why did this
 instruction produce nothing", that is a question for the emitters or the decoder, not for this

@@ -27,6 +27,11 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   translator: register state, control-flow structurization, and per-instruction lowering.
   The existing SOPP opcode switch lives in `ir/lower/sopp_case_routes`, borrowing the original
   emitter state and safe-branch set without changing branch or barrier admission.
+- `spirv/texture_types` — sampled-image type construction and texture descriptor declarations.
+  Their bodies compile in a source; defaults and the type-key accessor stay with `SpirvCompute`.
+- `spirv/lds_gds_access` — internal GDS storage declarations, predicated LDS stores and the
+  workgroup-scratch wave-append implementation. Their defaults stay on `SpirvCompute` declarations;
+  the unchanged bodies compile in a source alongside the other DS/GDS definitions.
 - `rdna2_cfg_counted_loop` — counted-loop shapes and their admission rules, shared by the
   structured emitter and IR region tree. `rdna2_cfg_branch_helpers` holds the common branch target,
   waterfall and bottom-tested SCC-condition helpers. Their bodies compile in sources;
@@ -370,3 +375,10 @@ module per path, not one per game shader.
 
 Primary reference: *"RDNA 2" Instruction Set Architecture Reference Guide* (AMD doc 70648). PS5
 extensions and AGC behaviour still require live title evidence.
+
+`rdna2_spirv_compute.inl` holds the builder class under the existing internal umbrella. Its
+state, value-operation, resource and workgroup/stage sections are class-scope includes, kept in
+original member order. Nontrivial method bodies compile in the facility sources under `spirv/`;
+include the umbrella rather than these declaration sections directly.
+Direct section includes redirect through the umbrella; declaration/member scope guards keep
+the original payload at its original class site.

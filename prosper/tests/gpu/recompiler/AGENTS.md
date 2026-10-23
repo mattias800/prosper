@@ -78,6 +78,52 @@ The existing [VINTRP scalar-liveness fixtures](test_vintrp_scalar_liveness.cpp) 
 [compare-kill fixtures](test_fragment_compare_kill.cpp) exercise its reads, physical half-width
 inputs and path termination through the original proof and compiler entry points.
 
+Native subgroup row and BPERMUTE emission lives in
+[`wave_lane_ops.cpp`](../../../src/gpu/recompiler/spirv/wave_lane_ops.cpp).
+The existing [DPP source fixtures](ir/test_ir_dpp_source_execution.cpp),
+[row-XOR fixtures](ir/test_ir_dpp_row_xor_execution.cpp) and
+[BPERMUTE oracle](test_portable_bpermute.cpp) exercise lane selection through the real compiler.
+
+SPIR-V buffer element selection and ordinary loads/stores live in
+[`buffer_access.cpp`](../../../src/gpu/recompiler/spirv/buffer_access.cpp).
+The existing [SMEM index fixtures](ir/test_ir_smem_index_execution.cpp) and
+[buffer-store fixtures](ir/test_ir_buffer_store_execution.cpp) reach these methods through the
+real compiler.
+
+Interpolation geometry setup and vertex emission live in
+[`geometry_setup.cpp`](../../../src/gpu/recompiler/spirv/geometry_setup.cpp) and
+[`geometry_vertices.cpp`](../../../src/gpu/recompiler/spirv/geometry_vertices.cpp).
+The existing [interpolation rendering fixtures](test_interp_render.cpp) and
+[rectangle synthesis fixtures](test_rect_synthesis_render.cpp) exercise their emitted modules.
+
+Storage-image declarations and read/write emission live in
+[`storage_image_access.cpp`](../../../src/gpu/recompiler/spirv/storage_image_access.cpp).
+The existing [storage-image copy fixtures](../test_storage_image_copy.cpp) exercise these methods
+through the real compiler and Vulkan execution.
+
+Fragment and vertex entry setup lives in
+[`stage_entry.cpp`](../../../src/gpu/recompiler/spirv/stage_entry.cpp).
+The existing [fragment front-face fixtures](test_fragment_front_face.cpp) and
+[vertex VCC lifetime fixtures](test_vertex_vcc_scalar_lifetime.cpp) exercise the corresponding
+stage shells through the real compiler.
+
+Manual 2D comparison sampling lives in
+[`image_compare_manual.cpp`](../../../src/gpu/recompiler/spirv/image_compare_manual.cpp).
+The existing [shadow comparison fixtures](../test_shadow_compare_render.cpp) exercise nearest and
+linear sampling through the real compiler and Vulkan execution.
+
+Storage-buffer declarations live in
+[`buffer_declarations.cpp`](../../../src/gpu/recompiler/spirv/buffer_declarations.cpp).
+The existing [SMEM index execution fixtures](ir/test_ir_smem_index_execution.cpp) exercise their
+table-indexed additional bindings through the real compiler; declarations and defaults remain
+available on `SpirvCompute` through its umbrella header.
+
+Compute entry setup lives in
+[`spirv/compute_entry.cpp`](../../../src/gpu/recompiler/spirv/compute_entry.cpp).
+The existing [native-launch fixtures](test_native_compute_launch.cpp) and
+[structural module fixtures](../test_rdna2_spirv_struct.cpp) continue through the unchanged compiler
+entry points. Storage declarations and invocation-coordinate setup retain their emission order.
+
 The remaining DS case routes live in
 [`ds_case_lowering.cpp`](../../../src/gpu/recompiler/ir/lower/ds_case_lowering.cpp).
 Their [address execution fixtures](ir/test_ir_ds_address_execution.cpp) cover real LDS accesses;
@@ -95,6 +141,17 @@ The MUBUF/MTBUF access tail lives in
 Its [format execution fixtures](ir/test_ir_buffer_format_execution.cpp) and
 [store execution fixtures](ir/test_ir_buffer_store_execution.cpp) continue through the real compiler.
 Descriptor/proof resolution and the diagnostic logger retain their original parent-case ownership.
+
+Sampled-image type construction and texture declarations live in
+[`texture_types.cpp`](../../../src/gpu/recompiler/spirv/texture_types.cpp).
+The existing [structural shader fixtures](../test_rdna2_spirv_struct.cpp) retain their sampled-image
+coverage; mechanical token read-back separately verifies the moved bodies and declaration defaults.
+
+The remaining LDS/GDS storage and scratch-wave append bodies live in
+[`lds_gds_access.cpp`](../../../src/gpu/recompiler/spirv/lds_gds_access.cpp).
+The existing [structural shader fixtures](../test_rdna2_spirv_struct.cpp) and
+[DS address execution fixtures](ir/test_ir_ds_address_execution.cpp) retain their operation coverage;
+mechanical token read-back checks the relocation and retained declaration defaults separately.
 
 **Prefer a small binary over another arm in a big one, whenever rejects are the subject.** Most
 tests here return at their first `[FAIL]`, which is fine for a suite that should be all-green but
@@ -230,3 +287,9 @@ Register-state data and shared mark helpers live in
 The existing [portable mask-half fixtures](test_portable_mask_half.cpp) cover half replacement
 and [launch-word fixtures](test_unloaded_launch_vgpr.cpp) cover definedness through the real compiler.
 Their umbrella include remains available to existing callers.
+
+The `rdna2_spirv_compute*.inl` sections retain the builder declaration behind the internal umbrella.
+Existing structural and execution fixtures keep using that API; relocating the sections must retain
+the original field order, initializers, method defaults and class scope.
+The existing source-shape guard expands all member sections from the class entry fragment and keeps
+the inline-body scan nonempty; no method body over 40 lines may return to those declarations.
