@@ -42,6 +42,11 @@ reference binding sites.
   associations with the caller's timing report. Its exact reference aliases, local aggregate and
   synchronous call must satisfy `tools/env/REFERENCE_OUTPUTS.md`; this does not infer general C++
   effects. The four reports that physically moved retain their baseline classifications by re-key.
+- `image_resource_state.cpp` — the image materializer's mip-target consumption, texture-store slot
+  selection and depth-snapshot reset helpers, over the original borrowed draw-resource context.
+- `image_resource_bytes.cpp` — the image materializer's guest/host-backed resource and metadata
+  copy, direct-source and tiled-staging helpers. The staging leases use the existing shared inline
+  scratch pool; its ownership and the synchronous helper captures stay unchanged.
 - `timing_report.{hpp,cpp}` — `report_render_timing_aggregates`: the `PROSPER_RENDER_TIMING`
   lifetime/window summaries; and `publish_renderer_timing_record`, the F8 capture's per-submit
   `RendererTimingRecord`.

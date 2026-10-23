@@ -5341,6 +5341,8 @@ endif()
                                                frontends/shared/live/submit_renderer/callback_thread_state.cpp
                                                frontends/shared/live/submit_renderer/draw_resources.cpp
                                                frontends/shared/live/submit_renderer/image_resources.cpp
+                                               frontends/shared/live/submit_renderer/image_resource_state.cpp
+                                               frontends/shared/live/submit_renderer/image_resource_bytes.cpp
                                                frontends/shared/live/submit_renderer/native_bc_chain_audit.cpp
                                                frontends/shared/live/submit_renderer/timing_report.cpp
                                                frontends/shared/live/submit_renderer/backend_draws.cpp
@@ -5755,6 +5757,8 @@ endif()
                                                frontends/shared/live/submit_renderer/callback_thread_state.cpp
                                                frontends/shared/live/submit_renderer/draw_resources.cpp
                                                frontends/shared/live/submit_renderer/image_resources.cpp
+                                               frontends/shared/live/submit_renderer/image_resource_state.cpp
+                                               frontends/shared/live/submit_renderer/image_resource_bytes.cpp
                                                frontends/shared/live/submit_renderer/native_bc_chain_audit.cpp
                                                frontends/shared/live/submit_renderer/timing_report.cpp
                                                frontends/shared/live/submit_renderer/backend_draws.cpp
