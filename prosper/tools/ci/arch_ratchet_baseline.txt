@@ -238,7 +238,7 @@ file-size|prosper/src/hle/kernel/hle_kernel.cpp 5547  # 1 below main (5548): the
 # note #4796: +7 lines for guest_virtual_address_tracked, the one query that must read the private
 # mapping table (g_maps under g_mx): whether ANY guest mapping covers an address, whatever its CPU
 # protection. Host readability cannot answer it for GPU-only memory (#4801 review B1).
-file-size|prosper/src/hle/memory/hle_kernel_mem.cpp 8665  # was lowered to 8658 when mapping-table query templates moved to guest_mapping_queries.hpp
+file-size|prosper/src/hle/memory/hle_kernel_mem.cpp 8458  # lowered: shared AMPR command-buffer accounting moved verbatim to ampr_command_buffer.cpp
 # note #3951: eighteen net lines, including two scoped-format wraps, connect owned input/output
 # plans to the existing renderer companion.
 # Logical64 current READFIRST/raw-load results complete before normal guest attachment publication.
@@ -307,7 +307,9 @@ platform-ifdef|prosper/src/hle/memory/heap_mutex.hpp 1
 # supplement the same HLE origin proof; the query never commits or repairs guest mappings.
 # #4349: bounded Windows tracking bridge for committed-direct section fault safety; native VM
 # policy lives in a companion. Linux granule proof and unsupported-host refusal remain separate.
-platform-ifdef|prosper/src/hle/memory/hle_kernel_mem.cpp 20
+platform-ifdef|prosper/src/hle/memory/hle_kernel_mem.cpp 19
+# note: original pre-include Windows feature guard moved to the shared private interface; net zero.
+platform-ifdef|prosper/src/hle/memory/ampr_command_buffer_internal.hpp 1
 platform-ifdef|prosper/src/hle/np/np.cpp 2
 platform-ifdef|prosper/src/hle/service/hle_service.cpp 2
 platform-ifdef|prosper/src/hle/service/service_trace.hpp 1
