@@ -104,6 +104,9 @@ changes nothing the guest sees (#4700).
 - `compute_tree_watch`, `compute_parent_walk` — watching addresses and walking compute parentage.
   The address-list parser they share, `watch_list`, and the rate limiter `diag_ratelimit` live one
   layer down in `src/diagnostics/`, because the diagnostics layer uses them too.
+- `compute_binding_watch` — stateless address-range matching and binding-row selection/dedup keys.
+  The executor umbrella exports its value types and declarations; bodies compile once in the core.
+  Environment parsing, reporting and process-lifetime dedup owners stay with their existing callers.
 - `draw_program_skip` — naming a graphics shader program, to census it or to decline every draw
   that uses it.
 - `refused_shader_dump` — on by default: each distinct refused shader (vertex, pixel or compute) is written once per run, with an index line naming its first unsupported instruction, into `refused_shaders_*/` under `PROSPER_CAPTURE_DIR`. Bounded and deduplicated by code hash, so it costs nothing on a clean run. `PROSPER_SHADER_DUMP` remains the unbounded opt-in.
