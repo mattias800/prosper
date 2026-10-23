@@ -337,25 +337,22 @@ a transfer, so read that as an upper bound.
 
 ### The prove-less alternative (2026-10-23)
 
-This section records a comparison made after the decision above was written. It may shrink the
-decision, so it comes before acceptance.
+This section records an alternative considered after the decision above was written. It may shrink
+the decision, so it comes before acceptance.
 
-**Where it came from.** Another PS5 recompiler, KytyPS5, was read as a cross-check. Nothing was
-taken from it; the point is that it is a working design with no validity analysis and no static
-mask-domain proofs. Read before comparing, because the first guess was wrong: **its execution model
-is the same as prosper's.** Both branch on a wave vote (a subgroup any/all over the per-lane
-predicate) and both write VGPRs through `select(exec, new, old)`. The difference is not control flow.
-It is two policies:
+**What prosper would change.** This alternative would retain prosper's wave-vote branches
+(subgroup any/all over the per-lane predicate) and `select(exec, new, old)` VGPR writes. It proposes
+two policy changes, subject to the proof obligations and measurements below:
 
-1. **A word nobody supplied reads as a value, not as a refusal.** Its SSA construction starts every
-   register at zero. Prosper calls such a word a *placeholder* and refuses any read it cannot prove
-   is confined to lanes that are never observed (`fresh_mask_sources_defined`,
+1. **An unsupplied word could read as a value.** Initializing every register to zero would give
+   unsupplied words a value. Prosper calls such a word a *placeholder* and refuses any read it cannot
+   prove is confined to lanes that are never observed (`fresh_mask_sources_defined`,
    `vector_word_defined_in_exec`, the loop-carried fabricated check).
-2. **Whether an SGPR holds a lane mask is a runtime value, not a proof.** Each SGPR carries an
-   SSA-tracked "holds a mask" bit next to its value. A mask read selects between the per-lane bit
-   and the bit decoded from the integer at the lane index, and constant propagation removes most of
-   those selects. Prosper proves the domain statically (`Domain`, the mask-half and spill-slot
-   domain analyses) and refuses when the proof fails.
+2. **An SGPR's mask representation could be tracked at runtime.** Each SGPR would carry an
+   SSA-tracked "holds a mask" bit next to its value. A mask read would select between the per-lane
+   bit and the bit decoded from the integer at the lane index. Constant propagation might remove
+   some selects; their remaining cost needs measurement. Prosper proves the domain statically
+   (`Domain`, the mask-half and spill-slot domain analyses) and refuses when the proof fails.
 
 **What those two policies cost prosper today.**
 
