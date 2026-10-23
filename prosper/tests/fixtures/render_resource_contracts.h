@@ -226,6 +226,7 @@ struct FrameResource : FrameBufferResource {
     // producer to be worth having. `CONFIDENCE: HIGH` that silent truncation is the wrong direction
     // here: a layout that quietly declares fewer descriptors than the guest asked for is the
     // under-reporting failure, and it is the one nobody files.
+    // NOLINTNEXTLINE(bugprone-derived-method-shadowing-base-method): preserve the texture-specific descriptor count.
     uint32_t written_descriptor_count() const {
         return is_texture() || is_internal_gds ? 1u : descriptor_arity();
     }
