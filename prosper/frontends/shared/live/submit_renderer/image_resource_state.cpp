@@ -1,6 +1,7 @@
 #include "shared/live/submit_renderer/image_resources.hpp"
 #include "shared/live/submit_renderer/draw_resources.hpp"
 #include "shared/live/submit_renderer/callback_types.hpp"
+#include "shared/live/live_renderer.hpp"
 #include <stddef.h>
 #include <stdint.h>
 #include <algorithm>
