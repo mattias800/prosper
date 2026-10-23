@@ -356,10 +356,12 @@ TEST(AprMeasureDuplicate, Contract) {
     //   Looking B up must now step OVER that tombstone. Terminating the chain there instead -- the
     //   classic open-addressing bug -- loses B silently: no error, no wrong return value, just an
     //   entry that never gets marked and later warns as a phantom mixed pattern.
-    {
+    // Hash placement includes the real destination address. Exercise distinct writable
+    // destinations, rather than relying on one address chosen by this process's ASLR.
+    std::array<Dest, 16> destinations;
+    for (Dest& d : destinations) {
         prosper_apr_reset_for_test();
         const uint32_t id = prosper_apr_register(path_a_storage, g_fixture.size());
-        Dest d;
         constexpr uint64_t kSize = 32;
         const uint64_t dst = d.addr();
 
@@ -368,24 +370,41 @@ TEST(AprMeasureDuplicate, Contract) {
         measure(id, dst, kSize, 0, 0, 0);
         read_file_guest(cb, 0, record, id, dst, kSize, 0, 0, 0);
 
-        // Search the key space for a colliding pair and for fillers that avoid their bucket.
+        // Search the key space for a colliding pair. The initial pairing record must not
+        // occupy either of the pair's slots: A must land at H and B at H+1.
         const auto bucket = [&](uint64_t off) {
             return prosper_apr_index_bucket_for_test(id, dst, off, kSize);
         };
+        constexpr size_t kIndexSlots = 256;
+        const size_t pairing_home = bucket(0);
         uint64_t off_a = 0, off_b = 0;
         bool found = false;
         for (uint64_t i = 1; i < 4000 && !found; ++i)
             for (uint64_t j = i + 1; j < 4000 && !found; ++j)
-                if (bucket(i * 4) == bucket(j * 4)) { off_a = i * 4; off_b = j * 4; found = true; }
+                if (const size_t home = bucket(i * 4);
+                    home != pairing_home && (home + 1) % kIndexSlots != pairing_home &&
+                    home == bucket(j * 4)) { off_a = i * 4; off_b = j * 4; found = true; }
         CHECK(found, "probe-collision arm: found two keys sharing a home bucket");
         if (found) {
             const size_t home = bucket(off_a);
+            // A different HOME alone is insufficient: a filler at H-1 can probe into and
+            // consume A's tombstone before B is looked up (#4094). Distinct filler homes,
+            // excluding all three occupied slots, make every filler insert at its own home.
+            std::array<bool, kIndexSlots> used_homes{};
+            used_homes[pairing_home] = true;
+            used_homes[home] = true;
+            used_homes[(home + 1) % kIndexSlots] = true;
             std::vector<uint64_t> fillers;
             for (uint64_t k = 1; fillers.size() < 63 && k < 200000; ++k) {
                 const uint64_t off = 8000 + k * 4;
-                if (off != off_a && off != off_b && bucket(off) != home) fillers.push_back(off);
+                const size_t filler_home = bucket(off);
+                if (off != off_a && off != off_b && !used_homes[filler_home]) {
+                    used_homes[filler_home] = true;
+                    fillers.push_back(off);
+                }
             }
-            CHECK(fillers.size() == 63, "probe-collision arm: found 63 non-colliding fillers");
+            CHECK(fillers.size() == 63, "probe-collision arm: found 63 distinct unoccupied filler homes");
+            if (fillers.size() != 63) continue;
 
             // PRECONDITION -- asserted for DIAGNOSIS, not for detection. Read that distinction
             // before trusting the assertion below, because the obvious justification for it is
