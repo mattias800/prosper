@@ -4,10 +4,16 @@
 // trusts it without re-running anything.
 #include <gtest/gtest.h>
 
-#include <cstdlib>
+#include <stdlib.h>
+#include <filesystem>
+#include <fstream>
+#include <ios>
+#include <iterator>
 #include <map>
 #include <string>
+#include <system_error>
 
+#include "fixtures/test_scratch.h"
 #include "report_bundle.hpp"
 
 using prosper::frontend::report_bundle_json;
@@ -109,4 +115,97 @@ TEST(ReportSwitches, CollectorSeesOnlyTheProsperSurface) {
     EXPECT_EQ(switches.find("PATH"), switches.end());
     EXPECT_EQ(switches.find("Path"), switches.end())
         << "the collector leaves non-PROSPER_* environment out of the record";
+}
+
+namespace {
+std::string read_report_file(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+class ReportBundleFile : public testing::Test {
+protected:
+    void SetUp() override {
+        directory = prosper_test::test_scratch_path(
+            testing::UnitTest::GetInstance()->current_test_info()->name());
+        std::filesystem::create_directories(directory);
+    }
+    void previous_report() {
+        std::ofstream(directory / "report.json") << "previous complete report\n";
+        std::ofstream(directory / "unrelated.txt") << "unrelated evidence\n";
+    }
+    void expect_previous_report() {
+        EXPECT_EQ(read_report_file(directory / "report.json"), "previous complete report\n");
+        EXPECT_EQ(read_report_file(directory / "unrelated.txt"), "unrelated evidence\n");
+        EXPECT_EQ(std::distance(std::filesystem::directory_iterator(directory),
+                                std::filesystem::directory_iterator()),
+                  2)
+            << "failed publication must clean only its private temporary";
+    }
+    std::filesystem::path directory;
+};
+}   // namespace
+
+TEST_F(ReportBundleFile, CreatesAndReplacesOnlyWithACompleteReport) {
+    std::error_code error;
+    ReportBundle bundle;
+    ASSERT_TRUE(prosper::frontend::write_report_bundle(directory, bundle, error));
+    EXPECT_FALSE(error);
+    EXPECT_EQ(read_report_file(directory / "report.json"), report_bundle_json(bundle) + "\n");
+    bundle.title_id = "PPSA00000";
+    ASSERT_TRUE(prosper::frontend::write_report_bundle(directory, bundle, error));
+    EXPECT_EQ(read_report_file(directory / "report.json"), report_bundle_json(bundle) + "\n");
+    EXPECT_EQ(std::distance(std::filesystem::directory_iterator(directory),
+                            std::filesystem::directory_iterator()),
+              1);
+}
+
+TEST_F(ReportBundleFile, PartialWritePreservesPreviousReport) {
+    previous_report();
+    std::error_code error;
+    const auto partial = [](const std::filesystem::path& path, const std::string&) {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out << "partial";
+        out.close();
+        return false;
+    };
+    EXPECT_FALSE(prosper::frontend::write_report_bundle(directory, ReportBundle{}, error, partial));
+    EXPECT_EQ(error, std::errc::io_error);
+    expect_previous_report();
+}
+
+TEST_F(ReportBundleFile, CloseFailurePreservesPreviousReport) {
+    previous_report();
+    std::error_code error;
+    const auto failed_close = [](const std::filesystem::path& path, const std::string& text) {
+        // Model the writer's late close error after every payload byte reached the temporary.
+        EXPECT_TRUE(prosper::frontend::write_report_payload(path, text));
+        return false;
+    };
+    EXPECT_FALSE(
+        prosper::frontend::write_report_bundle(directory, ReportBundle{}, error, failed_close));
+    EXPECT_EQ(error, std::errc::io_error);
+    expect_previous_report();
+}
+
+TEST_F(ReportBundleFile, FailedInstallPreservesDestinationAndUnrelatedEvidence) {
+    std::filesystem::create_directory(directory / "report.json");
+    std::ofstream(directory / "report.json" / "marker") << "retained\n";
+    std::ofstream(directory / "unrelated.txt") << "unrelated evidence\n";
+    std::error_code error;
+    EXPECT_FALSE(prosper::frontend::write_report_bundle(directory, ReportBundle{}, error));
+    EXPECT_TRUE(error);
+    EXPECT_EQ(read_report_file(directory / "report.json" / "marker"), "retained\n");
+    EXPECT_EQ(read_report_file(directory / "unrelated.txt"), "unrelated evidence\n");
+    EXPECT_EQ(std::distance(std::filesystem::directory_iterator(directory),
+                            std::filesystem::directory_iterator()),
+              2);
+}
+
+TEST_F(ReportBundleFile, RefusesAFileInPlaceOfTheReportDirectory) {
+    const auto output = directory / "not-a-directory";
+    std::ofstream(output) << "retained\n";
+    std::error_code error;
+    EXPECT_FALSE(prosper::frontend::write_report_bundle(output, ReportBundle{}, error));
+    EXPECT_TRUE(error);
+    EXPECT_EQ(read_report_file(output), "retained\n");
 }

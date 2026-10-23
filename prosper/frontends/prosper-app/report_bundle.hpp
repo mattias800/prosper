@@ -9,12 +9,20 @@
 // manifest's UTF-8 and Windows case-normalization contract instead of maintaining a second copy.
 
 #include <cstdio>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <ios>
 #include <map>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <system_error>
 
 #include "shared/capture/capture_manifest.hpp"
+#include "host/platform/file_replace.hpp"
 
 namespace prosper::frontend {
 
@@ -113,6 +121,53 @@ inline std::string report_host_os() {
 // collection refuses the report, rather than looking like an empty configuration.
 inline std::optional<std::map<std::string, std::string>> collect_report_switches() {
     return prosper::screenshot::collect_prosper_switches();
+}
+
+inline bool write_report_payload(const std::filesystem::path& path, const std::string& text) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out.write(text.data(), static_cast<std::streamsize>(text.size()));
+    out.put('\n');
+    out.close();
+    return static_cast<bool>(out);
+}
+
+// The writer includes close success. Injection exercises partial writes and late close errors
+// against real files without requiring a full filesystem. Only a completed private sibling is
+// installed; a failed write or replacement leaves the previous report available for triage.
+inline bool write_report_bundle(const std::filesystem::path& directory, const ReportBundle& bundle,
+                                std::error_code& error,
+                                bool (*write_payload)(const std::filesystem::path&,
+                                                      const std::string&) = write_report_payload) {
+    const std::string text = report_bundle_json(bundle);
+    std::filesystem::create_directories(directory, error);
+    if (error) return false;
+    static std::atomic<uint64_t> serial{0};
+    std::filesystem::path temporary;
+    for (unsigned attempt = 0; attempt < 16; ++attempt) {
+        temporary = directory /
+                    (".report-tmp-" +
+                     std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+                     "-" + std::to_string(serial.fetch_add(1)));
+        if (std::filesystem::create_directory(temporary, error)) break;
+        if (error || attempt == 15) {
+            if (!error) error = std::make_error_code(std::errc::file_exists);
+            return false;
+        }
+    }
+    struct Cleanup {
+        std::filesystem::path directory;
+        ~Cleanup() {
+            std::error_code ignored;
+            std::filesystem::remove_all(directory, ignored);
+        }
+    } cleanup{temporary};
+    const auto payload = temporary / "report.json";
+    if (!write_payload(payload, text)) {
+        error = std::make_error_code(std::errc::io_error);
+        return false;
+    }
+    prosper::host::replace_file(payload, directory / "report.json", error);
+    return !error;
 }
 
 }   // namespace prosper::frontend

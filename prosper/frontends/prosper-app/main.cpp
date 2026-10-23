@@ -2005,28 +2005,13 @@ int main(int argc, char** argv) {
             return 2;
         }
         bundle.switches = std::move(*switches);
-        std::error_code dir_ec;
-        std::filesystem::create_directories(reportDir, dir_ec);
-        if (dir_ec) {
-            std::fprintf(stderr, "prosper-app: cannot create report directory '%s': %s\n",
-                         reportDir.c_str(), dir_ec.message().c_str());
+        std::error_code report_ec;
+        if (!prosper::frontend::write_report_bundle(reportDir, bundle, report_ec)) {
+            std::fprintf(stderr, "prosper-app: cannot write report in '%s': %s\n",
+                         reportDir.c_str(), report_ec.message().c_str());
             return 1;
         }
         const std::string path = reportDir + "/report.json";
-        FILE* out = std::fopen(path.c_str(), "wb");
-        if (!out) {
-            std::fprintf(stderr, "prosper-app: cannot open '%s': %s\n", path.c_str(),
-                         std::error_code(errno, std::generic_category()).message().c_str());
-            return 1;
-        }
-        const std::string line = prosper::frontend::report_bundle_json(bundle);
-        const bool written = std::fprintf(out, "%s\n", line.c_str()) >= 0;
-        const bool closed = std::fclose(out) == 0;
-        if (!written || !closed) {
-            std::fprintf(stderr, "prosper-app: cannot write '%s': %s\n", path.c_str(),
-                         std::error_code(errno, std::generic_category()).message().c_str());
-            return 1;
-        }
         std::printf("prosper-app: report written -> %s\n", path.c_str());
         return 0;
     }

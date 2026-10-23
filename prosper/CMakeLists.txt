@@ -2057,7 +2057,12 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_prosper_app_report_bundle
     SOURCES tests/frontend/test_report_bundle.cpp
             frontends/shared/capture/capture_manifest.cpp
-    INCLUDES frontends frontends/prosper-app
+    INCLUDES frontends frontends/prosper-app tests
+    LIBRARIES prosper_core)
+
+  prosper_add_gtest(test_host_file_replace
+    SOURCES tests/host/platform/test_file_replace.cpp
+    INCLUDES tests
     LIBRARIES prosper_core)
 
   # F9 frame-grab file naming: one stamp and one exclusively claimed name pair per capture, so two
