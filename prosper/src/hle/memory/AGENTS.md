@@ -18,8 +18,12 @@ happens without being tracked is a mapping the rest of prosper cannot see.
   never reimplements it.
 * `hle/fs/` owns the APR **file read** half of libSceAmpr. This folder owns the command-buffer
   object itself (construct / set-buffer / reset / cursor) and the **AMM** memory-mapping half. The
-  two share `AmprCbState` and the completion bookkeeping, which is why both live above the
-  platform split in `hle_kernel_mem.cpp` rather than in either arm.
+  command-buffer accounting lives in `ampr_command_buffer.cpp`: its capacity/cursor and attached
+  storage state stay private there, while `ampr_command_buffer_internal.hpp` declares the helpers
+  both platform arms call. Completion bookkeeping remains above the platform split in
+  `hle_kernel_mem.cpp`.
+  Include the private accounting header first in both sources: it retains the original Windows
+  feature-level guard before any system header.
 * `hle/kernel/` owns the event queues an APR completion is posted to.
 
 ## What a newcomer gets wrong here

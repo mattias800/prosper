@@ -11,3 +11,7 @@ requested behavior and its ownership preconditions instead of treating them as i
 Existing TLS-module, DTV-recycle and exit-registry fixtures exercise `kernel_tls.cpp` through
 the registered `__tls_get_addr` entry and public publication/purge functions. The original
 destruction canary and immortal-registry checks retain their lifetime contracts.
+
+The existing AMPR offset, AMM buffer and gather/scatter fixtures exercise the shared
+`ampr_command_buffer.cpp` accounting through the registered guest APIs and retained test seam.
+The capacity/cursor and attached-storage state have one owner shared by both platform arms.
