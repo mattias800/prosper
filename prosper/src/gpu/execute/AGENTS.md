@@ -42,6 +42,9 @@ comparisons; `compute_witness_analyses` counts actual cache-entry-point parser i
 - `gpu_execute.hpp` — the shared contracts, including **`SrtUse`**: a descriptor use recovered by the
   const-fold, keyed by the `s_load` immediate byte offset. Read this before assuming prosper cannot
   see a descriptor channel.
+- `draw_index_width` — the byte fingerprints for an unannounced 32-bit index buffer.
+  `draw_index_source` owns the shared index-source rule and the indexed NGG fetch that consumes it.
+  The executor umbrella exports both contracts.
 - `ngg_subgroup_plan` — partitions a merged ES+GS NGG draw into guest subgroups and computes the
   launch SGPR s3 and VGPRs v0..v8 each wave receives (#3135 phase P1). Partition choices the public
   sources do not settle are an explicit, documented policy; anything unmodelled is a refusal.

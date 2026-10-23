@@ -7,3 +7,7 @@ performance oracles. Vulkan execution coverage is separate, including tests unde
 
 When changing a cache key, exercise both a reusable identical key and a changed code-generation
 input. Diagnostic selectors are code-generation inputs too, even when normal launches leave them off.
+
+`test_index_size_detect` covers the `draw_index_width` fingerprints. `test_ngg_indexed_realize`
+covers the shared `draw_index_source` rule and indexed NGG fetch through the executor umbrella.
+Both targets link the implementations from `prosper_core`.
