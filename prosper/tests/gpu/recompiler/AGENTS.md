@@ -174,6 +174,12 @@ platform-independent — the file also has `if(WIN32)`/`if(UNIX)` branches, and 
 the wrong one silently never runs while ctest stays green. Verify by name with `ctest -N`, never by
 the total count.
 
+`test_native_loop_carry_mask` executes compare-produced SGPR masks as carry/borrow inputs inside
+native Wave64 EXEC-zero loops. Its missing-mask, physical-DATA and merge-poison controls retain
+the boundary between a current Bool mask and fabricated scalar words; the missing-spill controls
+remain in `test_native_cfg_saved_mask_data`.
+The same carry/borrow kernels execute through the exact dispatcher beside the native regressions.
+
 The direct SOPP opcode switch lives in
 [`sopp_case_routes.cpp`](../../../src/gpu/recompiler/ir/lower/sopp_case_routes.cpp).
 Existing structural shader and branch fixtures keep their compiler entry points when this switch
