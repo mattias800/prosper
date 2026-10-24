@@ -5329,6 +5329,14 @@ One line per falsified hypothesis, the evidence that killed it, and where. **Rea
 a new one** — and note which entries are *solid* versus *void*, because a void result is not a
 falsification.
 
+- **#5497's `ps_405a9fc400` PC 153 refusal is an untouched launch s3 poisoned by a CFG
+  join** — falsified by instruction-order mark tracing: PC 152 overwrites s3 with
+  READFIRSTLANE of v34, defined inside current EXEC but hard outside it. That transfer loses
+  its owner; the following CMPX refuses. The minimal local-index waterfall reproduces the
+  same fresh-mask refusal on main, including a separate never-written-index control.
+  This is compiler/replay evidence, with no game run or rendering claim
+  ([#5497 trace](https://github.com/mattias800/prosper/issues/5497#issuecomment-6376556740)).
+
 - **The drop from ~9 to ~2.5 guest flips/s in the bank scene between the 2026-09-30/10-02 and the
   2026-10-03/04 cohorts came from host conditions or unmatched windows, not code** — falsified on
   2026-10-04 by matched rebuilds: same route bytes, visible `prosper-app` window,

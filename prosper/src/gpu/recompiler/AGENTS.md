@@ -6,6 +6,13 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
 when a predicate combines different EXEC owners. It uses the legacy root reader supplied by its
 caller; source definedness and prior observations remain the existing guard's responsibility.
 
+`rdna2_cfg_local_index_waterfall` proves the closed register-only READFIRSTLANE/CMPX/M0
+sequence whose existing waterfall route runs once per lane. It requires a saved cohort,
+restored M0 and a dead scalar index; memory/cross-lane bodies need their own proof. CMPX
+preserves VCC. This certificate supplies no source word or general broadcast implementation.
+The scalar scope consumer retains a complete current-cohort source only for that exact
+fragment packet; hard scalar relays and expanded-EXEC reads retain their refusals.
+
 - `fragment_entry_facts` / `raster_launch_facts` / `fragment_packet_resources` / `sopp_cfg` — plain data and
   direct-branch helpers the recompiler consumes. They live here, not in `gpu/state` or `gpu/execute`, because
   the recompiler is a pure function of its request (ADR 0006, spec GPU-1) and may include nothing from the

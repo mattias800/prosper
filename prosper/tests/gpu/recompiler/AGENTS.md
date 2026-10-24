@@ -5,6 +5,12 @@ a current complete rewrite with a pre-loop loaded operand. Its interpreter witne
 real loaded value and enabled lanes; missing resources and live back-edge dependencies remain
 refusals. It complements the complete-writer and scalar-relay loop fixtures.
 
+`test_local_index_waterfall` pins the fragment READFIRSTLANE cohort transfer and the closed
+register-index proof. Its compute transport executes fragment ALU policy in the SPIR-V
+interpreter, observing the selected bank, inactive old words, restored EXEC and preserved VCC;
+the public fragment regression separately covers the genuine input/export shell. Missing
+sources and index escapes remain refusals.
+
 Most tests here ask a question of `src/gpu/recompiler` alone: does this instruction stream decode,
 does it recompile, does the module it produces have the shape the contract promises, and — just as
 often — does a stream that must NOT compile still reject, and reject *loudly*. No device is created,
