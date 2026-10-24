@@ -22,6 +22,7 @@
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
+#include "gpu/recompiler/rdna2_scalar_exec_scopes.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
@@ -534,6 +535,7 @@ inline bool scalar_reads_scc(const Rdna2Inst& in) {
 inline void join_merge_placeholder(RegState& rs, int r, bool either_edge_fabricated,
                                    bool other_edge_memory,
                                    const std::set<uint64_t>* blanket_roots = nullptr) {
+    rs.sreg_exec_scopes.erase(r);
     if (either_edge_fabricated)
         rs.sreg_merge_placeholder.insert(r);
     else
@@ -598,6 +600,7 @@ inline void join_merge_edge(RegState& rs, int r, const MergeEdgeMarks& other) {
 // Join SCC and the spill slots at the same merge (a poisoned SCC edge merges as bfalse, which is
 // fabricated too; a slot marked on either edge is marked after it).
 inline void join_merge_scc_and_slots(RegState& rs, const MergeEdgeMarks& other) {
+    rs.sreg_exec_scopes.clear();   // an edge-local view does not prove the merged generation
     if (other.execz_skip_exec) {
         VectorWordMarks skipped = other.vectors;
         confine_execz_skip_marks(rs, skipped, rs.vreg_source_marks, other.execz_skip_exec);
@@ -666,6 +669,7 @@ struct LoopBlanketCheck {
     // that nothing read through only stops the exits from handing its assumption on.
     template <class Exits>
     bool holds(SpirvCompute& b, RegState& rs, Exits& exits) const {
+        rs.sreg_exec_scopes.clear();   // exit restoration must establish its own scalar views
         // A carried word is violated when its back-edge value is hard-marked, or blanket-marked on
         // an assumption of this header that is itself violated (s10 = s11 carries s11's fate). An
         // arbitrary back edge holds a defined-preheader vector word weakly (#5193).
@@ -723,6 +727,7 @@ struct LoopBlanketCheck {
 template <class Registers>
 void mark_loop_carried(RegState& rs, const Registers& carried, const std::vector<Rdna2Inst>& ins,
                        uint32_t lo, uint32_t hi, LoopBlanketCheck& blanket) {
+    rs.sreg_exec_scopes.clear();   // incoming views do not authenticate new loop-header PHIs
     mark_vector_loop_carried(rs, ins, lo, hi, blanket.carried, blanket.confined, &blanket.arbitrary,
                              blanket.no_arbitrary_header);
     blanket.weak_allowed = loop_may_hold_weakly(ins, lo, hi);
@@ -814,6 +819,8 @@ inline bool ordinary_portable_wave64_masks(const SpirvCompute& b) {
 struct SavedB64MaskSnapshot {
     // Instruction-order architectural writes only; load_state does not use this snapshot.
     bool portable_numeric_replacement = false;
+    // Agreement proof for this exact READFIRSTLANE input, captured before emission.
+    bool scalar_first_lane_agrees = false;
     // (root, Bool id). At most a few entries: only the roots this one instruction can overwrite.
     std::vector<std::pair<int, uint32_t>> entries;
     // The instruction's input marks, taken before emission with the masks (#4706).
@@ -1091,7 +1098,8 @@ inline uint32_t emitted_scalar_write_width(const RegState& rs, const Rdna2Inst& 
 // Apply one emitted instruction's input marks to what it wrote (#4706): every destination word, a
 // v_writelane spill slot, and SCC when a scalar instruction may have written it.
 inline void propagate_merge_placeholder(RegState& rs, const Rdna2Inst& in,
-                                        const ScalarSourceMarks& marks) {
+                                        const ScalarSourceMarks& marks,
+                                        bool scalar_first_lane_agrees = false) {
     record_vector_word_marks(rs, in, marks);
     if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361) {
         if (in.dst.kind != OperandKind::VGPR || in.src[1].kind != OperandKind::InlineInt) return;
@@ -1141,6 +1149,7 @@ inline void propagate_merge_placeholder(RegState& rs, const Rdna2Inst& in,
                 rs.sreg_memory_pattern.insert(r);
             else
                 rs.sreg_memory_pattern.erase(r);
+            record_scalar_exec_scope(rs, in, r, ballot, marks, scalar_first_lane_agrees);
         }
     });
     // SCC: a marked input marks an operation which may rewrite it. Only a compare from definite
@@ -1166,7 +1175,8 @@ inline void propagate_merge_placeholder(RegState& rs, const Rdna2Inst& in,
 inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,
                          bool allow_compute_scalar_vcc_bridge,
                          const SavedB64MaskSnapshot& saved_b64_masks_before) {
-    propagate_merge_placeholder(rs, in, saved_b64_masks_before.source_marks);
+    propagate_merge_placeholder(rs, in, saved_b64_masks_before.source_marks,
+                                saved_b64_masks_before.scalar_first_lane_agrees);
     for_each_scalar_write(in, [&](int base, uint32_t width) {
         for (uint32_t w = 0; w < width; ++w)
             rs.unavailable_saved_mask_words.erase(base + static_cast<int>(w));

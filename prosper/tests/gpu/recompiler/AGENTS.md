@@ -21,6 +21,10 @@ and its PC-relative/dynamic-index routes; owned backing and VCC lifetime coverag
 [`test_raw_wide_mask_lifetime.cpp`](test_raw_wide_mask_lifetime.cpp).
 The provenance definitions retain their existing owners outside these relocated callers.
 
+`test_native_loop_hard_active_roots` executes complete rewrites whose retained inactive lanes owe
+an older loop root. Its missing-input, expanded-reader, merge, repeated-write and root-retirement
+controls keep that global obligation distinct from the current writer's active sources.
+
 Counted-loop detection and its shared branch helpers live in
 [`rdna2_cfg_counted_loop.hpp`](../../../src/gpu/recompiler/rdna2_cfg_counted_loop.hpp) and
 [`rdna2_cfg_branch_helpers.hpp`](../../../src/gpu/recompiler/rdna2_cfg_branch_helpers.hpp).
@@ -179,6 +183,12 @@ native Wave64 EXEC-zero loops. Its missing-mask, physical-DATA and merge-poison 
 the boundary between a current Bool mask and fabricated scalar words; the missing-spill controls
 remain in `test_native_cfg_saved_mask_data`.
 The same carry/borrow kernels execute through the exact dispatcher beside the native regressions.
+
+`test_native_loop_scalar_scope` exercises current-EXEC rewrites followed by READFIRSTLANE and
+scalar compare/VCC relays in native Wave64 loops. Its observed missing-back-edge twin keeps the
+loop assumption check load-bearing while the interpreter checks the defined overwrite's result.
+Varying lane reads, wider EXEC, replacement generations and joins remain negative controls.
+VCC preflight tests distinguish numeric scratch from actual mask reads and publication.
 
 The direct SOPP opcode switch lives in
 [`sopp_case_routes.cpp`](../../../src/gpu/recompiler/ir/lower/sopp_case_routes.cpp).

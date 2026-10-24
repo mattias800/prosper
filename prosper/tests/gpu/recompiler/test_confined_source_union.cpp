@@ -467,7 +467,12 @@ TEST(ConditionalWordPublication, CompleteWriterPublishesTheSameExecDomainBeforeM
     ASSERT_TRUE(e.emit({cmpx_a, mov6, mov8, fmac6_from8}));
     EXPECT_TRUE(e.defined(compare6));
     EXPECT_EQ(e.rs.vreg_source_marks.at(6).outside_exec, e.rs.exec);
-    EXPECT_TRUE(e.rs.vreg_source_marks.at(6).blanket_roots.empty());
+    // The active replacement owes no old root; retained inactive lanes still do. The new
+    // representation keeps both planes rather than discarding the inactive obligation.
+    const auto root = blanket_root(0, kVectorBlanketBase + 6);
+    EXPECT_TRUE(e.rs.vreg_source_marks.at(6).scoped_blanket_roots.empty());
+    EXPECT_TRUE(e.rs.vreg_source_marks.at(6).blanket_roots.contains(root));
+    EXPECT_FALSE(e.b.loop_blanket_roots_read.contains(root));
 }
 
 TEST(ConditionalWordPublication, CompleteWriterCanFeedAnExplicitSourceAndRelay) {

@@ -206,7 +206,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
     // flags them (and gets their length right); reject here rather than compute with a wrong operand.
     PortableMaskHalfInstruction portable_halves(b, rs, in, ok);
     if (!ok || portable_halves.handled()) return true;
-    VccMaskViewDrop drop(rs);   // takes VCC's lane view away at exit when armed
+    VccMaskViewDrop drop(b, rs);   // takes VCC's lane view away at exit when armed
     if (refuse_mask_write(b, rs, in, drop, ok) || emit_exec_cmov(b, rs, in, ok)) return true;
     switch (in.fmt) {
         case Rdna2Format::SOP1: {
