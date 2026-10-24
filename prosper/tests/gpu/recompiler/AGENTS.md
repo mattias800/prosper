@@ -324,3 +324,5 @@ the inline-body scan nonempty; no method body over 40 lines may return to those 
 `test_packed_scalar_width` executes packed FMA followed by a fresh predicate with an absent
 unused scalar sibling. Missing actual operands and missing lane spills still refuse; the
 physical-width inventory covers every known VOP3P source through the canonical effects table.
+Partial-launch native and dispatcher witnesses keep unrelated packed reads from demanding
+physical DATA for Bool-only mask logic; numeric VCC high words retain independent poison checks.
