@@ -240,8 +240,8 @@ TEST(FreshMaskOperandRoots, BothWordsOfBothWideOperandsRemainObserved) {
     registers.exec = 7;
     for (int word = 2; word <= 5; ++word)
         registers.vreg_source_marks[word].blanket_roots = {blanket_root(5, 256 + word)};
-    const uint32_t word = 0x7c440902u; // v_cmp_eq_f64 vcc, v[2:3], v[4:5]
-    const auto compare = rdna2_decode_one(&word, 1);
+    const uint32_t packet = 0x7c440902u; // v_cmp_eq_f64 vcc, v[2:3], v[4:5]
+    const auto compare = rdna2_decode_one(&packet, 1);
     const auto roots = predicate_operand_roots(registers, compare, &test_roots);
     ASSERT_TRUE(roots.has_value());
     EXPECT_EQ(roots->size(), 4u);
