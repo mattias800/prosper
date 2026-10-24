@@ -6,6 +6,8 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
 sequence whose existing waterfall route runs once per lane. It requires a saved cohort,
 restored M0 and a dead scalar index; memory/cross-lane bodies need their own proof. CMPX
 preserves VCC. This certificate supplies no source word or general broadcast implementation.
+The scalar scope consumer retains a complete current-cohort source only for that exact
+fragment packet; hard scalar relays and expanded-EXEC reads retain their refusals.
 
 - `fragment_entry_facts` / `raster_launch_facts` / `fragment_packet_resources` / `sopp_cfg` — plain data and
   direct-branch helpers the recompiler consumes. They live here, not in `gpu/state` or `gpu/execute`, because

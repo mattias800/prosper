@@ -10,6 +10,8 @@ struct SpirvCompute;
 const ScalarSourceMarks* current_scalar_exec_scope(const RegState& rs, int reg);
 bool scalar_scope_first_lane_agrees(const SpirvCompute& b, const RegState& rs,
                                     const Rdna2Inst& read);
+bool scalar_scope_local_index_waterfall(const SpirvCompute& b, const Rdna2Inst& read);
 void record_scalar_exec_scope(RegState& rs, const Rdna2Inst& in, int reg, bool ballot,
-                              const ScalarSourceMarks& source, bool first_agrees = false);
+                              const ScalarSourceMarks& source, bool first_agrees = false,
+                              bool local_index = false);
 } // namespace prosper::gpu

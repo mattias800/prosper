@@ -1,6 +1,7 @@
 #include "gpu/recompiler/rdna2_scalar_exec_scopes.hpp"
 
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_cfg_local_index_waterfall.hpp"
 #include "gpu/recompiler/rdna2_cfg_branch_helpers.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
@@ -120,6 +121,20 @@ bool scalar_scope_first_lane_agrees(const SpirvCompute& b, const RegState& rs,
     return first_lane_source_agrees(rs, instructions, read);
 }
 
+bool scalar_scope_local_index_waterfall(const SpirvCompute& b, const Rdna2Inst& read) {
+    // The existing fragment waterfall route executes once for this invocation's index.
+    // Unlike a general READFIRSTLANE, its local scalar is unobservable after the body.
+    if (!b.is_fragment || (b.wave_size != 32 && b.wave_size != 64) ||
+        read.fmt != Rdna2Format::VOP1 || !rdna2_lane_read_writes_sgpr(read))
+        return false;
+    const auto& words = b.saved_mask_original_words;
+    std::vector<Rdna2Inst> instructions;
+    if (rdna2_walk(words.data(), words.size(), instructions) != words.size() ||
+        std::find(instructions.begin(), instructions.end(), read) == instructions.end())
+        return false;
+    return local_index_waterfall_latch(instructions, read.pc) != UINT32_MAX;
+}
+
 const ScalarSourceMarks* current_scalar_exec_scope(const RegState& rs, int reg) {
     const auto scope = rs.sreg_exec_scopes.find(reg);
     const auto value = rs.sreg.find(reg);
@@ -132,16 +147,18 @@ const ScalarSourceMarks* current_scalar_exec_scope(const RegState& rs, int reg) 
     // Joins discard these views, and an intervening change to the global marks invalidates one.
     const auto roots = rs.sreg_loop_blanket.find(reg);
     const auto& source = scope->second.source;
-    if (!source.placeholder || source.hard || !source.scoped_complete_word ||
-        !source.outside_exec || roots == rs.sreg_loop_blanket.end() ||
-        roots->second != source.blanket_roots ||
+    if (!source.placeholder || !source.scoped_complete_word || !source.outside_exec ||
+        (source.hard
+             ? roots != rs.sreg_loop_blanket.end()
+             : roots == rs.sreg_loop_blanket.end() || roots->second != source.blanket_roots) ||
         rs.sreg_memory_pattern.contains(reg) != source.memory)
         return nullptr;
     return &source;
 }
 
 void record_scalar_exec_scope(RegState& rs, const Rdna2Inst& in, int reg, bool ballot,
-                              const ScalarSourceMarks& source, bool first_agrees) {
+                              const ScalarSourceMarks& source, bool first_agrees,
+                              bool local_index) {
     // READFIRSTLANE consumes the active cohort. READLANE's selected peer can lie outside it;
     // spills and mask outputs retain their existing independent lifetime rules.
     const bool first_lane = in.fmt == Rdna2Format::VOP1 && rdna2_lane_read_writes_sgpr(in);
@@ -149,9 +166,10 @@ void record_scalar_exec_scope(RegState& rs, const Rdna2Inst& in, int reg, bool b
         in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2 || in.fmt == Rdna2Format::SOPK;
     const auto value = rs.sreg.find(reg);
     if ((rs.vector_wave_size != 32 && rs.vector_wave_size != 64) || ballot ||
-        (!first_lane && !scalar_alu) || (first_lane && !first_agrees) || value == rs.sreg.end() ||
-        !value->second || !source.placeholder || source.hard || !source.scoped_complete_word ||
-        source.blanket_roots.empty() || !source.outside_exec || !rs.exec ||
+        (!first_lane && !scalar_alu) || (first_lane && !(first_agrees || local_index)) ||
+        value == rs.sreg.end() || !value->second || !source.placeholder ||
+        (source.hard && !(first_lane && local_index)) || !source.scoped_complete_word ||
+        (!source.hard && source.blanket_roots.empty()) || !source.outside_exec || !rs.exec ||
         !exec_within(rs, rs.exec, source.outside_exec)) {
         rs.sreg_exec_scopes.erase(reg);
         return;
@@ -160,6 +178,8 @@ void record_scalar_exec_scope(RegState& rs, const Rdna2Inst& in, int reg, bool b
     // this definition; expanding EXEC still needs the global assumption and its back-edge check.
     auto current = source;
     current.outside_exec = rs.exec;
+    // Scalar DATA never inherits permission for arbitrary bits outside a vector cohort.
+    if (current.hard) current.arbitrary = false;
     rs.sreg_exec_scopes.insert_or_assign(reg, RegState::ScalarExecScope{value->second, current});
 }
 }   // namespace prosper::gpu

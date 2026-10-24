@@ -133,6 +133,7 @@ SavedB64MaskSnapshot snapshot_saved_b64_masks(SpirvCompute& b, const RegState& r
                                               const Rdna2Inst& in) {
     auto snapshot = snapshot_saved_b64_masks(rs, in);
     snapshot.scalar_first_lane_agrees = scalar_scope_first_lane_agrees(b, rs, in);
+    snapshot.scalar_local_index_waterfall = scalar_scope_local_index_waterfall(b, in);
     note_memory_address(b, rs, in, snapshot.source_marks);   // #5193, before the roots are cleared
     if (in.fmt == Rdna2Format::FLAT || in.fmt == Rdna2Format::MUBUF ||
         in.fmt == Rdna2Format::MTBUF) {

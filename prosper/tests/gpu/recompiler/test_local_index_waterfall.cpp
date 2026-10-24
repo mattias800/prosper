@@ -8,6 +8,7 @@
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include "gpu/recompiler/rdna2_saved_mask_words.hpp"
+#include "gpu/recompiler/rdna2_scalar_exec_scopes.hpp"
 
 #include <gtest/gtest.h>
 #include <cstdint>
@@ -159,6 +160,7 @@ TEST(LocalIndexWaterfall, DifferentCompareOrRestoredCohortDoesNotProveTheIndex) 
              {9, 0xbea40480u},  // remaining = 0, rather than the current EXEC cohort
              {19, 0xbefe0424u}, // restores the exhausted remainder, rather than saved EXEC
              {20, 0xbefc0303u}, // M0 retains the lane-varying scalar index
+             {20, 0xbefc037cu}, // M0 = M0 also retains that index
          }) {
         auto code = program();
         code[at] = word;
@@ -185,4 +187,97 @@ TEST(LocalIndexWaterfall, MemoryOrScalarCopiesInsideTheBodyNeedAnotherProof) {
     code.insert(code.begin() + 15, {0xe0302000u, 0x80020000u}); // buffer_load_dword
     code[20] = 0xbf85fff7u; // retain the same RFL branch target after the insertion
     EXPECT_EQ(latch(code), UINT32_MAX);
+}
+
+namespace {
+struct HardCohort {
+    SpirvCompute builder;
+    RegState registers;
+    ScalarSourceMarks source;
+    Rdna2Inst read;
+    HardCohort() {
+        builder.is_fragment = true;
+        builder.wave_size = 64;
+        builder.saved_mask_original_words = program();
+        read = rdna2_decode_one(builder.saved_mask_original_words.data() + 12, 1);
+        read.pc = 12;
+        registers.exec = 7;
+        registers.exec_narrowed = true;
+        registers.vector_wave_size = 64;
+        registers.sreg[3] = 101;
+        registers.sreg_merge_placeholder.insert(3);
+        registers.vreg[1] = 201;
+        source.placeholder = source.hard = source.arbitrary = source.scoped_complete_word = true;
+        source.outside_exec = registers.exec;
+    }
+    void record(bool local = true) {
+        record_scalar_exec_scope(registers, read, 3, false, source, false, local);
+    }
+    bool compare() {
+        const uint32_t word = 0x7d840203u; // vcc = s3 == v1
+        return fresh_mask_sources_defined(builder, registers, rdna2_decode_one(&word, 1));
+    }
+};
+} // namespace
+
+TEST(LocalIndexWaterfall, HardScalarViewNeedsTheExactOriginalFragmentRoute) {
+    HardCohort cohort;
+    EXPECT_TRUE(scalar_scope_local_index_waterfall(cohort.builder, cohort.read));
+    auto changed = cohort.read;
+    changed.src[0].value = 33;
+    EXPECT_FALSE(scalar_scope_local_index_waterfall(cohort.builder, changed));
+    cohort.builder.is_fragment = false;
+    cohort.builder.is_compute = true;
+    EXPECT_FALSE(scalar_scope_local_index_waterfall(cohort.builder, cohort.read));
+    cohort.record(false);
+    EXPECT_EQ(current_scalar_exec_scope(cohort.registers, 3), nullptr);
+    EXPECT_FALSE(cohort.compare());
+}
+
+TEST(LocalIndexWaterfall, HardScalarViewCannotAuthenticateExpandedExec) {
+    HardCohort cohort;
+    cohort.record();
+    const auto* scope = current_scalar_exec_scope(cohort.registers, 3);
+    ASSERT_NE(scope, nullptr);
+    EXPECT_FALSE(scope->arbitrary);
+    EXPECT_TRUE(cohort.compare());
+    cohort.registers.exec = 8;
+    EXPECT_FALSE(cohort.compare());
+}
+
+TEST(LocalIndexWaterfall, HardScalarViewExpiresWithValuePhysicalBackingAndGlobalMarks) {
+    for (int mutation = 0; mutation < 4; ++mutation) {
+        HardCohort cohort;
+        cohort.record();
+        ASSERT_NE(current_scalar_exec_scope(cohort.registers, 3), nullptr);
+        if (mutation == 0) cohort.registers.sreg[3] = 102;
+        if (mutation == 1) cohort.registers.unavailable_saved_mask_words.insert(3);
+        if (mutation == 2) cohort.registers.sreg_loop_blanket[3] = {blanket_root(5, 256)};
+        if (mutation == 3) cohort.registers.sreg_memory_pattern.insert(3);
+        EXPECT_EQ(current_scalar_exec_scope(cohort.registers, 3), nullptr) << mutation;
+        EXPECT_FALSE(cohort.compare()) << mutation;
+    }
+}
+
+TEST(LocalIndexWaterfall, GeneralAgreementAndScalarRelaysCannotCreateHardViews) {
+    HardCohort cohort;
+    record_scalar_exec_scope(cohort.registers, cohort.read, 3, false, cohort.source, true);
+    EXPECT_EQ(current_scalar_exec_scope(cohort.registers, 3), nullptr);
+    const uint32_t word = 0xbe830303u; // s3 = s3
+    record_scalar_exec_scope(cohort.registers, rdna2_decode_one(&word, 1), 3, false, cohort.source,
+                             false, true);
+    EXPECT_EQ(current_scalar_exec_scope(cohort.registers, 3), nullptr);
+    EXPECT_FALSE(cohort.compare());
+}
+
+TEST(LocalIndexWaterfall, IncompleteUnownedAndBallotSourcesCannotCreateHardViews) {
+    for (int mutation = 0; mutation < 3; ++mutation) {
+        HardCohort cohort;
+        if (mutation == 0) cohort.source.scoped_complete_word = false;
+        if (mutation == 1) cohort.source.outside_exec = 8;
+        record_scalar_exec_scope(cohort.registers, cohort.read, 3, mutation == 2, cohort.source,
+                                 false, true);
+        EXPECT_EQ(current_scalar_exec_scope(cohort.registers, 3), nullptr) << mutation;
+        EXPECT_FALSE(cohort.compare()) << mutation;
+    }
 }
