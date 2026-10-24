@@ -320,3 +320,7 @@ Existing structural and execution fixtures keep using that API; relocating the s
 the original field order, initializers, method defaults and class scope.
 The existing source-shape guard expands all member sections from the class entry fragment and keeps
 the inline-body scan nonempty; no method body over 40 lines may return to those declarations.
+
+`test_packed_scalar_width` executes packed FMA followed by a fresh predicate with an absent
+unused scalar sibling. Missing actual operands and missing lane spills still refuse; the
+physical-width inventory covers every known VOP3P source through the canonical effects table.

@@ -40,7 +40,8 @@ uint32_t scalar_alu_source_words(const Rdna2Inst& in, uint32_t source) {
         case Rdna2Format::VOP1:
         case Rdna2Format::VOP2:
         case Rdna2Format::VOPC:
-        case Rdna2Format::VOP3: {
+        case Rdna2Format::VOP3:
+        case Rdna2Format::VOP3P: {
             // Every VALU source width comes from the instruction-effects table, derived from the
             // ISA (70648 12.7-12.12) and checked against llvm-mc: a B32 operand is one SGPR, an
             // F64/I64/U64/B64 operand a pair, and a lane mask (SRC2 of v_cndmask_b32 and the

@@ -400,3 +400,7 @@ original member order. Nontrivial method bodies compile in the facility sources 
 include the umbrella rather than these declaration sections directly.
 Direct section includes redirect through the umbrella; declaration/member scope guards keep
 the original payload at its original class site.
+
+`rdna2_scalar_source_words` consumes the canonical effects table for VOP3P as well as ordinary
+VALU forms. A packed pair of halves is one physical scalar word; absent adjacent SGPRs do not
+supply an operand or justify poisoning that word.
