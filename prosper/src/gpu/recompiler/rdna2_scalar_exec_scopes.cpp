@@ -128,9 +128,17 @@ bool scalar_scope_local_index_waterfall(const SpirvCompute& b, const Rdna2Inst& 
         read.fmt != Rdna2Format::VOP1 || !rdna2_lane_read_writes_sgpr(read))
         return false;
     const auto& words = b.saved_mask_original_words;
-    std::vector<Rdna2Inst> instructions;
-    if (rdna2_walk(words.data(), words.size(), instructions) != words.size() ||
-        std::find(instructions.begin(), instructions.end(), read) == instructions.end())
+    // Fragment kill tails can follow the first END. Reuse the emitter's validated
+    // liveness inventory so a tail read cannot appear dead in a truncated prefix.
+    auto instructions = b.saved_mask_liveness_instructions;
+    if (instructions.empty()) rdna2_walk(words.data(), words.size(), instructions);
+    for (const auto& in : instructions) {
+        if (in.pc >= words.size()) return false;
+        auto original = rdna2_decode_one(words.data() + in.pc, words.size() - in.pc);
+        original.pc = in.pc;
+        if (original != in) return false;
+    }
+    if (std::find(instructions.begin(), instructions.end(), read) == instructions.end())
         return false;
     return local_index_waterfall_latch(instructions, read.pc) != UINT32_MAX;
 }

@@ -270,7 +270,7 @@ TEST(LocalIndexWaterfall, GeneralAgreementAndScalarRelaysCannotCreateHardViews) 
     HardCohort cohort;
     record_scalar_exec_scope(cohort.registers, cohort.read, 3, false, cohort.source, true);
     EXPECT_EQ(current_scalar_exec_scope(cohort.registers, 3), nullptr);
-    const uint32_t word = 0xbe830303u; // s3 = s3
+    const uint32_t word = 0xbe830303u;   // s3 = s3
     record_scalar_exec_scope(cohort.registers, rdna2_decode_one(&word, 1), 3, false, cohort.source,
                              false, true);
     EXPECT_EQ(current_scalar_exec_scope(cohort.registers, 3), nullptr);
@@ -286,5 +286,26 @@ TEST(LocalIndexWaterfall, IncompleteUnownedAndBallotSourcesCannotCreateHardViews
                                  false, true);
         EXPECT_EQ(current_scalar_exec_scope(cohort.registers, 3), nullptr) << mutation;
         EXPECT_FALSE(cohort.compare()) << mutation;
+    }
+}
+
+TEST(LocalIndexWaterfall, ExistingTerminalTailInventoryParticipatesInIndexDeadness) {
+    for (const bool reads_index : {false, true}) {
+        HardCohort cohort;
+        auto& code = cohort.builder.saved_mask_original_words;
+        code.insert(code.begin() + 21, 0xbf850003u);   // branch past the first END
+        code.push_back(reads_index ? 0xbe850303u : 0xbe850381u);   // tail s5 = s3 or 1
+        code.push_back(0xbf810000u);
+        auto& inventory = cohort.builder.saved_mask_liveness_instructions;
+        for (uint32_t pc = 0; pc < code.size();) {
+            auto in = rdna2_decode_one(code.data() + pc, code.size() - pc);
+            ASSERT_NE(in.len_dwords, 0u);
+            in.pc = pc;
+            inventory.push_back(in);
+            pc += in.len_dwords;
+        }
+        EXPECT_EQ(scalar_scope_local_index_waterfall(cohort.builder, cohort.read), !reads_index);
+        inventory.clear();   // an unparsed target never proves deadness
+        EXPECT_FALSE(scalar_scope_local_index_waterfall(cohort.builder, cohort.read));
     }
 }
