@@ -11,6 +11,11 @@ interpreter, observing the selected bank, inactive old words, restored EXEC and 
 the public fragment regression separately covers the genuine input/export shell. Missing
 sources and index escapes remain refusals.
 
+`test_relative_bank_source` adds the complete-cohort result proof: bank words exist only in
+that cohort, the old destination is missing, and a fresh mask consumes the result. The interpreter
+observes selected values, fresh VCC, restored EXEC and untouched inactive output. Missing and
+unbounded banks, stale index/M0 generations and expanded readers remain negative controls.
+
 Most tests here ask a question of `src/gpu/recompiler` alone: does this instruction stream decode,
 does it recompile, does the module it produces have the shape the contract promises, and — just as
 often — does a stream that must NOT compile still reject, and reject *loudly*. No device is created,

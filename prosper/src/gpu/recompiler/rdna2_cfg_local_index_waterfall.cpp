@@ -145,4 +145,23 @@ uint32_t local_index_waterfall_latch(const std::vector<Rdna2Inst>& ins, uint32_t
     }
     return waterfall_branches(ins).contains(latch.pc) ? latch.pc : UINT32_MAX;
 }
+uint32_t local_index_waterfall_read_pc(const std::vector<Rdna2Inst>& ins, const Rdna2Inst& in) {
+    const auto found = std::find(ins.begin(), ins.end(), in);
+    if (found == ins.end()) return UINT32_MAX;
+    const auto at = static_cast<std::size_t>(found - ins.begin());
+    std::size_t candidate = at;
+    for (;;) {
+        const auto& read = ins[candidate];
+        if (read.fmt == Rdna2Format::VOP1 && rdna2_lane_read_writes_sgpr(read)) {
+            const uint32_t latch = local_index_waterfall_latch(ins, read.pc);
+            if (latch == UINT32_MAX) return UINT32_MAX;
+            const bool copy = at == candidate + 2 && move(in, 124, read.dst.value, false);
+            const bool body = at >= candidate + 3 && in.pc < latch && in.fmt == Rdna2Format::VOP1 &&
+                              in.opcode == 0x43;
+            return at == candidate || copy || body ? read.pc : UINT32_MAX;
+        }
+        if (!candidate) return UINT32_MAX;
+        --candidate;
+    }
+}
 } // namespace prosper::gpu

@@ -4245,6 +4245,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_local_index_waterfall.cpp
     INCLUDES tests tests/gpu/recompiler
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_relative_bank_source
+    SOURCES tests/gpu/recompiler/test_relative_bank_source.cpp
+    INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_packed_scalar_width
     SOURCES tests/gpu/recompiler/test_packed_scalar_width.cpp
     INCLUDES tests tests/gpu/recompiler
