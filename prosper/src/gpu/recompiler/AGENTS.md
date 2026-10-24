@@ -2,6 +2,10 @@
 
 Takes a guest shader's instruction bytes and emits a SPIR-V module.
 
+`rdna2_predicate_operand_roots` keeps each explicit vector operand's read dependencies separate
+when a predicate combines different EXEC owners. It uses the legacy root reader supplied by its
+caller; source definedness and prior observations remain the existing guard's responsibility.
+
 `rdna2_cfg_local_index_waterfall` proves the closed register-only READFIRSTLANE/CMPX/M0
 sequence whose existing waterfall route runs once per lane. It requires a saved cohort,
 restored M0 and a dead scalar index; memory/cross-lane bodies need their own proof. CMPX

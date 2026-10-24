@@ -1,5 +1,10 @@
 # `tests/gpu/recompiler` — translation tests and the legacy compute execution fixture
 
+`test_fresh_mask_operand_roots` exercises a native SCC loop whose fresh data predicate combines
+a current complete rewrite with a pre-loop loaded operand. Its interpreter witness observes the
+real loaded value and enabled lanes; missing resources and live back-edge dependencies remain
+refusals. It complements the complete-writer and scalar-relay loop fixtures.
+
 `test_local_index_waterfall` pins the fragment READFIRSTLANE cohort transfer and the closed
 register-index proof. Its compute transport executes fragment ALU policy in the SPIR-V
 interpreter, observing the selected bank, inactive old words, restored EXEC and preserved VCC;
