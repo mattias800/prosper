@@ -9,8 +9,8 @@ std::optional<std::set<uint64_t>> predicate_operand_roots(const RegState& rs, co
                                                           PredicateRootReader read_roots) {
     // These compares read two explicit lane-local vector data operands; their EXEC
     // gate is handled by the caller. DPP/SDWA and other families keep the existing proof.
-    if (in.fmt != Rdna2Format::VOPC || in.has_dpp || in.has_modifier || in.n_src != 2 ||
-        in.src[0].kind != OperandKind::VGPR || in.src[1].kind != OperandKind::VGPR)
+    if (in.fmt != Rdna2Format::VOPC || in.has_dpp || in.has_modifier || in.has_sdwa ||
+        in.n_src != 2 || in.src[0].kind != OperandKind::VGPR || in.src[1].kind != OperandKind::VGPR)
         return std::nullopt;
     std::set<uint64_t> roots;
     for (uint32_t k = 0; k < 2; ++k) {

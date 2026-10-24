@@ -233,6 +233,10 @@ TEST(FreshMaskOperandRoots, UnsupportedFormsKeepTheLegacyObservation) {
     EXPECT_FALSE(
         predicate_operand_roots(fixture.registers, fixture.compare, &test_roots).has_value());
     fixture.compare.has_modifier = false;
+    fixture.compare.has_sdwa = true;
+    EXPECT_FALSE(
+        predicate_operand_roots(fixture.registers, fixture.compare, &test_roots).has_value());
+    fixture.compare.has_sdwa = false;
     fixture.compare.src[0].kind = OperandKind::SGPR;
     EXPECT_FALSE(
         predicate_operand_roots(fixture.registers, fixture.compare, &test_roots).has_value());
