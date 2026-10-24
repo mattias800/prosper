@@ -173,7 +173,10 @@ TEST(LocalIndexWaterfall, DifferentCompareOrRestoredCohortDoesNotProveTheIndex) 
 
 TEST(LocalIndexWaterfall, ABranchIntoTheBodyOrAnExecChangeAfterSavingInvalidatesIt) {
     auto code = program();
-    code[10] = 0xbf880001u; // branch enters the first predicate, bypassing the RFL
+    code[7] = 0xbf820005u; // PC 7 enters the compare at PC 13 before the cohort saves
+    EXPECT_EQ(latch(code), UINT32_MAX);
+    code = program();
+    code[10] = 0xbf880001u; // PC 10 targets the RFL at PC 12 inside the saved-cohort span
     EXPECT_EQ(latch(code), UINT32_MAX);
     code = program();
     code[10] = 0xbefe04c1u; // widen after the saved cohort
