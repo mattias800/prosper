@@ -2,6 +2,10 @@
 
 Takes a guest shader's instruction bytes and emits a SPIR-V module.
 
+`rdna2_predicate_operand_roots` keeps each explicit vector operand's read dependencies separate
+when a predicate combines different EXEC owners. It uses the legacy root reader supplied by its
+caller; source definedness and prior observations remain the existing guard's responsibility.
+
 - `fragment_entry_facts` / `raster_launch_facts` / `fragment_packet_resources` / `sopp_cfg` — plain data and
   direct-branch helpers the recompiler consumes. They live here, not in `gpu/state` or `gpu/execute`, because
   the recompiler is a pure function of its request (ADR 0006, spec GPU-1) and may include nothing from the

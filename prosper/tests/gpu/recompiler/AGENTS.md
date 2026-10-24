@@ -1,5 +1,10 @@
 # `tests/gpu/recompiler` — translation tests and the legacy compute execution fixture
 
+`test_fresh_mask_operand_roots` exercises a native SCC loop whose fresh data predicate combines
+a current complete rewrite with a pre-loop loaded operand. Its interpreter witness observes the
+real loaded value and enabled lanes; missing resources and live back-edge dependencies remain
+refusals. It complements the complete-writer and scalar-relay loop fixtures.
+
 Most tests here ask a question of `src/gpu/recompiler` alone: does this instruction stream decode,
 does it recompile, does the module it produces have the shape the contract promises, and — just as
 often — does a stream that must NOT compile still reject, and reject *loudly*. No device is created,

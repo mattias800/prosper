@@ -4237,6 +4237,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_native_loop_scalar_scope.cpp
     INCLUDES tests tests/gpu/recompiler
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_fresh_mask_operand_roots
+    SOURCES tests/gpu/recompiler/test_fresh_mask_operand_roots.cpp
+    INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_native_numeric_vcc_move
     SOURCES tests/gpu/recompiler/test_native_numeric_vcc_move.cpp
     INCLUDES tests tests/gpu/recompiler
