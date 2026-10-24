@@ -25,12 +25,12 @@ struct ScalarSourceMarks {
     // A complete writer proved its active lanes under this immutable EXEC value. Hard marks have
     // missing lanes only outside it; soft marks also retain their global conditional proof above.
     uint32_t outside_exec = 0;
-    // Only an audited complete VALU writer publishes the independent soft-mark domain. An old
-    // outside_exec value on a memory result is not that arithmetic publication.
+    // Audited complete arithmetic writers and ordinary buffer reads publish this independent
+    // active-root proof. A historical outside_exec value alone does not establish it.
     bool scoped_complete_word = false;
-    // For a soft mark, the owner's active domain depends only on these source roots, while its
+    // The owner's active domain depends only on these source roots, while its
     // global blanket_roots may additionally depend on the inactive old generation. Hard marks
-    // continue to carry their active-domain obligations in blanket_roots.
+    // without this independent proof carry their active-domain obligations in blanket_roots.
     std::set<uint64_t> scoped_blanket_roots;
     // #5174 / #5185: no lane of this HARD mark holds a value whose hardware counterpart is real
     // but unknown to prosper. Every lane that is not defined holds an ARBITRARY value: the launch

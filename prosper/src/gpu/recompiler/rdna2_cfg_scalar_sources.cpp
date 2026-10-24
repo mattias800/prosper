@@ -5,6 +5,7 @@
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_loaded_arbitrary.hpp"
+#include "gpu/recompiler/rdna2_scalar_exec_scopes.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <set>
@@ -14,6 +15,10 @@
 namespace prosper::gpu {
 namespace {
 void scalar_source_word_marks(const RegState& rs, ScalarSourceMarks& marks, int& r) {
+    if (const auto* scope = current_scalar_exec_scope(rs, r)) {
+        union_source_marks(marks, *scope);
+        return;
+    }
     const bool fabricated = sreg_word_may_be_fabricated(rs, r);
     marks.placeholder = marks.placeholder || fabricated;
     // A scalar word is unconfined: it may be absent in every lane, so no EXEC confinement survives it.
@@ -127,6 +132,7 @@ SavedB64MaskSnapshot snapshot_saved_b64_masks(const RegState& rs, const Rdna2Ins
 SavedB64MaskSnapshot snapshot_saved_b64_masks(SpirvCompute& b, const RegState& rs,
                                               const Rdna2Inst& in) {
     auto snapshot = snapshot_saved_b64_masks(rs, in);
+    snapshot.scalar_first_lane_agrees = scalar_scope_first_lane_agrees(b, rs, in);
     note_memory_address(b, rs, in, snapshot.source_marks);   // #5193, before the roots are cleared
     if (in.fmt == Rdna2Format::FLAT || in.fmt == Rdna2Format::MUBUF ||
         in.fmt == Rdna2Format::MTBUF) {

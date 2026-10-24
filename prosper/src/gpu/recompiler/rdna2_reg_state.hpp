@@ -92,6 +92,13 @@ struct RegState {
     // lane bits on it was fabricated there (#4714, #4749 review). Each entry names the assumptions
     // (blanket_root: header pc and carried register) the word depends on.
     std::map<int, std::set<uint64_t>> sreg_loop_blanket;
+    // A READFIRSTLANE/SALU generation's existing active-domain view. The global marks above
+    // remain authoritative outside it; scalar writes and control-flow joins expire the view.
+    struct ScalarExecScope {
+        uint32_t value = 0;
+        ScalarSourceMarks source;
+    };
+    std::map<int, ScalarExecScope> sreg_exec_scopes;
     std::set<std::pair<int, int>> lane_slot_merge_placeholder;
     // Whether a DATA read of an ordinary SGPR that holds nothing (absent from `sreg` and
     // `sreg_input`, no mask covering it) is the fabricated zero `operand_bits` reads it as. True in

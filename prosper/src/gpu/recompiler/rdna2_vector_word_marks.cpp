@@ -145,11 +145,13 @@ bool meet_arbitrary(const ScalarSourceMarks& a, const ScalarSourceMarks& b) {
 void union_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other,
                  const RegState* current = nullptr, bool explicit_sources = false) {
     const bool arbitrary = meet_arbitrary(into, other);
+    const bool hard_scoped =
+        (into.hard && into.scoped_complete_word) || (other.hard && other.scoped_complete_word);
     const uint32_t into_side = into.hard || into.scoped_complete_word ? into.outside_exec : 0u;
     const uint32_t other_side = other.hard || other.scoped_complete_word ? other.outside_exec : 0u;
-    auto scoped = into.placeholder && !into.hard ? into.scoped_blanket_roots : into.blanket_roots;
+    auto scoped = into.scoped_complete_word ? into.scoped_blanket_roots : into.blanket_roots;
     const auto& other_scoped =
-        other.placeholder && !other.hard ? other.scoped_blanket_roots : other.blanket_roots;
+        other.scoped_complete_word ? other.scoped_blanket_roots : other.blanket_roots;
     scoped.insert(other_scoped.begin(), other_scoped.end());
     if (into.placeholder && other.placeholder) {
         // CONFIDENCE: HIGH -- outside A union outside B is outside B when B is a proved
@@ -175,11 +177,12 @@ void union_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other,
         if (!owner && explicit_sources) {
             if (!other.hard && !other.blanket_roots.empty() && into_side) {
                 owner = into_side;
-                scoped = into.hard ? into.blanket_roots : into.scoped_blanket_roots;
+                scoped = into.scoped_complete_word ? into.scoped_blanket_roots : into.blanket_roots;
                 scoped.insert(other.blanket_roots.begin(), other.blanket_roots.end());
             } else if (!into.hard && !into.blanket_roots.empty() && other_side) {
                 owner = other_side;
-                scoped = other.hard ? other.blanket_roots : other.scoped_blanket_roots;
+                scoped =
+                    other.scoped_complete_word ? other.scoped_blanket_roots : other.blanket_roots;
                 scoped.insert(into.blanket_roots.begin(), into.blanket_roots.end());
             }
         }
@@ -200,23 +203,23 @@ void union_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other,
         into.blanket_roots.clear();
     else
         into.blanket_roots.insert(other.blanket_roots.begin(), other.blanket_roots.end());
-    // CONFIDENCE: HIGH -- a complete soft writer has two proofs: the global carried value and
-    // its own active domain. Hard-source unions need only the latter. Predecessors retain it only
-    // for an equal owner on every marked edge; an unconfined soft source has no scoped owner.
-    into.scoped_complete_word = !into.hard && into.outside_exec != 0;
+    // A complete writer can owe different roots inside and outside its owner. Retain both:
+    // a later active read needs only the former, while an outside arbitrary read still owes
+    // the old generation's global roots. Ordinary hard marks retain their existing domain.
+    into.scoped_complete_word = into.outside_exec != 0 && (!into.hard || hard_scoped);
     if (into.outside_exec) {
-        if (into.hard)
+        if (into.hard && !hard_scoped)
             into.blanket_roots = std::move(scoped);
-        else
+        else if (into.scoped_complete_word)
             into.scoped_blanket_roots = std::move(scoped);
     }
-    if (into.hard || !into.outside_exec) into.scoped_blanket_roots.clear();
+    if (!into.scoped_complete_word) into.scoped_blanket_roots.clear();
     into.arbitrary = arbitrary && into.placeholder && into.hard;
 }
 
 const std::set<uint64_t>& source_roots_in_exec(const RegState& rs, const ScalarSourceMarks& marks,
                                                uint32_t exec) {
-    if (!marks.hard && marks.scoped_complete_word && marks.outside_exec &&
+    if (marks.scoped_complete_word && marks.outside_exec &&
         exec_within(rs, exec, marks.outside_exec))
         return marks.scoped_blanket_roots;
     return marks.blanket_roots;
@@ -367,7 +370,7 @@ ScalarSourceMarks vector_source_marks(const RegState& rs, const Rdna2Inst& in) {
             if (reg >= 0 && reg <= 255 && vector_word_defined_in_exec(rs, source, rs.exec) &&
                 value != rs.vreg.end() && value->second) {
                 // A defined address reads its owner's lanes only (kArbitraryOutsideRootOffset).
-                for (uint64_t root : source.blanket_roots)
+                for (uint64_t root : source_roots_in_exec(rs, source, rs.exec))
                     if (!arbitrary_outside_root(root)) roots.insert(root);
             } else if (reg >= 0 && reg <= 255 && source.placeholder && source.hard &&
                        source.arbitrary) {
@@ -672,8 +675,9 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
                 (!image_proof || (rs.mimg_sources.pc == in.pc && rs.mimg_sources.enabled &&
                                   rs.mimg_sources.defined));
             result.outside_exec = defined_inside ? rs.exec : 0u;
-            result.scoped_complete_word = defined_inside && !result.hard &&
-                                          lane_mapped_vector_write(in) && !memory_result(in);
+            result.scoped_complete_word =
+                defined_inside && ((lane_mapped_vector_write(in) && !memory_result(in)) ||
+                                   (in.fmt == Rdna2Format::MUBUF && arbitrary_read_form(in)));
             if (result.scoped_complete_word)
                 result.scoped_blanket_roots = source_roots_in_exec(rs, source, rs.exec);
             if (defined_inside && result.hard) {
@@ -698,7 +702,16 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
                 if (keep_wider || completes_partition) {
                     result.outside_exec = keep_wider ? old.outside_exec : partition->first;
                     result.blanket_roots.insert(old.blanket_roots.begin(), old.blanket_roots.end());
+                    if (result.scoped_complete_word) {
+                        const auto& prior =
+                            old.scoped_complete_word ? old.scoped_blanket_roots : old.blanket_roots;
+                        result.scoped_blanket_roots.insert(prior.begin(), prior.end());
+                    }
                 }
+                // A hard word can also have an independent active proof. Its retained
+                // inactive lanes still owe their global roots after this overwrite.
+                if (old.hard && old.scoped_complete_word)
+                    result.blanket_roots.insert(old.blanket_roots.begin(), old.blanket_roots.end());
                 // CONFIDENCE: HIGH -- every lane inside EXEC is written here from defined
                 // sources, so each undefined lane of the result is an undefined lane of the old
                 // word outside EXEC, as arbitrary as the old word's were (#5174). A source's own
@@ -734,7 +747,7 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
         // An unconfined hard result keeps the obligations its defined lanes owe a loop proof only
         // while it is arbitrary (as in union_marks); otherwise it is hard with nothing to owe.
         if (result.hard && !result.outside_exec && !arbitrary) result.blanket_roots.clear();
-        if (result.hard || !result.outside_exec) result.scoped_complete_word = false;
+        if (!result.outside_exec) result.scoped_complete_word = false;
         if (!result.scoped_complete_word) result.scoped_blanket_roots.clear();
         result.arbitrary = arbitrary && result.placeholder && result.hard;
         set_word(rs.vreg_source_marks, reg, std::move(result));
@@ -805,14 +818,14 @@ void retire_vector_word_roots(ScalarSourceMarks& marks, const std::set<uint64_t>
     };
     if (invalid(marks.blanket_roots)) {
         marks.arbitrary = false;   // a defined lane relied on the assumption
-        const bool scoped = !marks.hard && marks.scoped_complete_word && marks.outside_exec &&
+        const bool scoped = marks.scoped_complete_word && marks.outside_exec &&
                             !invalid(marks.scoped_blanket_roots);
         marks.blanket_roots = scoped ? marks.scoped_blanket_roots : std::set<uint64_t>{};
         marks.hard = true;
         marks.scoped_complete_word = false;
         if (!scoped) marks.outside_exec = 0;
         marks.scoped_blanket_roots.clear();
-    } else if (!marks.hard && marks.scoped_complete_word && invalid(marks.scoped_blanket_roots)) {
+    } else if (marks.scoped_complete_word && invalid(marks.scoped_blanket_roots)) {
         marks.outside_exec = 0;
         marks.scoped_complete_word = false;
         marks.scoped_blanket_roots.clear();
@@ -893,13 +906,11 @@ void mark_vector_loop_carried(RegState& rs, const std::vector<Rdna2Inst>& ins, u
             rs.vreg_source_marks[reg] = std::move(source);
             continue;
         }
-        // A new soft header generation needs its own backedge obligation; its global proof
-        // survives, but a prior complete writer's active-domain proof does not bypass that edge.
-        if (!source.hard) {
-            source.outside_exec = 0;
-            source.scoped_complete_word = false;
-            source.scoped_blanket_roots.clear();
-        }
+        // Every header generation needs its own backedge obligation. A preheader's complete
+        // writer proves neither a soft nor a confined hard PHI's next iteration.
+        source.scoped_complete_word = false;
+        source.scoped_blanket_roots.clear();
+        if (!source.hard) { source.outside_exec = 0; }
         const bool confined_arbitrary =
             keeps_arbitrary && source.placeholder && source.hard && source.arbitrary;
         if (rs.vreg.contains(reg) && (!source.hard || source.outside_exec != 0)) {

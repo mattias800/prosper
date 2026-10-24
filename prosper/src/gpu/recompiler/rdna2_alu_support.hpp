@@ -587,13 +587,22 @@ inline bool scalar_mask_write_is_vcc_only(const Rdna2Inst& in) {
 
 // Applies drop_vcc_mask_view when the instruction finishes, if `on`.
 struct VccMaskViewDrop {
+    SpirvCompute& b;
     RegState& rs;
     bool on = false;
-    explicit VccMaskViewDrop(RegState& state) : rs(state) {}
+    std::set<uint64_t> projection_roots;
+    VccMaskViewDrop(SpirvCompute& builder, RegState& state) : b(builder), rs(state) {}
     VccMaskViewDrop(const VccMaskViewDrop&) = delete;
     VccMaskViewDrop& operator=(const VccMaskViewDrop&) = delete;
     ~VccMaskViewDrop() {
         if (on) drop_vcc_mask_view(rs);
+        if (projection_roots.empty()) return;
+        // Plain scalar arithmetic retires VCC's Bool spelling. Its DATA result has not
+        // observed any lane bits. Charge the entry guard's provisional projection only
+        // when lowering actually publishes a mask; actual source-mask reads charge their
+        // own roots during lowering and are never rolled back here.
+        if (rs.vcc || rs.sreg_bool.contains(106) || rs.sreg_bool.contains(107))
+            b.loop_blanket_roots_read.insert(projection_roots.begin(), projection_roots.end());
     }
 };
 
@@ -615,7 +624,24 @@ inline bool refuse_mask_write(SpirvCompute& b, const RegState& rs, const Rdna2In
         return true;
     }
     if (in.fmt != Rdna2Format::SOP1 && in.fmt != Rdna2Format::SOP2) return false;
-    if (scalar_data_sources_projectable_into_mask(b, rs, in)) return false;
+    const auto roots_before =
+        scalar_mask_write_is_vcc_only(in) ? b.loop_blanket_roots_read : std::set<uint64_t>{};
+    const bool projectable = scalar_data_sources_projectable_into_mask(b, rs, in);
+    if (scalar_mask_write_is_vcc_only(in)) {
+        // This preflight does not know whether the selected route will publish a mask
+        // or keep VCC as numeric scratch. Keep only its newly introduced obligations
+        // provisional. Existing obligations, and later real mask reads, stay committed.
+        for (auto root = b.loop_blanket_roots_read.begin();
+             root != b.loop_blanket_roots_read.end();) {
+            if (!roots_before.contains(*root)) {
+                drop.projection_roots.insert(*root);
+                root = b.loop_blanket_roots_read.erase(root);
+            } else {
+                ++root;
+            }
+        }
+    }
+    if (projectable) return false;
     if (scalar_mask_write_is_vcc_only(in)) {
         drop.on = true;   // VCC as scalar scratch: data kept, no lane view
         return false;

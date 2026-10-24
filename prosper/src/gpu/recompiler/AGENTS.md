@@ -65,6 +65,10 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   word helper borrows the original mark state; the CFG umbrella exposes the declarations.
   `rdna2_cfg_scalar_source_reads` compiles the pure instruction-read predicates separately for
   standalone CPU proofs. Shared source widths stay in `rdna2_scalar_source_words`.
+- `rdna2_scalar_exec_scopes` — bounded READFIRSTLANE/SALU generation views of existing vector
+  EXEC proofs. Global marks remain in place; writes, joins and loop boundaries expire the views.
+  Native READFIRSTLANE views additionally require an agreement proof for the original input;
+  they do not supply cross-lane broadcast lowering or whole-wave DATA-to-mask authority.
 - `rdna2_cfg_wave_uniform` — VCC-preserving instruction scans and the recursive proof that one
   guest wave agrees on an exit condition. Its private scalar/VGPR slices borrow the original
   recursion object. Workgroup branch admission additionally proves agreement across waves.
@@ -125,6 +129,9 @@ Takes a guest shader's instruction bytes and emits a SPIR-V module.
   not the emitter's per-block marks, is what carries a word's EXEC confinement across a block edge (#5173).
   A writer joins the set only when `active_vector_sources_defined` proves its inputs; an EXEC write that is
   not a proved narrowing clears it.
+- `rdna2_vector_word_marks` — emitter provenance for current vector generations. Complete arithmetic and buffer reads
+  retains separate active-EXEC and inactive old-generation obligations; a scoped read does not
+  authenticate the whole word, an expanded EXEC or memory initialization.
 - `rdna2_smem_pointer_provenance` — the once-per-program SMEM pointer and raw-data provenance seed
   every compute and fragment shell runs before emission; it only fills `RegState` facts.
 - `rdna2_dead_wave_masks` — the liveness proof that lets the CFG emitter elide a 64-bit VCC mask
