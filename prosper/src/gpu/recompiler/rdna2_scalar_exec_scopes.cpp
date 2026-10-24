@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <functional>
 #include <cstdint>
+#include <map>
+#include <tuple>
 #include <vector>
 
 namespace prosper::gpu {
@@ -34,7 +36,7 @@ bool first_lane_source_agrees(const RegState& rs, const std::vector<Rdna2Inst>& 
         }
     }
     std::function<bool(const Operand&, uint32_t, unsigned)> agrees;
-    agrees = [&](const Operand& operand, uint32_t before, unsigned depth) {
+    auto prove = [&](const Operand& operand, uint32_t before, unsigned depth) {
         if (depth > 32) return false;
         if (operand.kind == OperandKind::InlineInt || operand.kind == OperandKind::InlineFloat ||
             operand.kind == OperandKind::Literal)
@@ -58,23 +60,45 @@ bool first_lane_source_agrees(const RegState& rs, const std::vector<Rdna2Inst>& 
             if (operand.value < in->dst.value ||
                 operand.value >= in->dst.value + static_cast<int>(width))
                 continue;
-            if (in->has_modifier || in->has_dpp ||
-                rdna2_valu_lane_mapped(in->fmt, in->opcode) != Rdna2Answer::Yes ||
-                !vector_write_completes_active_word(*in))
+            const auto& effects = rdna2_instruction_effects(*in);
+            // Lane-mapped does not imply agreement: MBCNT also consumes the lane index,
+            // and mask operands select a different bit in each lane even from one SGPR.
+            if (in->has_modifier || in->has_dpp || !effects.describes_vector_result() ||
+                effects.lane_flow != Rdna2LaneFlow::LaneWise || effects.implicit_reads ||
+                effects.lane_mask_src2 || !vector_write_completes_active_word(*in))
                 return false;
             for (const auto& between : instructions)
                 if (between.pc > in->pc && between.pc < before &&
                     rdna2_instruction_may_change_exec(between))
                     return false;
-            for (uint32_t k = 0; k < in->n_src; ++k)
-                if (!agrees(in->src[k], in->pc, depth + 1)) return false;
+            for (uint32_t k = 0; k < in->n_src; ++k) {
+                auto source = in->src[k];
+                const bool reg =
+                    source.kind == OperandKind::SGPR || source.kind == OperandKind::VGPR;
+                const uint32_t words = reg ? effects.ssrc_dwords[k] : 1u;
+                if (!words) return false;
+                for (uint32_t word = 0; word < words; ++word) {
+                    if (!agrees(source, in->pc, depth + 1)) return false;
+                    if (reg) ++source.value;
+                }
+            }
             return in->n_src != 0;
         }
         return false;
     };
+    // Repeated operands share the same proof. Depth is part of the key so caching cannot
+    // turn a query beyond the existing recursion limit into a successful shallower one.
+    std::map<std::tuple<OperandKind, int, uint32_t, unsigned>, bool> memo;
+    agrees = [&](const Operand& operand, uint32_t before, unsigned depth) {
+        const auto key = std::tuple{operand.kind, operand.value, before, depth};
+        if (const auto known = memo.find(key); known != memo.end()) return known->second;
+        const bool result = prove(operand, before, depth);
+        memo.emplace(key, result);
+        return result;
+    };
     return agrees(read.src[0], read.pc, 0);
 }
-} // namespace
+}   // namespace
 
 bool scalar_scope_first_lane_agrees(const SpirvCompute& b, const RegState& rs,
                                     const Rdna2Inst& read) {

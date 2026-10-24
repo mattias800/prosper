@@ -304,3 +304,126 @@ TEST(NativeLoopScalarScope, AgreementProofNeedsTheOriginalPacketAndReadonlyLaunc
     b.saved_mask_original_words[3] = 0xbe8a0381u;   // s10 is now a shader-written word
     EXPECT_FALSE(scalar_scope_first_lane_agrees(b, fixture.registers, read));
 }
+
+TEST(NativeLoopScalarScope, AgreementProofRejectsLaneIndexSources) {
+    ScopedScalar fixture;
+    auto& b = fixture.builder;
+    b.native_subgroup_size = 64;
+    b.saved_mask_original_words = {
+        0xd7650000u,
+        0x000100c1u,   // v_mbcnt_lo v0, -1, 0: explicit inputs agree, lanes do not
+        0x7e280500u,   // s20 = readfirstlane(v0)
+        0xbf810000u,
+    };
+    auto read = rdna2_decode_one(b.saved_mask_original_words.data() + 2, 1);
+    read.pc = 2;
+    EXPECT_FALSE(scalar_scope_first_lane_agrees(b, fixture.registers, read));
+}
+
+TEST(NativeLoopScalarScope, AgreementProofRejectsImplicitLaneMaskSources) {
+    ScopedScalar fixture;
+    auto& b = fixture.builder;
+    b.native_subgroup_size = 64;
+    b.saved_mask_original_words = {
+        0x7e020282u,   // v1 = 2
+        0x02000281u,   // v_cndmask v0, 1, v1: implicit VCC selects a different bit in each lane
+        0x7e280500u,   // s20 = readfirstlane(v0)
+        0xbf810000u,
+    };
+    auto read = rdna2_decode_one(b.saved_mask_original_words.data() + 2, 1);
+    read.pc = 2;
+    EXPECT_FALSE(scalar_scope_first_lane_agrees(b, fixture.registers, read));
+}
+
+TEST(NativeLoopScalarScope, AgreementProofRejectsExplicitLaneMaskSources) {
+    ScopedScalar fixture;
+    auto& b = fixture.builder;
+    b.native_subgroup_size = 64;
+    fixture.registers.sreg[10] =
+        202;   // a readonly scalar word can still contain differing lane bits
+    b.saved_mask_original_words = {
+        0x7e020282u,   // v1 = 2
+        0xd5010000u, 129u | (257u << 9u) | (10u << 18u),   // v_cndmask v0, 1, v1, s[10:11]
+        0x7e280500u,   // s20 = readfirstlane(v0)
+        0xbf810000u,
+    };
+    auto read = rdna2_decode_one(b.saved_mask_original_words.data() + 3, 1);
+    read.pc = 3;
+    EXPECT_FALSE(scalar_scope_first_lane_agrees(b, fixture.registers, read));
+}
+
+TEST(NativeLoopScalarScope, AgreementProofChecksEveryVectorSourceWord) {
+    ScopedScalar fixture;
+    auto& b = fixture.builder;
+    b.native_subgroup_size = 64;
+    b.saved_mask_original_words = {
+        0x7e040280u,   // v2 = 0, low word
+        0x7e060282u,   // v3 = 2, high word
+        0x7e001f02u,   // v_cvt_f32_f64 v0, v[2:3]
+        0x7e280500u,   // s20 = readfirstlane(v0)
+        0xbf810000u,
+    };
+    auto read = rdna2_decode_one(b.saved_mask_original_words.data() + 3, 1);
+    read.pc = 3;
+    EXPECT_TRUE(scalar_scope_first_lane_agrees(b, fixture.registers, read));
+    b.saved_mask_original_words[1] = 0x7e060300u;   // v3 = launch lane index, low v2 unchanged
+    EXPECT_FALSE(scalar_scope_first_lane_agrees(b, fixture.registers, read));
+}
+
+TEST(NativeLoopScalarScope, AgreementProofChecksEveryScalarSourceWord) {
+    ScopedScalar fixture;
+    auto& b = fixture.builder;
+    b.native_subgroup_size = 64;
+    fixture.registers.sreg[10] = 202;
+    fixture.registers.sreg[11] = 203;
+    b.saved_mask_original_words = {
+        0xbf800000u,   // no scalar write
+        0x7e001e0au,   // v_cvt_f32_f64 v0, s[10:11]
+        0x7e280500u,   // s20 = readfirstlane(v0)
+        0xbf810000u,
+    };
+    auto read = rdna2_decode_one(b.saved_mask_original_words.data() + 2, 1);
+    read.pc = 2;
+    EXPECT_TRUE(scalar_scope_first_lane_agrees(b, fixture.registers, read));
+    b.saved_mask_original_words[0] =
+        0xbe8b0381u;   // high s11 is shader-written; low s10 is readonly
+    EXPECT_FALSE(scalar_scope_first_lane_agrees(b, fixture.registers, read));
+}
+
+TEST(NativeLoopScalarScope, LaneMaskReadfirstlaneStillNeedsABroadcast) {
+    auto program = loop_program();
+    program[3] = 0xbeea0481u;   // VCC = 1: only lane zero selects the one-valued operand
+    program.insert(program.begin() + 6, 0xbf800000u);   // same-sized region control
+    program[17] = 0xbf82fff3u;   // adjusted back edge to header pc5
+    const auto c = config();
+    const auto table = resources();
+    const uint64_t address = 0x5497200400ull;
+    ASSERT_FALSE(recompile_compute(program.data(), program.size(), &table, c,
+                                   {RecompileDiagnosticStage::Compute, address})
+                     .empty())
+        << last_terminal_reject_reason(address);
+    program[6] =
+        0x02000080u;   // v_cndmask v0, 0, v0: equal explicit inputs do not prove VCC agrees
+    EXPECT_TRUE(recompile_compute(program.data(), program.size(), &table, c,
+                                  {RecompileDiagnosticStage::Compute, address + 1})
+                    .empty());
+    EXPECT_NE(last_terminal_reject_reason(address + 1).find("loop-carried v0 is fabricated"),
+              std::string::npos)
+        << last_terminal_reject_reason(address + 1);
+}
+
+TEST(NativeLoopScalarScope, AgreementProofReusesRepeatedSourceSubproblems) {
+    ScopedScalar fixture;
+    auto& b = fixture.builder;
+    b.native_subgroup_size = 64;
+    b.saved_mask_original_words = {0x7e000281u};   // v0 = 1
+    // Each add uses the same preceding definition twice. A depth bound alone still permits
+    // over two billion recursive visits; the proof must share repeated subproblems.
+    for (unsigned i = 0; i < 30; ++i) b.saved_mask_original_words.push_back(0x4a000100u);
+    const auto pc = static_cast<uint32_t>(b.saved_mask_original_words.size());
+    b.saved_mask_original_words.insert(b.saved_mask_original_words.end(),
+                                       {0x7e280500u, 0xbf810000u});
+    auto read = rdna2_decode_one(b.saved_mask_original_words.data() + pc, 1);
+    read.pc = pc;
+    EXPECT_TRUE(scalar_scope_first_lane_agrees(b, fixture.registers, read));
+}

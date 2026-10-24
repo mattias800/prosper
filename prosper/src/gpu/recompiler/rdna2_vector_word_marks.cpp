@@ -910,9 +910,7 @@ void mark_vector_loop_carried(RegState& rs, const std::vector<Rdna2Inst>& ins, u
         // writer proves neither a soft nor a confined hard PHI's next iteration.
         source.scoped_complete_word = false;
         source.scoped_blanket_roots.clear();
-        if (!source.hard) {
-            source.outside_exec = 0;
-        }
+        if (!source.hard) { source.outside_exec = 0; }
         const bool confined_arbitrary =
             keeps_arbitrary && source.placeholder && source.hard && source.arbitrary;
         if (rs.vreg.contains(reg) && (!source.hard || source.outside_exec != 0)) {
