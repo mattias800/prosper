@@ -4,6 +4,10 @@
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_reg_state.hpp"
 
+#include <cstdint>
+#include <optional>
+#include <set>
+
 namespace prosper::gpu {
 std::optional<std::set<uint64_t>> predicate_operand_roots(const RegState& rs, const Rdna2Inst& in,
                                                           PredicateRootReader read_roots) {
