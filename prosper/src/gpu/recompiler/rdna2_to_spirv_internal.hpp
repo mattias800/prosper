@@ -821,6 +821,8 @@ struct SavedB64MaskSnapshot {
     bool portable_numeric_replacement = false;
     // Agreement proof for this exact READFIRSTLANE input, captured before emission.
     bool scalar_first_lane_agrees = false;
+    // Closed, once-through fragment local-index route; no general broadcast authority.
+    bool scalar_local_index_waterfall = false;
     // (root, Bool id). At most a few entries: only the roots this one instruction can overwrite.
     std::vector<std::pair<int, uint32_t>> entries;
     // The instruction's input marks, taken before emission with the masks (#4706).
@@ -1099,7 +1101,8 @@ inline uint32_t emitted_scalar_write_width(const RegState& rs, const Rdna2Inst& 
 // v_writelane spill slot, and SCC when a scalar instruction may have written it.
 inline void propagate_merge_placeholder(RegState& rs, const Rdna2Inst& in,
                                         const ScalarSourceMarks& marks,
-                                        bool scalar_first_lane_agrees = false) {
+                                        bool scalar_first_lane_agrees = false,
+                                        bool scalar_local_index_waterfall = false) {
     record_vector_word_marks(rs, in, marks);
     if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361) {
         if (in.dst.kind != OperandKind::VGPR || in.src[1].kind != OperandKind::InlineInt) return;
@@ -1149,7 +1152,8 @@ inline void propagate_merge_placeholder(RegState& rs, const Rdna2Inst& in,
                 rs.sreg_memory_pattern.insert(r);
             else
                 rs.sreg_memory_pattern.erase(r);
-            record_scalar_exec_scope(rs, in, r, ballot, marks, scalar_first_lane_agrees);
+            record_scalar_exec_scope(rs, in, r, ballot, marks, scalar_first_lane_agrees,
+                                     scalar_local_index_waterfall);
         }
     });
     // SCC: a marked input marks an operation which may rewrite it. Only a compare from definite
@@ -1176,7 +1180,8 @@ inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,
                          bool allow_compute_scalar_vcc_bridge,
                          const SavedB64MaskSnapshot& saved_b64_masks_before) {
     propagate_merge_placeholder(rs, in, saved_b64_masks_before.source_marks,
-                                saved_b64_masks_before.scalar_first_lane_agrees);
+                                saved_b64_masks_before.scalar_first_lane_agrees,
+                                saved_b64_masks_before.scalar_local_index_waterfall);
     for_each_scalar_write(in, [&](int base, uint32_t width) {
         for (uint32_t w = 0; w < width; ++w)
             rs.unavailable_saved_mask_words.erase(base + static_cast<int>(w));
