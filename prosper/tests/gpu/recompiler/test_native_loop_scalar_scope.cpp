@@ -341,6 +341,8 @@ TEST(NativeLoopScalarScope, AgreementProofRejectsExplicitLaneMaskSources) {
     b.native_subgroup_size = 64;
     fixture.registers.sreg[10] =
         202;   // a readonly scalar word can still contain differing lane bits
+    fixture.registers.sreg[11] =
+        203;   // both physical halves are present; lane-bit selection varies
     b.saved_mask_original_words = {
         0x7e020282u,   // v1 = 2
         0xd5010000u, 129u | (257u << 9u) | (10u << 18u),   // v_cndmask v0, 1, v1, s[10:11]
@@ -421,6 +423,65 @@ TEST(NativeLoopScalarScope, AgreementProofReusesRepeatedSourceSubproblems) {
     // over two billion recursive visits; the proof must share repeated subproblems.
     for (unsigned i = 0; i < 30; ++i) b.saved_mask_original_words.push_back(0x4a000100u);
     const auto pc = static_cast<uint32_t>(b.saved_mask_original_words.size());
+    b.saved_mask_original_words.insert(b.saved_mask_original_words.end(),
+                                       {0x7e280500u, 0xbf810000u});
+    auto read = rdna2_decode_one(b.saved_mask_original_words.data() + pc, 1);
+    read.pc = pc;
+    EXPECT_TRUE(scalar_scope_first_lane_agrees(b, fixture.registers, read));
+}
+
+TEST(NativeLoopScalarScope, AgreementProofChecksTheHighWordOfAVectorSource) {
+    ScopedScalar fixture;
+    auto& b = fixture.builder;
+    b.native_subgroup_size = 64;
+    b.saved_mask_original_words = {
+        0x7e080280u,   // v4 = 0; v5 is still a lane-varying or absent incoming word
+        0x7e001f04u,   // v0 = cvt_f32_f64(v[4:5])
+        0x7e280500u,   // s20 = readfirstlane(v0)
+        0xbf810000u,
+    };
+    auto read = rdna2_decode_one(b.saved_mask_original_words.data() + 2, 1);
+    read.pc = 2;
+    EXPECT_FALSE(scalar_scope_first_lane_agrees(b, fixture.registers, read))
+        << "a constant low half cannot prove the F64 operand agrees";
+    b.saved_mask_original_words.insert(b.saved_mask_original_words.begin(), 0x7e0a0280u);
+    read.pc = 3;
+    EXPECT_TRUE(scalar_scope_first_lane_agrees(b, fixture.registers, read))
+        << "both halves now have complete constant definitions";
+}
+
+TEST(NativeLoopScalarScope, AgreementProofChecksEveryLaunchWordOfAWideSource) {
+    ScopedScalar fixture;
+    auto& b = fixture.builder;
+    b.native_subgroup_size = 64;
+    b.saved_mask_original_words = {
+        0x7e001e0au,   // v0 = cvt_f32_f64(s[10:11])
+        0x7e280500u,
+        0xbf810000u,
+    };
+    auto read = rdna2_decode_one(b.saved_mask_original_words.data() + 1, 1);
+    read.pc = 1;
+    fixture.registers.sreg[10] = 202;
+    EXPECT_FALSE(scalar_scope_first_lane_agrees(b, fixture.registers, read))
+        << "the low launch word does not supply its absent sibling";
+    fixture.registers.sreg[11] = 203;
+    EXPECT_TRUE(scalar_scope_first_lane_agrees(b, fixture.registers, read));
+    b.saved_mask_original_words.insert(b.saved_mask_original_words.begin(), 0xbe8b0381u);
+    read.pc = 2;
+    EXPECT_FALSE(scalar_scope_first_lane_agrees(b, fixture.registers, read))
+        << "the high word is no longer a read-only launch input";
+}
+
+TEST(NativeLoopScalarScope, RepeatedWideOperandsKeepTheAgreementWalkBounded) {
+    ScopedScalar fixture;
+    auto& b = fixture.builder;
+    b.native_subgroup_size = 64;
+    b.saved_mask_original_words = {0x7e000280u, 0x7e020280u};   // v[0:1] = 0
+    for (unsigned step = 0; step < 16; ++step) {
+        b.saved_mask_original_words.push_back(0xd7000000u);   // v_lshrrev_b64 v[0:1],1,v[0:1]
+        b.saved_mask_original_words.push_back(0x00020081u);
+    }
+    const uint32_t pc = static_cast<uint32_t>(b.saved_mask_original_words.size());
     b.saved_mask_original_words.insert(b.saved_mask_original_words.end(),
                                        {0x7e280500u, 0xbf810000u});
     auto read = rdna2_decode_one(b.saved_mask_original_words.data() + pc, 1);
