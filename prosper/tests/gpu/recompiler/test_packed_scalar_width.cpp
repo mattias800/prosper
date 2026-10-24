@@ -3,11 +3,13 @@
 #include "bpermute_spirv_oracle.hpp"
 #include "fixtures/checked_compute_launch.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
 
 #include <gtest/gtest.h>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -68,7 +70,7 @@ TEST(PackedScalarWidth, FreshPredicateAndPackedValuesExecuteWithoutAnUnusedSibli
     const auto out = vm.run_buffers(64, {{3, std::vector<uint32_t>(128, 0xdeadbeefu)}}, 3);
     ASSERT_TRUE(vm.error.empty()) << vm.error;
     ASSERT_EQ(out.size(), 128u);
-    for (uint32_t lane = 0; lane < 64; ++lane) {
+    for (std::size_t lane = 0; lane < 64; ++lane) {
         EXPECT_EQ(out[lane * 2], 0x41004100u) << "packed 2.5, lane " << lane;
         EXPECT_EQ(out[lane * 2 + 1], 1u) << "fresh predicate, lane " << lane;
     }
@@ -80,7 +82,8 @@ TEST(PackedScalarWidth, AnActuallyMissingPackedScalarStillRefuses) {
     const uint64_t address = 0x5497500200ull;
     EXPECT_TRUE(compile(code, address).empty());
     EXPECT_NE(last_terminal_reject_reason(address).find("fabricated-fresh-mask-source pc=8"),
-              std::string::npos) << last_terminal_reject_reason(address);
+              std::string::npos)
+        << last_terminal_reject_reason(address);
 }
 
 TEST(PackedScalarWidth, AMissingLaneSpillCannotSupplyThePackedSource) {
@@ -90,7 +93,8 @@ TEST(PackedScalarWidth, AMissingLaneSpillCannotSupplyThePackedSource) {
     const uint64_t address = 0x5497500300ull;
     EXPECT_TRUE(compile(code, address).empty());
     EXPECT_NE(last_terminal_reject_reason(address).find("mode=unresolved-operand pc=0"),
-              std::string::npos) << last_terminal_reject_reason(address);
+              std::string::npos)
+        << last_terminal_reject_reason(address);
 }
 
 TEST(PackedScalarWidth, EveryKnownPackedSourceUsesTheCanonicalPhysicalWidth) {
