@@ -268,3 +268,16 @@ TEST(RelativeBankSource, RangeQueryUsesOnlyExistingCohortFactsAndStaysBounded) {
     const auto bad_shift = f.b.ibin(Op_ShiftLeftLogical, f.index, f.b.uconst(32));
     EXPECT_FALSE(relative_index_values(f.b, f.rs, bad_shift, f.cohort));
 }
+
+TEST(RelativeBankSource, PublicationDoesNotNarrowExistingWiderCoverage) {
+    BankFixture f;
+    const auto proof = relative_bank_source_proof(f.b, f.rs, f.relative);
+    ASSERT_TRUE(proof);
+    const auto whole = f.b.btrue();
+    f.rs.exec_subset_of[f.cohort] = whole;
+    auto& result = f.rs.vreg_source_marks.at(37);
+    result.outside_exec = whole;
+    publish_relative_bank_word(f.rs, f.relative, proof->source, proof->publication);
+    EXPECT_EQ(result.outside_exec, whole);
+    EXPECT_FALSE(result.scoped_complete_word);
+}

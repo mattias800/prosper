@@ -120,6 +120,11 @@ void publish_relative_bank_word(RegState& rs, const Rdna2Inst& in, const ScalarS
     if (result == rs.vreg_source_marks.end() || !result->second.placeholder ||
         value == rs.vreg.end() || !value->second)
         return;
+    // One owner field also retains the legacy hard-word coverage. Do not narrow an
+    // existing wider or unrelated view merely to add this independent cohort view.
+    if (result->second.outside_exec &&
+        !exec_within(rs, result->second.outside_exec, publication.cohort))
+        return;
     // The ordinary writer already retained old lanes, roots and MEMORY. This independent
     // complete-word view covers only the checked cohort, including after its EXEC restore.
     result->second.outside_exec = publication.cohort;

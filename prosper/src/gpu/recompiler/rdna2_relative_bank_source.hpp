@@ -1,6 +1,6 @@
 // Current-cohort result proof for an authenticated, closed local-index packet.
 #pragma once
-#include "gpu/recompiler/rdna2_reg_state.hpp"
+#include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 
 #include <cstdint>
 #include <optional>
