@@ -234,3 +234,25 @@ TEST(FreshMaskOperandRoots, UnsupportedFormsKeepTheLegacyObservation) {
     fixture.compare.src[0].kind = OperandKind::SGPR;
     EXPECT_FALSE(predicate_operand_roots(fixture.registers, fixture.compare, &test_roots));
 }
+
+TEST(FreshMaskOperandRoots, BothWordsOfBothWideOperandsRemainObserved) {
+    RegState registers;
+    registers.exec = 7;
+    for (int word = 2; word <= 5; ++word)
+        registers.vreg_source_marks[word].blanket_roots = {blanket_root(5, 256 + word)};
+    const uint32_t word = 0x7c440902u; // v_cmp_eq_f64 vcc, v[2:3], v[4:5]
+    const auto compare = rdna2_decode_one(&word, 1);
+    const auto roots = predicate_operand_roots(registers, compare, &test_roots);
+    ASSERT_TRUE(roots.has_value());
+    EXPECT_EQ(roots->size(), 4u);
+    for (int word = 2; word <= 5; ++word)
+        EXPECT_TRUE(roots->contains(blanket_root(5, 256 + word))) << word;
+}
+
+TEST(FreshMaskOperandRoots, AReaderOutsideTheOwnerStillChargesTheOldGeneration) {
+    DistinctOwners fixture;
+    fixture.registers.exec = 8;
+    EXPECT_TRUE(fresh_mask_sources_defined(fixture.builder, fixture.registers, fixture.compare));
+    EXPECT_TRUE(fixture.builder.loop_blanket_roots_read.contains(fixture.old));
+    EXPECT_TRUE(fixture.builder.loop_blanket_roots_read.contains(fixture.active));
+}
