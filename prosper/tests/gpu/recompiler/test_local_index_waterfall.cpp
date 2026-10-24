@@ -12,6 +12,7 @@
 
 #include <gtest/gtest.h>
 #include <cstdint>
+#include <cstddef>
 #include <string>
 #include <utility>
 #include <unordered_set>
@@ -119,14 +120,16 @@ TEST(LocalIndexWaterfall, EveryLaneSelectsItsOwnBankAndPreservesInactiveWordsAnd
     ASSERT_FALSE(module.empty()) << "refused at PC " << refused;
     bpermute_oracle::Interpreter vm(module);
     vm.native_subgroup_width = 64;
-    const auto result = vm.run_buffers(64, {{1, std::vector<uint32_t>(64 * 3, 0xdeadbeefu)}}, 1);
+    const auto result =
+        vm.run_buffers(64, {{1, std::vector<uint32_t>(std::size_t{64} * 3, 0xdeadbeefu)}}, 1);
     ASSERT_TRUE(vm.error.empty()) << vm.error;
     ASSERT_EQ(result.size(), 64u * 3);
     for (uint32_t lane = 0; lane < 64; ++lane) {
         const uint32_t value = lane < 31 ? 0x40400000u : lane % 2 ? 0x40000000u : 0x3f800000u;
-        EXPECT_EQ(result[lane * 3], value) << "bank/old word, lane " << lane;
-        EXPECT_EQ(result[lane * 3 + 1], lane >= 31 ? 1u : 0u) << "EXEC, lane " << lane;
-        EXPECT_EQ(result[lane * 3 + 2], lane < 17 ? 1u : 0u) << "VCC, lane " << lane;
+        const size_t at = static_cast<size_t>(lane) * 3;
+        EXPECT_EQ(result[at], value) << "bank/old word, lane " << lane;
+        EXPECT_EQ(result[at + 1], lane >= 31 ? 1u : 0u) << "EXEC, lane " << lane;
+        EXPECT_EQ(result[at + 2], lane < 17 ? 1u : 0u) << "VCC, lane " << lane;
     }
 }
 

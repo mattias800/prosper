@@ -1153,7 +1153,7 @@ inline void propagate_merge_placeholder(RegState& rs, const Rdna2Inst& in,
             else
                 rs.sreg_memory_pattern.erase(r);
             record_scalar_exec_scope(rs, in, r, ballot, marks, scalar_first_lane_agrees,
-                                      scalar_local_index_waterfall);
+                                     scalar_local_index_waterfall);
         }
     });
     // SCC: a marked input marks an operation which may rewrite it. Only a compare from definite

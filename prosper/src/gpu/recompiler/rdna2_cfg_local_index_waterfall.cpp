@@ -3,11 +3,12 @@
 #include "gpu/recompiler/rdna2_cfg_branch_helpers.hpp"
 #include "gpu/recompiler/rdna2_cfg_scalar_merge.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
-#include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <vector>
 #include <cstdlib>
 
 namespace prosper::gpu {
