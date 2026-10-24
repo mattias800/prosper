@@ -309,3 +309,19 @@ TEST(LocalIndexWaterfall, ExistingTerminalTailInventoryParticipatesInIndexDeadne
         EXPECT_FALSE(scalar_scope_local_index_waterfall(cohort.builder, cohort.read));
     }
 }
+
+TEST(LocalIndexWaterfall, SdwaSelectionDoesNotProveThePlainIdentityCompare) {
+    const auto code = program();
+    for (const uint32_t pc : {12u, 13u, 15u}) {
+        std::vector<Rdna2Inst> instructions;
+        ASSERT_EQ(rdna2_walk(code.data(), code.size(), instructions), code.size());
+        bool changed = false;
+        for (auto& in : instructions) {
+            if (in.pc != pc) continue;
+            in.has_sdwa = true;   // independent of has_modifier in the decoded inventory
+            changed = true;
+        }
+        ASSERT_TRUE(changed);
+        EXPECT_EQ(local_index_waterfall_latch(instructions, 12), UINT32_MAX) << pc;
+    }
+}

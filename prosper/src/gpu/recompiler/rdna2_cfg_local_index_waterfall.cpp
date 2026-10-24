@@ -86,7 +86,7 @@ size_t relative_moves_end(const std::vector<Rdna2Inst>& ins, size_t first) {
             continue;
         }
         if (in.fmt != Rdna2Format::VOP1 || in.opcode != 0x43 ||
-            in.src[0].kind != OperandKind::VGPR || in.has_modifier || in.has_dpp)
+            in.src[0].kind != OperandKind::VGPR || in.has_modifier || in.has_dpp || in.has_sdwa)
             break;
         moved = true;
         ++tail;
@@ -102,13 +102,15 @@ uint32_t local_index_waterfall_latch(const std::vector<Rdna2Inst>& ins, uint32_t
     const size_t at = static_cast<size_t>(read - ins.begin());
     if (at + 8 >= ins.size() || read->fmt != Rdna2Format::VOP1 ||
         !rdna2_lane_read_writes_sgpr(*read) || read->dst.value < 0 || read->dst.value > 105 ||
-        read->src[0].kind != OperandKind::VGPR || read->has_modifier || read->has_dpp)
+        read->src[0].kind != OperandKind::VGPR || read->has_modifier || read->has_dpp ||
+        read->has_sdwa)
         return UINT32_MAX;
     const int index = read->dst.value;
     const auto& compare = ins[at + 1];
     if (compare.fmt != Rdna2Format::VOPC || compare.opcode != kVopcOpcodeCmpxEqU32 ||
-        compare.has_modifier || compare.has_dpp || !scalar(compare.src[0], index) ||
-        compare.src[1] != read->src[0] || !move(ins[at + 2], 124, index, false))
+        compare.has_modifier || compare.has_dpp || compare.has_sdwa ||
+        !scalar(compare.src[0], index) || compare.src[1] != read->src[0] ||
+        !move(ins[at + 2], 124, index, false))
         return UINT32_MAX;
     const size_t tail = relative_moves_end(ins, at + 3);
     if (tail + 5 >= ins.size()) return UINT32_MAX;
