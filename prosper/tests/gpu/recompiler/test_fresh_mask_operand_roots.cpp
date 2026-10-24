@@ -226,13 +226,16 @@ TEST(FreshMaskOperandRoots, DistinctOwnersRetainEveryActiveDependency) {
 TEST(FreshMaskOperandRoots, UnsupportedFormsKeepTheLegacyObservation) {
     DistinctOwners fixture;
     fixture.compare.has_dpp = true;
-    EXPECT_FALSE(predicate_operand_roots(fixture.registers, fixture.compare, &test_roots));
+    EXPECT_FALSE(
+        predicate_operand_roots(fixture.registers, fixture.compare, &test_roots).has_value());
     fixture.compare.has_dpp = false;
     fixture.compare.has_modifier = true;
-    EXPECT_FALSE(predicate_operand_roots(fixture.registers, fixture.compare, &test_roots));
+    EXPECT_FALSE(
+        predicate_operand_roots(fixture.registers, fixture.compare, &test_roots).has_value());
     fixture.compare.has_modifier = false;
     fixture.compare.src[0].kind = OperandKind::SGPR;
-    EXPECT_FALSE(predicate_operand_roots(fixture.registers, fixture.compare, &test_roots));
+    EXPECT_FALSE(
+        predicate_operand_roots(fixture.registers, fixture.compare, &test_roots).has_value());
 }
 
 TEST(FreshMaskOperandRoots, BothWordsOfBothWideOperandsRemainObserved) {
