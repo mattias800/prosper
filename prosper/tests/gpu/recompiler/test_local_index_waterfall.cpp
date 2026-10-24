@@ -255,7 +255,14 @@ TEST(LocalIndexWaterfall, HardScalarViewExpiresWithValuePhysicalBackingAndGlobal
         if (mutation == 2) cohort.registers.sreg_loop_blanket[3] = {blanket_root(5, 256)};
         if (mutation == 3) cohort.registers.sreg_memory_pattern.insert(3);
         EXPECT_EQ(current_scalar_exec_scope(cohort.registers, 3), nullptr) << mutation;
-        EXPECT_FALSE(cohort.compare()) << mutation;
+        if (mutation == 2) {
+            // The original scalar policy admits a soft loop root and records its
+            // back-edge obligation; invalidating this view must preserve that contract.
+            EXPECT_TRUE(cohort.compare());
+            EXPECT_TRUE(cohort.builder.loop_blanket_roots_read.contains(blanket_root(5, 256)));
+        } else {
+            EXPECT_FALSE(cohort.compare()) << mutation;
+        }
     }
 }
 
