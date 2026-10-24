@@ -7,6 +7,7 @@
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_launch_vgprs.hpp"
+#include "gpu/recompiler/rdna2_predicate_operand_roots.hpp"
 #include "gpu/recompiler/rdna2_loaded_arbitrary.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_vector_old_word.hpp"
@@ -544,6 +545,12 @@ bool fresh_mask_sources_defined(SpirvCompute& b, const RegState& rs, const Rdna2
     // A memory-loaded value can form a fresh predicate; a missing spill's zero storage cannot.
     const auto marks = scalar_source_marks(rs, in);
     if (!marks.placeholder) return true;
+    // Keep the existing admission verdict. Observe each actual source's active roots
+    // before their union can lose distinct EXEC owners; never erase earlier reads.
+    const auto operand_roots = predicate_operand_roots(rs, in, &source_roots_in_exec);
+    const auto observed = [&](uint64_t root) {
+        return !operand_roots || operand_roots->contains(root);
+    };
     // The predicate reads only the lanes its own EXEC enables, and its result is masked by that EXEC,
     // so a placeholder confined to the lanes outside the same EXEC value is never observed.
     // CONFIDENCE: HIGH -- an un-narrowed EXEC equal to the owner is the same immutable value, so
@@ -556,7 +563,8 @@ bool fresh_mask_sources_defined(SpirvCompute& b, const RegState& rs, const Rdna2
         // the header obligation before accepting this scoped read; the back edge checks it.
         // The lanes outside the owner are not read, so neither is their arbitrary-outside root.
         for (uint64_t root : source_roots_in_exec(rs, marks, rs.exec))
-            if (!arbitrary_outside_root(root)) b.loop_blanket_roots_read.insert(root);
+            if (!arbitrary_outside_root(root) && observed(root))
+                b.loop_blanket_roots_read.insert(root);
         return true;
     }
     const bool strict = in.pc >= b.strict_loop_condition.first &&
@@ -568,12 +576,14 @@ bool fresh_mask_sources_defined(SpirvCompute& b, const RegState& rs, const Rdna2
         // defined ones. Hardware holds an earlier wave's leftovers there, and the value supplied
         // here is one hardware could hold: there is no lane identity to fabricate. Defined lanes
         // still owe their loop obligations.
-        b.loop_blanket_roots_read.insert(marks.blanket_roots.begin(), marks.blanket_roots.end());
+        for (const auto root : marks.blanket_roots)
+            if (observed(root)) b.loop_blanket_roots_read.insert(root);
         return true;
     }
     if (marks.hard || marks.blanket_roots.empty()) return false;
     // These roots name defined loop seeds, whose back edges the existing loop proof checks.
-    b.loop_blanket_roots_read.insert(marks.blanket_roots.begin(), marks.blanket_roots.end());
+    for (const auto root : marks.blanket_roots)
+            if (observed(root)) b.loop_blanket_roots_read.insert(root);
     return true;
 }
 

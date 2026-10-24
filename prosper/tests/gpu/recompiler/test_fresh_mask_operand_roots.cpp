@@ -3,6 +3,9 @@
 #include "bpermute_spirv_oracle.hpp"
 #include "fixtures/checked_compute_launch.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include "gpu/recompiler/rdna2_vector_word_marks.hpp"
+#include "gpu/recompiler/rdna2_predicate_operand_roots.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -165,4 +168,69 @@ TEST(FreshMaskOperandRoots, ARequiredActiveOperandStillNeedsItsBackEdge) {
     EXPECT_NE(last_terminal_reject_reason(address).find("loop-carried v7 is fabricated"),
               std::string::npos)
         << last_terminal_reject_reason(address);
+}
+
+namespace {
+struct DistinctOwners {
+    SpirvCompute builder;
+    RegState registers;
+    Rdna2Inst compare;
+    uint64_t old = blanket_root(5, 256);
+    uint64_t active = blanket_root(5, 257);
+    DistinctOwners() {
+        builder.is_compute = true;
+        builder.wave_size = 64;
+        registers.vector_wave_size = 64;
+        registers.exec_narrowed = true;
+        registers.exec = 7;
+        registers.vreg[0] = 100;
+        registers.vreg[1] = 101;
+        auto& current = registers.vreg_source_marks[0];
+        current.placeholder = current.hard = current.arbitrary = current.scoped_complete_word =
+            true;
+        current.outside_exec = 7;
+        current.blanket_roots = {old};
+        auto& other = registers.vreg_source_marks[1];
+        other.placeholder = other.hard = other.arbitrary = true;
+        other.blanket_roots = {active};
+        const uint32_t word = 0x7d840300u; // vcc = v0 == v1
+        compare = rdna2_decode_one(&word, 1);
+    }
+};
+const std::set<uint64_t>& test_roots(const RegState&, const ScalarSourceMarks& marks,
+                                     uint32_t exec) {
+    return marks.scoped_complete_word && marks.outside_exec == exec ? marks.scoped_blanket_roots
+                                                                    : marks.blanket_roots;
+}
+} // namespace
+
+TEST(FreshMaskOperandRoots, ExistingObservationsAreNeverRolledBack) {
+    DistinctOwners fixture;
+    fixture.builder.loop_blanket_roots_read.insert(fixture.old);
+    EXPECT_TRUE(fresh_mask_sources_defined(fixture.builder, fixture.registers, fixture.compare));
+    EXPECT_TRUE(fixture.builder.loop_blanket_roots_read.contains(fixture.old));
+    EXPECT_TRUE(fixture.builder.loop_blanket_roots_read.contains(fixture.active));
+}
+
+TEST(FreshMaskOperandRoots, DistinctOwnersRetainEveryActiveDependency) {
+    DistinctOwners fixture;
+    EXPECT_TRUE(fresh_mask_sources_defined(fixture.builder, fixture.registers, fixture.compare));
+    EXPECT_FALSE(fixture.builder.loop_blanket_roots_read.contains(fixture.old));
+    EXPECT_TRUE(fixture.builder.loop_blanket_roots_read.contains(fixture.active));
+    fixture.registers.vreg_source_marks[0].scoped_blanket_roots.insert(fixture.old);
+    fixture.builder.loop_blanket_roots_read.clear();
+    EXPECT_TRUE(fresh_mask_sources_defined(fixture.builder, fixture.registers, fixture.compare));
+    EXPECT_TRUE(fixture.builder.loop_blanket_roots_read.contains(fixture.old));
+}
+
+TEST(FreshMaskOperandRoots, UnsupportedFormsKeepTheLegacyObservation) {
+    DistinctOwners fixture;
+    fixture.compare.has_dpp = true;
+    EXPECT_FALSE(predicate_operand_roots(fixture.registers, fixture.compare, &test_roots));
+    fixture.compare.has_dpp = false;
+    fixture.compare.has_modifier = true;
+    EXPECT_FALSE(predicate_operand_roots(fixture.registers, fixture.compare, &test_roots));
+    fixture.compare.has_modifier = false;
+    fixture.compare.src[0].kind = OperandKind::SGPR;
+    EXPECT_FALSE(predicate_operand_roots(fixture.registers, fixture.compare, &test_roots));
 }
