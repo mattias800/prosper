@@ -253,9 +253,10 @@ TEST(FreshMaskOperandRoots, BothWordsOfBothWideOperandsRemainObserved) {
     const auto compare = rdna2_decode_one(&packet, 1);
     const auto roots = predicate_operand_roots(registers, compare, &test_roots);
     ASSERT_TRUE(roots.has_value());
-    EXPECT_EQ(roots->size(), 4u);
+    const auto values = roots.value_or(std::set<uint64_t>{});
+    EXPECT_EQ(values.size(), 4u);
     for (int word = 2; word <= 5; ++word)
-        EXPECT_TRUE(roots->contains(blanket_root(5, 256 + word))) << word;
+        EXPECT_TRUE(values.contains(blanket_root(5, 256 + word))) << word;
 }
 
 TEST(FreshMaskOperandRoots, AReaderOutsideTheOwnerStillChargesTheOldGeneration) {

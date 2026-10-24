@@ -583,7 +583,7 @@ bool fresh_mask_sources_defined(SpirvCompute& b, const RegState& rs, const Rdna2
     if (marks.hard || marks.blanket_roots.empty()) return false;
     // These roots name defined loop seeds, whose back edges the existing loop proof checks.
     for (const auto root : marks.blanket_roots)
-            if (observed(root)) b.loop_blanket_roots_read.insert(root);
+        if (observed(root)) b.loop_blanket_roots_read.insert(root);
     return true;
 }
 
