@@ -23,6 +23,7 @@
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_scalar_exec_scopes.hpp"
+#include "gpu/recompiler/rdna2_relative_bank_source.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_compute_contracts.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
@@ -827,6 +828,7 @@ struct SavedB64MaskSnapshot {
     std::vector<std::pair<int, uint32_t>> entries;
     // The instruction's input marks, taken before emission with the masks (#4706).
     ScalarSourceMarks source_marks;
+    RelativeBankPublication relative_bank_publication;
 };
 
 inline void expire_saved_b64_mask(RegState& rs, const SavedB64MaskSnapshot& before, int reg,
@@ -1102,8 +1104,10 @@ inline uint32_t emitted_scalar_write_width(const RegState& rs, const Rdna2Inst& 
 inline void propagate_merge_placeholder(RegState& rs, const Rdna2Inst& in,
                                         const ScalarSourceMarks& marks,
                                         bool scalar_first_lane_agrees = false,
-                                        bool scalar_local_index_waterfall = false) {
+                                        bool scalar_local_index_waterfall = false,
+                                        const RelativeBankPublication& relative_bank = {}) {
     record_vector_word_marks(rs, in, marks);
+    if (relative_bank.cohort) publish_relative_bank_word(rs, in, marks, relative_bank);
     if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361) {
         if (in.dst.kind != OperandKind::VGPR || in.src[1].kind != OperandKind::InlineInt) return;
         const std::pair<int, int> slot{in.dst.value, in.src[1].value};
@@ -1181,7 +1185,8 @@ inline void record_scalar_write(RegState& rs, const Rdna2Inst& in,
                          const SavedB64MaskSnapshot& saved_b64_masks_before) {
     propagate_merge_placeholder(rs, in, saved_b64_masks_before.source_marks,
                                 saved_b64_masks_before.scalar_first_lane_agrees,
-                                saved_b64_masks_before.scalar_local_index_waterfall);
+                                saved_b64_masks_before.scalar_local_index_waterfall,
+                                saved_b64_masks_before.relative_bank_publication);
     for_each_scalar_write(in, [&](int base, uint32_t width) {
         for (uint32_t w = 0; w < width; ++w)
             rs.unavailable_saved_mask_words.erase(base + static_cast<int>(w));

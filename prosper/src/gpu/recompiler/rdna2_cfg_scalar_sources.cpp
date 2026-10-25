@@ -1,3 +1,4 @@
+#include "gpu/recompiler/rdna2_relative_bank_source.hpp"
 // Existing scalar input-mark propagation and saved-mask snapshots.
 #include "gpu/recompiler/rdna2_cfg_scalar_sources.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
@@ -148,8 +149,14 @@ SavedB64MaskSnapshot snapshot_saved_b64_masks(SpirvCompute& b, const RegState& r
         });
         if (!roots.empty()) snapshot.source_marks.placeholder = true;
     }
-    if (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x43)
-        snapshot.source_marks = vector_relative_source_marks(b, rs, in);
+    if (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x43) {
+        if (auto proof = relative_bank_source_proof(b, rs, in)) {
+            snapshot.source_marks = std::move(proof->source);
+            snapshot.relative_bank_publication = proof->publication;
+        } else {
+            snapshot.source_marks = vector_relative_source_marks(b, rs, in);
+        }
+    }
     snapshot.portable_numeric_replacement = ordinary_portable_wave64_masks(b);
     return snapshot;
 }

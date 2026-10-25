@@ -9,14 +9,17 @@
 #include "gpu/recompiler/rdna2_launch_vgprs.hpp"
 #include "gpu/recompiler/rdna2_predicate_operand_roots.hpp"
 #include "gpu/recompiler/rdna2_loaded_arbitrary.hpp"
+#include "gpu/recompiler/rdna2_native_image_results.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_vector_old_word.hpp"
+#include "gpu/recompiler/rdna2_relative_bank_source.hpp"
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <map>
 #include <set>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -501,6 +504,11 @@ void record_addtid_spill(SpirvCompute& b, RegState& rs, const Rdna2Inst& write, 
     rs.lds_addtid_marks[key] = std::move(marks);
 }
 
+std::optional<RelativeBankSourceProof>
+relative_bank_source_proof(const SpirvCompute& b, const RegState& rs, const Rdna2Inst& in) {
+    return prove_relative_bank_source(b, rs, in, source_roots_in_exec);
+}
+
 ScalarSourceMarks vector_relative_source_marks(const SpirvCompute& b, const RegState& rs,
                                                const Rdna2Inst& in) {
     ScalarSourceMarks missing;
@@ -623,6 +631,7 @@ void record_native_interpolation_publication(const SpirvCompute& b, RegState& rs
 
 void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSourceMarks& source) {
     const auto interpolation = std::exchange(rs.native_interpolation_publication, {});
+    const bool native_image = consume_native_image_result(rs, in);
     const auto value = rs.vreg.find(in.dst.value);
     const bool published_interpolation =
         rs.vector_native_interpolation && in.fmt == Rdna2Format::VINTRP &&
@@ -639,7 +648,7 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
     const bool preserve = vector_write_depends_on_old_word(in, full_exec);
     // CONFIDENCE: HIGH -- these reads are complete in their active lanes exactly as a buffer
     // load is; only this transfer function uses that fact (CFG DATA facts keep their own).
-    const bool complete = published_interpolation || complete_full_word_write(in) ||
+    const bool complete = published_interpolation || native_image || complete_full_word_write(in) ||
                           memory_read_completes_active_word(in);
     const int end = relative ? rs.max_vgpr + 1 : in.dst.value + static_cast<int>(width);
     for (int reg = in.dst.value; reg < end; ++reg) {

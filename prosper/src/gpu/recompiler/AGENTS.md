@@ -7,6 +7,16 @@ checks unchanged, and supplies no physical mask words or source definedness.
 
 Takes a guest shader's instruction bytes and emits a SPIR-V module.
 
+`rdna2_native_image_results` records and consumes the exact result generations of the
+established native Wave64 `0xa0` 2D sample lowering. Its complete-word proof requires the
+actual source proof and genuine descriptors, and expires after one transfer. It changes no
+global opcode/effects classification or image admission; inactive lanes retain their marks.
+
+`rdna2_saved_mask_phi` recognizes completed Bool PHIs whose incoming values are the saved
+value and the PHI itself, or the same saved value twice. Both real predecessor branches must
+reach that header. Native Wave64 EXEC restores retain this immutable ancestry without changing
+the move, physical mask words, lifetime marks or existing route admission.
+
 `rdna2_predicate_operand_roots` keeps each explicit vector operand's read dependencies separate
 when a predicate combines different EXEC owners. It uses the legacy root reader supplied by its
 caller; source definedness and prior observations remain the existing guard's responsibility.
@@ -16,7 +26,14 @@ sequence whose existing waterfall route runs once per lane. It requires a saved 
 restored M0 and a dead scalar index; memory/cross-lane bodies need their own proof. CMPX
 preserves VCC. This certificate supplies no source word or general broadcast implementation.
 The scalar scope consumer retains a complete current-cohort source only for that exact
-fragment packet; hard scalar relays and expanded-EXEC reads retain their refusals.
+fragment packet and its direct M0 copy; other hard scalar relays and expanded-EXEC reads
+retain their refusals.
+
+`rdna2_relative_index_values` bounds U32 index expressions in an existing EXEC cohort; it
+authenticates no register DATA. `rdna2_relative_bank_source` combines that range with the closed
+fragment packet, current index/M0 generations and complete selected bank words. Its instruction
+snapshot publishes only a cohort view after the ordinary writer retains global old-lane marks,
+roots and MEMORY; no EXEC ancestry or global scalar authority is added.
 
 - `fragment_entry_facts` / `raster_launch_facts` / `fragment_packet_resources` / `sopp_cfg` — plain data and
   direct-branch helpers the recompiler consumes. They live here, not in `gpu/state` or `gpu/execute`, because

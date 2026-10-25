@@ -1,3 +1,4 @@
+#include "gpu/recompiler/rdna2_saved_mask_phi.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_native_launch.hpp"
@@ -272,6 +273,7 @@ bool emit_s_mov_b64_exec(SpirvCompute& b, RegState& rs, const Rdna2Inst& in) {
     const auto narrowed = rs.sreg_bool_narrowed.find(source.value);
     rs.exec = m;
     rs.exec_narrowed = narrowed != rs.sreg_bool_narrowed.end() ? narrowed->second : true;
+    record_saved_mask_phi_subset(b, rs, in);
     return true;
 }
 
