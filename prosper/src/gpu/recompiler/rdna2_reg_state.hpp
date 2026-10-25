@@ -4,6 +4,7 @@
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include "gpu/recompiler/rdna2_portable_mask_slots.hpp"
+#include "gpu/recompiler/rdna2_native_image_results.hpp"
 #include <cstdint>
 #include <map>
 #include <set>
@@ -261,6 +262,8 @@ struct RegState {
     // The provenance of each slot's spilled word (addtid_spill_marks), so the reload carries the
     // spilled word's missing lanes instead of looking genuine (#5183).
     std::unordered_map<uint64_t, ScalarSourceMarks> lds_addtid_marks;
+    // One successful native sample result, consumed by its own word-mark transfer.
+    NativeImageResultPublication native_image_result_publication;
 };
 struct LoopBlanketCheck;
 template <class Registers>

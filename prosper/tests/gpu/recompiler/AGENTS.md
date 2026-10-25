@@ -1,5 +1,11 @@
 # `tests/gpu/recompiler` — translation tests and the legacy compute execution fixture
 
+`test_native_image_results` pins the admitted native legacy sample's complete active words.
+Its public fragment regression and compute transport observe the second dword, fresh VCC,
+both Wave64 halves and inactive output. The interpreter owns a single exact-center nearest mip;
+it makes no general derivative/filtering claim. Missing sources, expanded EXEC and stale
+instruction/result publications retain their refusals; global effects stay conservative.
+
 `test_saved_mask_phi` restores a loop-carried saved EXEC before a fresh DATA comparison.
 Its native Wave64 interpreter witness observes three iterations, both cohort halves and inactive
 output. Changed masks, unavailable relays, pending/changed PHIs and wrong source contexts remain

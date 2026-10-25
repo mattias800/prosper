@@ -2,6 +2,11 @@
 
 Takes a guest shader's instruction bytes and emits a SPIR-V module.
 
+`rdna2_native_image_results` records and consumes the exact result generations of the
+established native Wave64 `0xa0` 2D sample lowering. Its complete-word proof requires the
+actual source proof and genuine descriptors, and expires after one transfer. It changes no
+global opcode/effects classification or image admission; inactive lanes retain their marks.
+
 `rdna2_saved_mask_phi` recognizes completed Bool PHIs whose incoming values are the saved
 value and the PHI itself, or the same saved value twice. Both real predecessor branches must
 reach that header. Native Wave64 EXEC restores retain this immutable ancestry without changing
