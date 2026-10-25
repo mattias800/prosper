@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <set>
 
 namespace {
@@ -198,8 +199,7 @@ TEST(CurrentWordRoots, AGenuineScalarSiblingDoesNotResurrectInactiveVectorRoots)
     const uint32_t word = 0x7da80024u;
     const auto in = rdna2_decode_one(&word, 1);
     const auto roots = predicate_operand_roots(f.rs, in, read_roots);
-    ASSERT_TRUE(roots.has_value());
-    EXPECT_TRUE(roots->empty());
+    EXPECT_EQ(roots, (std::optional<std::set<uint64_t>>{std::set<uint64_t>{}}));
     f.rs.unavailable_saved_mask_words.insert(36);
     EXPECT_FALSE(predicate_operand_roots(f.rs, in, read_roots).has_value());
     f.rs.unavailable_saved_mask_words.clear();
