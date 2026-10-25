@@ -11,12 +11,14 @@
 #include "gpu/recompiler/rdna2_loaded_arbitrary.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_vector_old_word.hpp"
+#include "gpu/recompiler/rdna2_relative_bank_source.hpp"
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <map>
 #include <set>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -499,6 +501,11 @@ void record_addtid_spill(SpirvCompute& b, RegState& rs, const Rdna2Inst& write, 
     }
     // A stale slot is real LDS content, not an arbitrary value: the meet above made it hard.
     rs.lds_addtid_marks[key] = std::move(marks);
+}
+
+std::optional<RelativeBankSourceProof>
+relative_bank_source_proof(const SpirvCompute& b, const RegState& rs, const Rdna2Inst& in) {
+    return prove_relative_bank_source(b, rs, in, source_roots_in_exec);
 }
 
 ScalarSourceMarks vector_relative_source_marks(const SpirvCompute& b, const RegState& rs,

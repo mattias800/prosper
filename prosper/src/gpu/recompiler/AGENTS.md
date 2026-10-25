@@ -11,7 +11,14 @@ sequence whose existing waterfall route runs once per lane. It requires a saved 
 restored M0 and a dead scalar index; memory/cross-lane bodies need their own proof. CMPX
 preserves VCC. This certificate supplies no source word or general broadcast implementation.
 The scalar scope consumer retains a complete current-cohort source only for that exact
-fragment packet; hard scalar relays and expanded-EXEC reads retain their refusals.
+fragment packet and its direct M0 copy; other hard scalar relays and expanded-EXEC reads
+retain their refusals.
+
+`rdna2_relative_index_values` bounds U32 index expressions in an existing EXEC cohort; it
+authenticates no register DATA. `rdna2_relative_bank_source` combines that range with the closed
+fragment packet, current index/M0 generations and complete selected bank words. Its instruction
+snapshot publishes only a cohort view after the ordinary writer retains global old-lane marks,
+roots and MEMORY; no EXEC ancestry or global scalar authority is added.
 
 - `fragment_entry_facts` / `raster_launch_facts` / `fragment_packet_resources` / `sopp_cfg` — plain data and
   direct-branch helpers the recompiler consumes. They live here, not in `gpu/state` or `gpu/execute`, because

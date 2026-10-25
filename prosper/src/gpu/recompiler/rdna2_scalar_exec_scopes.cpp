@@ -124,8 +124,13 @@ bool scalar_scope_first_lane_agrees(const SpirvCompute& b, const RegState& rs,
 bool scalar_scope_local_index_waterfall(const SpirvCompute& b, const Rdna2Inst& read) {
     // The existing fragment waterfall route executes once for this invocation's index.
     // Unlike a general READFIRSTLANE, its local scalar is unobservable after the body.
-    if (!b.is_fragment || (b.wave_size != 32 && b.wave_size != 64) ||
-        read.fmt != Rdna2Format::VOP1 || !rdna2_lane_read_writes_sgpr(read))
+    const bool first = read.fmt == Rdna2Format::VOP1 && rdna2_lane_read_writes_sgpr(read);
+    const bool ordinary64 = b.wave_size == 64 && !b.is_compute && !b.is_fragment_packet() &&
+                            !b.ngg_workgroup_shell && !b.ngg_one_lane;
+    const bool m0 = ordinary64 && read.fmt == Rdna2Format::SOP1 &&
+                    read.opcode == kSop1OpcodeMovB32 && read.dst.value == 124;
+    const bool relative = ordinary64 && read.fmt == Rdna2Format::VOP1 && read.opcode == 0x43;
+    if (!b.is_fragment || (b.wave_size != 32 && b.wave_size != 64) || (!first && !m0 && !relative))
         return false;
     const auto& words = b.saved_mask_original_words;
     // Fragment kill tails can follow the first END. Reuse the emitter's validated
@@ -140,7 +145,7 @@ bool scalar_scope_local_index_waterfall(const SpirvCompute& b, const Rdna2Inst& 
     }
     if (std::find(instructions.begin(), instructions.end(), read) == instructions.end())
         return false;
-    return local_index_waterfall_latch(instructions, read.pc) != UINT32_MAX;
+    return local_index_waterfall_read_pc(instructions, read) != UINT32_MAX;
 }
 
 const ScalarSourceMarks* current_scalar_exec_scope(const RegState& rs, int reg) {
@@ -172,13 +177,18 @@ void record_scalar_exec_scope(RegState& rs, const Rdna2Inst& in, int reg, bool b
     const bool first_lane = in.fmt == Rdna2Format::VOP1 && rdna2_lane_read_writes_sgpr(in);
     const bool scalar_alu =
         in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2 || in.fmt == Rdna2Format::SOPK;
+    // Only the authenticated packet's direct M0 copy may retain this hard view.
+    // Ordinary scalar relays remain outside that packet's lifetime and authority.
+    const bool local_m0 = local_index && rs.vector_wave_size == 64 && reg == 124 &&
+                          in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB32 &&
+                          in.dst.value == 124;
     const auto value = rs.sreg.find(reg);
     if ((rs.vector_wave_size != 32 && rs.vector_wave_size != 64) || ballot ||
         (!first_lane && !scalar_alu) || (first_lane && !(first_agrees || local_index)) ||
         value == rs.sreg.end() || !value->second || !source.placeholder ||
-        (source.hard && !(first_lane && local_index)) || !source.scoped_complete_word ||
-        (!source.hard && source.blanket_roots.empty()) || !source.outside_exec || !rs.exec ||
-        !exec_within(rs, rs.exec, source.outside_exec)) {
+        (source.hard && !(first_lane && local_index) && !local_m0) ||
+        !source.scoped_complete_word || (!source.hard && source.blanket_roots.empty()) ||
+        !source.outside_exec || !rs.exec || !exec_within(rs, rs.exec, source.outside_exec)) {
         rs.sreg_exec_scopes.erase(reg);
         return;
     }
