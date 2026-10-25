@@ -1,4 +1,5 @@
 #include "gpu/recompiler/rdna2_cfg_local_index_waterfall.hpp"
+#include "gpu/recompiler/rdna2_cfg_m0_retirement.hpp"
 
 #include "gpu/recompiler/rdna2_cfg_branch_helpers.hpp"
 #include "gpu/recompiler/rdna2_cfg_scalar_merge.hpp"
@@ -67,9 +68,10 @@ bool saved_cohort_prefix(const std::vector<Rdna2Inst>& ins, size_t read, int rem
 
 bool unobservable_after(const std::vector<Rdna2Inst>& ins, size_t tail, int index) {
     const auto& restore_m0 = ins[tail + 4];
-    if (restore_m0.fmt != Rdna2Format::SOP1 || restore_m0.opcode != kSop1OpcodeMovB32 ||
-        !scalar(restore_m0.dst, 124) || scalar(restore_m0.src[0], index) ||
-        scalar(restore_m0.src[0], 124))
+    if ((restore_m0.fmt != Rdna2Format::SOP1 || restore_m0.opcode != kSop1OpcodeMovB32 ||
+         !scalar(restore_m0.dst, 124) || scalar(restore_m0.src[0], index) ||
+         scalar(restore_m0.src[0], 124)) &&
+        !deferred_waterfall_m0_retirement(ins, tail + 4, index))
         return false;
     const uint32_t after = ins[tail + 3].pc;
     // CMPX on gfx10 writes EXEC only; the allowed body and tail also preserve VCC.

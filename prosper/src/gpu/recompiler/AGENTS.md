@@ -24,6 +24,11 @@ The scalar scope consumer retains a complete current-cohort source only for that
 fragment packet and its direct M0 copy; other hard scalar relays and expanded-EXEC reads
 retain their refusals.
 
+`rdna2_cfg_m0_retirement` checks a bounded straight-line suffix after a closed local-index
+packet. It authenticates the decoded packet, including separately stored trailing literals,
+and requires no M0 read before an independent overwrite. It consumes legacy effects only;
+it supplies no source words or route permission and keeps general M0 liveness conservative.
+
 `rdna2_relative_index_values` bounds U32 index expressions in an existing EXEC cohort; it
 authenticates no register DATA. `rdna2_relative_bank_source` combines that range with the closed
 fragment packet, current index/M0 generations and complete selected bank words. Its instruction
