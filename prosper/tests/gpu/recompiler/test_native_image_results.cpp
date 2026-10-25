@@ -221,7 +221,7 @@ TEST(NativeImageResults, ChangedContextCannotConsumeAnEarlierPublication) {
     }
 }
 TEST(NativeImageResults, UnsupportedFormsCannotCaptureAResult) {
-    for (unsigned mutation = 0; mutation < 9; ++mutation) {
+    for (unsigned mutation = 0; mutation < 10; ++mutation) {
         PublicationHarness h;
         switch (mutation) {
             case 0: h.sample.words[0] &= ~(15u << 8); break;
@@ -238,11 +238,17 @@ TEST(NativeImageResults, UnsupportedFormsCannotCaptureAResult) {
                 h.rs.vreg[256] = h.b.uconst(2);
                 break;
             case 8: h.rs.vreg.erase(7); break;
+            case 9: break;   // unchanged packet exercises the same decode and publication sequence
         }
         const auto pc = h.sample.pc;
         h.sample = rdna2_decode_one(h.sample.words, h.sample.len_dwords);
         h.sample.pc = pc;
         record_native_image_result(h.rs, h.sample);
+        if (mutation == 9) {
+            EXPECT_NE(h.rs.native_image_result_publication.exec, 0u) << "control must publish";
+            EXPECT_TRUE(consume_native_image_result(h.rs, h.sample)) << "control must consume";
+            continue;
+        }
         EXPECT_EQ(h.rs.native_image_result_publication.exec, 0u) << mutation;
         EXPECT_FALSE(consume_native_image_result(h.rs, h.sample)) << mutation;
     }
