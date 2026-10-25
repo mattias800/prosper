@@ -68,7 +68,7 @@ bool plain_numeric_roots(const RegState& rs, const Rdna2Inst& in, std::set<uint6
 
 bool atomic_result_roots(const RegState& rs, const Rdna2Inst& in, const ScalarSourceMarks& source,
                          std::set<uint64_t>& roots, WordRootReader read_roots) {
-    // These x1 services return old memory or their genuine old VDATA fallback. This is not a
+    // These x1 services return old memory in EXEC and preserve old VDATA outside it. This is not a
     // memory-effect classifier: address/resource admission stays with the existing lowering.
     if (in.fmt != Rdna2Format::MUBUF || (in.opcode != 0x30u && in.opcode != 0x32u) ||
         !in.mubuf_glc || in.mubuf_tfe || in.mubuf_lds || in.len_dwords != 2 ||

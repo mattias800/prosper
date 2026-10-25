@@ -233,16 +233,29 @@ TEST(NativeAtomicActiveScope, ExchangeReturnsTheOldWordInsideTheSameCurrentCohor
 
 TEST(NativeAtomicActiveScope, MissingAtomicDataAndScalarOffsetStillRefuse) {
     for (bool offset : {false, true}) {
+        SCOPED_TRACE(offset ? "missing scalar offset"
+                            : "expanded reader of missing inactive VDATA");
         auto code = program();
         if (offset)
             code[18] = 0x3c020007u; // the existing atomic packet with absent s60 as SOFFSET
-        else
-            code[12] = 0x7e00023cu; // absent old VDATA immediately before the GLC return
+        else {
+            // Active GLC returns read memory. Restoring C also exposes inactive lanes'
+            // actual old-VDATA fallback, which the atomic did not replace.
+            code[12] = 0x7e00023cu;
+            code.insert(code.begin() + 20, 0xbefe0406u);
+            const auto back = code.size() - 5;
+            code[back] = 0xbf850000u | static_cast<uint16_t>(11 - static_cast<int>(back) - 1);
+        }
         const auto c = config();
         const auto table = resources();
         const uint64_t address = 0x5497090800ull + offset;
         EXPECT_TRUE(recompile_compute(code.data(), code.size(), &table, c,
                                       {RecompileDiagnosticStage::Compute, address})
                         .empty());
+        if (!offset)
+            EXPECT_NE(
+                last_terminal_reject_reason(address).find("fabricated-fresh-mask-source pc=21 "),
+                std::string::npos)
+                << last_terminal_reject_reason(address);
     }
 }

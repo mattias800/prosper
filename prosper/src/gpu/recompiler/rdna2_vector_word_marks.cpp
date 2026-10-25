@@ -710,7 +710,7 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
                                     (arbitrary_read_form(in) || current_roots.atomic_result)));
             if (result.scoped_complete_word) {
                 result.scoped_blanket_roots = source_roots_in_exec(rs, source, rs.exec);
-                // A GLC return's predicated/OOB fallback still reads its old VDATA.
+                // A GLC return's predicated fallback still reads its old VDATA.
                 if (current_roots.atomic_result)
                     result.scoped_blanket_roots.insert(current_roots.view.roots.begin(),
                                                        current_roots.view.roots.end());
