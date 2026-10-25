@@ -5,9 +5,10 @@ SCC loop's original instructions. Saved pairs meet every CFG path and back edge;
 is the induction hypothesis. Its DATA certificate leaves route admission and existing back-edge
 checks unchanged, and supplies no physical mask words or source definedness.
 
-`rdna2_current_word_roots` retains an immutable current-EXEC root view within the canonical
-word marks. Its API preserves the existing coverage and root planes; unsupported producers
-and input generations keep the legacy proof.
+`rdna2_current_word_roots` retains a producer's immutable current-EXEC root view within
+canonical word marks. It leaves broader coverage and root obligations intact; joins, lane
+selections and spills drop the generation view. Buffer ADD/EXCHANGE returns include genuine
+address, resource and old-VDATA fallback obligations. It grants no loop route or missing word.
 
 Takes a guest shader's instruction bytes and emits a SPIR-V module.
 

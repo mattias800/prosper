@@ -1,3 +1,5 @@
+// #5497: GLC returns and numeric relays must retain genuine current-EXEC dependencies.
+// The interpreter observes old memory values; absent inputs must still refuse.
 #include "bpermute_spirv_oracle.hpp"
 #include "fixtures/checked_compute_launch.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
@@ -227,4 +229,20 @@ TEST(NativeAtomicActiveScope, ExchangeReturnsTheOldWordInsideTheSameCurrentCohor
     EXPECT_TRUE(participating(returned[1])) << returned[1];
     EXPECT_TRUE(participating(returned[2])) << returned[2];
     for (size_t i = 3; i < returned.size(); ++i) EXPECT_EQ(returned[i], 0xdeadbeefu) << i;
+}
+
+TEST(NativeAtomicActiveScope, MissingAtomicDataAndScalarOffsetStillRefuse) {
+    for (bool offset : {false, true}) {
+        auto code = program();
+        if (offset)
+            code[18] = 0x3c020007u; // the existing atomic packet with absent s60 as SOFFSET
+        else
+            code[12] = 0x7e00023cu; // absent old VDATA immediately before the GLC return
+        const auto c = config();
+        const auto table = resources();
+        const uint64_t address = 0x5497090800ull + offset;
+        EXPECT_TRUE(recompile_compute(code.data(), code.size(), &table, c,
+                                      {RecompileDiagnosticStage::Compute, address})
+                        .empty());
+    }
 }

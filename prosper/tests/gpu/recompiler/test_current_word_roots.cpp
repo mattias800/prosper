@@ -1,3 +1,5 @@
+// #5497: a current rewrite can owe fewer roots than its preserved inactive lanes.
+// The independent view must retain broader-cohort checks and missing atomic inputs.
 #include "gpu/recompiler/rdna2_current_word_roots.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_predicate_operand_roots.hpp"
@@ -176,7 +178,7 @@ TEST(CurrentWordRoots, AtomicReturnsRetainAddressAndOldDataObligations) {
 }
 
 TEST(CurrentWordRoots, MissingAtomicDataResourcesAndAddressValuesDoNotPublish) {
-    for (unsigned mutation = 0; mutation < 3; ++mutation) {
+    for (unsigned mutation = 0; mutation < 4; ++mutation) {
         Frame f;
         if (mutation == 0) f.rs.sreg_merge_placeholder.insert(9);
         if (mutation == 1) {
@@ -184,6 +186,7 @@ TEST(CurrentWordRoots, MissingAtomicDataResourcesAndAddressValuesDoNotPublish) {
             old.placeholder = old.hard = true;
         }
         if (mutation == 2) f.rs.vreg.erase(7);
+        if (mutation == 3) f.rs.vreg.erase(0);
         const auto publication = snapshot_current_word_roots(f.rs, atomic(), {}, read_roots);
         EXPECT_FALSE(publication.atomic_result) << mutation;
         EXPECT_EQ(publication.view.exec, 0u) << mutation;
@@ -205,4 +208,32 @@ TEST(CurrentWordRoots, AGenuineScalarSiblingDoesNotResurrectInactiveVectorRoots)
     f.rs.unavailable_saved_mask_words.clear();
     f.rs.sreg_loop_blanket[36] = {data_root};
     EXPECT_FALSE(predicate_operand_roots(f.rs, in, read_roots).has_value());
+}
+
+TEST(CurrentWordRoots, TrailingLiteralPacketsRetainTheirActualConstant) {
+    Frame f;
+    const uint32_t words[] = {0x7e0002ffu, 0x12345678u};
+    const auto in = rdna2_decode_one(words, 2);
+    ASSERT_TRUE(in.has_literal);
+    ASSERT_EQ(in.literal, 0x12345678u);
+    EXPECT_EQ(snapshot_current_word_roots(f.rs, in, {}, read_roots).view.exec, 20u);
+    auto changed = in;
+    changed.src[0].kind = OperandKind::SGPR;
+    changed.src[0].value = 124;
+    EXPECT_EQ(snapshot_current_word_roots(f.rs, changed, {}, read_roots).view.exec, 0u);
+}
+TEST(CurrentWordRoots, MeetsAndLaneSelectionsDropTheProducingGenerationView) {
+    Frame f;
+    auto mark = bounded();
+    mark.current_roots = std::make_shared<const CurrentWordRoots>(CurrentWordRoots{20, {}});
+    const auto before = mark;
+    union_source_marks(mark, {});
+    EXPECT_FALSE(mark.current_roots);
+    legacy_equal(mark, before);
+    f.rs.vreg_source_marks[1] = before;
+    const uint32_t word = 0x7e060501u; // s3 = readfirstlane(v1)
+    const auto read = rdna2_decode_one(&word, 1);
+    const auto selected = vector_lane_read_marks(f.rs, read);
+    EXPECT_FALSE(selected.current_roots);
+    legacy_equal(selected, before);
 }

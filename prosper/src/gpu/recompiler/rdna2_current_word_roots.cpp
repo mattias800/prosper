@@ -18,7 +18,13 @@ namespace {
 bool original_instruction(const Rdna2Inst& in) {
     if (!in.len_dwords || in.len_dwords > std::size(in.words) || in.synthetic_terminator)
         return false;
-    auto decoded = rdna2_decode_one(in.words, in.len_dwords);
+    uint32_t packet[5];
+    std::copy(std::begin(in.words), std::end(in.words), std::begin(packet));
+    if (in.has_literal) {
+        if (in.len_dwords < 2) return false;
+        packet[in.len_dwords - 1] = in.literal;
+    }
+    auto decoded = rdna2_decode_one(packet, in.len_dwords);
     decoded.pc = in.pc;
     return decoded == in;
 }

@@ -1,4 +1,5 @@
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
+#include "gpu/recompiler/rdna2_current_word_roots.hpp"
 #include "gpu/recompiler/ir/cfg/exec_value_census.hpp"
 #include "gpu/recompiler/ir/cfg/exec_relation_consumer.hpp"
 
@@ -148,6 +149,8 @@ bool meet_arbitrary(const ScalarSourceMarks& a, const ScalarSourceMarks& b) {
 
 void union_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other,
                  const RegState* current = nullptr, bool explicit_sources = false) {
+    // A CFG/source meet has no single producing generation's independent root view.
+    into.current_roots.reset();
     const bool arbitrary = meet_arbitrary(into, other);
     const bool hard_scoped =
         (into.hard && into.scoped_complete_word) || (other.hard && other.scoped_complete_word);
@@ -223,6 +226,7 @@ void union_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other,
 
 const std::set<uint64_t>& source_roots_in_exec(const RegState& rs, const ScalarSourceMarks& marks,
                                                uint32_t exec) {
+    if (const auto* current = current_word_roots(rs, marks, exec)) return *current;
     if (marks.scoped_complete_word && marks.outside_exec &&
         exec_within(rs, exec, marks.outside_exec))
         return marks.scoped_blanket_roots;
@@ -501,6 +505,8 @@ void record_addtid_spill(SpirvCompute& b, RegState& rs, const Rdna2Inst& write, 
         union_marks(marks, unwritten, &rs);
     }
     // A stale slot is real LDS content, not an arbitrary value: the meet above made it hard.
+    // A spill carries the canonical proof, not a VGPR generation view.
+    marks.current_roots.reset();
     rs.lds_addtid_marks[key] = std::move(marks);
 }
 
@@ -540,7 +546,9 @@ ScalarSourceMarks vector_lane_read_marks(const RegState& rs, const Rdna2Inst& in
     }
     // Ordinary constant AND dynamic lane reads have the same possible source words. A clean
     // overwritten constant spill slot above remains separate from other lanes' marks.
-    return vector_word(rs, reg);
+    auto marks = vector_word(rs, reg);
+    marks.current_roots.reset();   // a selected lane need not belong to the current reader's EXEC
+    return marks;
 }
 
 bool fresh_mask_sources_defined(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in) {
@@ -630,6 +638,7 @@ void record_native_interpolation_publication(const SpirvCompute& b, RegState& rs
 }
 
 void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSourceMarks& source) {
+    const auto current_roots = snapshot_current_word_roots(rs, in, source, source_roots_in_exec);
     const auto interpolation = std::exchange(rs.native_interpolation_publication, {});
     const bool native_image = consume_native_image_result(rs, in);
     const auto value = rs.vreg.find(in.dst.value);
@@ -654,6 +663,7 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
     for (int reg = in.dst.value; reg < end; ++reg) {
         const auto old = vector_word(rs, reg);
         ScalarSourceMarks result = source;
+        result.current_roots.reset();
         // CONFIDENCE: HIGH -- RDNA2 70648's ordinary VALU writes retain inactive lanes; WRITELANE
         // replaces one selected lane regardless of EXEC. Partial/relative writes retain old bits.
         if (preserve) union_marks(result, old, &rs);
@@ -696,9 +706,15 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
             result.outside_exec = defined_inside ? rs.exec : 0u;
             result.scoped_complete_word =
                 defined_inside && ((lane_mapped_vector_write(in) && !memory_result(in)) ||
-                                   (in.fmt == Rdna2Format::MUBUF && arbitrary_read_form(in)));
-            if (result.scoped_complete_word)
+                                   (in.fmt == Rdna2Format::MUBUF &&
+                                    (arbitrary_read_form(in) || current_roots.atomic_result)));
+            if (result.scoped_complete_word) {
                 result.scoped_blanket_roots = source_roots_in_exec(rs, source, rs.exec);
+                // A GLC return's predicated/OOB fallback still reads its old VDATA.
+                if (current_roots.atomic_result)
+                    result.scoped_blanket_roots.insert(current_roots.view.roots.begin(),
+                                                       current_roots.view.roots.end());
+            }
             if (defined_inside && result.hard) {
                 // A narrower write leaves genuine old lanes in the rest of the prior owner. Keep
                 // that wider domain and its carried obligation; an equal-owner complete write
@@ -707,6 +723,9 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
                                         old.outside_exec != rs.exec &&
                                         exec_within(rs, rs.exec, old.outside_exec);
                 result.blanket_roots = source_roots_in_exec(rs, source, rs.exec);
+                if (current_roots.atomic_result)
+                    result.blanket_roots.insert(current_roots.view.roots.begin(),
+                                                current_roots.view.roots.end());
                 if (image_proof)
                     result.blanket_roots.insert(rs.mimg_sources.roots.begin(),
                                                 rs.mimg_sources.roots.end());
@@ -769,6 +788,7 @@ void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSou
         if (!result.outside_exec) result.scoped_complete_word = false;
         if (!result.scoped_complete_word) result.scoped_blanket_roots.clear();
         result.arbitrary = arbitrary && result.placeholder && result.hard;
+        retain_current_word_roots(result, rs, current_roots, source_roots_in_exec);
         set_word(rs.vreg_source_marks, reg, std::move(result));
     }
 }
