@@ -84,7 +84,7 @@ bool atomic_result_roots(const RegState& rs, const Rdna2Inst& in, const ScalarSo
     roots.insert(address.begin(), address.end());
     return true;
 }
-}  // namespace
+}   // namespace
 
 CurrentWordRootPublication snapshot_current_word_roots(const RegState& rs, const Rdna2Inst& in,
                                                        const ScalarSourceMarks& source,
@@ -131,4 +131,4 @@ const std::set<uint64_t>* current_word_roots(const RegState& rs, const ScalarSou
         return nullptr;
     return &marks.current_roots->roots;
 }
-}  // namespace prosper::gpu
+}   // namespace prosper::gpu
