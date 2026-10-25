@@ -1,5 +1,9 @@
 # `recompiler` — RDNA2 machine code → SPIR-V
 
+`rdna2_accumulator_cohort` runs the ordinary vector-word transfer once, then retains a
+broader existing cohort across a narrower, plain same-lane accumulation. It changes only the
+owner of an already scoped proof; root planes, flags, physical words and EXEC stay unchanged.
+
 Takes a guest shader's instruction bytes and emits a SPIR-V module.
 
 `rdna2_saved_mask_phi` recognizes completed Bool PHIs whose incoming values are the saved

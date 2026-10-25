@@ -5,6 +5,11 @@ Its native Wave64 interpreter witness observes three iterations, both cohort hal
 output. Changed masks, unavailable relays, pending/changed PHIs and wrong source contexts remain
 negative controls; recording ancestry never supplies physical scalar words.
 
+`test_accumulator_cohort` observes a narrower accumulating write and the untouched part
+of its original cohort through the public compiler and Wave64 interpreter. Missing old values,
+missing active operands and expanded readers retain their refusals. Unit cases preserve every
+ordinary root/flag plane while checking the coverage owner.
+
 `test_fresh_mask_operand_roots` exercises a native SCC loop whose fresh data predicate combines
 a current complete rewrite with a pre-loop loaded operand. Its interpreter witness observes the
 real loaded value and enabled lanes; missing resources and live back-edge dependencies remain
