@@ -240,3 +240,24 @@ TEST(AccumulatorCohort, UnsupportedOrIncompleteContextsKeepTheOrdinaryTransfer) 
         }
     }
 }
+
+TEST(AccumulatorCohort, FmacKeepsBothTheOldCohortAndItsNarrowerWrittenValues) {
+    auto code = program();
+    code[16] = 0x560406f2u; // v_fmac_f32 v2, 1.0, v3; old v2 is implicit
+    const auto module = compile(code, 0x5497090700ull);
+    ASSERT_FALSE(module.empty()) << last_terminal_reject_reason(0x5497090700ull);
+    const auto c = config();
+    bpermute_oracle::Interpreter vm(module);
+    vm.native_subgroup_width = 64;
+    vm.push_constants = c.user_sgprs;
+    const auto words =
+        vm.run_buffers(64, {{3, std::vector<uint32_t>(std::size_t{64} * 2, 0xdeadbeefu)}}, 3);
+    ASSERT_TRUE(vm.error.empty()) << vm.error;
+    ASSERT_EQ(words.size(), 128u);
+    for (uint32_t lane = 0; lane < 64; ++lane) {
+        EXPECT_EQ(words[std::size_t{2} * lane],
+                  lane < 31 ? 0xdeadbeefu : (lane < 47 ? 0x3f800000u : 0x40400000u))
+            << lane;
+        EXPECT_EQ(words[std::size_t{2} * lane + 1], lane >= 31 ? 1u : 0u) << lane;
+    }
+}

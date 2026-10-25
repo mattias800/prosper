@@ -341,12 +341,13 @@ TEST(FreshMaskLaneWiseRelay, AMergeOfNestedOwnersKeepsTheNarrowerOne) {
     ASSERT_TRUE(e.emit({cmpx_a, mov6, cmpx_b, mov7}));
     const uint32_t b = e.rs.exec;
     VectorWordMarks skipped{{6, e.rs.vreg_source_marks.at(6)}};   // owner A
-    ASSERT_TRUE(e.emit({fmac6}));   // owner B on the taken arm
-    ASSERT_EQ(e.rs.vreg_source_marks.at(6).outside_exec, b);
-    VectorWordMarks merged = e.rs.vreg_source_marks;
+    // Use the emitted owner B directly; an accumulator now preserves its old owner A.
+    const VectorWordMarks taken{{6, e.rs.vreg_source_marks.at(7)}};
+    ASSERT_EQ(taken.at(6).outside_exec, b);
+    VectorWordMarks merged = taken;
     join_vector_word_marks(merged, skipped, &e.rs);
     EXPECT_EQ(merged.at(6).outside_exec, b);
-    VectorWordMarks context_free = e.rs.vreg_source_marks;
+    VectorWordMarks context_free = taken;
     join_vector_word_marks(context_free, skipped);
     EXPECT_EQ(context_free.at(6).outside_exec, 0u) << "without the EXEC facts, owners must match";
 }
