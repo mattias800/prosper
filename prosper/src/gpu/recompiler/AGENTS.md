@@ -1,5 +1,10 @@
 # `recompiler` — RDNA2 machine code → SPIR-V
 
+`rdna2_loop_exec_data` proves a preheader EXEC bound over the authentic native Wave64
+loop's original instructions. Saved pairs meet every CFG path and back edge; only header EXEC
+is the induction hypothesis. Its DATA certificate leaves route admission and existing back-edge
+checks unchanged, and supplies no physical mask words or source definedness.
+
 Takes a guest shader's instruction bytes and emits a SPIR-V module.
 
 `rdna2_predicate_operand_roots` keeps each explicit vector operand's read dependencies separate

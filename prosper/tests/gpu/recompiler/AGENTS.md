@@ -1,5 +1,9 @@
 # `tests/gpu/recompiler` — translation tests and the legacy compute execution fixture
 
+`test_native_loop_exec_data` executes genuine cohort inputs across native SCC-loop EXEC
+PHIs. Missing inputs and live back-edge dependencies remain refused. The certificate's saved
+mask joins, physical-word overlap and original-profile checks are separate from route admission.
+
 `test_fresh_mask_operand_roots` exercises a native SCC loop whose fresh data predicate combines
 a current complete rewrite with a pre-loop loaded operand. Its interpreter witness observes the
 real loaded value and enabled lanes; missing resources and live back-edge dependencies remain

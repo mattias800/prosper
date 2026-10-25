@@ -91,16 +91,19 @@ bool closed_compute_store_loop_data_retry(const SpirvCompute& b, const RegState&
 uint32_t make_narrowing_loop_exec_phi(SpirvCompute& b, RegState& rs, uint32_t preheader,
                                       std::size_t& patch, bool admitted);
 // The header EXEC phi is a subset of the preheader EXEC when every back edge carries a subset of
-// it (induction over iterations). Two certificates grant that fact: the code-only compute one
+// it (induction over iterations). The route certificates grant that fact: the code-only compute one
 // (narrowing_loop_exec_admission), and a checked one for fragment loops whose EXEC writes are
 // all narrowing forms: assumed at the header, then verified at the back edge from the
 // EXEC subset facts the body actually recorded. A failed check refuses the loop (#5039).
+// The separate native code-only DATA bound changes no route or strict-root admission.
 // Implemented in rdna2_loop_exec_subset.cpp.
 class LoopExecSubset {
 public:
     LoopExecSubset(const SpirvCompute& b, const std::vector<Rdna2Inst>& ins, const DivLoop& loop,
                    const RegState& entry);
     bool admitted() const { return certified_ || checked_; }
+    // DATA ancestry alone cannot select a route or relax the strict loop-root checks.
+    bool has_data_exec_bound() const { return admitted() || data_certified_; }
     void open(const RegState& preheader) {
         preheader_exec_ = preheader.exec;
         preheader_full_ = !preheader.exec_narrowed;
@@ -111,6 +114,7 @@ public:
 private:
     bool certified_ = false;
     bool checked_ = false;
+    bool data_certified_ = false;
     uint32_t preheader_exec_ = 0;
     bool preheader_full_ = false;
 };
@@ -123,7 +127,8 @@ void open_narrowing_loop_exec_phi(SpirvCompute& b, RegState& rs, uint32_t prehea
                                   PhiRecords& phis, LoopExecSubset& proof) {
     std::size_t patch;
     proof.open(rs);
-    const uint32_t phi = make_narrowing_loop_exec_phi(b, rs, preheader, patch, proof.admitted());
+    const uint32_t phi =
+        make_narrowing_loop_exec_phi(b, rs, preheader, patch, proof.has_data_exec_bound());
     phis.push_back({0, 4, phi, patch});
 }
 
