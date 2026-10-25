@@ -1,5 +1,9 @@
 # `tests/gpu/recompiler` — translation tests and the legacy compute execution fixture
 
+`test_native_loop_exec_data` executes genuine cohort inputs across native SCC-loop EXEC
+PHIs. Missing inputs and live back-edge dependencies remain refused. The certificate's saved
+mask joins, physical-word overlap and original-profile checks are separate from route admission.
+
 `test_native_image_results` pins the admitted native legacy sample's complete active words.
 Its public fragment regression and compute transport observe the second dword, fresh VCC,
 both Wave64 halves and inactive output. The interpreter owns a single exact-center nearest mip;

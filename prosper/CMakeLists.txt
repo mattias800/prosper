@@ -4245,6 +4245,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_fresh_mask_operand_roots.cpp
     INCLUDES tests tests/gpu/recompiler
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_native_loop_exec_data
+    SOURCES tests/gpu/recompiler/test_native_loop_exec_data.cpp
+    INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_saved_mask_phi
     SOURCES tests/gpu/recompiler/test_saved_mask_phi.cpp
     INCLUDES tests tests/gpu/recompiler
