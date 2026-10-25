@@ -3,6 +3,7 @@
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_cfg_branch_helpers.hpp"
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
