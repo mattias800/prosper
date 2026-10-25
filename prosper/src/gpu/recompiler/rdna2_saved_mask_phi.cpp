@@ -55,7 +55,7 @@ uint32_t identity_phi(const SpirvCompute& b, uint32_t value) {
 } // namespace
 
 uint32_t saved_mask_phi_identity(const SpirvCompute& b, uint32_t value) {
-    if (value == b.bconst_true || value == b.bconst_false) return 0;
+    if (value == b.bconst_false) return 0;
     return identity_phi(b, value);
 }
 
