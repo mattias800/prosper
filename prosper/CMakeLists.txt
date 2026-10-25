@@ -2867,6 +2867,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_active_image_word_definedness.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_native_image_results
+    SOURCES tests/gpu/recompiler/test_native_image_results.cpp
+    INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_complementary_exec_data
     SOURCES tests/gpu/recompiler/test_complementary_exec_data.cpp
     INCLUDES tests

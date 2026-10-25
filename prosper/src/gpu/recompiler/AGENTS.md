@@ -2,6 +2,11 @@
 
 Takes a guest shader's instruction bytes and emits a SPIR-V module.
 
+`rdna2_native_image_results` records and consumes the exact result generations of the
+established native Wave64 `0xa0` 2D sample lowering. Its complete-word proof requires the
+actual source proof and genuine descriptors, and expires after one transfer. It changes no
+global opcode/effects classification or image admission; inactive lanes retain their marks.
+
 `rdna2_predicate_operand_roots` keeps each explicit vector operand's read dependencies separate
 when a predicate combines different EXEC owners. It uses the legacy root reader supplied by its
 caller; source definedness and prior observations remain the existing guard's responsibility.

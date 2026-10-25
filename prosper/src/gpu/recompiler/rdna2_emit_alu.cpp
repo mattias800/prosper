@@ -1,3 +1,4 @@
+#include "gpu/recompiler/rdna2_native_image_results.hpp"
 // rdna2_emit_alu.cpp — emit_alu: the RDNA2 instruction-family translator, split out of
 // rdna2_to_spirv.cpp. Shared state lives in gpu/recompiler/rdna2_to_spirv_internal.hpp.
 #include <array>
@@ -1057,6 +1058,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             const uint32_t SQ_DIM_2D = 1u;
             const uint32_t SQ_DIM_3D = 2u;
             const uint32_t SQ_DIM_2D_ARRAY = 5u;   // (x, y, layer) -- #2265
+            rs.native_image_result_publication = {};
             begin_mimg_source_proof(rs, in.pc);
             auto vread = [&](int r) { return read_mimg_source_word(b, rs, r); };
 
@@ -1827,6 +1829,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             // D16 changes the VDATA layout, not the logical image result: selected components are
             // still in dmask order, but two binary16 values share each consecutive VGPR.
             if (!write_mimg_results(out)) { ok = false; return true; }
+            record_native_image_result(rs, in);
             return true;
         }
         case Rdna2Format::DS: {
