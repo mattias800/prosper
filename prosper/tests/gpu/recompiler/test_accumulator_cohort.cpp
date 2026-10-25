@@ -7,6 +7,7 @@
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include <gtest/gtest.h>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 namespace {
@@ -74,14 +75,14 @@ TEST(AccumulatorCohort, NativeWave64ObservesBothCohortsAndInactiveOutput) {
     bpermute_oracle::Interpreter vm(module);
     vm.native_subgroup_width = 64;
     vm.push_constants = c.user_sgprs;
-    const auto words = vm.run_buffers(64, {{3, std::vector<uint32_t>(64 * 2, 0xdeadbeefu)}}, 3);
+    const auto words = vm.run_buffers(64, {{3, std::vector<uint32_t>(std::size_t{64} * 2, 0xdeadbeefu)}}, 3);
     ASSERT_TRUE(vm.error.empty()) << vm.error;
     ASSERT_EQ(words.size(), 128u);
     for (uint32_t lane = 0; lane < 64; ++lane) {
-        EXPECT_EQ(words[2 * lane],
+        EXPECT_EQ(words[std::size_t{2} * lane],
                   lane < 31 ? 0xdeadbeefu : (lane < 47 ? 0x3f800000u : 0x40e00000u))
             << lane;
-        EXPECT_EQ(words[2 * lane + 1], lane >= 31 ? 1u : 0u) << lane;
+        EXPECT_EQ(words[std::size_t{2} * lane + 1], lane >= 31 ? 1u : 0u) << lane;
     }
 }
 TEST(AccumulatorCohort, AMissingActiveSourceStillRefuses) {
