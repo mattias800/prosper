@@ -2,6 +2,11 @@
 
 Takes a guest shader's instruction bytes and emits a SPIR-V module.
 
+`rdna2_saved_mask_phi` recognizes completed Bool PHIs whose incoming values are the saved
+value and the PHI itself, or the same saved value twice. Both real predecessor branches must
+reach that header. Native Wave64 EXEC restores retain this immutable ancestry without changing
+the move, physical mask words, lifetime marks or existing route admission.
+
 `rdna2_predicate_operand_roots` keeps each explicit vector operand's read dependencies separate
 when a predicate combines different EXEC owners. It uses the legacy root reader supplied by its
 caller; source definedness and prior observations remain the existing guard's responsibility.
