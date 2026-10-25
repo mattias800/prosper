@@ -4,7 +4,17 @@
 broader existing cohort across a narrower, plain same-lane accumulation. It changes only the
 owner of an already scoped proof; root planes, flags, physical words and EXEC stay unchanged.
 
+`rdna2_loop_exec_data` proves a preheader EXEC bound over the authentic native Wave64
+SCC loop's original instructions. Saved pairs meet every CFG path and back edge; only header EXEC
+is the induction hypothesis. Its DATA certificate leaves route admission and existing back-edge
+checks unchanged, and supplies no physical mask words or source definedness.
+
 Takes a guest shader's instruction bytes and emits a SPIR-V module.
+
+`rdna2_native_image_results` records and consumes the exact result generations of the
+established native Wave64 `0xa0` 2D sample lowering. Its complete-word proof requires the
+actual source proof and genuine descriptors, and expires after one transfer. It changes no
+global opcode/effects classification or image admission; inactive lanes retain their marks.
 
 `rdna2_saved_mask_phi` recognizes completed Bool PHIs whose incoming values are the saved
 value and the PHI itself, or the same saved value twice. Both real predecessor branches must

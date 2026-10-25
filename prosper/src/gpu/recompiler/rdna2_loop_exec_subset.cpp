@@ -10,6 +10,7 @@
 //     edge checks it from the facts the body recorded, using the assumption for the iteration that
 //     entered the body, as the induction step allows. A loop whose check fails is refused.
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/rdna2_loop_exec_data.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
@@ -73,6 +74,8 @@ uint32_t merge_exec_arm(SpirvCompute& b, RegState& rs, uint32_t skipped_exec,
 LoopExecSubset::LoopExecSubset(const SpirvCompute& b, const std::vector<Rdna2Inst>& ins,
                                const DivLoop& loop, const RegState& entry) {
     certified_ = b.is_compute && narrowing_loop_exec_admission(ins, loop, entry);
+    // An independent EXEC bound supplies DATA ancestry without adding route permission.
+    data_certified_ = !certified_ && native_loop_data_exec_bound(b, ins, loop, entry);
     // Fragment loops only. A fragment invocation stays in a structured loop until the complete
     // guest wave leaves it, so the header EXEC is a wave fact. A compute loop leaves per invocation,
     // and its certificate also requires a lane-local body (narrowing_loop_exec_admission), which
