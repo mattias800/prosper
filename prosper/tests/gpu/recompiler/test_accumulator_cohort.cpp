@@ -75,7 +75,8 @@ TEST(AccumulatorCohort, NativeWave64ObservesBothCohortsAndInactiveOutput) {
     bpermute_oracle::Interpreter vm(module);
     vm.native_subgroup_width = 64;
     vm.push_constants = c.user_sgprs;
-    const auto words = vm.run_buffers(64, {{3, std::vector<uint32_t>(std::size_t{64} * 2, 0xdeadbeefu)}}, 3);
+    const auto words =
+        vm.run_buffers(64, {{3, std::vector<uint32_t>(std::size_t{64} * 2, 0xdeadbeefu)}}, 3);
     ASSERT_TRUE(vm.error.empty()) << vm.error;
     ASSERT_EQ(words.size(), 128u);
     for (uint32_t lane = 0; lane < 64; ++lane) {
