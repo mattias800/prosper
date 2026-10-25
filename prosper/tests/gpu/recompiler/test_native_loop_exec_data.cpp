@@ -308,6 +308,23 @@ TEST(NativeLoopExecData, APhysicalHighWordReplacementEndsThePairBound) {
     BoundFrame f({0xbe98047eu, 0xbe9903c1u, 0xbefe0418u, 0xbf82fffcu, 0xbf810000u});
     EXPECT_FALSE(f.bound());
 }
+TEST(NativeLoopExecData, AnImplicitCarryWriteCannotRetainTheOldVccBound) {
+    // Restoring the original VCC after a temporary widening keeps its entry bound.
+    BoundFrame unchanged({0xbefe04c1u, 0xbf800000u, 0xbefe046au, 0xbf82fffcu, 0xbf810000u});
+    unchanged.rs.vcc = unchanged.rs.exec;
+    ASSERT_TRUE(unchanged.bound());
+    for (uint32_t opcode : {0x28u, 0x29u, 0x2au}) {
+        SCOPED_TRACE(opcode);
+        // The e32 carry replaces VCC under the wider EXEC. Its new bits can lie outside
+        // entry EXEC, so restoring that generation cannot borrow the old VCC bound.
+        const uint32_t carry = (opcode << 25u) | 0x81u;
+        BoundFrame changed({0xbefe04c1u, carry, 0xbefe046au, 0xbf82fffcu, 0xbf810000u});
+        changed.rs.vcc = changed.rs.exec;
+        ASSERT_EQ(changed.ins[1].fmt, Rdna2Format::VOP2);
+        ASSERT_EQ(changed.ins[1].opcode, opcode);
+        EXPECT_FALSE(changed.bound());
+    }
+}
 TEST(NativeLoopExecData, TheStaticCertificateAddsNoDynamicAuditRefusal) {
     BoundFrame f(both_arms());
     LoopExecSubset proof(f.b, f.ins, f.loop, f.rs);

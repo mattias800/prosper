@@ -3,6 +3,7 @@
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_cfg_branch_helpers.hpp"
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
+#include "gpu/recompiler/rdna2_cfg_wave_uniform.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
@@ -45,6 +46,8 @@ bool transfer_bound(const Rdna2Inst& in, const BoundMasks& before, BoundMasks& a
     for_each_scalar_write(in, kill);
     const auto& effects = rdna2_instruction_effects(in.fmt, in.opcode);
     if (effects.sdst_dwords) kill(in.dst.value, effects.sdst_dwords);
+    // The explicit writer inventory omits VOP2's implicit carry destination.
+    if (in.fmt == Rdna2Format::VOP2 && !cannot_write_vcc(in)) kill(106, 2);
     if (!valid) return false;
     const auto set_pair = [&](bool value) {
         if ((in.dst.kind == OperandKind::SGPR || in.dst.kind == OperandKind::Special) &&
