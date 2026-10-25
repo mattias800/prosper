@@ -6,6 +6,7 @@
 
 #include <bit>
 #include <cstdint>
+#include <iterator>
 #include <utility>
 
 namespace prosper::gpu {
@@ -15,10 +16,10 @@ bool source_proved(const RegState& rs, const Rdna2Inst& in) {
         !rs.exec_narrowed || in.fmt != Rdna2Format::MIMG || in.opcode != 0xa0 || in.mimg_dim != 1 ||
         !in.mimg_dmask || (in.mimg_dmask & ~15u) || in.mimg_d16 || in.mimg_tfe || in.mimg_lwe ||
         in.mimg_r128 || in.mimg_reserved || in.has_modifier || in.has_dpp || in.has_sdwa ||
-        in.len_dwords < 2 || in.len_dwords > in.words.size() || in.dst.kind != OperandKind::VGPR ||
-        in.dst.value < 0 || in.dst.value > 255)
+        in.len_dwords < 2 || in.len_dwords > std::size(in.words) ||
+        in.dst.kind != OperandKind::VGPR || in.dst.value < 0 || in.dst.value > 255)
         return false;
-    auto decoded = rdna2_decode_one(in.words.data(), in.len_dwords);
+    auto decoded = rdna2_decode_one(in.words, in.len_dwords);
     decoded.pc = in.pc;
     const auto& source = rs.mimg_sources;
     return decoded == in && source.pc == in.pc && source.enabled && source.defined &&
