@@ -195,7 +195,9 @@ bool graph_keeps_bound(const BoundGraph& graph, BoundMasks entry) {
 }   // namespace
 bool native_loop_data_exec_bound(const SpirvCompute& b, const std::vector<Rdna2Inst>& ins,
                                  const DivLoop& loop, const RegState& entry) {
-    if (b.saved_mask_original_words.size() > 65536 ||
+    // EXEC/VCC-tested loops retain their separate scalar live-out and broadcast safety boundary.
+    if (loop.condition != DivLoop::Condition::Scc ||
+        b.saved_mask_original_words.size() > 65536 ||
         loop.exit_pc >= b.saved_mask_original_words.size() || entry.vector_wave_size != 64 ||
         !entry.exec || !entry.exec_narrowed || entry.vector_full_exec ||
         !native_exact_retry_authentic(b, b.saved_mask_original_words.data(),

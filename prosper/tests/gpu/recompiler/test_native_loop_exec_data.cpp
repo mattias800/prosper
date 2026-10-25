@@ -318,7 +318,7 @@ TEST(NativeLoopExecData, TheStaticCertificateAddsNoDynamicAuditRefusal) {
     EXPECT_TRUE(proof.holds(f.b, f.rs));
 }
 TEST(NativeLoopExecData, ContextOriginalWordsAndB32ViewsCannotSupplyTheCertificate) {
-    for (unsigned mutation = 0; mutation < 12; ++mutation) {
+    for (unsigned mutation = 0; mutation < 14; ++mutation) {
         BoundFrame f(both_arms());
         switch (mutation) {
             case 0: f.b.native_subgroup_size = 0; break;
@@ -333,6 +333,8 @@ TEST(NativeLoopExecData, ContextOriginalWordsAndB32ViewsCannotSupplyTheCertifica
             case 9: f.rs.vector_full_exec = true; break;
             case 10: f.loop.backedge_pc = 0; break;
             case 11: f.b.saved_mask_original_words.resize(65537, 0); break;
+            case 12: f.loop.condition = DivLoop::Condition::Exec; break;
+            case 13: f.loop.condition = DivLoop::Condition::Vcc; break;
         }
         EXPECT_FALSE(f.bound()) << mutation;
     }
