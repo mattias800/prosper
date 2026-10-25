@@ -1,3 +1,4 @@
+#include "gpu/recompiler/rdna2_relative_bank_source.hpp"
 // Existing scalar input-mark propagation and saved-mask snapshots.
 #include "gpu/recompiler/rdna2_cfg_scalar_sources.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"

@@ -1,5 +1,5 @@
 #include "gpu/recompiler/rdna2_relative_index_values.hpp"
-#include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
 #include <bit>

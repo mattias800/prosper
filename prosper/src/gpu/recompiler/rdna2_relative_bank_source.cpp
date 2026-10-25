@@ -1,13 +1,13 @@
 #include "gpu/recompiler/rdna2_relative_bank_source.hpp"
 #include "gpu/recompiler/rdna2_cfg_local_index_waterfall.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_relative_index_values.hpp"
 #include "gpu/recompiler/rdna2_scalar_exec_scopes.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 
 #include <algorithm>
-#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <set>

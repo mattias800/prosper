@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <map>
 #include <set>
+#include <optional>
 #include <utility>
 #include <vector>
 

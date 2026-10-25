@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <string>
 #include <set>
+#include <optional>
 #include <unordered_set>
 #include <vector>
 
@@ -199,7 +200,10 @@ struct BankFixture {
 TEST(RelativeBankSource, SelectedRootsKeepActiveAndInactiveGenerationsSeparate) {
     BankFixture f;
     const auto proof = relative_bank_source_proof(f.b, f.rs, f.relative);
-    ASSERT_TRUE(proof);
+    if (!proof) {
+        ADD_FAILURE() << "authenticated fixture did not create a bank proof";
+        return;
+    }
     EXPECT_FALSE(proof->source.hard);
     EXPECT_TRUE(proof->source.memory);
     EXPECT_EQ(proof->source.blanket_roots, (std::set<uint64_t>{0x23450104ull}));
@@ -239,7 +243,10 @@ TEST(RelativeBankSource, ChangedInstructionOrGenerationCannotPublishTheCapturedP
     for (unsigned mutation = 0; mutation < 7; ++mutation) {
         BankFixture f;
         auto proof = relative_bank_source_proof(f.b, f.rs, f.relative);
-        ASSERT_TRUE(proof);
+        if (!proof) {
+            ADD_FAILURE() << "authenticated fixture did not create a bank proof";
+            return;
+        }
         switch (mutation) {
             case 0: ++f.relative.pc; break;
             case 1: ++f.relative.dst.value; break;
@@ -272,7 +279,10 @@ TEST(RelativeBankSource, RangeQueryUsesOnlyExistingCohortFactsAndStaysBounded) {
 TEST(RelativeBankSource, PublicationDoesNotNarrowExistingWiderCoverage) {
     BankFixture f;
     const auto proof = relative_bank_source_proof(f.b, f.rs, f.relative);
-    ASSERT_TRUE(proof);
+    if (!proof) {
+        ADD_FAILURE() << "authenticated fixture did not create a bank proof";
+        return;
+    }
     const auto whole = f.b.btrue();
     f.rs.exec_subset_of[f.cohort] = whole;
     auto& result = f.rs.vreg_source_marks.at(37);
