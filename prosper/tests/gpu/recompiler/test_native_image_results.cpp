@@ -224,16 +224,24 @@ TEST(NativeImageResults, UnsupportedFormsCannotCaptureAResult) {
     for (unsigned mutation = 0; mutation < 9; ++mutation) {
         PublicationHarness h;
         switch (mutation) {
-            case 0: h.sample.mimg_dmask = 0; break;
-            case 1: h.sample.mimg_dim = 2; break;
-            case 2: h.sample.mimg_d16 = true; break;
-            case 3: h.sample.mimg_tfe = true; break;
-            case 4: h.sample.mimg_lwe = true; break;
-            case 5: h.sample.mimg_r128 = true; break;
-            case 6: h.sample.mimg_reserved = true; break;
-            case 7: h.sample.dst.value = 255; break;
+            case 0: h.sample.words[0] &= ~(15u << 8); break;
+            case 1: h.sample.words[0] = (h.sample.words[0] & ~(7u << 3)) | (2u << 3); break;
+            case 2: h.sample.words[1] |= 1u << 31; break;
+            case 3: h.sample.words[0] |= 1u << 16; break;
+            case 4: h.sample.words[0] |= 1u << 17; break;
+            case 5: h.sample.words[0] |= 1u << 15; break;
+            case 6: h.sample.words[0] |= 1u << 6; break;
+            case 7:
+                h.sample.words[1] = (h.sample.words[1] & ~(255u << 8)) | (255u << 8);
+                // Both map entries exist so only the physical VGPR bound can refuse this span.
+                h.rs.vreg[255] = h.b.uconst(1);
+                h.rs.vreg[256] = h.b.uconst(2);
+                break;
             case 8: h.rs.vreg.erase(7); break;
         }
+        const auto pc = h.sample.pc;
+        h.sample = rdna2_decode_one(h.sample.words, h.sample.len_dwords);
+        h.sample.pc = pc;
         record_native_image_result(h.rs, h.sample);
         EXPECT_EQ(h.rs.native_image_result_publication.exec, 0u) << mutation;
         EXPECT_FALSE(consume_native_image_result(h.rs, h.sample)) << mutation;
