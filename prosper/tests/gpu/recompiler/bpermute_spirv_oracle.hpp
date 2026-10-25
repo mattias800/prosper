@@ -709,6 +709,24 @@ struct Interpreter {
     l.from = l.label;
     l.pc = it->second;
   }
+  // Explicit one-wave buffer fixture; sequential execution supplies no device ordering evidence.
+  bool allow_buffer_u32_atomics = false;
+  void atomic_buffer_u32(Lane& l, uint32_t op, const std::vector<uint32_t>& a) {
+      if (storage_descriptor_set != 0 || a.size() != 6 || !uint_type(a[0]) || word(l, a[3]) != 1 ||
+          word(l, a[4]) != 0x48 || (op != 229 && op != 234))
+          fail("unsupported buffer atomic profile");
+      const auto p = pointer(l, a[2]);
+      bool owned = p.root == storage;
+      for (const auto& [binding, root] : extra_writable_roots) owned |= p.root == root;
+      const auto old = read(l, p);
+      const auto input = value(l, a[5]);
+      if (!owned || p.type != a[0] || input.type != a[0] || !old.defined || !input.defined ||
+          old.words.size() != 1 || input.words.size() != 1)
+          fail("unsupported buffer atomic storage");
+      const uint32_t updated = op == 229 ? input.words[0] : old.words[0] + input.words[0];
+      write(l, p, {a[0], {updated}, true});
+      set(l, a[1], a[0], old.words);
+  }
   void atomic_header_increment(Lane& l, const std::vector<uint32_t>& a) {
     // Only the NGG shell's commutative Device/Relaxed uint32 header increment. Sequential
     // CPU execution checks values/bounds; it supplies no device concurrency evidence.
@@ -739,9 +757,12 @@ struct Interpreter {
           fail("not Workgroup AcquireRelease memory barrier");
         return;
       }
-      if (op == 234) {
+      if (op == 234 || (op == 229 && allow_buffer_u32_atomics)) {
           ++l.pc;
-          atomic_header_increment(l, a);
+          if (allow_buffer_u32_atomics)
+              atomic_buffer_u32(l, op, a);
+          else
+              atomic_header_increment(l, a);
           continue;
       }
       ++l.pc;

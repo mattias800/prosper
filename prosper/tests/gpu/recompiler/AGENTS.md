@@ -15,6 +15,11 @@ Its native Wave64 interpreter witness observes three iterations, both cohort hal
 output. Changed masks, unavailable relays, pending/changed PHIs and wrong source contexts remain
 negative controls; recording ancestry never supplies physical scalar words.
 
+`test_current_word_roots` checks root-view ownership, actual input dependencies and canonical
+word lifetime. `test_native_atomic_active_scope` adds buffer ADD/EXCHANGE interpreter witnesses,
+missing-input twins and a broader-cohort control. The oracle opts into the closed buffer atomic
+profile explicitly; its existing NGG increment contract remains separate.
+
 `test_fresh_mask_operand_roots` exercises a native SCC loop whose fresh data predicate combines
 a current complete rewrite with a pre-loop loaded operand. Its interpreter witness observes the
 real loaded value and enabled lanes; missing resources and live back-edge dependencies remain

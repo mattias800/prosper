@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <set>
 #include <vector>
 
@@ -14,6 +15,7 @@ namespace prosper::gpu {
 struct LaunchVgpr;
 struct RegState;
 struct SpirvCompute;
+struct CurrentWordRoots;
 
 struct ScalarSourceMarks {
     bool placeholder = false;
@@ -43,6 +45,9 @@ struct ScalarSourceMarks {
     // input that can reach a result lane is hard, and every transfer that cannot prove that
     // clears it (memory results, relative and scalar sources, loop headers, dropped obligations).
     bool arbitrary = false;
+    // An immutable refinement of this complete word's read dependencies in a narrower EXEC.
+    // The legacy coverage and root planes above remain authoritative outside that view.
+    std::shared_ptr<const CurrentWordRoots> current_roots;
 };
 using VectorWordMarks = std::map<int, ScalarSourceMarks>;
 
