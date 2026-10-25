@@ -291,3 +291,121 @@ TEST(RelativeBankSource, PublicationDoesNotNarrowExistingWiderCoverage) {
     EXPECT_EQ(result.outside_exec, whole);
     EXPECT_FALSE(result.scoped_complete_word);
 }
+
+namespace {
+std::vector<uint32_t> deferred_m0_program() {
+    auto code = program();
+    // The closed packet has already restored its cohort. These ordinary operations do not
+    // read M0; the independent overwrite remains ahead of its next use.
+    code.insert(code.begin() + 19, {0x4a500881u, 0xbe820387u, 0xbf800000u});
+    return code;
+}
+std::vector<uint32_t> deferred_m0_body(const std::vector<uint32_t>& code, uint32_t& refused_pc) {
+    std::vector<Rdna2Inst> ins;
+    if (rdna2_walk(code.data(), code.size(), ins) != code.size()) return {};
+    const auto latch = local_index_waterfall_latch(ins, 11);
+    if (latch == UINT32_MAX) return {};
+    SpirvCompute b;
+    b.native_subgroup_size = 64;
+    b.begin(5, nullptr, 64, 1, 1, 64, 0, true, true);
+    b.is_compute = false;
+    b.is_fragment = true;
+    b.saved_mask_original_words = code;
+    RegState rs;
+    rs.exec = b.btrue();
+    rs.vcc = b.bfalse();
+    rs.scc = b.bfalse();
+    rs.vreg[0] = b.cvt_u2f(b.localid_comp[0]);
+    rs.max_vgpr = 38;
+    seed_vector_word_definedness(rs, ins, true, 64);
+    const std::unordered_set<uint32_t> safe{latch};
+    for (const auto& in : ins) {
+        if (in.fmt == Rdna2Format::EXP || in.is_end) break;
+        prepare_saved_mask_word_write(b, rs, in);
+        const auto before = snapshot_saved_b64_masks(b, rs, in);
+        bool ok = true;
+        if (!emit_alu(b, rs, in, ok, true, &safe) || !ok) {
+            refused_pc = in.pc;
+            return {};
+        }
+        record_scalar_write(rs, in, false, before);
+        retain_saved_mask_words(b, rs, in);
+    }
+    b.store_output_word(rs.vreg.at(37), 5, 0, rs.exec);
+    b.store_output_word(rs.vreg.at(38), 5, 1, rs.exec);
+    b.store_output_word(b.sel(rs.exec, b.uconst(1), b.uconst(0)), 5, 2);
+    b.store_output_word(b.sel(rs.vcc, b.uconst(1), b.uconst(0)), 5, 3);
+    b.store_output_word(rs.sreg.at(124), 5, 4, rs.exec);
+    return b.finish();
+}
+}   // namespace
+
+TEST(RelativeBankSource, DeferredM0RestoreRetainsTheClosedFragmentPacket) {
+    EXPECT_FALSE(compile(deferred_m0_program(), 0x54970c0100ull).empty())
+        << last_terminal_reject_reason(0x54970c0100ull);
+}
+TEST(RelativeBankSource, DeferredM0RestoreKeepsSelectedValuesAndBothWaveHalves) {
+    uint32_t refused = UINT32_MAX;
+    const auto module = deferred_m0_body(deferred_m0_program(), refused);
+    ASSERT_FALSE(module.empty()) << "refused at PC " << refused;
+    bpermute_oracle::Interpreter vm(module);
+    vm.native_subgroup_width = 64;
+    const auto result =
+        vm.run_buffers(64, {{1, std::vector<uint32_t>(std::size_t{64} * 5, 0xdeadbeefu)}}, 1);
+    ASSERT_TRUE(vm.error.empty()) << vm.error;
+    ASSERT_EQ(result.size(), 64u * 5);
+    for (uint32_t lane = 0; lane < 64; ++lane) {
+        const auto at = static_cast<size_t>(lane) * 5;
+        const uint32_t expected = lane < 31 ? 0xdeadbeefu : lane % 2 ? 0x40000000u : 0x3f800000u;
+        EXPECT_EQ(result[at], expected) << "selected word, lane " << lane;
+        EXPECT_EQ(result[at + 1], expected) << "fresh mask selection, lane " << lane;
+        EXPECT_EQ(result[at + 2], lane >= 31 ? 1u : 0u) << "restored EXEC, lane " << lane;
+        EXPECT_EQ(result[at + 3], lane >= 31 ? 1u : 0u) << "fresh VCC, lane " << lane;
+        EXPECT_EQ(result[at + 4], lane >= 31 ? 0u : 0xdeadbeefu) << "restored M0, lane " << lane;
+    }
+}
+
+TEST(RelativeBankSource, DeferredM0CannotSkipAnExplicitOrImplicitM0OrIndexRead) {
+    for (uint32_t word : {0x7e50027cu, 0x7e508704u, 0xbf900000u, 0x7e500203u}) {
+        auto code = deferred_m0_program();
+        code[19] = word;   // v40=M0, MOVRELS, SENDMSG, or v40=s3
+        code[code.size() - 2] = 0x28282828u;   // observe v40 when that form supplies it
+        const uint64_t address = 0x54970c0200ull + word;
+        EXPECT_TRUE(compile(code, address).empty()) << word;
+        EXPECT_NE(last_terminal_reject_reason(address).find("fabricated-fresh-mask-source pc=12"),
+                  std::string::npos)
+            << word;
+    }
+}
+TEST(RelativeBankSource, DeferredM0MissingBankAndExpandedReaderStillRefuse) {
+    for (bool expanded : {false, true}) {
+        auto code = deferred_m0_program();
+        if (expanded) {
+            code.insert(code.begin() + 23, 0xbefe04c1u);
+        } else {
+            code[5] = 0x7e10023cu;
+            code[6] = 0xbf800000u;
+        }
+        EXPECT_TRUE(compile(code, 0x54970c0300ull + expanded).empty());
+    }
+}
+TEST(RelativeBankSource, DeferredM0RequiresAnIndependentUnconditionalOverwrite) {
+    for (uint32_t word : {0xbefc037cu, 0xbefc0303u, 0xbefc0580u}) {
+        auto code = deferred_m0_program();
+        code[22] = word;   // M0 itself, the per-lane index, or a conditional replacement
+        const uint64_t address = 0x54970c0400ull + word;
+        EXPECT_TRUE(compile(code, address).empty());
+        EXPECT_NE(last_terminal_reject_reason(address).find("fabricated-fresh-mask-source pc=12"),
+                  std::string::npos);
+    }
+}
+TEST(RelativeBankSource, DeferredM0DoesNotCrossABranchOrAnUnboundedTail) {
+    for (bool branch : {false, true}) {
+        auto code = deferred_m0_program();
+        if (branch)
+            code[19] = 0xbf820001u;
+        else
+            code.insert(code.begin() + 19, 80, 0xbf800000u);
+        EXPECT_TRUE(compile(code, 0x54970c0500ull + branch).empty());
+    }
+}
