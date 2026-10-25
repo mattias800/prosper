@@ -6,6 +6,11 @@ both Wave64 halves and inactive output. The interpreter owns a single exact-cent
 it makes no general derivative/filtering claim. Missing sources, expanded EXEC and stale
 instruction/result publications retain their refusals; global effects stay conservative.
 
+`test_saved_mask_phi` restores a loop-carried saved EXEC before a fresh DATA comparison.
+Its native Wave64 interpreter witness observes three iterations, both cohort halves and inactive
+output. Changed masks, unavailable relays, pending/changed PHIs and wrong source contexts remain
+negative controls; recording ancestry never supplies physical scalar words.
+
 `test_fresh_mask_operand_roots` exercises a native SCC loop whose fresh data predicate combines
 a current complete rewrite with a pre-loop loaded operand. Its interpreter witness observes the
 real loaded value and enabled lanes; missing resources and live back-edge dependencies remain
@@ -225,6 +230,10 @@ The no-descriptor-patch high-word arm also exercises the outer lifetime shortcut
 arm reaches derived provenance. The one-arm compare targets the MUST mask meet at a forward join.
 
 ## Ruled out
+
+- A launch-provided VGPR can retain genuine inactive words after a partial overwrite. A cohort
+  regression must first create an unavailable old generation, then overwrite only the intended
+  cohort; a globally genuine word does not exercise the saved-mask ancestry boundary.
 
 - Complete owned packet inputs do not supply live mask facts to unreachable dispatcher blocks.
   [PR #4114's d317 Linux CI](https://github.com/mattias800/prosper/actions/runs/37032364442/job/110922088436)
