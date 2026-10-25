@@ -1,4 +1,5 @@
 #include "gpu/recompiler/rdna2_accumulator_cohort.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 // #5497: a same-lane accumulator must retain genuine old lanes outside its narrower write.
