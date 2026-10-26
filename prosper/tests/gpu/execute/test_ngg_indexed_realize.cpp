@@ -412,6 +412,52 @@ TEST(DrawIndexSource, AnOffsetDrawRecomputesTheAddressAtTheDetectedSize) {
     EXPECT_EQ(announced.addr, draw.index_addr);
 }
 
+// #4637: the fingerprint is read from the candidate's own bytes. At an ODD offset the CP's 16-bit
+// address (index_base + offset*2) sits at the other parity of the 32-bit data, so its odd words are
+// low halves -- non-zero -- and the zero-high-half detector used to decline a perfectly ordinary
+// 32-bit quad there. At the candidate address (index_base + offset*4) the odd words are the zero
+// high halves.
+TEST(DrawIndexSource, TheFingerprintIsReadAtTheCandidateAddress) {
+    alignas(4) static const uint32_t kBuffer[9] = {11, 12, 13, 0, 1, 2, 2, 1, 3};
+    GpuState st;
+    st.index_type = 0;
+    st.index_type_announced = false;
+    GpuState::Draw draw;
+    draw.indexed = true;
+    draw.index_count = 6;
+    draw.from_offset = true;
+    draw.index_base = reinterpret_cast<uint64_t>(kBuffer);
+    draw.index_offset = 3;
+    draw.index_addr = draw.index_base + uint64_t{2} * draw.index_offset;
+    const DrawIndexSource source = resolve_draw_index_source(st, draw, 6, 0);
+    EXPECT_STREQ(source.detected, "zero-high-half");
+    EXPECT_EQ(source.addr, draw.index_base + 12u);
+    const NggDrawIndexFetch fetched = fetch_ngg_draw_indices(st, draw, 0);
+    ASSERT_TRUE(fetched.indices) << (fetched.refusal ? fetched.refusal : "");
+    EXPECT_EQ(*fetched.indices, (std::vector<uint32_t>{0, 1, 2, 2, 1, 3}));
+}
+
+// #4637: a draw from the start of a pool larger than 65,536 vertices whose indices cross a 64 KiB
+// window -- Tomb Raider I's level. The third detector takes it, and only inside such a pool.
+TEST(DrawIndexSource, ADrawCrossingAWindowInsideALargePoolIs32Bit) {
+    alignas(4) static uint32_t indices[40];
+    for (uint32_t d = 0; d < 20; d++) indices[d] = d;
+    for (uint32_t d = 0; d < 20; d++) indices[20 + d] = 65530 + d;
+    GpuState st;
+    st.index_type = 0;
+    st.index_type_announced = false;
+    GpuState::Draw draw;
+    draw.indexed = true;
+    draw.index_count = 40;
+    draw.index_addr = reinterpret_cast<uint64_t>(indices);
+    const DrawIndexSource source = resolve_draw_index_source(st, draw, draw.index_count, 489947);
+    EXPECT_STREQ(source.detected, "in-pool");
+    EXPECT_EQ(source.element_bytes, 4u);
+    const DrawIndexSource small_pool = resolve_draw_index_source(st, draw, draw.index_count, 60000);
+    EXPECT_EQ(small_pool.detected, nullptr) << "indices past a 60,000-vertex pool are not indices";
+    EXPECT_EQ(small_pool.element_bytes, 2u);
+}
+
 // #3135 P7: Kena's culling-VS draw state. VGT_SHADER_STAGES_EN 0x2000 (PRIMGEN_EN, no GS), the
 // program in the ES registers with no chain, VGT_GS_OUT_PRIM_TYPE 0 and GS_MAX_VERT_OUT 0,
 // GE_MAX_OUTPUT_PER_SUBGROUP 64, an indexed triangle list.

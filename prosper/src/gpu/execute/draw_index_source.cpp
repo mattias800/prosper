@@ -31,7 +31,12 @@ DrawIndexSource resolve_draw_index_source(const GpuState& ds, const GpuState::Dr
         return source;
     if (!guest_readable(draw.index_addr, n * 2u) || !guest_readable(source.addr32, n * 4u))
         return source;
-    const uint16_t* p16 = (const uint16_t*)(uintptr_t)draw.index_addr;
+    // The fingerprint is read from the CANDIDATE's own bytes: its odd 16-bit words are the high
+    // halves of the 32-bit indices. For a DrawIndexOffset the CP's 16-bit address is index_base +
+    // offset*2, half way to the indices, so words read there belong to other indices -- often in
+    // another 64 KiB window, or at the other parity -- and Tomb Raider I's world draws were
+    // declined on them (#4637). Without an offset the two addresses are the same bytes.
+    const uint16_t* p16 = (const uint16_t*)(uintptr_t)source.addr32;
     const uint32_t* p32 = (const uint32_t*)(uintptr_t)source.addr32;
     // Zero high halves first, so every buffer that detector already classifies keeps its existing
     // verdict; the constant-non-zero form (#304 part two) only ever sees what it rejected.
@@ -39,6 +44,8 @@ DrawIndexSource resolve_draw_index_source(const GpuState& ds, const GpuState::Dr
         source.detected = "zero-high-half";
     else if (index_buffer_is_unannounced_32bit_high(p16, p32, n, vb_records_unclamped))
         source.detected = "constant-high-half";
+    else if (index_buffer_is_unannounced_32bit_in_pool(p32, n, vb_records_unclamped))
+        source.detected = "in-pool";
     if (source.detected) {
         source.element_bytes = 4;
         source.addr = source.addr32;

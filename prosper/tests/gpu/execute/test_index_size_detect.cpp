@@ -230,6 +230,64 @@ TEST(IndexSizeDetect, Contract) {
           "DOLL zero-high-half quad -> declined here, still owned by the original detector");
 
     // ---------------------------------------------------------------------------------------
+    // #4637: the third shape -- a pool of MORE than 65,536 vertices, with the draw's indices crossing
+    // a 64 KiB window. Neither detector above can take it: its head has a zero high half, its tail a
+    // non-zero one. The only evidence is that every index addresses a vertex the pool holds.
+    printf("-- #4637: crossing a window inside a large pool --\n");
+    {
+        constexpr uint32_t kTr1Pool = 489947;   // Tomb Raider I's level pool, size/stride
+        std::vector<uint32_t> crossing;   // starts at the pool, as the census saw it
+        crossing.reserve(114);
+        for (uint32_t d = 0; d < 44; d++) crossing.push_back(d);
+        for (uint32_t d = 65530; d < 65600; d++) crossing.push_back(d);
+        const uint32_t n = (uint32_t)crossing.size();
+        CHECK(index_buffer_is_unannounced_32bit_in_pool(crossing.data(), n, kTr1Pool),
+              "TR I pool-start draw crossing 65,536 -> 32-bit");
+        CHECK(!index_buffer_is_unannounced_32bit(reinterpret_cast<const uint16_t*>(crossing.data()),
+                                                 crossing.data(), n),
+              "...and the zero-high-half detector declines it (why a third rule exists)");
+        CHECK(!index_buffer_is_unannounced_32bit_high(
+                  reinterpret_cast<const uint16_t*>(crossing.data()), crossing.data(), n, kTr1Pool),
+              "...and so does the constant-high-half detector");
+        // The bound is checked on EVERY index, not a sample: one index past the pool, last of all.
+        std::vector<uint32_t> past = crossing;
+        past.push_back(kTr1Pool);
+        CHECK(
+            !index_buffer_is_unannounced_32bit_in_pool(past.data(), n + 1, kTr1Pool),
+            "one index at the pool size, at the very end -> rejected (pins the full scan and >=)");
+        CHECK(
+            !index_buffer_is_unannounced_32bit_in_pool(crossing.data(), n, 0x10000u),
+            "a pool of exactly 65,536 vertices -> not consulted (16-bit indices reach all of it)");
+        // A genuine 16-bit mesh read as 32 bits puts an index in the high half: past any real pool.
+        std::vector<uint16_t> mesh16;
+        mesh16.reserve(128);
+        for (uint16_t i = 0; i < 64; i++) {
+            mesh16.push_back(100 + i);
+            mesh16.push_back(3000 + i);
+        }
+        CHECK(!index_buffer_is_unannounced_32bit_in_pool(
+                  reinterpret_cast<const uint32_t*>(mesh16.data()), 64, kTr1Pool),
+              "16-bit mesh with ordinary odd indices -> stays 16-bit");
+        std::vector<uint32_t> few(16, 70000u);
+        few[1] = 70001u;
+        few[2] = 70002u;
+        CHECK(!index_buffer_is_unannounced_32bit_in_pool(few.data(), 16, kTr1Pool),
+              "three distinct values -> not enough to call it an index list");
+        CHECK(!index_buffer_is_unannounced_32bit_in_pool(crossing.data(), 7, kTr1Pool),
+              "fewer than eight indices -> not consulted");
+        // KNOWN LIMIT, asserted rather than left in a comment: a 16-bit strip around an apex at most
+        // (pool - 1) >> 16 reads as in-pool 32-bit indices, exactly as the detector above documents.
+        std::vector<uint16_t> apex;
+        for (uint16_t rim = 0; rim < 64; rim++) {
+            apex.push_back(rim);
+            apex.push_back(5);
+        }
+        CHECK(index_buffer_is_unannounced_32bit_in_pool(
+                  reinterpret_cast<const uint32_t*>(apex.data()), 64, kTr1Pool),
+              "KNOWN LIMIT: a strip around apex vertex 5 inside a 489,947-vertex pool IS accepted");
+    }
+
+    // ---------------------------------------------------------------------------------------
     // #3009: WHETHER either detector may be consulted at all.
     //
     // Both are named for what they do -- recover an element size the guest NEVER ANNOUNCED -- but the

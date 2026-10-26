@@ -163,6 +163,41 @@ bool index_buffer_is_unannounced_32bit_high(const uint16_t* p16, const uint32_t*
     }
     return (have_even && even_const && even0 != 0) || (have_odd && odd_const && odd0 != 0);
 }
+// #4637, the third shape: a draw into a pool of MORE than 65,536 vertices whose indices cross a
+// 64 KiB window inside the draw. Tomb Raider I's Lara's Home draws 133,353 indices from the start of
+// a 489,947-vertex pool: the first ones sit below 65,536 (high half zero, so the detector above that
+// wants a non-zero constant declines) and later ones above it (so the zero-high-half detector, which
+// wants every index under 65,536, declines too). Read as 16-bit, the level is long triangles
+// radiating from vertex 0.
+//
+// The evidence is the bound alone, over EVERY index rather than a sample: each 32-bit reading must
+// address a vertex the pool holds. A genuine 16-bit buffer read as 32-bit puts its odd-position index
+// in the high half, so passing needs every odd-position index to be at most (pool - 1) >> 16 -- 7 for
+// Tomb Raider's pool -- across the whole draw. That is the period-2 shape the detector above already
+// documents (a strip or line list around a low apex), and the same KNOWN LIMIT applies: inside a pool
+// this large such a buffer is accepted. Only consulted when the pool exceeds 65,536 vertices, where a
+// 16-bit index buffer could not address most of the pool anyway.
+bool index_buffer_is_unannounced_32bit_in_pool(const uint32_t* p32, uint32_t n,
+                                               uint32_t vertex_upper_bound) {
+    constexpr uint32_t kMinSamples = 8;
+    constexpr uint32_t kMinDistinct = 4;
+    constexpr uint32_t kMaxPlausibleIndex = 1u << 24;
+    if (n < kMinSamples || vertex_upper_bound <= 0x10000u) return false;
+    const uint32_t ceiling = std::min(vertex_upper_bound, kMaxPlausibleIndex);
+    uint32_t distinct = 0, seen[kMinDistinct] = {};
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t d;
+        std::memcpy(&d, reinterpret_cast<const char*>(p32) + uint64_t{4} * i, 4);
+        if (d >= ceiling) return false;
+        if (distinct < kMinDistinct) {
+            bool dup = false;
+            for (uint32_t k = 0; k < distinct; k++)
+                if (seen[k] == d) { dup = true; break; }
+            if (!dup) seen[distinct++] = d;
+        }
+    }
+    return distinct >= kMinDistinct;
+}
 // clang-format on
 
 } // namespace prosper::gpu
