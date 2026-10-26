@@ -3,8 +3,9 @@
 set pagination off
 set width 0
 set confirm off
-set breakpoint pending off
-start
+# main can be absent from the linked test binary. Arm before launch and resolve
+# the runtime's throwing function when its shared library loads.
+set breakpoint pending on
 break std::__throw_system_error(int)
 commands
   silent
@@ -12,6 +13,6 @@ commands
   thread apply all bt 32
   quit 42
 end
-continue
+run
 echo PROSPER_NO_SYSTEM_ERROR_STACK\n
 quit 0

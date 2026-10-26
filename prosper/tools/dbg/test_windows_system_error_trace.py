@@ -3,6 +3,8 @@
 import importlib.util
 import json
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,6 +25,60 @@ def test_capture_requires_breakpoint_exit_and_an_actual_throw_frame():
     assert not trace.captured_stack(42, "PROSPER_SYSTEM_ERROR_STACK\nNo stack.\n")
     assert not trace.captured_stack(42, "#0 std::__throw_system_error (int)\n")
     assert not trace.captured_stack(42, stack.replace("#0", "#1"))
+
+
+@pytest.mark.parametrize("mode,captured", [("throw", True), ("normal", False), ("signal", False)])
+def test_real_debugger_does_not_require_a_main_symbol(tmp_path, mode, captured):
+    compiler, debugger = shutil.which("g++"), shutil.which("gdb")
+    if not compiler or not debugger:
+        pytest.skip("real debugger control requires g++ and gdb")
+    source = tmp_path / "control.cpp"
+    source.write_text(
+        "#include <bits/functexcept.h>\n#include <csignal>\n"
+        "int main(int argc, char** argv) {\n"
+        "  if (argc > 1 && argv[1][0] == 't') std::__throw_system_error(22);\n"
+        "  if (argc > 1 && argv[1][0] == 's') std::raise(SIGSEGV);\n"
+        "  return 0;\n}\n"
+    )
+    executable = tmp_path / ("control.exe" if os.name == "nt" else "control")
+    subprocess.run(
+        [compiler, "-O0", "-s", str(source), "-o", str(executable)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    env = dict(os.environ, DEBUGINFOD_URLS="")
+    # Establish the missing-symbol condition independently of the script under test.
+    status, output = trace.run_debugger(
+        [debugger, "--batch", "--nx", "-ex", "info address main", "--args", str(executable)],
+        str(tmp_path),
+        env,
+    )
+    assert status == 1 and '"main"' in output, output
+    script = Path(__file__).with_name("system_error_stack.gdb")
+    status, output = trace.run_debugger(
+        [
+            debugger,
+            "--batch",
+            "--nx",
+            "-iex",
+            "set auto-load off",
+            "-x",
+            str(script),
+            "--args",
+            str(executable),
+            mode,
+        ],
+        str(tmp_path),
+        env,
+    )
+    assert trace.captured_stack(status, output) == captured, output
+    if captured:
+        assert status == 42
+    else:
+        assert status == 0 and "PROSPER_NO_SYSTEM_ERROR_STACK" in output, output
+        assert "PROSPER_SYSTEM_ERROR_STACK\n" not in output
 
 
 def test_only_actual_failed_fixture_names_are_selected():
