@@ -9,6 +9,11 @@ SCC loop's original instructions. Saved pairs meet every CFG path and back edge;
 is the induction hypothesis. Its DATA certificate leaves route admission and existing back-edge
 checks unchanged, and supplies no physical mask words or source definedness.
 
+`rdna2_current_word_roots` retains a producer's immutable current-EXEC root view within
+canonical word marks. It leaves broader coverage and root obligations intact. Joins retain
+only an identical generation view on both edges; lane selections and spills drop it. Buffer ADD/EXCHANGE returns include genuine
+address, resource and old-VDATA fallback obligations. It grants no loop route or missing word.
+
 Takes a guest shader's instruction bytes and emits a SPIR-V module.
 
 `rdna2_native_image_results` records and consumes the exact result generations of the

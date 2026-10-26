@@ -15,6 +15,11 @@ Its native Wave64 interpreter witness observes three iterations, both cohort hal
 output. Changed masks, unavailable relays, pending/changed PHIs and wrong source contexts remain
 negative controls; recording ancestry never supplies physical scalar words.
 
+`test_current_word_roots` checks root-view ownership, actual input dependencies and canonical
+word lifetime. `test_native_atomic_active_scope` adds buffer ADD/EXCHANGE interpreter witnesses,
+missing-input twins and a broader-cohort control. The oracle opts into the closed buffer atomic
+profile explicitly; its existing NGG increment contract remains separate.
+
 `test_accumulator_cohort` observes a narrower accumulating write and the untouched part
 of its original cohort through the public compiler and Wave64 interpreter. Missing old values,
 missing active operands and expanded readers retain their refusals. Unit cases preserve every

@@ -2841,6 +2841,12 @@ if(TARGET prosper_core)
     INCLUDES tests tests/gpu/recompiler
     LIBRARIES prosper_core)
 
+  prosper_add_gtest(test_current_word_roots
+    SOURCES tests/gpu/recompiler/test_current_word_roots.cpp
+            tests/gpu/recompiler/test_native_atomic_active_scope.cpp
+    INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
+
   prosper_add_gtest(test_narrowing_loop_exec
     SOURCES tests/gpu/recompiler/test_narrowing_loop_exec.cpp
     INCLUDES tests
