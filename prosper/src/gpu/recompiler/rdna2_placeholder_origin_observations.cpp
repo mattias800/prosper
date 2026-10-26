@@ -1,4 +1,9 @@
 // Existing native Input and resource publications terminate a diagnostic dependency slice.
+#include "gpu/recompiler/rdna2_instruction_effects.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_vector_word_marks.hpp"
+#include <optional>
+#include <cstdint>
 #include "gpu/recompiler/rdna2_placeholder_origins.hpp"
 #include "gpu/recompiler/rdna2_loaded_arbitrary.hpp"
 #include "gpu/recompiler/rdna2_native_launch.hpp"

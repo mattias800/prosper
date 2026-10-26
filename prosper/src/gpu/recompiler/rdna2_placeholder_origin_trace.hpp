@@ -1,8 +1,11 @@
 // Source-private backward diagnostic slice; never queried by an admitting proof.
 #pragma once
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include <vector>
+#include <set>
+#include <cstdint>
 #include "gpu/recompiler/rdna2_placeholder_origins.hpp"
 #include "gpu/recompiler/ir/cfg/guest_cfg.hpp"
-#include <utility>
 
 namespace prosper::gpu::detail {
 struct PlaceholderOriginTrace {
@@ -15,6 +18,7 @@ struct PlaceholderOriginTrace {
     std::set<int> image_addresses(const Rdna2Inst&) const;
     std::vector<PlaceholderWord> sources(const Rdna2Inst&, PlaceholderWord) const;
     PlaceholderRoots entry(PlaceholderWord) const;
-    PlaceholderRoots before(uint32_t pc, const std::vector<PlaceholderWord>&) const;
+    PlaceholderRoots before(uint32_t pc, const std::vector<PlaceholderWord>&,
+                            uint32_t work_limit = 1000000) const;
 };
 } // namespace prosper::gpu::detail

@@ -1,3 +1,5 @@
+#include <string>
+#include <memory>
 #include "gpu/recompiler/rdna2_placeholder_origins.hpp"
 #pragma once
 #include "gpu/recompiler/rdna2_scalar_condition_marks.hpp"

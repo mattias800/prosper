@@ -143,7 +143,9 @@ TEST(Wave64Vop3B32VccRead, MissingLocalYCannotFabricateCompareMask) {
     Rejections rejections;
     EXPECT_TRUE(compile(program(kBfeVccLo0, kBfeVccLo1, true), &rejections, 0).empty());
     const std::pair<std::string, std::string> expected{
-        "fabricated-fresh-mask-source", "pc=1 a fresh predicate requires defined inputs"};
+        "fabricated-fresh-mask-source",
+        "pc=1 a fresh predicate requires defined inputs placeholder-roots=["
+        "origin=unknown-launch word=s30 at=entry]"};
     EXPECT_NE(std::find(rejections.begin(), rejections.end(), expected), rejections.end())
         << testing::PrintToString(rejections);
     EXPECT_TRUE(std::any_of(rejections.begin(), rejections.end(), [](const auto& rejection) {

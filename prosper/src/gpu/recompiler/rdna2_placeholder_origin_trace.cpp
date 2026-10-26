@@ -1,3 +1,9 @@
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_placeholder_origins.hpp"
+#include "gpu/recompiler/ir/cfg/guest_cfg.hpp"
+#include <vector>
+#include <cstdint>
+#include <utility>
 #include "gpu/recompiler/rdna2_placeholder_origin_trace.hpp"
 #include "gpu/recompiler/rdna2_vector_old_word.hpp"
 #include <algorithm>
@@ -37,7 +43,8 @@ PlaceholderOriginTrace::PlaceholderOriginTrace(const PlaceholderOriginProgram& p
 }
 
 PlaceholderRoots PlaceholderOriginTrace::before(uint32_t pc,
-                                                const std::vector<PlaceholderWord>& words) const {
+                                                const std::vector<PlaceholderWord>& words,
+                                                uint32_t work_limit) const {
     const auto& ins = program.instructions;
     const auto at = std::find_if(ins.begin(), ins.end(), [&](const auto& x) { return x.pc == pc; });
     PlaceholderRoots roots;
@@ -60,7 +67,7 @@ PlaceholderRoots PlaceholderOriginTrace::before(uint32_t pc,
         const auto [index, word] = work.back();
         work.pop_back();
         if (!seen.emplace(index, word).second) continue;
-        if (seen.size() > 1000000) {
+        if (seen.size() > work_limit) {
             roots.insert({PlaceholderOrigin::TraceBudget, word, ins[index].pc});
             break;
         }
@@ -84,7 +91,9 @@ PlaceholderRoots PlaceholderOriginTrace::before(uint32_t pc,
         if (word.file == PlaceholderFile::Vector &&
             vector_write_depends_on_old_word(in, full_exec[index]))
             enqueue_before(index, word);
-        if (word.file == PlaceholderFile::Spill && word.lane < 0) enqueue_before(index, word);
+        if (word.file == PlaceholderFile::Spill &&
+            (word.lane < 0 || in.src[1].kind != OperandKind::InlineInt))
+            enqueue_before(index, word);
     }
     if (roots.empty())
         for (auto word : words) roots.insert({PlaceholderOrigin::LostDefinition, word, pc});

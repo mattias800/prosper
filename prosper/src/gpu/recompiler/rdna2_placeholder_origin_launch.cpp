@@ -1,3 +1,9 @@
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_launch_vgprs.hpp"
+#include <vector>
+#include <utility>
+#include <string>
+#include <cstdint>
 #include "gpu/recompiler/rdna2_placeholder_origins.hpp"
 #include "gpu/recompiler/rdna2_reg_state.hpp"
 #include <memory>

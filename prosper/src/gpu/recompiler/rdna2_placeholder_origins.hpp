@@ -2,7 +2,6 @@
 #pragma once
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_launch_vgprs.hpp"
-#include <compare>
 #include <cstdint>
 #include <map>
 #include <memory>

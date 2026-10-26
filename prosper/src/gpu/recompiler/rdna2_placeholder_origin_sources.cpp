@@ -1,7 +1,15 @@
+#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include "gpu/recompiler/rdna2_launch_vgprs.hpp"
+#include "gpu/recompiler/rdna2_placeholder_origins.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include <set>
+#include <vector>
+#include <cstdint>
 #include "gpu/recompiler/rdna2_placeholder_origin_trace.hpp"
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
+#include "gpu/recompiler/rdna2_legacy_vcc_writes.hpp"
 #include "gpu/recompiler/rdna2_vector_old_word.hpp"
 #include <algorithm>
 
@@ -35,6 +43,9 @@ bool PlaceholderOriginTrace::writes(const Rdna2Inst& in, PlaceholderWord word) c
         if (!vector_write_leaves_old_word(in, program.native_interpolation))
             for_each_possible_vector_write(in, 255, [&](int reg) { found |= reg == word.reg; });
     } else {
+        if ((word.reg == 106 || (word.reg == 107 && program.wave_size != 32)) &&
+            legacy_valu_writes_vcc(in))
+            found = true;
         for_each_scalar_write(
             in,
             [&](int base, uint32_t width) {
@@ -66,6 +77,8 @@ std::vector<PlaceholderWord> PlaceholderOriginTrace::sources(const Rdna2Inst& in
                 if (found != program.observations->relative_words.end()) {
                     for (int reg : found->second) words.push_back({PlaceholderFile::Vector, reg});
                 } else if (source.value >= 0 && source.value <= 255) {
+                    // An out-of-range source can alias v0; retain that possible input too.
+                    add(PlaceholderFile::Vector, 0, 1);
                     add(PlaceholderFile::Vector, source.value, 256u - source.value);
                 }
             } else if (in.fmt == Rdna2Format::MIMG && k == 0) {
@@ -98,8 +111,10 @@ std::vector<PlaceholderWord> PlaceholderOriginTrace::sources(const Rdna2Inst& in
             if (width == UINT32_MAX) continue;
             // Legacy scalar descriptor accounting, shared with CFG merge-deadness. These
             // format fields are scalar reads even though the ALU-width query returns zero.
-            if (in.fmt == Rdna2Format::MIMG && k == 1) width = 8;
-            if (in.fmt == Rdna2Format::MIMG && k == 2) width = 4;
+            if (in.fmt == Rdna2Format::MIMG && k == 1) width = in.mimg_r128 ? 4 : 8;
+            if (in.fmt == Rdna2Format::MIMG && k == 2)
+                // The existing resource check uses the legacy MIMG sampler boundary.
+                width = in.opcode >= 0x20u ? 4 : 0;
             if ((in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF) && k == 1) width = 4;
             if ((in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF) && k == 2) width = 1;
             if (in.fmt == Rdna2Format::FLAT && k == 1) width = 2;
@@ -110,7 +125,8 @@ std::vector<PlaceholderWord> PlaceholderOriginTrace::sources(const Rdna2Inst& in
     }
     const auto& effects = rdna2_instruction_effects(in);
     if (effects.implicit_reads & kRdna2ImplicitM0) add(PlaceholderFile::Scalar, 124, 1);
-    if (effects.implicit_reads & kRdna2ImplicitVcc) add(PlaceholderFile::Scalar, 106, 2);
+    if (effects.implicit_reads & kRdna2ImplicitVcc)
+        add(PlaceholderFile::Scalar, 106, program.wave_size == 32 ? 1 : 2);
     if (effects.implicit_reads & kRdna2ImplicitScc) words.push_back({PlaceholderFile::Scc});
     if (result.file == PlaceholderFile::Scalar)
         add(PlaceholderFile::Scalar, in.dst.value, scalar_implicit_destination_read_width(in));
@@ -123,6 +139,7 @@ PlaceholderRoots PlaceholderOriginTrace::entry(PlaceholderWord word) const {
         program.observations->supplied_special_words.contains(word.reg))
         return {};
     if (word.file == PlaceholderFile::Vector) {
+        if (word.reg < 0 || word.reg > 255) return {{PlaceholderOrigin::UnmodelledTransfer, word}};
         const auto launch = std::find_if(program.vectors.begin(), program.vectors.end(),
                                          [&](const auto& x) { return x.vgpr == word.reg; });
         if (launch != program.vectors.end() && launch->state != LaunchVgprState::Reserved &&
@@ -138,9 +155,13 @@ PlaceholderRoots PlaceholderOriginTrace::entry(PlaceholderWord word) const {
         return {};
     if (word.file == PlaceholderFile::Scalar && program.loaded_scalars.contains(word.reg))
         return {{PlaceholderOrigin::LaunchInput, word}};
-    // A complete ordinary SGPR layout does not specify special-register initialization.
+    // The compute request records the enabled user/system prefix, but not SCRATCH_EN.
+    // Hardware can append one scratch-offset SGPR (RDNA2 ISA 3.12.2); that word remains
+    // unknown. The prefix also says nothing about special-register initialization.
+    const int possible_scratch =
+        program.loaded_scalars.empty() ? 0 : *program.loaded_scalars.rbegin() + 1;
     const bool unloaded = program.scalar_profile_known && word.file == PlaceholderFile::Scalar &&
-                          word.reg >= 0 && word.reg <= 105;
+                          word.reg >= 0 && word.reg <= 105 && word.reg != possible_scratch;
     return {{unloaded ? PlaceholderOrigin::Unloaded : PlaceholderOrigin::UnknownLaunch, word}};
 }
 }   // namespace prosper::gpu::detail

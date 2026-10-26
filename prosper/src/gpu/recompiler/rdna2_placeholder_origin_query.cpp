@@ -1,10 +1,14 @@
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include <string>
+#include <vector>
+#include <cstdint>
+#include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include "gpu/recompiler/rdna2_placeholder_origins.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_placeholder_origin_trace.hpp"
 #include "gpu/recompiler/rdna2_reg_state.hpp"
 #include "gpu/recompiler/rdna2_vector_old_word.hpp"
-#include <algorithm>
 
 namespace prosper::gpu {
 namespace {
@@ -47,7 +51,7 @@ std::string fresh_placeholder_origins(const RegState& rs, const Rdna2Inst& in,
     }
     const auto& effects = rdna2_instruction_effects(in);
     if (effects.implicit_reads & kRdna2ImplicitVcc)
-        for (int reg : {106, 107})
+        for (int reg = 106; reg < (rs.vector_wave_size == 32 ? 107 : 108); ++reg)
             if (sreg_word_may_be_fabricated(rs, reg))
                 words.push_back({PlaceholderFile::Scalar, reg});
     if ((effects.implicit_reads & kRdna2ImplicitScc) && (!rs.scc || rs.scc_merge_placeholder))
@@ -83,6 +87,9 @@ std::string loop_placeholder_origins(const RegState& rs, uint32_t header,
             roots.insert(incoming.begin(), incoming.end());
         }
         if (!roots.empty()) return format_placeholder_origins(roots);
+        // No matching edge means the back-edge dependency is unknown, not the header seed.
+        for (auto word : words) roots.insert({PlaceholderOrigin::UnmodelledTransfer, word, header});
+        return format_placeholder_origins(roots);
     }
     return describe(program, header, words);
 }
