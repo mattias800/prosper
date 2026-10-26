@@ -1,3 +1,4 @@
+#include "gpu/recompiler/rdna2_legacy_vcc_writes.hpp"
 // An EXEC phi may inherit a preheader subset only from a closed, monotonically narrowing loop.
 // Keep this code-only proof separate from the carried-value obligations checked by the emitter.
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
@@ -198,10 +199,7 @@ int loop_live_wave_scalar(const std::vector<Rdna2Inst>& ins, const DivLoop& loop
         };
         for_each_scalar_write(in, record);
         if (in.fmt == Rdna2Format::SOP2) record(in.dst.value, rdna2_sop2_dest_dwords(in.opcode));
-        if ((in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
-             in.dst.kind == OperandKind::Special) ||
-            (in.fmt == Rdna2Format::VOP2 && in.opcode >= 0x28u && in.opcode <= 0x2au))
-            record(106, 2);
+        if (legacy_valu_writes_vcc(in)) record(106, 2);
         writes_scc |= scalar_instruction_writes_scc(in);
     }
     for (int reg : written) {
