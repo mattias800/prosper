@@ -1072,6 +1072,7 @@ jobs:
             git
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-gdb
             mingw-w64-ucrt-x86_64-ccache
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-spirv-tools
@@ -1159,9 +1160,18 @@ jobs:
         run: ./prosper/tools/ci/windows_build_storage.ps1 -Phase after -CompilerTempDirectory $env:CI_COMPILER_TEMP
 
       - name: Test
+        id: windows_tests
         shell: msys2 {0}
         # See the linux job: plain ctest exits 0 on an empty suite (#2187).
         run: ctest --test-dir prosper/build-ci --output-on-failure --timeout 600 --no-tests=error -LE timing-margin -j4
+
+      # #5104: obtain the throwing operation without changing the original suite verdict.
+      # Only failed CPU producer fixtures are replayed; a missing stack stays unverified.
+      - name: Diagnose PM4 system-error failures
+        if: ${{ !cancelled() && steps.windows_tests.outcome == 'failure' }}
+        timeout-minutes: 8
+        shell: msys2 {0}
+        run: .venv/Scripts/python.exe prosper/tools/dbg/windows_system_error_trace.py --build prosper/build-ci
 
       # Same measured-margin report as the Linux job -- see the long note there (#3067/#3208).
       - name: Report the measured wait margins
