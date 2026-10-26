@@ -4,10 +4,68 @@
 #include "gpu/pm4/command_processor.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <set>
 #include <stdint.h>
+#include "diagnostics/env_cache.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 
 namespace prosper::gpu {
+
+namespace {
+// PROSPER_INDEX_DETECT_CENSUS=1 -- diagnostic only. For an unannounced indexed draw that BOTH 32-bit
+// detectors left as 16-bit, print once per index buffer what each detector's clauses saw: the count,
+// the vertex bound, the first readings at 32 bits, their spread, and how many distinct high halves
+// each parity holds. A level that still renders as stretched triangles (#4637) is then either a 16-bit
+// buffer read correctly, or a 32-bit one whose shape no clause admits, and this says which clause.
+void note_index_left_16bit(uint64_t addr, const uint16_t* p16, const uint32_t* p32, uint32_t n,
+                           uint32_t vertex_bound) {
+    static std::mutex mutex;
+    static std::set<uint64_t> seen;
+    static std::atomic<uint32_t> printed{0};
+    constexpr uint32_t kMaxLines = 256;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (printed.load() >= kMaxLines || !seen.insert(addr).second) return;
+        ++printed;
+    }
+    const uint32_t m = std::min(n, 64u);
+    uint32_t lo = UINT32_MAX, hi = 0, above_bound = 0;
+    std::set<uint32_t> distinct32;
+    std::set<uint16_t> even_halves, odd_halves;
+    for (uint32_t i = 0; i < m; ++i) {
+        uint32_t d = 0;
+        std::memcpy(&d, reinterpret_cast<const char*>(p32) + size_t{4} * i, 4);
+        lo = std::min(lo, d);
+        hi = std::max(hi, d);
+        if (d >= vertex_bound) ++above_bound;
+        distinct32.insert(d);
+        uint16_t w = 0;
+        std::memcpy(&w, reinterpret_cast<const char*>(p16) + size_t{2} * i, 2);
+        (i & 1 ? odd_halves : even_halves).insert(w);
+    }
+    char first[160] = {};
+    int at = 0;
+    for (uint32_t i = 0; i < std::min(m, 8u) && at < (int)sizeof(first) - 12; ++i) {
+        uint32_t d = 0;
+        std::memcpy(&d, reinterpret_cast<const char*>(p32) + size_t{4} * i, 4);
+        at += std::snprintf(first + at, sizeof(first) - at, "%s%u", i ? "," : "", d);
+    }
+    std::fprintf(stderr,
+                 "[index-census] left 16-bit addr=0x%llx n=%u vertex_bound=%u as32=[%s] "
+                 "lo=%u hi=%u span=%u distinct32=%zu above_bound=%u/%u even_halves=%zu "
+                 "odd_halves=%zu (#4637)\n",
+                 static_cast<unsigned long long>(addr), n, vertex_bound, first, lo, hi, hi - lo,
+                 distinct32.size(), above_bound, m, even_halves.size(), odd_halves.size());
+    if (printed.load() == kMaxLines)
+        std::fprintf(stderr, "[index-census] line cap %u reached (a CAP, not a count)\n",
+                     kMaxLines);
+}
+}   // namespace
+
 // clang-format off: preserve the byte-identical moved bodies.
 
 // The bound vertex buffers' UNCLAMPED record count (size/stride, the largest) -- the bound the #304
@@ -49,6 +107,9 @@ DrawIndexSource resolve_draw_index_source(const GpuState& ds, const GpuState::Dr
     if (source.detected) {
         source.element_bytes = 4;
         source.addr = source.addr32;
+    // NOLINTNEXTLINE(concurrency-mt-unsafe): cached environment read
+    } else if (PROSPER_ENV_ON("PROSPER_INDEX_DETECT_CENSUS")) {
+        note_index_left_16bit(draw.index_addr, p16, p32, n, vb_records_unclamped);
     }
     return source;
 }
