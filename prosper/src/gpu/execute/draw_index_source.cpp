@@ -4,10 +4,106 @@
 #include "gpu/pm4/command_processor.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <set>
 #include <stdint.h>
+#include "diagnostics/env_cache.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 
 namespace prosper::gpu {
+
+namespace {
+// PROSPER_INDEX_DETECT_CENSUS=1 -- diagnostic only. For an unannounced indexed draw that all 32-bit
+// detectors left as 16-bit, print once per index buffer what each detector's clauses saw: the count,
+// the vertex bound, the first readings at 32 bits, their spread, and how many distinct high halves
+// each parity holds. A level that still renders as stretched triangles (#4637) is then either a 16-bit
+// buffer read correctly, or a 32-bit one whose shape no clause admits; this reports the sampled
+// clauses, it does not prove the width. Draws taken by the offset/same-bytes RECOVERY path (the
+// verdicts the original two-address detectors did not give) are listed too. Each stream reports
+// only its first sighting of an address, up to 256 addresses. Changed counts, bounds or contents at
+// an already seen address are not reported again; this is not a complete census of draw decisions.
+void note_index_left_16bit(uint64_t addr, const uint16_t* p16, const uint32_t* p32, uint32_t n,
+                           uint32_t vertex_bound) {
+    static std::mutex mutex;
+    static std::set<uint64_t> seen;
+    static std::atomic<uint32_t> printed{0};
+    constexpr uint32_t kMaxLines = 256;
+    if (printed.load(std::memory_order_relaxed) >= kMaxLines) return;   // no lock once capped
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (printed.load() >= kMaxLines || !seen.insert(addr).second) return;
+        ++printed;
+    }
+    const uint32_t m = std::min(n, 64u);
+    uint32_t lo = UINT32_MAX, hi = 0, above_bound = 0;
+    std::set<uint32_t> distinct32;
+    std::set<uint16_t> even_halves, odd_halves;
+    for (uint32_t i = 0; i < m; ++i) {
+        uint32_t d = 0;
+        std::memcpy(&d, reinterpret_cast<const char*>(p32) + size_t{4} * i, 4);
+        lo = std::min(lo, d);
+        hi = std::max(hi, d);
+        if (d >= vertex_bound) ++above_bound;
+        distinct32.insert(d);
+        uint16_t w = 0;
+        std::memcpy(&w, reinterpret_cast<const char*>(p16) + size_t{2} * i, 2);
+        (i & 1 ? odd_halves : even_halves).insert(w);
+    }
+    char first[160] = {};
+    int at = 0;
+    for (uint32_t i = 0; i < std::min(m, 8u) && at < (int)sizeof(first) - 12; ++i) {
+        uint32_t d = 0;
+        std::memcpy(&d, reinterpret_cast<const char*>(p32) + size_t{4} * i, 4);
+        at += std::snprintf(first + at, sizeof(first) - at, "%s%u", i ? "," : "", d);
+    }
+    std::fprintf(stderr,
+                 "[index-census] left 16-bit addr=0x%llx n=%u vertex_bound=%u as32=[%s] "
+                 "lo=%u hi=%u span=%u distinct32=%zu above_bound=%u/%u even_halves=%zu "
+                 "odd_halves=%zu (#4637)\n",
+                 static_cast<unsigned long long>(addr), n, vertex_bound, first, lo, hi, hi - lo,
+                 distinct32.size(), above_bound, m, even_halves.size(), odd_halves.size());
+    if (printed.load() == kMaxLines)
+        std::fprintf(stderr, "[index-census] line cap %u reached (a CAP, not a count)\n",
+                     kMaxLines);
+}
+
+void note_index_recovered(const char* rule, const GpuState::Draw& draw, uint64_t addr32,
+                          const uint32_t* p32, uint32_t n, uint32_t vertex_bound) {
+    static std::mutex mutex;
+    static std::set<uint64_t> seen;
+    static std::atomic<uint32_t> printed{0};
+    constexpr uint32_t kMaxLines = 256;
+    if (printed.load(std::memory_order_relaxed) >= kMaxLines) return;   // no lock once capped
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (printed.load() >= kMaxLines || !seen.insert(addr32).second) return;
+        ++printed;
+    }
+    uint32_t lo = UINT32_MAX, hi = 0;
+    char first[160] = {};
+    int at = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint32_t d = 0;
+        std::memcpy(&d, reinterpret_cast<const char*>(p32) + size_t{4} * i, 4);
+        lo = std::min(lo, d);
+        hi = std::max(hi, d);
+        if (i < 8 && at < (int)sizeof(first) - 12)
+            at += std::snprintf(first + at, sizeof(first) - at, "%s%u", i ? "," : "", d);
+    }
+    std::fprintf(stderr,
+                 "[index-census] recovered %s addr32=0x%llx from_offset=%d offset=%u n=%u "
+                 "vertex_bound=%u as32=[%s] lo=%u hi=%u (#4637)\n",
+                 rule, static_cast<unsigned long long>(addr32), draw.from_offset ? 1 : 0,
+                 draw.index_offset, n, vertex_bound, first, lo, hi);
+    if (printed.load() == kMaxLines)
+        std::fprintf(stderr, "[index-census] recovered line cap %u reached (a CAP, not a count)\n",
+                     kMaxLines);
+}
+}   // namespace
+
 // clang-format off: preserve the byte-identical moved bodies.
 
 // The bound vertex buffers' UNCLAMPED record count (size/stride, the largest) -- the bound the #304
@@ -20,6 +116,8 @@ uint32_t vertex_buffer_records_unclamped(const ShaderResourceTable* table) {
                 records = std::max(records, r.size / r.stride);
     return records;
 }
+// clang-format on
+
 DrawIndexSource resolve_draw_index_source(const GpuState& ds, const GpuState::Draw& draw,
                                                  uint32_t n, uint32_t vb_records_unclamped) {
     DrawIndexSource source;
@@ -33,18 +131,52 @@ DrawIndexSource resolve_draw_index_source(const GpuState& ds, const GpuState::Dr
         return source;
     const uint16_t* p16 = (const uint16_t*)(uintptr_t)draw.index_addr;
     const uint32_t* p32 = (const uint32_t*)(uintptr_t)source.addr32;
-    // Zero high halves first, so every buffer that detector already classifies keeps its existing
-    // verdict; the constant-non-zero form (#304 part two) only ever sees what it rejected.
+    // Retain both original checks, including the draw's own 16-bit region on offset draws.
+    // A readable 32-bit candidate can be another resource after a genuine 16-bit index buffer.
     if (index_buffer_is_unannounced_32bit(p16, p32, n))
         source.detected = "zero-high-half";
     else if (index_buffer_is_unannounced_32bit_high(p16, p32, n, vb_records_unclamped))
         source.detected = "constant-high-half";
+    if (!source.detected) {
+        // `legacy_ran`: the two original rules already judged exactly these bytes as both
+        // readings (a draw whose candidate is its own address), so only `in-pool` can add.
+        const auto detect_same_bytes = [vb_records_unclamped](uint64_t addr, uint32_t count,
+                                                              bool legacy_ran) -> const char* {
+            const auto* words = reinterpret_cast<const uint16_t*>(static_cast<uintptr_t>(addr));
+            const auto* dwords = reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(addr));
+            if (!legacy_ran && index_buffer_is_unannounced_32bit(words, dwords, count))
+                return "zero-high-half";
+            if (!legacy_ran &&
+                index_buffer_is_unannounced_32bit_high(words, dwords, count, vb_records_unclamped))
+                return "constant-high-half";
+            if (index_buffer_is_unannounced_32bit_in_pool(dwords, count, vb_records_unclamped))
+                return "in-pool";
+            return nullptr;
+        };
+        // Every recovery, with or without an offset, also needs a 32-bit shape WITHIN the already
+        // validated n*2 bytes of the draw's own region. At an odd offset its first halfword is a
+        // high half: skip it and inspect only complete dwords aligned relative to index_base. No
+        // read beyond the 16-bit draw's extent may supply this corroboration. Without an offset the
+        // region is the candidate's first half, which is what stops a short 16-bit mesh followed
+        // by zeros from passing `in-pool` on the zeros' locality (#5520 review).
+        const uint32_t skip = draw.index_offset & 1u;
+        if (detect_same_bytes(draw.index_addr + uint64_t{2} * skip, (n - skip) / 2u, false))
+            source.detected = detect_same_bytes(source.addr32, n, source.addr32 == draw.index_addr);
+        // NOLINTNEXTLINE(concurrency-mt-unsafe): cached environment read
+        if (source.detected && PROSPER_ENV_ON("PROSPER_INDEX_DETECT_CENSUS"))
+            note_index_recovered(source.detected, draw, source.addr32, p32, n,
+                                 vb_records_unclamped);
+    }
     if (source.detected) {
         source.element_bytes = 4;
         source.addr = source.addr32;
+        // NOLINTNEXTLINE(concurrency-mt-unsafe): cached environment read
+    } else if (PROSPER_ENV_ON("PROSPER_INDEX_DETECT_CENSUS")) {
+        note_index_left_16bit(draw.index_addr, p16, p32, n, vb_records_unclamped);
     }
     return source;
 }
+// clang-format off: preserve the unchanged fetch body.
 NggDrawIndexFetch fetch_ngg_draw_indices(const GpuState& ds, const GpuState::Draw& draw,
                                                 uint32_t vb_records_unclamped) {
     NggDrawIndexFetch out;

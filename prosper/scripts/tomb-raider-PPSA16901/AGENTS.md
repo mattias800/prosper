@@ -9,8 +9,8 @@ the filename says otherwise.
 
 **`reach-gameplay.pad` does not keep that promise by itself.** It is timed in seconds, and which
 game it enters has changed with the frame rate of the build running it: Tomb Raider II in 2026-08,
-Tomb Raider I on 2026-10-06. The two games' `Lara's Home` are in very different states (#4637), so
-check the subtitle or the scene before reading a run of it. `reach-tr2-laras-home.pad` presses Down
+Tomb Raider I on 2026-10-06. Both games' `Lara's Home` render now (Tomb Raider I's since #4637),
+but they are different levels, so check the subtitle or the scene before reading a run. `reach-tr2-laras-home.pad` presses Down
 on the title screen on purpose and names its destination.
 
 ## What a route has to get past

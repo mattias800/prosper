@@ -460,6 +460,7 @@ PROSPER_IME_AUTOKEY  unclassified
 PROSPER_IME_AUTOKEY_HID  unclassified
 PROSPER_IME_SCRIPT  unclassified
 PROSPER_INDEXTYPE_LOG  unclassified
+PROSPER_INDEX_DETECT_CENSUS  diagnostic  # why an unannounced indexed draw stayed 16-bit (#4637)
 PROSPER_INDEX_ECHO  unclassified
 PROSPER_INDEX_EXPAND_STATS  unclassified
 PROSPER_INDIRECTLOG  unclassified

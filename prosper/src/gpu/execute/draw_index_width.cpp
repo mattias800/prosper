@@ -14,9 +14,10 @@ namespace prosper::gpu {
 // 32-bit for `n` entries; a real 32-bit buffer has EVERY odd 16-bit word (the zero high halves) == 0
 // AND every 32-bit value small (< 0x10000) and not all-zero. Genuine 16-bit index buffers (DOLL's
 // scene/text meshes; every Messenger quad, e.g. [0,1,2,2,3,0]) have a non-zero odd word and are
-// rejected, so this never reinterprets a real 16-bit buffer. `p16` reads from the 16-bit (elem=2)
-// address; `p32` from the recomputed 32-bit address — for a DrawIndexOffset they differ, but both
-// land on a quad-periodic region so the fingerprint holds on either. CONFIDENCE: HIGH.
+// rejected. A genuine 16-bit list with every odd word zero remains byte-ambiguous. The legacy
+// offset path reads p16 at the 16-bit address and p32 at the recomputed 32-bit address. Additional
+// same-byte recovery checks the original draw region first; see resolve_draw_index_source.
+// CONFIDENCE: MED (a byte fingerprint, not an explicit guest index-width declaration).
 bool index_buffer_is_unannounced_32bit(const uint16_t* p16, const uint32_t* p32, uint32_t n) {
     if (n < 2) return false;                         // need at least one odd word to test
     bool odd_zero = true, all_small = true, any_nonzero = false, has_odd = false;
@@ -164,5 +165,54 @@ bool index_buffer_is_unannounced_32bit_high(const uint16_t* p16, const uint32_t*
     return (have_even && even_const && even0 != 0) || (have_odd && odd_const && odd0 != 0);
 }
 // clang-format on
+
+// #4637, the third shape: a draw into a pool of MORE than 65,536 vertices whose indices cross a
+// 64 KiB window inside the draw. Tomb Raider I's Lara's Home draws 133,353 indices from the start of
+// a 489,947-vertex pool: the first ones sit below 65,536 (high half zero, so the detector above that
+// wants a non-zero constant declines) and later ones above it (so the zero-high-half detector, which
+// wants every index under 65,536, declines too). Read as 16-bit, the level is long triangles
+// radiating from vertex 0.
+//
+// A bound alone cannot distinguish a small genuine 16-bit mesh in a large shared V# from
+// 32-bit indices. Require local consecutive readings too: at least three quarters of the n-1
+// adjacent deltas must be below 0x8000. Changing the odd 16-bit index normally moves a misread dword
+// by 0x10000, whereas crossing 65535 -> 65536 moves a real index by one. A minority of jumps allows
+// separate mesh regions in one draw. The fraction and distance are conservative heuristic policy,
+// not an architectural index-width contract. CONFIDENCE: MED.
+//
+// KNOWN LIMIT: period-2 16-bit strips still alias 32-bit lists. So can non-periodic buffers with
+// sufficiently rare odd-word changes or compensating low halves: this is not limited to fans.
+// The supplied bound is the largest V# size/stride, potentially unrelated or aperture-sized;
+// it is an upper bound only, not proof that these vertices belong to this mesh.
+bool index_buffer_is_unannounced_32bit_in_pool(const uint32_t* p32, uint32_t n,
+                                               uint32_t vertex_upper_bound) {
+    constexpr uint32_t kMinSamples = 8;
+    constexpr uint32_t kMinDistinct = 4;
+    constexpr uint32_t kMaxPlausibleIndex = 1u << 24;
+    if (n < kMinSamples || vertex_upper_bound <= 0x10000u) return false;
+    const uint32_t ceiling = std::min(vertex_upper_bound, kMaxPlausibleIndex);
+    uint32_t distinct = 0, seen[kMinDistinct] = {};
+    uint32_t previous = 0, nonlocal = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t d;
+        std::memcpy(&d, reinterpret_cast<const char*>(p32) + uint64_t{4} * i, 4);
+        if (d >= ceiling) return false;
+        if (i != 0) {
+            const uint32_t delta = d > previous ? d - previous : previous - d;
+            if (delta >= 0x8000u && ++nonlocal > (n - 1u) / 4u) return false;
+        }
+        previous = d;
+        if (distinct < kMinDistinct) {
+            bool dup = false;
+            for (uint32_t k = 0; k < distinct; k++)
+                if (seen[k] == d) {
+                    dup = true;
+                    break;
+                }
+            if (!dup) seen[distinct++] = d;
+        }
+    }
+    return distinct >= kMinDistinct;
+}
 
 } // namespace prosper::gpu

@@ -19,12 +19,12 @@ II's** `Lara's Home`, and so is every committed screenshot of it. Re-run on 2026
 `assets/screenshots/tomb-raider-2-laras-home-steps.webp`, route
 `scripts/tomb-raider-PPSA16901/reach-tr2-laras-home.pad`.
 
-**Tomb Raider I's** `Lara's Home` does not render: a handful of huge triangles radiating from a
-point, on every build tried back to the `v0.2.2` release
-([#4637](https://github.com/mattias800/prosper/issues/4637),
-`assets/screenshots/tomb-raider-1-laras-home-exploded.webp`). That is where
-`reach-gameplay.pad` arrives today, which is how it was found: a routine run of the documented
-route showed an exploded world and read as a regression. It is not one. See the route's header.
+**Tomb Raider I's** `Lara's Home` renders too, since #4637
+(`assets/screenshots/tomb-raider-1-laras-home.webp`, route `reach-gameplay.pad`, taken on the
+corrected candidate described below). Before it the level was a handful of huge triangles radiating from a point on every
+build tried back to `v0.2.2` (`assets/screenshots/tomb-raider-1-laras-home-exploded.webp`): two
+shapes of unannounced 32-bit index buffer were read as 16-bit. The shapes and the rules that now
+admit them are in the #4637 section below.
 
 Prior to 2026-08-26 the title had no record anywhere in this repository — no `COMPATIBILITY.md`
 row, no tracker, no mention in any source file or script. It reached rung 2 with **no prosper code
@@ -47,7 +47,7 @@ submit-race signature ever shows up here, though nothing so far points that way.
 | Tomb Raider II title screen | logo, Lara model, villain silhouette and background all correct |
 | Tomb Raider III title screen | art correct; ring area is a solid violet block |
 | Croft Manor (`Lara's Home`), Tomb Raider II | correct geometry, correct character models, **untextured** (#2998; textured as of 2026-10-06) |
-| `Lara's Home`, Tomb Raider I | exploded geometry on every build tried (#4637) |
+| `Lara's Home`, Tomb Raider I | renders since #4637; exploded geometry on every build before it |
 
 ## The one fix that produced rung 3: an unannounced 32-bit index buffer with large indices
 
@@ -98,6 +98,48 @@ Two further details cost time and are worth keeping:
   Those are different extents, and only crossings at dword 32 or later are rescued: swept, crossings
   at dword 5, 22 and 31 are still rejected. Both halves are pinned by tests, because stated as a
   total mitigation it reads as a guarantee the code does not provide.
+
+### #4637: candidate-address recovery and crossing indices
+
+`PROSPER_INDEX_DETECT_CENSUS=1` identified two further shapes on Tomb Raider I's 489,947-record
+pool: offset draws whose candidate fingerprint differs from the CP's 16-bit region, and a
+133,353-index draw beginning below 65,536 and crossing that boundary. A first fix read the
+fingerprint at the candidate address alone and admitted any list inside the bound; review found
+both accepted hand-built genuine 16-bit meshes, so the rules below are narrower.
+
+The corrected path keeps the two legacy checks described above. Further offset recovery requires a
+32-bit shape **within the draw's original `n*2` bytes**, then tests the recomputed candidate. At odd
+offsets it skips the initial high half and examines only complete dwords aligned to `index_base`.
+A valid-looking quad in a later resource cannot by itself authorize a width change.
+
+The crossing rule requires at least eight indices, four distinct readings, every reading below both
+the supplied bound and 2^24, and at least three quarters of adjacent deltas below 0x8000. Crossing
+65,535 to 65,536 has delta one. Reading an ordinary small 16-bit mesh as dwords instead changes the
+high half whenever its odd-position index changes. The locality fraction is heuristic policy,
+not a published index-width contract. The supplied bound is the largest V# size/stride, potentially
+scene or instance data; it is an upper bound only.
+
+**Residual ambiguity remains:** constant-odd-word strips alias local 32-bit lists, and infrequent
+odd-word changes or compensating low halves can also pass. This is broader than period-2 fans.
+The CPU fixtures distinguish the reported ordinary meshes and offset resource substitution.
+
+**Live qualification, 2026-10-26** (`prosper-app`, Linux/RADV, census on). The runs below used the
+`4bb1a89b12a1` rules plus the recovery census. The final rules also require the draw's own bytes to
+agree on a draw WITHOUT an offset (a short mesh followed by zeros otherwise passed `in-pool`); that
+changes only Tomb Raider I's pool-start draw among the draws below, and a re-run of Tomb Raider I on
+the final rules recovered the same 8 addresses and rendered the same manor frames.
+
+The recovery census reports only the first recovery at each candidate address, with a separate
+256-address cap from the rejected-candidate stream. It does not report changed counts, bounds or
+contents at an already seen address. The following counts are distinct observed addresses, not a
+complete inventory of changed draw decisions; none of these recovery streams reached its cap:
+
+| run | distinct recovered addresses | observed samples |
+| --- | --- | --- |
+| Tomb Raider I, `reach-gameplay.pad` | 8 (5 zero-high-half, 2 in-pool, 1 constant-high-half) | world-pool triangle lists, each draw's offset starting where the previous one ended; the manor renders |
+| Tomb Raider II, `reach-tr2-laras-home.pad` | 8 (constant-high-half) | the same, in a 775,111-record pool; `main` read them as 16-bit too, though the visible frames were already right |
+| GTA V, `gta5/reach-performance-story.pad` | 0 | prologue world, HUD and radar; no recovery was recorded during this run |
+| Dragon Quest VII, `dragon-quest-vii/reach-gameplay.pad` | 7 (6 zero-high-half, 1 in-pool) | six small zero-high-half draws at ODD offsets (including `39,41,40, 39,42,41, ...` into an 860-record V#), where the CP's 16-bit address lands half a dword off, and one 135,228-index draw with readings spanning 30,567 to 77,474 in a 154,950-record pool; all in the opening-chapter cutscene. These samples are consistent with 32-bit lists, but their 16-bit reading alternating with vertex 0 does not independently prove the width. The sampled main/candidate frames do not provide a matching before/after view of these draws |
 
 ## Open defects
 
@@ -162,6 +204,12 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
 
 ## Ruled out
 
+- **RESOLVED 2026-10-26 -- Tomb Raider I's exploded manor (#4637) was not detection being off.**
+  Both original detectors fired thousands of times. The census named two shapes they could not
+  admit: offset draws whose fingerprint was read half way to the indices, and a pool-start draw
+  crossing 65,536. A first fix that read only the candidate address and accepted anything inside
+  the bound also took hand-built 16-bit meshes; the corrected rules keep the draw's own bytes as
+  corroboration and require neighbouring indices to stay close. See the #4637 section above.
 - **RESOLVED 2026-08-27 — the interior wrong-texture defect (#2998) was the decode cache's
   validation span.** `persistent_base_source_size` returned ONE surface for a layered array, so the
   cache proved reuse against **262144 of 90177536 bytes (0.29%)** of the 256-layer world atlas.
@@ -456,6 +504,4 @@ beside both readings of its own bytes, and must be run **live**.
   seconds, and on today's builds `reach-gameplay.pad` arrives on Tomb Raider I instead. A Down that
   lands on the title screen is enough to switch (`reach-tr2-laras-home.pad` does it on purpose).
   Which press of the old route used to land there was not traced.
-- Tomb Raider I's `Lara's Home` (#4637): no diagnosis. Both unannounced-32-bit detectors fire
-  during the run, so it is not simply the pre-fix defect with detection off.
 - Tomb Raider III beyond its title screen.
