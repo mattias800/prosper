@@ -64,6 +64,10 @@ recompiler tests also live one level up in `tests/gpu/` for historical reasons â
 `test_rdna2_spirv_struct.cpp` (structural module validation) and `test_recompile_coverage.cpp` â€”
 and new work usually belongs in this folder instead.
 
+`test_saved_mask_implicit_reads` covers physical ballot demand from implicit SDST consumers.
+Its high-word CMPK and low-word ADDK interpreter witnesses complement RMW compilation and
+unknown/partial-launch refusals; an SDST storage field alone must never supply missing mask DATA.
+
 SMEM's relocated route callers live in
 [`smem_case_routes.hpp`](../../../src/gpu/recompiler/ir/lower/smem_case_routes.hpp).
 The [SMEM index execution fixtures](ir/test_ir_smem_index_execution.cpp) exercise the real compiler

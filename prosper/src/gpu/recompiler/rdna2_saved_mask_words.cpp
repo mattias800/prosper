@@ -304,6 +304,9 @@ void initialize_saved_mask_word_proof(SpirvCompute& b, const std::vector<Rdna2In
         }
     };
     for (const auto& in : original) {
+        // CMPK and read-modify-write forms consume SDST without an explicit source operand.
+        for (uint32_t word = 0; word < scalar_implicit_destination_read_width(in); ++word)
+            demand_word(in.dst.value + static_cast<int>(word));
         for_each_scalar_write(in, [&](int base, uint32_t width) {
             if (width != 1) return;
             const uint32_t next = in.pc + in.len_dwords;
