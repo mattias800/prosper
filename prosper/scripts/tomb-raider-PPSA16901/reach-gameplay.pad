@@ -4,10 +4,9 @@
 # WHICH GAME THIS ARRIVES IN HAS CHANGED. When TOMB_RAIDER_STATUS.md was written (2026-08) this
 # file arrived on Tomb Raider II, three runs of three. On 2026-10-06 it arrives on Tomb Raider I,
 # on every build tried back to the v0.2.2 release. Tomb Raider I's home rendered as exploded geometry
-# on main. The initial #4637 candidate renders it; the safety-corrected head is not yet qualified.
-# For Tomb Raider II's use reach-tr2-laras-home.pad.
-# The ring is a 5-item cycle with no New Game item on it (run05/run06), so this
-# is the shortest route from a default launch to a real playable level.
+# until #4637 was fixed and renders now; for Tomb Raider II's use reach-tr2-laras-home.pad.
+# The ring is a 5-item cycle; its "Game" item is New Game (reach-fmv.pad selects it). Lara's Home
+# is the default item, so this is the shortest route from a default launch to a real playable level.
 6-14:down
 16-18:cross
 44-46:cross
