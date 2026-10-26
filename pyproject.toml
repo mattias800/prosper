@@ -56,6 +56,7 @@ testpaths = [
     "prosper/tests/tools/test_rdna2_ref.py",
     "prosper/tools/ci",
     "prosper/tools/doctor/test_doctor.py",
+    "prosper/tools/dbg/test_windows_system_error_trace.py",
     "prosper/tools/docs/test_check_arch_docs.py",
     "prosper/tools/docs/test_check_doc_meta.py",
     "prosper/tools/screenshots/test_check_screenshot_paths.py",
