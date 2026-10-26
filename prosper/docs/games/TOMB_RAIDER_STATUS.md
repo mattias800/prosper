@@ -123,10 +123,11 @@ scene or instance data; it is an upper bound only.
 odd-word changes or compensating low halves can also pass. This is broader than period-2 fans.
 The CPU fixtures distinguish the reported ordinary meshes and offset resource substitution.
 
-**Existing live qualification, 2026-10-26** (`prosper-app`, Linux/RADV, census on). The recorded
-binary embeds commit `4bb1a89b12a1`, with the recovery-census extension still uncommitted; the
-extension was subsequently committed as `d7d5a806d5f9`. These are candidate observations, not a
-record of a merged build. The PR records the binary and source-content identities.
+**Live qualification, 2026-10-26** (`prosper-app`, Linux/RADV, census on). The runs below used the
+`4bb1a89b12a1` rules plus the recovery census. The final rules also require the draw's own bytes to
+agree on a draw WITHOUT an offset (a short mesh followed by zeros otherwise passed `in-pool`); that
+changes only Tomb Raider I's pool-start draw among the draws below, and a re-run of Tomb Raider I on
+the final rules recovered the same 8 addresses and rendered the same manor frames.
 
 The recovery census reports only the first recovery at each candidate address, with a separate
 256-address cap from the rejected-candidate stream. It does not report changed counts, bounds or
@@ -135,7 +136,7 @@ complete inventory of changed draw decisions; none of these recovery streams rea
 
 | run | distinct recovered addresses | observed samples |
 | --- | --- | --- |
-| Tomb Raider I, `reach-gameplay.pad` | 8 (5 zero-high-half, 2 in-pool, 1 constant-high-half) | world-pool strips, each draw's offset starting where the previous one ended; the manor renders |
+| Tomb Raider I, `reach-gameplay.pad` | 8 (5 zero-high-half, 2 in-pool, 1 constant-high-half) | world-pool triangle lists, each draw's offset starting where the previous one ended; the manor renders |
 | Tomb Raider II, `reach-tr2-laras-home.pad` | 8 (constant-high-half) | the same, in a 775,111-record pool; `main` read them as 16-bit too, though the visible frames were already right |
 | GTA V, `gta5/reach-performance-story.pad` | 0 | prologue world, HUD and radar; no recovery was recorded during this run |
 | Dragon Quest VII, `dragon-quest-vii/reach-gameplay.pad` | 7 (6 zero-high-half, 1 in-pool) | six small zero-high-half draws at ODD offsets (including `39,41,40, 39,42,41, ...` into an 860-record V#), where the CP's 16-bit address lands half a dword off, and one 135,228-index draw with readings spanning 30,567 to 77,474 in a 154,950-record pool; all in the opening-chapter cutscene. These samples are consistent with 32-bit lists, but their 16-bit reading alternating with vertex 0 does not independently prove the width. The sampled main/candidate frames do not provide a matching before/after view of these draws |

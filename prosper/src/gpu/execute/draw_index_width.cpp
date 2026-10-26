@@ -214,6 +214,5 @@ bool index_buffer_is_unannounced_32bit_in_pool(const uint32_t* p32, uint32_t n,
     }
     return distinct >= kMinDistinct;
 }
-// clang-format on
 
 } // namespace prosper::gpu

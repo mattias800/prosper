@@ -362,6 +362,11 @@ TEST(IndexSizeDetect, InPoolRequiresThreeQuartersLocalNeighbours) {
     EXPECT_TRUE(index_buffer_is_unannounced_32bit_in_pool(indices.data(), 9, 489947));
     indices.back() = 300000;
     EXPECT_FALSE(index_buffer_is_unannounced_32bit_in_pool(indices.data(), 9, 489947));
+    // The budget is (n - 1) / 4 far steps, not n / 4: at n = 12 three far steps is one too many.
+    indices = {0, 1, 2, 40000, 40001, 40002, 80000, 80001, 80002, 120000, 120001, 120002};
+    EXPECT_FALSE(index_buffer_is_unannounced_32bit_in_pool(indices.data(), 12, 489947));
+    indices.resize(9);
+    EXPECT_TRUE(index_buffer_is_unannounced_32bit_in_pool(indices.data(), 9, 489947));
     // An exactly 0x8000 jump is nonlocal, including in the descending direction.
     indices = {0, 1, 2, 3, 4, 32772, 4, 5, 32773};
     EXPECT_FALSE(index_buffer_is_unannounced_32bit_in_pool(indices.data(), 9, 489947));

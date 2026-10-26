@@ -98,6 +98,9 @@ void note_index_recovered(const char* rule, const GpuState::Draw& draw, uint64_t
                  "vertex_bound=%u as32=[%s] lo=%u hi=%u (#4637)\n",
                  rule, static_cast<unsigned long long>(addr32), draw.from_offset ? 1 : 0,
                  draw.index_offset, n, vertex_bound, first, lo, hi);
+    if (printed.load() == kMaxLines)
+        std::fprintf(stderr, "[index-census] recovered line cap %u reached (a CAP, not a count)\n",
+                     kMaxLines);
 }
 }   // namespace
 
@@ -135,25 +138,30 @@ DrawIndexSource resolve_draw_index_source(const GpuState& ds, const GpuState::Dr
     else if (index_buffer_is_unannounced_32bit_high(p16, p32, n, vb_records_unclamped))
         source.detected = "constant-high-half";
     if (!source.detected) {
-        const auto detect_same_bytes = [vb_records_unclamped](uint64_t addr,
-                                                              uint32_t count) -> const char* {
+        // `legacy_ran`: the two original rules already judged exactly these bytes as both
+        // readings (a draw whose candidate is its own address), so only `in-pool` can add.
+        const auto detect_same_bytes = [vb_records_unclamped](uint64_t addr, uint32_t count,
+                                                              bool legacy_ran) -> const char* {
             const auto* words = reinterpret_cast<const uint16_t*>(static_cast<uintptr_t>(addr));
             const auto* dwords = reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(addr));
-            if (index_buffer_is_unannounced_32bit(words, dwords, count)) return "zero-high-half";
-            if (index_buffer_is_unannounced_32bit_high(words, dwords, count, vb_records_unclamped))
+            if (!legacy_ran && index_buffer_is_unannounced_32bit(words, dwords, count))
+                return "zero-high-half";
+            if (!legacy_ran &&
+                index_buffer_is_unannounced_32bit_high(words, dwords, count, vb_records_unclamped))
                 return "constant-high-half";
             if (index_buffer_is_unannounced_32bit_in_pool(dwords, count, vb_records_unclamped))
                 return "in-pool";
             return nullptr;
         };
-        // New offset recovery also needs a 32-bit shape WITHIN the already validated n*2 bytes
-        // of the draw's own region. At an odd offset its first halfword is a high half: skip it
-        // and inspect only complete dwords aligned relative to index_base. No additional read
-        // beyond the 16-bit draw's extent is allowed to supply this corroboration.
+        // Every recovery, with or without an offset, also needs a 32-bit shape WITHIN the already
+        // validated n*2 bytes of the draw's own region. At an odd offset its first halfword is a
+        // high half: skip it and inspect only complete dwords aligned relative to index_base. No
+        // read beyond the 16-bit draw's extent may supply this corroboration. Without an offset the
+        // region is the candidate's first half, which is what stops a short 16-bit mesh followed
+        // by zeros from passing `in-pool` on the zeros' locality (#5520 review).
         const uint32_t skip = draw.index_offset & 1u;
-        if (source.addr32 == draw.index_addr ||
-            detect_same_bytes(draw.index_addr + uint64_t{2} * skip, (n - skip) / 2u))
-            source.detected = detect_same_bytes(source.addr32, n);
+        if (detect_same_bytes(draw.index_addr + uint64_t{2} * skip, (n - skip) / 2u, false))
+            source.detected = detect_same_bytes(source.addr32, n, source.addr32 == draw.index_addr);
         // NOLINTNEXTLINE(concurrency-mt-unsafe): cached environment read
         if (source.detected && PROSPER_ENV_ON("PROSPER_INDEX_DETECT_CENSUS"))
             note_index_recovered(source.detected, draw, source.addr32, p32, n,

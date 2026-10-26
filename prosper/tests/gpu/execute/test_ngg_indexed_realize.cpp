@@ -506,6 +506,77 @@ TEST(DrawIndexSource, OffsetRecoveryChecksCompleteDwordsInTheDrawRegion) {
     EXPECT_EQ(source.addr, draw.index_base + 12u);
 }
 
+namespace {
+GpuState unannounced_16bit_state() {
+    GpuState st;
+    st.index_type = 0;
+    st.index_type_announced = false;
+    return st;
+}
+}   // namespace
+
+// #5520 review: a short genuine 16-bit mesh followed by zeros, drawn WITHOUT an offset. Read as 32
+// bits its own words jump by 0x10000 three times, but the zeros after it are perfectly local, so
+// over the whole candidate `in-pool` passed (3 far steps of 23). The draw's own bytes must agree.
+TEST(DrawIndexSource, AShortMeshFollowedByZerosStays16BitWithoutAnOffset) {
+    alignas(4) static uint16_t words[48] = {0, 1, 2, 2, 1, 3};
+    GpuState st = unannounced_16bit_state();
+    GpuState::Draw draw;
+    draw.indexed = true;
+    draw.index_count = 24;
+    draw.index_addr = reinterpret_cast<uint64_t>(words);
+    for (uint32_t bound : {489947u, 1u << 24}) {
+        const DrawIndexSource source = resolve_draw_index_source(st, draw, 24, bound);
+        EXPECT_EQ(source.detected, nullptr) << bound;
+        EXPECT_EQ(source.element_bytes, 2u) << bound;
+    }
+}
+
+// The corroborating read is the DRAW's own n*2 bytes, nothing else. Two mutations pass every
+// other arm: reading at index_base instead (here 32-bit-looking), and reading n dwords instead of
+// n/2 (which here reaches the candidate). Both arms below would then report a 32-bit draw.
+TEST(DrawIndexSource, OffsetRecoveryReadsOnlyTheDrawsOwnBytes) {
+    {
+        // index_base: dwords {1,2,3}. The draw (offset 12, n 6) owns a 16-bit mesh at words 12..17,
+        // and the candidate at dword 12 is a valid-looking 32-bit triangle pair.
+        alignas(4) static uint32_t dwords[18] = {1, 2, 3};
+        auto* words = reinterpret_cast<uint16_t*>(dwords);
+        const uint16_t mesh[] = {4, 5, 6, 6, 5, 7};
+        std::memcpy(words + 12, mesh, sizeof mesh);
+        const uint32_t candidate[] = {8, 9, 10, 10, 9, 11};
+        std::memcpy(dwords + 12, candidate, sizeof candidate);
+        GpuState st = unannounced_16bit_state();
+        GpuState::Draw draw;
+        draw.indexed = true;
+        draw.index_count = 6;
+        draw.from_offset = true;
+        draw.index_base = reinterpret_cast<uint64_t>(dwords);
+        draw.index_offset = 12;
+        draw.index_addr = draw.index_base + 24u;
+        const DrawIndexSource source = resolve_draw_index_source(st, draw, 6, 489947);
+        EXPECT_EQ(source.detected, nullptr) << "corroborated at index_base, not the draw's bytes";
+        EXPECT_EQ(source.element_bytes, 2u);
+    }
+    {
+        // Offset 16, n 16: the draw's own bytes are dwords 8..15, all zero, which no rule takes.
+        // The candidate, dwords 16..31, crosses 65,536 locally. Reading n dwords from dword 8
+        // would see zeros then the candidate: four distinct, one far step -- `in-pool`.
+        alignas(4) static uint32_t dwords[32] = {};
+        for (uint32_t i = 0; i < 16; ++i) dwords[16 + i] = 65530u + i;
+        GpuState st = unannounced_16bit_state();
+        GpuState::Draw draw;
+        draw.indexed = true;
+        draw.index_count = 16;
+        draw.from_offset = true;
+        draw.index_base = reinterpret_cast<uint64_t>(dwords);
+        draw.index_offset = 16;
+        draw.index_addr = draw.index_base + 32u;
+        const DrawIndexSource source = resolve_draw_index_source(st, draw, 16, 489947);
+        EXPECT_EQ(source.detected, nullptr) << "corroboration read past the draw's n*2 bytes";
+        EXPECT_EQ(source.element_bytes, 2u);
+    }
+}
+
 // #3135 P7: Kena's culling-VS draw state. VGT_SHADER_STAGES_EN 0x2000 (PRIMGEN_EN, no GS), the
 // program in the ES registers with no chain, VGT_GS_OUT_PRIM_TYPE 0 and GS_MAX_VERT_OUT 0,
 // GE_MAX_OUTPUT_PER_SUBGROUP 64, an indexed triangle list.
