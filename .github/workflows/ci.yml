@@ -1144,8 +1144,8 @@ jobs:
         # NTFS compression plus serialized links (#5279/#5303/#5308) still ran D: out of space linking
         # the static test executables (#5296), and binutils cannot compress PE/COFF debug sections.
         # So this job also emits line tables and function names only (-g1): about a quarter of the
-        # -g object size. That REDUCES DEBUG INFO in this job only; nothing here reads DWARF and the
-        # job ships no artifact. The lasting fix is splitting prosper_core into per-layer libraries.
+        # -g object size. Failure diagnostics use those retained names/line tables, without full
+        # variable debug information. The lasting fix is splitting prosper_core into per-layer libraries.
         # Bound concurrent large Debug links while retaining all targets.
         run: cmake -S prosper -B prosper/build-ci -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS_DEBUG=-g1 -DCMAKE_CXX_FLAGS_DEBUG=-g1 -DCMAKE_JOB_POOLS=windows_ci_link=1 -DCMAKE_JOB_POOL_LINK=windows_ci_link -DPROSPER_WINDOWS_FLUSH_LINK_OUTPUT=ON -DCMAKE_DISABLE_FIND_PACKAGE_Vulkan=TRUE -DPROSPER_DIAGNOSTICS=ON -DPython3_EXECUTABLE="$(cygpath -m "$PWD/.venv/Scripts/python.exe")"
 
