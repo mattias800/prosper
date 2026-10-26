@@ -6,6 +6,7 @@
 #include "gpu/resources/shader_resources.hpp"
 #include <gtest/gtest.h>
 #include <array>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -258,4 +259,54 @@ TEST(NativeAtomicActiveScope, MissingAtomicDataAndScalarOffsetStillRefuse) {
                 std::string::npos)
                 << last_terminal_reject_reason(address);
     }
+}
+
+TEST(NativeAtomicActiveScope, APreservedOuterCohortKeepsOnlyCurrentDataDependencies) {
+    constexpr uint64_t address = 0x5497090900ull;
+    auto code = program();
+    code[2] = 0x7e00023cu; // old v0 is missing outside the pre-loop cohort
+    code[3] = 0x7e06023cu; // old v3 is missing outside the pre-loop cohort
+    code.insert(code.begin() + 11, {0x7e000280u, 0x7e060280u}); // genuine v0/v3 in C
+    const auto poison = std::find(code.begin() + 13, code.end(), 0x7e00023cu);
+    ASSERT_NE(poison, code.end());
+    code.insert(poison + 1, 0x7e06023cu); // both words are dead until their next active rewrite
+    const auto back = code.size() - 5;
+    code[back] = 0xbf850000u | static_cast<uint16_t>(13 - static_cast<int>(back) - 1);
+    const auto c = config();
+    const auto table = resources();
+    const auto module = recompile_compute(code.data(), code.size(), &table, c,
+                                          {RecompileDiagnosticStage::Compute, address});
+    ASSERT_FALSE(module.empty()) << last_terminal_reject_reason(address);
+    ASSERT_TRUE(has_op(module, 246));
+    ASSERT_FALSE(has_op(module, 251));
+    ASSERT_TRUE(has_op(module, 234));
+    bpermute_oracle::Interpreter vm(module);
+    vm.native_subgroup_width = 64;
+    vm.push_constants = config().user_sgprs;
+    vm.allow_buffer_u32_atomics = true;
+    vm.extra_writable_bindings = {4, 5};
+    const auto counts = vm.run_buffers(64,
+                                       {{3, std::vector<uint32_t>(64, 0xdeadbeefu)},
+                                        {4, {0}},
+                                        {5, std::vector<uint32_t>(128, 0xdeadbeefu)}},
+                                       3);
+    ASSERT_TRUE(vm.error.empty()) << vm.error;
+    ASSERT_EQ(counts.size(), 64u);
+    for (uint32_t lane = 0; lane < 64; ++lane)
+        EXPECT_EQ(counts[lane], lane >= 31 && (lane & 1) ? 3u : 0u) << lane;
+    const auto counter = vm.writable_result(4);
+    ASSERT_EQ(counter.size(), 1u);
+    EXPECT_EQ(counter[0], 51u);
+    const auto returned = vm.writable_result(5);
+    ASSERT_EQ(returned.size(), 128u);
+    std::array<uint32_t, 64> observations{};
+    EXPECT_EQ(returned[0], 0xdeadbeefu);
+    for (size_t i = 1; i <= 51; ++i) {
+        ASSERT_GE(returned[i], 31u) << i;
+        ASSERT_LT(returned[i], 64u) << i;
+        EXPECT_EQ(returned[i] & 1u, 1u);
+        ++observations[returned[i]];
+    }
+    for (uint32_t lane = 31; lane < 64; lane += 2) EXPECT_EQ(observations[lane], 3u) << lane;
+    for (size_t i = 52; i < returned.size(); ++i) EXPECT_EQ(returned[i], 0xdeadbeefu) << i;
 }

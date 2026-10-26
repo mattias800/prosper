@@ -6,8 +6,8 @@ is the induction hypothesis. Its DATA certificate leaves route admission and exi
 checks unchanged, and supplies no physical mask words or source definedness.
 
 `rdna2_current_word_roots` retains a producer's immutable current-EXEC root view within
-canonical word marks. It leaves broader coverage and root obligations intact; joins, lane
-selections and spills drop the generation view. Buffer ADD/EXCHANGE returns include genuine
+canonical word marks. It leaves broader coverage and root obligations intact. Joins retain
+only an identical generation view on both edges; lane selections and spills drop it. Buffer ADD/EXCHANGE returns include genuine
 address, resource and old-VDATA fallback obligations. It grants no loop route or missing word.
 
 Takes a guest shader's instruction bytes and emits a SPIR-V module.

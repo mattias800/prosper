@@ -148,8 +148,17 @@ bool meet_arbitrary(const ScalarSourceMarks& a, const ScalarSourceMarks& b) {
 }
 
 void union_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other,
-                 const RegState* current = nullptr, bool explicit_sources = false) {
-    // A CFG/source meet has no single producing generation's independent root view.
+                 const RegState* current = nullptr, bool explicit_sources = false,
+                 bool cfg_join = false) {
+    // An unchanged generation on both edges retains the same immutable view. Other meets
+    // cannot borrow either side's narrower dependencies.
+    const auto common_view = cfg_join && into.scoped_complete_word && other.scoped_complete_word &&
+                                     into.outside_exec != 0 &&
+                                     into.outside_exec == other.outside_exec &&
+                                     into.current_roots == other.current_roots
+                                 ? into.current_roots
+                                 : nullptr;
+    const uint32_t common_owner = into.outside_exec;
     into.current_roots.reset();
     const bool arbitrary = meet_arbitrary(into, other);
     const bool hard_scoped =
@@ -222,6 +231,8 @@ void union_marks(ScalarSourceMarks& into, const ScalarSourceMarks& other,
     }
     if (!into.scoped_complete_word) into.scoped_blanket_roots.clear();
     into.arbitrary = arbitrary && into.placeholder && into.hard;
+    if (common_view && into.scoped_complete_word && into.outside_exec == common_owner)
+        into.current_roots = common_view;
 }
 
 const std::set<uint64_t>& source_roots_in_exec(const RegState& rs, const ScalarSourceMarks& marks,
@@ -797,7 +808,7 @@ void join_vector_word_marks(VectorWordMarks& into, const VectorWordMarks& other,
                             const RegState* current) {
     // A word with no mark on the other path is defined there: written, or a supplied input. That
     // adds no hard lane, so the arbitrary property of a mark on this path survives (#5185).
-    for (const auto& [reg, source] : other) union_marks(into[reg], source, current, false);
+    for (const auto& [reg, source] : other) union_marks(into[reg], source, current, false, true);
 }
 
 void confine_execz_skip_marks(const RegState& rs, VectorWordMarks& skipped,

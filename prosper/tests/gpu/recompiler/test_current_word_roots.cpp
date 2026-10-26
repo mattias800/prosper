@@ -230,10 +230,42 @@ TEST(CurrentWordRoots, MeetsAndLaneSelectionsDropTheProducingGenerationView) {
     union_source_marks(mark, {});
     EXPECT_FALSE(mark.current_roots);
     legacy_equal(mark, before);
+    mark = before;
+    union_source_marks(mark,
+                       before); // input meets do not authenticate a new producing generation
+    EXPECT_FALSE(mark.current_roots);
+    legacy_equal(mark, before);
     f.rs.vreg_source_marks[1] = before;
     const uint32_t word = 0x7e060501u; // s3 = readfirstlane(v1)
     const auto read = rdna2_decode_one(&word, 1);
     const auto selected = vector_lane_read_marks(f.rs, read);
     EXPECT_FALSE(selected.current_roots);
     legacy_equal(selected, before);
+}
+
+TEST(CurrentWordRoots, OnlyAnUnchangedGenerationSurvivesBothIncomingEdges) {
+    Frame f;
+    auto same = bounded();
+    same.current_roots = std::make_shared<const CurrentWordRoots>(CurrentWordRoots{20, {}});
+    for (bool with_state : {false, true}) {
+        VectorWordMarks left{{0, same}}, right{{0, same}};
+        join_vector_word_marks(left, right, with_state ? &f.rs : nullptr);
+        EXPECT_EQ(left.at(0).current_roots, same.current_roots);
+        EXPECT_TRUE(read_roots(f.rs, left.at(0), 20).empty());
+        legacy_equal(left.at(0), same);
+    }
+    for (bool changed_lifetime : {false, true}) {
+        VectorWordMarks left{{0, same}}, right{{0, same}};
+        auto& changed = right.at(0);
+        changed.blanket_roots.insert(data_root);
+        changed.scoped_blanket_roots.insert(data_root);
+        if (changed_lifetime)
+            changed.scoped_complete_word = false;
+        else
+            changed.current_roots =
+                std::make_shared<const CurrentWordRoots>(CurrentWordRoots{20, {data_root}});
+        join_vector_word_marks(left, right, &f.rs);
+        EXPECT_FALSE(left.at(0).current_roots);
+        EXPECT_TRUE(read_roots(f.rs, left.at(0), 20).contains(data_root));
+    }
 }
