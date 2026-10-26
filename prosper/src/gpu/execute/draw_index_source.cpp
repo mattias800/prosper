@@ -22,8 +22,9 @@ namespace {
 // each parity holds. A level that still renders as stretched triangles (#4637) is then either a 16-bit
 // buffer read correctly, or a 32-bit one whose shape no clause admits; this reports the sampled
 // clauses, it does not prove the width. Draws taken by the offset/same-bytes RECOVERY path (the
-// verdicts the original two-address detectors did not give) are listed too, one line per buffer, so
-// a run shows every draw whose width the #4637 rules changed.
+// verdicts the original two-address detectors did not give) are listed too. Each stream reports
+// only its first sighting of an address, up to 256 addresses. Changed counts, bounds or contents at
+// an already seen address are not reported again; this is not a complete census of draw decisions.
 void note_index_left_16bit(uint64_t addr, const uint16_t* p16, const uint32_t* p32, uint32_t n,
                            uint32_t vertex_bound) {
     static std::mutex mutex;

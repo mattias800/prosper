@@ -21,7 +21,7 @@ II's** `Lara's Home`, and so is every committed screenshot of it. Re-run on 2026
 
 **Tomb Raider I's** `Lara's Home` renders too, since #4637
 (`assets/screenshots/tomb-raider-1-laras-home.webp`, route `reach-gameplay.pad`, taken on the
-merged head). Before it the level was a handful of huge triangles radiating from a point on every
+corrected candidate described below). Before it the level was a handful of huge triangles radiating from a point on every
 build tried back to `v0.2.2` (`assets/screenshots/tomb-raider-1-laras-home-exploded.webp`): two
 shapes of unannounced 32-bit index buffer were read as 16-bit. The shapes and the rules that now
 admit them are in the #4637 section below.
@@ -123,16 +123,22 @@ scene or instance data; it is an upper bound only.
 odd-word changes or compensating low halves can also pass. This is broader than period-2 fans.
 The CPU fixtures distinguish the reported ordinary meshes and offset resource substitution.
 
-**Live check on the merged head, 2026-10-26** (`prosper-app`, Linux/RADV, census on). The census
-prints one line per index buffer the recovery path widened, i.e. every draw whose width differs
-from `main` before #4637:
+**Existing live qualification, 2026-10-26** (`prosper-app`, Linux/RADV, census on). The recorded
+binary embeds commit `4bb1a89b12a1`, with the recovery-census extension still uncommitted; the
+extension was subsequently committed as `d7d5a806d5f9`. These are candidate observations, not a
+record of a merged build. The PR records the binary and source-content identities.
 
-| run | buffers widened | what they are |
+The recovery census reports only the first recovery at each candidate address, with a separate
+256-address cap from the rejected-candidate stream. It does not report changed counts, bounds or
+contents at an already seen address. The following counts are distinct observed addresses, not a
+complete inventory of changed draw decisions; none of these recovery streams reached its cap:
+
+| run | distinct recovered addresses | observed samples |
 | --- | --- | --- |
 | Tomb Raider I, `reach-gameplay.pad` | 8 (5 zero-high-half, 2 in-pool, 1 constant-high-half) | world-pool strips, each draw's offset starting where the previous one ended; the manor renders |
 | Tomb Raider II, `reach-tr2-laras-home.pad` | 8 (constant-high-half) | the same, in a 775,111-record pool; `main` read them as 16-bit too, though the visible frames were already right |
-| GTA V, `gta5/reach-performance-story.pad` | 0 | prologue world, HUD and radar; no draw's width changed |
-| Dragon Quest VII, `dragon-quest-vii/reach-gameplay.pad` | 7 (6 zero-high-half, 1 in-pool) | six small fans at ODD offsets (`39,41,40, 39,42,41, ...` into an 860-record V#), where the CP's 16-bit address lands half a dword off, and one 135,228-index run of consecutive indices from 30,567 to 77,474 in a 154,950-record pool; all in the opening-chapter cutscene. Read as 16-bit, the fans' own bytes would make every other index vertex 0, so they are 32-bit lists `main` has been misdrawing |
+| GTA V, `gta5/reach-performance-story.pad` | 0 | prologue world, HUD and radar; no recovery was recorded during this run |
+| Dragon Quest VII, `dragon-quest-vii/reach-gameplay.pad` | 7 (6 zero-high-half, 1 in-pool) | six small zero-high-half draws at ODD offsets (including `39,41,40, 39,42,41, ...` into an 860-record V#), where the CP's 16-bit address lands half a dword off, and one 135,228-index draw with readings spanning 30,567 to 77,474 in a 154,950-record pool; all in the opening-chapter cutscene. These samples are consistent with 32-bit lists, but their 16-bit reading alternating with vertex 0 does not independently prove the width. The sampled main/candidate frames do not provide a matching before/after view of these draws |
 
 ## Open defects
 
@@ -201,7 +207,7 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
   Both original detectors fired thousands of times. The census named two shapes they could not
   admit: offset draws whose fingerprint was read half way to the indices, and a pool-start draw
   crossing 65,536. A first fix that read only the candidate address and accepted anything inside
-  the bound also took hand-built 16-bit meshes; the merged rules keep the draw's own bytes as
+  the bound also took hand-built 16-bit meshes; the corrected rules keep the draw's own bytes as
   corroboration and require neighbouring indices to stay close. See the #4637 section above.
 - **RESOLVED 2026-08-27 — the interior wrong-texture defect (#2998) was the decode cache's
   validation span.** `persistent_base_source_size` returned ONE surface for a layered array, so the
