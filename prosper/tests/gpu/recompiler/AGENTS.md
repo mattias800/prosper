@@ -4,6 +4,10 @@
 PHIs. Missing inputs and live back-edge dependencies remain refused. The certificate's saved
 mask joins, physical-word overlap and original-profile checks are separate from route admission.
 
+`test_uniform_cmpx_loop_data` separates early DATA CMPX exits from a uniform scalar-counter
+cap. Its Wave64 interpreter observes different per-lane counts and untouched output; missing
+inputs, live scalar results, unproved counter sources and READFIRST relays remain controls.
+
 `test_native_image_results` pins the admitted native legacy sample's complete active words.
 Its public fragment regression and compute transport observe the second dword, fresh VCC,
 both Wave64 halves and inactive output. The interpreter owns a single exact-center nearest mip;

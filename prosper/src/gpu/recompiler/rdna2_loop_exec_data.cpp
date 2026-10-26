@@ -6,6 +6,7 @@
 #include "gpu/recompiler/rdna2_cfg_wave_uniform.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
+#include "gpu/recompiler/rdna2_uniform_counter_data.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include <array>
@@ -198,12 +199,15 @@ bool graph_keeps_bound(const BoundGraph& graph, BoundMasks entry) {
 }   // namespace
 bool native_loop_data_exec_bound(const SpirvCompute& b, const std::vector<Rdna2Inst>& ins,
                                  const DivLoop& loop, const RegState& entry) {
-    // EXEC/VCC-tested loops retain their separate scalar live-out and broadcast safety boundary.
-    if (loop.condition != DivLoop::Condition::Scc || b.saved_mask_original_words.size() > 65536 ||
+    if (b.saved_mask_original_words.size() > 65536 ||
         loop.exit_pc >= b.saved_mask_original_words.size() || entry.vector_wave_size != 64 ||
         !entry.exec || !entry.exec_narrowed || entry.vector_full_exec ||
         !native_exact_retry_authentic(b, b.saved_mask_original_words.data(),
                                       b.saved_mask_original_words.size()))
+        return false;
+    // EXEC exits need their own uniform-counter and scalar-live-out boundary; no new route.
+    if (loop.condition != DivLoop::Condition::Scc &&
+        !uniform_counter_loop_data_boundary(b, ins, loop, entry))
         return false;
     BoundGraph graph;
     if (!make_bound_graph(b, ins, loop, graph)) return false;
