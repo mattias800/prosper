@@ -24,7 +24,9 @@ def selected_tests(manifest, failed):
         test
         for test in manifest["tests"]
         if test["name"] in failed
-        and re.fullmatch(r"WaitProducerTrace(?:Disabled|Selective)?\.[A-Za-z0-9_]+", test["name"])
+        and re.fullmatch(
+            r"WaitProducerTrace(?:Budget|Disabled|Selective)?\.[A-Za-z0-9_]+", test["name"]
+        )
     ][:4]
 
 

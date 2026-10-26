@@ -30,13 +30,14 @@ def test_only_actual_failed_fixture_names_are_selected():
         "WaitProducerTrace.One",
         "WaitProducerTraceDisabled.One",
         "WaitProducerTraceSelective.One",
+        "WaitProducerTraceBudget.MissingLatestTagAndBoundedRecordsStayExplicit",
         "WaitProducerTrace.Passed",
         "NotWaitProducerTrace.One",
         "indirect_pointer_descriptor_range",
     ]
     tests = [{"name": name, "command": ["owned executable", name]} for name in names]
     selected = trace.selected_tests({"tests": tests}, set(names) - {"WaitProducerTrace.Passed"})
-    assert [test["name"] for test in selected] == names[:3]
+    assert [test["name"] for test in selected] == names[:4]
     assert selected[0]["command"] == tests[0]["command"]
 
 
@@ -89,14 +90,23 @@ def test_debugger_output_and_failure_exit_are_retained():
     assert not trace.captured_stack(status, output)
 
 
-def test_debugger_timeout_is_unverified_and_waits_for_owned_process():
+def test_debugger_timeout_is_unverified_and_waits_for_owned_process(capsys):
+    # The descendant keeps the captured pipe open. Killing only its parent cannot
+    # reach EOF within the drain timeout, so that omission must fail this assertion.
+    child = "import time; print('TRACE_DESCENDANT_READY', flush=True); time.sleep(20)"
+    parent = (
+        "import subprocess, sys; "
+        f"subprocess.Popen([sys.executable, '-c', {child!r}], "
+        "stdout=sys.stdout, stderr=sys.stderr).wait()"
+    )
     with pytest.raises(RuntimeError, match="timed out; owned process tree stopped"):
         trace.run_debugger(
-            [sys.executable, "-c", "import time; time.sleep(20)"],
+            [sys.executable, "-c", parent],
             None,
             dict(os.environ),
-            timeout=0.1,
+            timeout=5,
         )
+    assert "TRACE_DESCENDANT_READY" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(
