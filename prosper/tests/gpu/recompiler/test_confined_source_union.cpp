@@ -224,9 +224,16 @@ TEST(ConfinedSourceUnion, ARelayPreservesTheNestedSourceDomain) {
 
 TEST(ConfinedSourceUnion, ImplicitAccumulatorMeetsItsOldWordWithTheNewSource) {
     Emitter e;
-    ASSERT_TRUE(e.emit(nested(fmac6)));
+    ASSERT_TRUE(e.emit({cmpx_a, mov6}));
+    const uint32_t owner = e.rs.exec;
+    ASSERT_TRUE(e.emit({cmpx_b, mov7}));
+    EXPECT_EQ(e.source(fmac6).outside_exec, e.rs.exec);
+    ASSERT_TRUE(e.emit({fmac6}));
     EXPECT_TRUE(e.defined(compare6));
-    EXPECT_EQ(e.rs.vreg_source_marks.at(6).outside_exec, e.rs.exec);
+    const auto& result = e.rs.vreg_source_marks.at(6);
+    EXPECT_EQ(result.outside_exec, owner);
+    EXPECT_TRUE(vector_word_defined_in_exec(e.rs, result, owner));
+    EXPECT_FALSE(vector_word_defined_in_exec(e.rs, result, e.b.btrue()));
 }
 
 TEST(ConfinedSourceUnion, AnAbsentAccumulatorOldWordRemainsUnconfined) {

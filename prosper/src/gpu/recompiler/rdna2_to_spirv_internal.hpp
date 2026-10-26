@@ -5,6 +5,7 @@
 #include "gpu/recompiler/compiler_choices.hpp"
 #include "gpu/recompiler/compiler_resource_access.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
+#include "gpu/recompiler/rdna2_accumulator_cohort.hpp"
 #include "gpu/recompiler/rdna2_loop_arbitrary_carry.hpp"
 #include "gpu/recompiler/rdna2_diagnostic_attempt.hpp"
 #include "gpu/recompiler/rdna2_portable_mask_slots.hpp"
@@ -1106,7 +1107,7 @@ inline void propagate_merge_placeholder(RegState& rs, const Rdna2Inst& in,
                                         bool scalar_first_lane_agrees = false,
                                         bool scalar_local_index_waterfall = false,
                                         const RelativeBankPublication& relative_bank = {}) {
-    record_vector_word_marks(rs, in, marks);
+    record_vector_word_marks_preserving_cohort(rs, in, marks);
     if (relative_bank.cohort) publish_relative_bank_word(rs, in, marks, relative_bank);
     if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361) {
         if (in.dst.kind != OperandKind::VGPR || in.src[1].kind != OperandKind::InlineInt) return;
