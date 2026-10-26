@@ -73,6 +73,14 @@ TEST(UniformCounterDataBoundary, AScalarLiveOutRetainsItsExistingRefusal) {
     EXPECT_FALSE(f.bound());
 }
 
+TEST(UniformCounterDataBoundary, AVccLiveOutRetainsItsExistingRefusal) {
+    auto words = counter_code();
+    words[7] = 0x02020701u; // v1 = VCC ? v3 : v1 before any VCC replacement
+    Frame f(words);
+    ASSERT_EQ(loop_live_wave_scalar(f.ins, f.loop), 106);
+    EXPECT_FALSE(f.bound());
+}
+
 TEST(UniformCounterDataBoundary, AParsedInitializationCannotReplaceItsOriginalPacket) {
     Frame f;
     f.ins.front().words[0] ^= 1;

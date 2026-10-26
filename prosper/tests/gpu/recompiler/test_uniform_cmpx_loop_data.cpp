@@ -2,6 +2,7 @@
 // leave early; scalar live-outs and missing words gain no authority.
 #include "bpermute_spirv_oracle.hpp"
 #include "fixtures/checked_compute_launch.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include <gtest/gtest.h>
@@ -174,13 +175,23 @@ TEST(UniformCmpxLoopData, AScalarCounterLiveOutCannotBorrowTheDataBound) {
 
 TEST(UniformCmpxLoopData, ALaneVaryingExitCannotBorrowTheUniformCounterProof) {
     auto code = uniform_counter_program();
-    code[15] = 0x06860007u; // CMPX consumes v7 instead of scalar s41
+    code[15] = 0x86060007u; // CMPX consumes v7 instead of scalar s41; its cap remains 3
+    const auto compare = rdna2_decode_one(code.data() + 14, 2);
+    ASSERT_EQ(compare.fmt, Rdna2Format::VOPC);
+    ASSERT_EQ(compare.opcode, 0xd1u);
+    ASSERT_EQ(compare.src[0].kind, OperandKind::VGPR);
+    ASSERT_EQ(compare.src[0].value, 7);
+    ASSERT_EQ(compare.src[1].kind, OperandKind::InlineInt);
+    ASSERT_EQ(compare.src[1].value, 3);
     const auto c = config();
     const auto table = counter_resources();
     constexpr uint64_t address = 0x5497120600ull;
     EXPECT_TRUE(recompile_compute(code.data(), code.size(), &table, c,
                                   {RecompileDiagnosticStage::Compute, address})
                     .empty());
+    EXPECT_NE(last_terminal_reject_reason(address).find("fabricated-fresh-mask-source pc=13"),
+              std::string::npos)
+        << last_terminal_reject_reason(address);
 }
 
 TEST(UniformCmpxLoopData, AReadfirstCounterCannotBorrowTheUniformCounterProof) {
