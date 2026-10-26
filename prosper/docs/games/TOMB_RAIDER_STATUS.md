@@ -19,12 +19,14 @@ II's** `Lara's Home`, and so is every committed screenshot of it. Re-run on 2026
 `assets/screenshots/tomb-raider-2-laras-home-steps.webp`, route
 `scripts/tomb-raider-PPSA16901/reach-tr2-laras-home.pad`.
 
-**Tomb Raider I's** `Lara's Home` does not render: a handful of huge triangles radiating from a
-point, on every build tried back to the `v0.2.2` release
-([#4637](https://github.com/mattias800/prosper/issues/4637),
-`assets/screenshots/tomb-raider-1-laras-home-exploded.webp`). That is where
-`reach-gameplay.pad` arrives today, which is how it was found: a routine run of the documented
-route showed an exploded world and read as a regression. It is not one. See the route's header.
+**Tomb Raider I's** `Lara's Home` renders too, since the fix for
+[#4637](https://github.com/mattias800/prosper/issues/4637)
+(`assets/screenshots/tomb-raider-1-laras-home.webp`, route `reach-gameplay.pad`). Before it the
+level was a handful of huge triangles radiating from a point, on every build back to the `v0.2.2`
+release (`assets/screenshots/tomb-raider-1-laras-home-exploded.webp`): its 32-bit index buffers
+came in two shapes that no unannounced-32-bit rule admitted, so they were read as 16-bit. The
+shapes and the rules are in the "one fix that produced rung 3" section below and in
+`src/gpu/execute/draw_index_width.cpp`.
 
 Prior to 2026-08-26 the title had no record anywhere in this repository — no `COMPATIBILITY.md`
 row, no tracker, no mention in any source file or script. It reached rung 2 with **no prosper code
@@ -47,7 +49,7 @@ submit-race signature ever shows up here, though nothing so far points that way.
 | Tomb Raider II title screen | logo, Lara model, villain silhouette and background all correct |
 | Tomb Raider III title screen | art correct; ring area is a solid violet block |
 | Croft Manor (`Lara's Home`), Tomb Raider II | correct geometry, correct character models, **untextured** (#2998; textured as of 2026-10-06) |
-| `Lara's Home`, Tomb Raider I | exploded geometry on every build tried (#4637) |
+| `Lara's Home`, Tomb Raider I | renders since #4637's fix; exploded geometry on every build before it |
 
 ## The one fix that produced rung 3: an unannounced 32-bit index buffer with large indices
 
@@ -162,6 +164,15 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
 
 ## Ruled out
 
+- **RESOLVED 2026-10-26 -- Tomb Raider I's exploded manor (#4637) was two index-buffer shapes no
+  rule admitted, not "the pre-fix defect with detection off".** Both detectors fired thousands of
+  times in the same run. `PROSPER_INDEX_DETECT_CENSUS=1` named the rejected draws: every world draw
+  indexes a 489,947-vertex pool, and (a) a draw with a DrawIndexOffset had its fingerprint read at
+  the CP's 16-bit address, half way to the indices, where the words belong to other indices; (b) one
+  draw of 133,353 indices from the pool's start crosses 65,536, so it fits neither "every high half
+  zero" nor "a non-zero constant high half". The fingerprint is now read at the candidate's own
+  address, and a third rule (`in-pool`) accepts a list whose every index lies inside a pool too big
+  for 16-bit indices.
 - **RESOLVED 2026-08-27 — the interior wrong-texture defect (#2998) was the decode cache's
   validation span.** `persistent_base_source_size` returned ONE surface for a layered array, so the
   cache proved reuse against **262144 of 90177536 bytes (0.29%)** of the 256-layer world atlas.
@@ -456,6 +467,4 @@ beside both readings of its own bytes, and must be run **live**.
   seconds, and on today's builds `reach-gameplay.pad` arrives on Tomb Raider I instead. A Down that
   lands on the title screen is enough to switch (`reach-tr2-laras-home.pad` does it on purpose).
   Which press of the old route used to land there was not traced.
-- Tomb Raider I's `Lara's Home` (#4637): no diagnosis. Both unannounced-32-bit detectors fire
-  during the run, so it is not simply the pre-fix defect with detection off.
 - Tomb Raider III beyond its title screen.

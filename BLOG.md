@@ -19,6 +19,14 @@ from the tracker issues, and still gated, because it is a projection of state ra
 > title's current state — for that, read the tracker. Nothing is ever removed when a title moves on,
 > because the point of a blog is that it records *when* things happened.
 
+## 2026-10-26
+
+### Tomb Raider I's Croft Manor renders
+
+Tomb Raider I's Lara's Home, a field of huge orange triangles on every build until now, renders: two shapes of 32-bit index buffer were being read as 16-bit ([#4637](https://github.com/mattias800/prosper/issues/4637)).
+
+<p align="center"><img src="assets/screenshots/tomb-raider-1-laras-home.webp" alt="Tomb Raider I, Lara's Home: Lara from behind in a wood-panelled room facing a window seat with cushions under two arched windows, patterned carpet, a red chair and a framed painting; Linux prosper-app, route reach-gameplay.pad, flip 4800"></p>
+
 ## 2026-10-15
 
 ### Kena's title world holds on every frame, on a default build
