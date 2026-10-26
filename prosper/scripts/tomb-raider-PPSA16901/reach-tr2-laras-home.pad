@@ -4,7 +4,8 @@
 #
 # reach-gameplay.pad has the same presses without the Down. It was written to enter Tomb Raider I's
 # home, arrived on Tomb Raider II when the status doc was written, and arrives on Tomb Raider I on
-# today's builds (whose level rendered as exploded geometry until #4637). A timed route's presses
+# main (where its level has exploded geometry; #4637's safety-corrected head awaits qualification).
+# A timed route's presses
 # land on different screens when the frame rate changes; this one states its destination.
 #
 # VALIDATED 2026-10-06, once (1 of 1), frontend prosper-app on Linux / RADV, on a loaded machine.

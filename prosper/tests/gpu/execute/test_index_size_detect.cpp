@@ -232,7 +232,7 @@ TEST(IndexSizeDetect, Contract) {
     // ---------------------------------------------------------------------------------------
     // #4637: the third shape -- a pool of MORE than 65,536 vertices, with the draw's indices crossing
     // a 64 KiB window. Neither detector above can take it: its head has a zero high half, its tail a
-    // non-zero one. The only evidence is that every index addresses a vertex the pool holds.
+    // non-zero one. The range and neighbour-locality checks constrain the new candidate.
     printf("-- #4637: crossing a window inside a large pool --\n");
     {
         constexpr uint32_t kTr1Pool = 489947;   // Tomb Raider I's level pool, size/stride
@@ -255,9 +255,6 @@ TEST(IndexSizeDetect, Contract) {
         CHECK(
             !index_buffer_is_unannounced_32bit_in_pool(past.data(), n + 1, kTr1Pool),
             "one index at the pool size, at the very end -> rejected (pins the full scan and >=)");
-        CHECK(
-            !index_buffer_is_unannounced_32bit_in_pool(crossing.data(), n, 0x10000u),
-            "a pool of exactly 65,536 vertices -> not consulted (16-bit indices reach all of it)");
         // A genuine 16-bit mesh read as 32 bits puts an index in the high half: past any real pool.
         std::vector<uint16_t> mesh16;
         mesh16.reserve(128);
@@ -276,7 +273,8 @@ TEST(IndexSizeDetect, Contract) {
         CHECK(!index_buffer_is_unannounced_32bit_in_pool(crossing.data(), 7, kTr1Pool),
               "fewer than eight indices -> not consulted");
         // KNOWN LIMIT, asserted rather than left in a comment: a 16-bit strip around an apex at most
-        // (pool - 1) >> 16 reads as in-pool 32-bit indices, exactly as the detector above documents.
+        // (pool - 1) >> 16 still aliases local 32-bit indices. Less frequent odd-word changes can
+        // also pass; this fixture pins the simplest residual, not the entire ambiguous class.
         std::vector<uint16_t> apex;
         for (uint16_t rim = 0; rim < 64; rim++) {
             apex.push_back(rim);
@@ -327,4 +325,44 @@ TEST(IndexSizeDetect, Contract) {
               "#3009: ...and is unreachable for a title that announced its index size");
     }
 
+}
+
+// A large or aperture-sized V# is only an upper bound, not proof of the index width.
+TEST(IndexSizeDetect, InPoolRejectsOrdinarySmallMeshesEvenWithLargeBounds) {
+    const std::vector<std::vector<uint16_t>> meshes = {
+        {0, 1, 2, 2, 1, 3, 4, 5, 6, 6, 5, 7, 0, 1, 2, 3},
+        {0, 1, 2, 3, 4, 5, 6, 7, 0, 2, 4, 6, 1, 3, 5, 7}};
+    for (const auto& mesh : meshes) {
+        for (uint32_t bound : {489947u, 1u << 24, 1u << 28}) {
+            EXPECT_FALSE(index_buffer_is_unannounced_32bit_in_pool(
+                reinterpret_cast<const uint32_t*>(mesh.data()), 8, bound));
+        }
+    }
+}
+
+TEST(IndexSizeDetect, InPoolSmallBoundGateIsIndependentlyExercised) {
+    const uint32_t indices[] = {0, 1, 2, 3, 4, 5, 6, 7};
+    EXPECT_FALSE(index_buffer_is_unannounced_32bit_in_pool(indices, 8, 65536));
+    EXPECT_TRUE(index_buffer_is_unannounced_32bit_in_pool(indices, 8, 65537));
+}
+
+TEST(IndexSizeDetect, InPoolAbsoluteCeilingAppliesToLargeDescriptors) {
+    const uint32_t indices[] = {0xffffff, 0xfffffe, 0xfffffd, 0xfffffc,
+                                0xfffffb, 0xfffffa, 0xfffff9, 0xfffff8};
+    EXPECT_TRUE(index_buffer_is_unannounced_32bit_in_pool(indices, 8, 1u << 28));
+    auto past = std::vector<uint32_t>(std::begin(indices), std::end(indices));
+    past.back() = 1u << 24;
+    EXPECT_FALSE(index_buffer_is_unannounced_32bit_in_pool(past.data(), 8, 1u << 28));
+}
+
+TEST(IndexSizeDetect, InPoolRequiresThreeQuartersLocalNeighbours) {
+    // Eight deltas, six local and two nonlocal. The crossing itself has delta one.
+    std::vector<uint32_t> indices = {65534,  65535,  65536,  65537, 100000,
+                                     100001, 100002, 200000, 200001};
+    EXPECT_TRUE(index_buffer_is_unannounced_32bit_in_pool(indices.data(), 9, 489947));
+    indices.back() = 300000;
+    EXPECT_FALSE(index_buffer_is_unannounced_32bit_in_pool(indices.data(), 9, 489947));
+    // An exactly 0x8000 jump is nonlocal, including in the descending direction.
+    indices = {0, 1, 2, 3, 4, 32772, 4, 5, 32773};
+    EXPECT_FALSE(index_buffer_is_unannounced_32bit_in_pool(indices.data(), 9, 489947));
 }

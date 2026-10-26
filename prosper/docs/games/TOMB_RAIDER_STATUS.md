@@ -19,14 +19,13 @@ II's** `Lara's Home`, and so is every committed screenshot of it. Re-run on 2026
 `assets/screenshots/tomb-raider-2-laras-home-steps.webp`, route
 `scripts/tomb-raider-PPSA16901/reach-tr2-laras-home.pad`.
 
-**Tomb Raider I's** `Lara's Home` renders too, since the fix for
-[#4637](https://github.com/mattias800/prosper/issues/4637)
-(`assets/screenshots/tomb-raider-1-laras-home.webp`, route `reach-gameplay.pad`). Before it the
-level was a handful of huge triangles radiating from a point, on every build back to the `v0.2.2`
-release (`assets/screenshots/tomb-raider-1-laras-home-exploded.webp`): its 32-bit index buffers
-came in two shapes that no unannounced-32-bit rule admitted, so they were read as 16-bit. The
-shapes and the rules are in the "one fix that produced rung 3" section below and in
-`src/gpu/execute/draw_index_width.cpp`.
+**Tomb Raider I's** `Lara's Home` rendered on the initial #4637 candidate
+`ea73365ddd55` (`assets/screenshots/tomb-raider-1-laras-home.webp`, route `reach-gameplay.pad`).
+Before it the level was a handful of huge triangles radiating from a point on every build tried
+back to `v0.2.2` (`assets/screenshots/tomb-raider-1-laras-home-exploded.webp`). The candidate recovered
+two unannounced 32-bit shapes, but review found it could also misclassify ordinary 16-bit meshes.
+The safety corrections described below have CPU regression coverage; their live rendering remains
+unverified. The screenshot is evidence for the initial candidate only.
 
 Prior to 2026-08-26 the title had no record anywhere in this repository — no `COMPATIBILITY.md`
 row, no tracker, no mention in any source file or script. It reached rung 2 with **no prosper code
@@ -49,7 +48,7 @@ submit-race signature ever shows up here, though nothing so far points that way.
 | Tomb Raider II title screen | logo, Lara model, villain silhouette and background all correct |
 | Tomb Raider III title screen | art correct; ring area is a solid violet block |
 | Croft Manor (`Lara's Home`), Tomb Raider II | correct geometry, correct character models, **untextured** (#2998; textured as of 2026-10-06) |
-| `Lara's Home`, Tomb Raider I | renders since #4637's fix; exploded geometry on every build before it |
+| `Lara's Home`, Tomb Raider I | initial #4637 candidate renders; safety-corrected head awaits live qualification |
 
 ## The one fix that produced rung 3: an unannounced 32-bit index buffer with large indices
 
@@ -100,6 +99,31 @@ Two further details cost time and are worth keeping:
   Those are different extents, and only crossings at dword 32 or later are rescued: swept, crossings
   at dword 5, 22 and 31 are still rejected. Both halves are pinned by tests, because stated as a
   total mitigation it reads as a guarantee the code does not provide.
+
+### #4637: candidate-address recovery and crossing indices
+
+The initial `ea73365ddd55` candidate identified two additional shapes on Tomb Raider I's
+489,947-record pool: offset draws whose candidate fingerprint differs from the CP's 16-bit region,
+and a 133,353-index draw beginning below 65,536 and crossing that boundary. Its screenshot above
+shows the initial candidate rendering the manor. A range-only crossing detector and candidate-only
+offset checks also accepted hand-built genuine 16-bit meshes, so neither is sufficient evidence.
+
+The corrected path keeps the two legacy checks described above. Further offset recovery requires a
+32-bit shape **within the draw's original `n*2` bytes**, then tests the recomputed candidate. At odd
+offsets it skips the initial high half and examines only complete dwords aligned to `index_base`.
+A valid-looking quad in a later resource cannot by itself authorize a width change.
+
+The crossing rule requires at least eight indices, four distinct readings, every reading below both
+the supplied bound and 2^24, and at least three quarters of adjacent deltas below 0x8000. Crossing
+65,535 to 65,536 has delta one. Reading an ordinary small 16-bit mesh as dwords instead changes the
+high half whenever its odd-position index changes. The locality fraction is heuristic policy,
+not a published index-width contract. The supplied bound is the largest V# size/stride, potentially
+scene or instance data; it is an upper bound only.
+
+**Residual ambiguity remains:** constant-odd-word strips alias local 32-bit lists, and infrequent
+odd-word changes or compensating low halves can also pass. This is broader than period-2 fans.
+The CPU fixtures distinguish the reported ordinary meshes and offset resource substitution;
+they do not qualify game rendering. No live game/device A/B was run for the safety corrections.
 
 ## Open defects
 
@@ -164,15 +188,12 @@ Measured layout, for anyone extending this: `layer_stride = 352256` for the 512x
 
 ## Ruled out
 
-- **RESOLVED 2026-10-26 -- Tomb Raider I's exploded manor (#4637) was two index-buffer shapes no
-  rule admitted, not "the pre-fix defect with detection off".** Both detectors fired thousands of
-  times in the same run. `PROSPER_INDEX_DETECT_CENSUS=1` named the rejected draws: every world draw
-  indexes a 489,947-vertex pool, and (a) a draw with a DrawIndexOffset had its fingerprint read at
-  the CP's 16-bit address, half way to the indices, where the words belong to other indices; (b) one
-  draw of 133,353 indices from the pool's start crosses 65,536, so it fits neither "every high half
-  zero" nor "a non-zero constant high half". The fingerprint is now read at the candidate's own
-  address, and a third rule (`in-pool`) accepts a list whose every index lies inside a pool too big
-  for 16-bit indices.
+- **2026-10-26 -- Tomb Raider I's exploded manor (#4637) was not simply detection being off.**
+  Both original detectors fired thousands of times. The initial candidate's census identified
+  offset draws with a mismatched fingerprint and a pool-start draw crossing 65,536; that candidate
+  rendered the manor. Independent CPU counterexamples exposed false width detections, so the
+  corrected path retains own-region corroboration and adds locality checks. The initial screenshot
+  does not establish rendering at the safety-corrected head; see the #4637 section above.
 - **RESOLVED 2026-08-27 — the interior wrong-texture defect (#2998) was the decode cache's
   validation span.** `persistent_base_source_size` returned ONE surface for a layered array, so the
   cache proved reuse against **262144 of 90177536 bytes (0.29%)** of the 256-layer world atlas.

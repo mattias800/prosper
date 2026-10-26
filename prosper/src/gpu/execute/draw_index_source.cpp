@@ -16,11 +16,11 @@
 namespace prosper::gpu {
 
 namespace {
-// PROSPER_INDEX_DETECT_CENSUS=1 -- diagnostic only. For an unannounced indexed draw that BOTH 32-bit
+// PROSPER_INDEX_DETECT_CENSUS=1 -- diagnostic only. For an unannounced indexed draw that all 32-bit
 // detectors left as 16-bit, print once per index buffer what each detector's clauses saw: the count,
 // the vertex bound, the first readings at 32 bits, their spread, and how many distinct high halves
 // each parity holds. A level that still renders as stretched triangles (#4637) is then either a 16-bit
-// buffer read correctly, or a 32-bit one whose shape no clause admits, and this says which clause.
+// buffer read correctly, or a 32-bit one whose shape no clause admits, and this reports the sampled clauses; it does not prove the width.
 void note_index_left_16bit(uint64_t addr, const uint16_t* p16, const uint32_t* p32, uint32_t n,
                            uint32_t vertex_bound) {
     static std::mutex mutex;
@@ -78,6 +78,8 @@ uint32_t vertex_buffer_records_unclamped(const ShaderResourceTable* table) {
                 records = std::max(records, r.size / r.stride);
     return records;
 }
+// clang-format on
+
 DrawIndexSource resolve_draw_index_source(const GpuState& ds, const GpuState::Draw& draw,
                                                  uint32_t n, uint32_t vb_records_unclamped) {
     DrawIndexSource source;
@@ -89,30 +91,45 @@ DrawIndexSource resolve_draw_index_source(const GpuState& ds, const GpuState::Dr
         return source;
     if (!guest_readable(draw.index_addr, n * 2u) || !guest_readable(source.addr32, n * 4u))
         return source;
-    // The fingerprint is read from the CANDIDATE's own bytes: its odd 16-bit words are the high
-    // halves of the 32-bit indices. For a DrawIndexOffset the CP's 16-bit address is index_base +
-    // offset*2, half way to the indices, so words read there belong to other indices -- often in
-    // another 64 KiB window, or at the other parity -- and Tomb Raider I's world draws were
-    // declined on them (#4637). Without an offset the two addresses are the same bytes.
-    const uint16_t* p16 = (const uint16_t*)(uintptr_t)source.addr32;
+    const uint16_t* p16 = (const uint16_t*)(uintptr_t)draw.index_addr;
     const uint32_t* p32 = (const uint32_t*)(uintptr_t)source.addr32;
-    // Zero high halves first, so every buffer that detector already classifies keeps its existing
-    // verdict; the constant-non-zero form (#304 part two) only ever sees what it rejected.
+    // Retain both original checks, including the draw's own 16-bit region on offset draws.
+    // A readable 32-bit candidate can be another resource after a genuine 16-bit index buffer.
     if (index_buffer_is_unannounced_32bit(p16, p32, n))
         source.detected = "zero-high-half";
     else if (index_buffer_is_unannounced_32bit_high(p16, p32, n, vb_records_unclamped))
         source.detected = "constant-high-half";
-    else if (index_buffer_is_unannounced_32bit_in_pool(p32, n, vb_records_unclamped))
-        source.detected = "in-pool";
+    if (!source.detected) {
+        const auto detect_same_bytes = [vb_records_unclamped](uint64_t addr,
+                                                              uint32_t count) -> const char* {
+            const auto* words = reinterpret_cast<const uint16_t*>(static_cast<uintptr_t>(addr));
+            const auto* dwords = reinterpret_cast<const uint32_t*>(static_cast<uintptr_t>(addr));
+            if (index_buffer_is_unannounced_32bit(words, dwords, count)) return "zero-high-half";
+            if (index_buffer_is_unannounced_32bit_high(words, dwords, count, vb_records_unclamped))
+                return "constant-high-half";
+            if (index_buffer_is_unannounced_32bit_in_pool(dwords, count, vb_records_unclamped))
+                return "in-pool";
+            return nullptr;
+        };
+        // New offset recovery also needs a 32-bit shape WITHIN the already validated n*2 bytes
+        // of the draw's own region. At an odd offset its first halfword is a high half: skip it
+        // and inspect only complete dwords aligned relative to index_base. No additional read
+        // beyond the 16-bit draw's extent is allowed to supply this corroboration.
+        const uint32_t skip = draw.index_offset & 1u;
+        if (source.addr32 == draw.index_addr ||
+            detect_same_bytes(draw.index_addr + uint64_t{2} * skip, (n - skip) / 2u))
+            source.detected = detect_same_bytes(source.addr32, n);
+    }
     if (source.detected) {
         source.element_bytes = 4;
         source.addr = source.addr32;
-    // NOLINTNEXTLINE(concurrency-mt-unsafe): cached environment read
+        // NOLINTNEXTLINE(concurrency-mt-unsafe): cached environment read
     } else if (PROSPER_ENV_ON("PROSPER_INDEX_DETECT_CENSUS")) {
         note_index_left_16bit(draw.index_addr, p16, p32, n, vb_records_unclamped);
     }
     return source;
 }
+// clang-format off: preserve the unchanged fetch body.
 NggDrawIndexFetch fetch_ngg_draw_indices(const GpuState& ds, const GpuState::Draw& draw,
                                                 uint32_t vb_records_unclamped) {
     NggDrawIndexFetch out;

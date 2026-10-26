@@ -23,9 +23,11 @@ from the tracker issues, and still gated, because it is a projection of state ra
 
 ### Tomb Raider I's Croft Manor renders
 
-Tomb Raider I's Lara's Home, a field of huge orange triangles on every build until now, renders: two shapes of 32-bit index buffer were being read as 16-bit ([#4637](https://github.com/mattias800/prosper/issues/4637)).
+Tomb Raider I's Lara's Home rendered on the initial review candidate `ea73365ddd55`; two shapes of 32-bit index buffer had been read as 16-bit ([#4637](https://github.com/mattias800/prosper/issues/4637)).
 
 <p align="center"><img src="assets/screenshots/tomb-raider-1-laras-home.webp" alt="Tomb Raider I, Lara's Home: Lara from behind in a wood-panelled room facing a window seat with cushions under two arched windows, patterned carpet, a red chair and a framed painting; Linux prosper-app, route reach-gameplay.pad, flip 4800"></p>
+
+The safety-corrected candidate still needs a live rendering check; this capture belongs to the initial candidate.
 
 ## 2026-10-15
 

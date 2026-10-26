@@ -458,6 +458,54 @@ TEST(DrawIndexSource, ADrawCrossingAWindowInsideALargePoolIs32Bit) {
     EXPECT_EQ(small_pool.element_bytes, 2u);
 }
 
+// A readable candidate is not evidence about the draw's own 16-bit section. The following
+// resource deliberately looks like a valid 32-bit quad, including a sparse degenerating one.
+TEST(DrawIndexSource, OffsetDetectionDoesNotBorrowTheFollowingResource) {
+    alignas(4) uint16_t words[24] = {0, 1, 2, 2, 1, 3, 4, 5, 6, 6, 5, 7};
+    const std::vector<std::vector<uint32_t>> following = {{8, 9, 10, 10, 9, 11},
+                                                          {0, 0, 0, 0, 1, 0}};
+    for (const auto& candidate : following) {
+        std::memcpy(words + 12, candidate.data(), candidate.size() * sizeof(uint32_t));
+        GpuState st;
+        st.index_type = 0;
+        st.index_type_announced = false;
+        GpuState::Draw draw;
+        draw.indexed = true;
+        draw.index_count = 6;
+        draw.from_offset = true;
+        draw.index_base = reinterpret_cast<uint64_t>(words);
+        draw.index_offset = 6;
+        draw.index_addr = draw.index_base + 12u;
+        for (uint32_t bound : {0u, 489947u, 1u << 24}) {
+            const DrawIndexSource source = resolve_draw_index_source(st, draw, 6, bound);
+            EXPECT_EQ(source.detected, nullptr);
+            EXPECT_EQ(source.element_bytes, 2u);
+            EXPECT_EQ(source.addr, draw.index_addr);
+            const NggDrawIndexFetch fetched = fetch_ngg_draw_indices(st, draw, bound);
+            ASSERT_TRUE(fetched.indices) << (fetched.refusal ? fetched.refusal : "");
+            EXPECT_EQ(*fetched.indices, (std::vector<uint32_t>{4, 5, 6, 6, 5, 7}));
+        }
+    }
+}
+
+TEST(DrawIndexSource, OffsetRecoveryChecksCompleteDwordsInTheDrawRegion) {
+    std::array<uint32_t, 43> indices{};
+    for (uint32_t i = 0; i < indices.size(); ++i) indices[i] = 65530u + i;
+    GpuState st;
+    st.index_type = 0;
+    st.index_type_announced = false;
+    GpuState::Draw draw;
+    draw.indexed = true;
+    draw.index_count = 40;
+    draw.from_offset = true;
+    draw.index_base = reinterpret_cast<uint64_t>(indices.data());
+    draw.index_offset = 3;
+    draw.index_addr = draw.index_base + 6u;
+    const auto source = resolve_draw_index_source(st, draw, 40, 489947);
+    EXPECT_STREQ(source.detected, "in-pool");
+    EXPECT_EQ(source.addr, draw.index_base + 12u);
+}
+
 // #3135 P7: Kena's culling-VS draw state. VGT_SHADER_STAGES_EN 0x2000 (PRIMGEN_EN, no GS), the
 // program in the ES registers with no chain, VGT_GS_OUT_PRIM_TYPE 0 and GS_MAX_VERT_OUT 0,
 // GE_MAX_OUTPUT_PER_SUBGROUP 64, an indexed triangle list.
