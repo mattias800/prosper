@@ -15,6 +15,7 @@
 #include "buffer_range_plan.h"
 #include "backend_color_formats.h"   // guest -> host colour/texture format tables
 #include "gpu/resources/device_storage_reads.hpp"   // published at device creation
+#include "color_slot_clear.h"   // what a colour slot above 1 starts from (#4624)
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/diagnostics/gpu_memory_budget_vk.hpp"  // #3533: count what we hold on each heap
 #include "gpu/diagnostics/gpu_breadcrumbs_vk.hpp"    // PROSPER_GPU_BREADCRUMBS: where did the GPU stop?
@@ -13689,13 +13690,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     clear[0].color = {{cc[0], cc[1], cc[2], cc[3]}};
     if (use_color1) clear[1].color = {{cc1[0], cc1[1], cc1[2], cc1[3]}};
     for (uint32_t slot = 2; slot < color_count; ++slot) {
-        float value[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-        for (const auto& draw : logical_draws) {
-            if (!draw.ps || !draw.ps->color_targets[slot].has_clear) continue;
-            std::copy(std::begin(draw.ps->color_targets[slot].clear),
-                      std::end(draw.ps->color_targets[slot].clear), value);
-            break;
-        }
+        const auto value = color_slot_clear_value(
+            color_target ? color_target->uniform_clear_slots[slot] : nullptr, logical_draws, slot);
         clear[slot].color = {{value[0], value[1], value[2], value[3]}};
     }
     for (uint32_t slot = 0; slot < color_count; ++slot)   // integer attachments clear by value

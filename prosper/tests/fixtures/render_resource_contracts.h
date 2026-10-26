@@ -269,6 +269,9 @@ struct BackendColorTarget {
     // Without it the final segment created fresh transient attachments and cleared away everything
     // the earlier segments drew into MRT2+.
     std::array<const uint8_t*, prosper::gpu::kColorTargetCount> seed_slots{};
+    // A uniform colour (four floats) slots 2..7 start from when nothing is loaded into them: the
+    // per-slot twin of the two clear arguments of render_draws_rgba (color_slot_clear.h, #4624).
+    std::array<const float*, prosper::gpu::kColorTargetCount> uniform_clear_slots{};
     // Slot 1's seed when the caller receives it through BackendMrtOutputs instead of `out_rgba1`.
     // The live renderer uses that API, so on a split its slot-1 readback landed in
     // `mrt_outputs.colors[1]` while the wrapper only carried a seed forward inside `if (out_rgba1)`
