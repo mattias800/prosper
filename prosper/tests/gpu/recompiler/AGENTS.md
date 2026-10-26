@@ -20,6 +20,11 @@ word lifetime. `test_native_atomic_active_scope` adds buffer ADD/EXCHANGE interp
 missing-input twins and a broader-cohort control. The oracle opts into the closed buffer atomic
 profile explicitly; its existing NGG increment contract remains separate.
 
+`test_accumulator_cohort` observes a narrower accumulating write and the untouched part
+of its original cohort through the public compiler and Wave64 interpreter. Missing old values,
+missing active operands and expanded readers retain their refusals. Unit cases preserve every
+ordinary root/flag plane while checking the coverage owner.
+
 `test_fresh_mask_operand_roots` exercises a native SCC loop whose fresh data predicate combines
 a current complete rewrite with a pre-loop loaded operand. Its interpreter witness observes the
 real loaded value and enabled lanes; missing resources and live back-edge dependencies remain

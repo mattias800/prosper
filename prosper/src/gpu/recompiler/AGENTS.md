@@ -1,5 +1,9 @@
 # `recompiler` — RDNA2 machine code → SPIR-V
 
+`rdna2_accumulator_cohort` runs the ordinary vector-word transfer once, then retains a
+broader existing cohort across a narrower, plain same-lane accumulation. It changes only the
+owner of an already scoped proof; root planes, flags, physical words and EXEC stay unchanged.
+
 `rdna2_loop_exec_data` proves a preheader EXEC bound over the authentic native Wave64
 SCC loop's original instructions. Saved pairs meet every CFG path and back edge; only header EXEC
 is the induction hypothesis. Its DATA certificate leaves route admission and existing back-edge
