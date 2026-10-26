@@ -14,6 +14,12 @@ canonical word marks. It leaves broader coverage and root obligations intact. Jo
 only an identical generation view on both edges; lane selections and spills drop it. Buffer ADD/EXCHANGE returns include genuine
 address, resource and old-VDATA fallback obligations. It grants no loop route or missing word.
 
+`rdna2_uniform_counter_data` bounds the separate EXEC-exit case: a genuine literal-initialized
+scalar counter caps the remaining lanes while condition-region DATA CMPX may remove lanes early.
+It excludes surviving wave-scalar results, other EXEC changes and cross-lane producers.
+The existing original-word mask proof still checks
+every back edge; this boundary adds DATA ancestry only, never route admission or missing words.
+
 Takes a guest shader's instruction bytes and emits a SPIR-V module.
 
 `rdna2_native_image_results` records and consumes the exact result generations of the
