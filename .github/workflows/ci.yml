@@ -1086,6 +1086,15 @@ jobs:
       - name: Install the locked Python test dependencies
         run: uv sync --locked --no-build --group dev
 
+      # #5516: this runtime retains import-only COFF symbols. GDB then omits its
+      # PE export fallback, leaving the throwing breakpoint pending. Remove only
+      # that metadata on the isolated runner; retain runtime code and PE exports.
+      - name: Expose runtime exports and qualify the debugger
+        shell: msys2 {0}
+        run: |
+          strip --strip-all "$MINGW_PREFIX/bin/libstdc++-6.dll"
+          .venv/Scripts/python.exe -m pytest -q prosper/tools/dbg/test_windows_system_error_trace.py
+
       - name: Restore ccache
         uses: actions/cache/restore@v4
         with:
