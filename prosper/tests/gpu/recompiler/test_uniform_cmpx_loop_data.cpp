@@ -1,5 +1,5 @@
-// #5497: a uniform scalar-counter exit must retain genuine preheader DATA
-// ancestry without admitting scalar live-outs or lane-varying exits.
+// #5497: preheader DATA stays genuine in a counter-capped EXEC loop. DATA CMPX may
+// leave early; scalar live-outs and missing words gain no authority.
 #include "bpermute_spirv_oracle.hpp"
 #include "fixtures/checked_compute_launch.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
