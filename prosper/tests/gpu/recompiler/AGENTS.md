@@ -36,6 +36,11 @@ that cohort, the old destination is missing, and a fresh mask consumes the resul
 observes selected values, fresh VCC, restored EXEC and untouched inactive output. Missing and
 unbounded banks, stale index/M0 generations and expanded readers remain negative controls.
 
+`test_deferred_m0_retirement` pins the bounded retirement proof's literal read-back and
+legacy scalar-memory/read boundaries. The deferred-tail cases in `test_relative_bank_source`
+exercise the public fragment path and observe selected words, EXEC, VCC and restored M0
+in both Wave64 halves; missing banks and observable M0/index reads remain refusals.
+
 Most tests here ask a question of `src/gpu/recompiler` alone: does this instruction stream decode,
 does it recompile, does the module it produces have the shape the contract promises, and — just as
 often — does a stream that must NOT compile still reject, and reject *loudly*. No device is created,

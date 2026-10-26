@@ -4266,6 +4266,7 @@ if(TARGET prosper_core)
     LIBRARIES prosper_core)
   prosper_add_gtest(test_relative_bank_source
     SOURCES tests/gpu/recompiler/test_relative_bank_source.cpp
+      tests/gpu/recompiler/test_deferred_m0_retirement.cpp
     INCLUDES tests tests/gpu/recompiler
     LIBRARIES prosper_core)
   prosper_add_gtest(test_packed_scalar_width
