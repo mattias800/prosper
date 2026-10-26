@@ -261,17 +261,27 @@ TEST(NativeAtomicActiveScope, MissingAtomicDataAndScalarOffsetStillRefuse) {
     }
 }
 
-TEST(NativeAtomicActiveScope, APreservedOuterCohortKeepsOnlyCurrentDataDependencies) {
-    constexpr uint64_t address = 0x5497090900ull;
+namespace {
+std::vector<uint32_t> mixed_cohort_program() {
     auto code = program();
+    code[20] = 0x7d880024u; // fresh VCC = (genuine s36=64 > returned v0)
     code[2] = 0x7e00023cu; // old v0 is missing outside the pre-loop cohort
     code[3] = 0x7e06023cu; // old v3 is missing outside the pre-loop cohort
     code.insert(code.begin() + 11, {0x7e000280u, 0x7e060280u}); // genuine v0/v3 in C
     const auto poison = std::find(code.begin() + 13, code.end(), 0x7e00023cu);
-    ASSERT_NE(poison, code.end());
+    EXPECT_NE(poison, code.end());
+    if (poison == code.end()) return {};
     code.insert(poison + 1, 0x7e06023cu); // both words are dead until their next active rewrite
+    code.insert(code.begin(), 0xbea403c0u); // genuine scalar sibling before C
     const auto back = code.size() - 5;
-    code[back] = 0xbf850000u | static_cast<uint16_t>(13 - static_cast<int>(back) - 1);
+    code[back] = 0xbf850000u | static_cast<uint16_t>(14 - static_cast<int>(back) - 1);
+    return code;
+}
+} // namespace
+
+TEST(NativeAtomicActiveScope, APreservedOuterCohortKeepsOnlyCurrentDataDependencies) {
+    constexpr uint64_t address = 0x5497090900ull;
+    const auto code = mixed_cohort_program();
     const auto c = config();
     const auto table = resources();
     const auto module = recompile_compute(code.data(), code.size(), &table, c,
@@ -309,4 +319,18 @@ TEST(NativeAtomicActiveScope, APreservedOuterCohortKeepsOnlyCurrentDataDependenc
     }
     for (uint32_t lane = 31; lane < 64; lane += 2) EXPECT_EQ(observations[lane], 3u) << lane;
     for (size_t i = 52; i < returned.size(); ++i) EXPECT_EQ(returned[i], 0xdeadbeefu) << i;
+}
+
+TEST(NativeAtomicActiveScope, AMissingScalarPredicateSiblingStillRefuses) {
+    auto code = mixed_cohort_program();
+    code[0] = 0xbea4033cu; // s36 from absent s60; the cached vector cannot supply this word
+    const auto c = config();
+    const auto table = resources();
+    constexpr uint64_t address = 0x5497090a00ull;
+    EXPECT_TRUE(recompile_compute(code.data(), code.size(), &table, c,
+                                  {RecompileDiagnosticStage::Compute, address})
+                    .empty());
+    EXPECT_NE(last_terminal_reject_reason(address).find("fabricated-fresh-mask-source pc=23 "),
+              std::string::npos)
+        << last_terminal_reject_reason(address);
 }
