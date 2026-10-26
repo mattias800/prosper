@@ -2792,6 +2792,11 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_fresh_mask_lane_wise_relay.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_placeholder_origins
+    SOURCES tests/gpu/recompiler/test_placeholder_origins.cpp
+            tests/gpu/recompiler/test_placeholder_origin_diagnostics.cpp
+    INCLUDES tests tests/gpu/recompiler src
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_unloaded_launch_vgpr
     SOURCES tests/gpu/recompiler/test_unloaded_launch_vgpr.cpp
     INCLUDES tests

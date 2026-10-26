@@ -79,6 +79,7 @@ testpaths = [
     "prosper/tools/shader_inspect/test_route_candidates.py",
     "prosper/tools/fragment_compile_replay/test_corpus.py",
     "prosper/tools/shader_inspect/test_recompile_corpus.py",
+    "prosper/tools/shader_inspect/test_placeholder_origin_census.py",
     "prosper/tools/snapshot/test_snapshot.py",
     "prosper/tools/snapshot/test_visible_capture.py",
     "prosper/tools/saves/test_save_fixture.py",

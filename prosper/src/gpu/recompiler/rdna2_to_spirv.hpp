@@ -12,6 +12,7 @@
 // runs the translated ALU ops, then stores v[out_vgpr] to storage buffer 1 (b[gid]).
 #pragma once
 #include <array>
+#include <memory>
 #include <string>
 #include <utility>
 #include <cstdint>
@@ -308,6 +309,8 @@ enum class RecompileDiagnosticStage : uint8_t {
 struct RecompileDiagnosticContext {
     RecompileDiagnosticStage stage = RecompileDiagnosticStage::Standalone;
     uint64_t program_address = 0;
+    // Attempt-local diagnostic detail; excluded from code generation and verdict tags.
+    std::shared_ptr<const std::string> placeholder_origins;
 };
 
 // Emit the canonical final live compute-skip diagnostic through the recompiler's atomic formatter.

@@ -1,4 +1,5 @@
 #include "gpu/recompiler/rdna2_relative_bank_source.hpp"
+#include "gpu/recompiler/rdna2_placeholder_origins.hpp"
 // Existing scalar input-mark propagation and saved-mask snapshots.
 #include "gpu/recompiler/rdna2_cfg_scalar_sources.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
@@ -133,6 +134,7 @@ SavedB64MaskSnapshot snapshot_saved_b64_masks(const RegState& rs, const Rdna2Ins
 SavedB64MaskSnapshot snapshot_saved_b64_masks(SpirvCompute& b, const RegState& rs,
                                               const Rdna2Inst& in) {
     auto snapshot = snapshot_saved_b64_masks(rs, in);
+    note_placeholder_resources(b, rs, in);
     snapshot.scalar_first_lane_agrees = scalar_scope_first_lane_agrees(b, rs, in);
     snapshot.scalar_local_index_waterfall = scalar_scope_local_index_waterfall(b, in);
     note_memory_address(b, rs, in, snapshot.source_marks);   // #5193, before the roots are cleared

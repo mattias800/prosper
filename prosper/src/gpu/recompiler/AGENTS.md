@@ -1,5 +1,14 @@
 # `recompiler` — RDNA2 machine code → SPIR-V
 
+`rdna2_placeholder_origins` diagnoses the roots of fabricated words without granting admission.
+The launch snapshot distinguishes absent inputs from words hardware never loads; the backward
+CFG slice follows joins and loops to those roots and keeps spill slots separate. Its query and
+formatter supply attempt-local refusal details; no validity consumer reads the diagnostic graph.
+Existing native Input and genuine resource publications terminate their semantic input edges;
+an encoded interpolation parameter field is not automatically an ordinary VGPR read.
+The slice reports a conservative union of possible roots. Existing bounded-index observations
+limit relative banks; without a bound it visits the complete bank rather than only its base word.
+
 `rdna2_accumulator_cohort` runs the ordinary vector-word transfer once, then retains a
 broader existing cohort across a narrower, plain same-lane accumulation. It changes only the
 owner of an already scoped proof; root planes, flags, physical words and EXEC stay unchanged.

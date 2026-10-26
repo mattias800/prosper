@@ -400,6 +400,13 @@ that constant propagation cannot fold. It needs the integer form of a mask to ex
 - One model still beats two, so Decision 1 to 4 survive either way. What shrinks is the lattice and
   what consumes it.
 
+**Owner direction (2026-10-26, #5497).** The honest version of policy 1 is approved:
+only placeholders rooted entirely in explicitly unloaded words may become Arbitrary, with an
+always-on diagnostic. Missing launch inputs, untracked spills and unknown launch profiles remain
+Hard. Policy 2 is out of scope. The first PR adds origins and measurements without changing
+admission; the admission PR follows only after the measurements merge. This direction does not
+accept the proposed unified-analysis migration above.
+
 **Measurement before acceptance.**
 
 1. **Kena's three programs.** For each fabricated word, name its origin: never written, a launch

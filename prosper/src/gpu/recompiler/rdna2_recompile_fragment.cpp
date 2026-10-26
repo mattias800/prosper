@@ -1,3 +1,4 @@
+#include "gpu/recompiler/rdna2_placeholder_origins.hpp"
 // rdna2_to_spirv.cpp — see rdna2_to_spirv.hpp. Internal SpirvCompute builder + the VALU translator.
 #include <atomic>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
@@ -671,6 +672,9 @@ std::vector<uint32_t> recompile_fragment_impl(
     seed_vector_word_definedness(
         rs, ins, /*native_interpolation=*/true, b.wave_size,
         system_inputs && pixel_launch_profile_known(*system_inputs) ? &launch_inventory : nullptr);
+    configure_pixel_placeholder_origins(
+        rs, launch_inventory, system_inputs && pixel_launch_profile_known(*system_inputs));
+    b.placeholder_origin_program = rs.placeholder_origin_program;
     SavedMaskCopyFragmentDispatchScope copy_dispatch_scope(b, rs, ins, code, dwords,
                                                            pcrel_dispatch_target);
     if (!emit_body(b, rs, ins, safe_branches, rt, /*allow_exec_update*/true, /*allow_smem*/rt != nullptr, exp_fn, code, dwords)) {
