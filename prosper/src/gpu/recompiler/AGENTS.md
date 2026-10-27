@@ -479,6 +479,8 @@ Missing/fabricated scalar results cannot terminate a trace. It also retains the 
 slice. An unloaded address does not authorize an atomic, cross-lane result or unproved read;
 `unproved-memory-result` stays Hard. Read contracts observe the existing bounded/actual-address
 lowering and conjoin observations across attempts.
-`rdna2_arbitrary_placeholder_loop` retains existing strong loop-read obligations: an unloaded
-back edge cannot authorize an unbounded/writing address or an unproved scalar publication.
+`rdna2_arbitrary_placeholder_loop` retains existing strong address-read obligations: an unloaded
+back edge cannot authorize an unbounded or writing address. The legacy lane-local scalar
+publication also remains Hard as `unmodelled-scalar-publication`: a real whole-wave value
+is required, and no broadcast is invented by the origin inventory.
 Those dependencies report `unproved-strong-read` and stay Hard.

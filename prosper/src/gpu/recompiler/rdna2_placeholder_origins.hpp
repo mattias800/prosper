@@ -23,7 +23,8 @@ enum class PlaceholderOrigin {
     TraceBudget,
     Unreachable,
     UnprovedMemoryResult,
-    UnprovedStrongRead
+    UnprovedStrongRead,
+    UnmodelledScalarPublication
 };
 enum class PlaceholderFile { Scalar, Vector, Spill, Scc };
 struct PlaceholderWord {

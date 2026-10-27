@@ -132,6 +132,18 @@ inline Words scalar_loop_relay() {
         0xe0702000u, 0x80020100u, 0xbf810000u,
     };
 }
+inline Words readfirst_loop_relay() {
+    return {
+        0x7e0c0283u, 0xbe9e0380u,   // genuine preheader v6=3, scalar counter=0
+        0x7e280506u,   // header2: s20 = readfirstlane(v6)
+        0x7d840d06u,   // fresh VCC observes the carried v6
+        0x7e0c023cu,   // v6 = unloaded s60, consistently zero
+        0x4a0c0106u, 0x4a0c0c87u,   // v6 = v6 + local lane + 7
+        0x801e811eu, 0xbf0a831eu, 0xbf85fff8u,   // three trips back to header2
+        0x7e020214u,   // v1 = actual final scalar publication, 7 from lane0
+        0xe0702000u, 0x80020100u, 0xbf810000u,
+    };
+}
 inline Words expected(bool narrowed) {
     Words result(64, 11u);
     if (narrowed)

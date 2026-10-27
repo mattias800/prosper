@@ -521,8 +521,10 @@ The admission candidate first preserves every successful strict compilation unch
 may retry only when an actual read has a nonempty root set consisting entirely of `unloaded`.
 The retry supplies no new values, physical mask words or runtime validity facts. Successful
 scalar loads terminate a dependency slice only after their actual complete, non-fabricated
-publication; an unproved memory result or strong loop-read obligation stays Hard. These name
-`unproved-memory-result` and `unproved-strong-read`, respectively.
+publication; an unproved memory result or unsafe address-read obligation stays Hard. These name
+`unproved-memory-result` and `unproved-strong-read`, respectively. The legacy READFIRST scalar
+value, which the per-invocation lowering does not broadcast, names
+`unmodelled-scalar-publication` and also stays Hard.
 
 The same 4,000-entry corpus compares 3,567 recorded-input replays and 433 stage probes:
 
@@ -545,7 +547,8 @@ The same 4,000-entry corpus compares 3,567 recorded-input replays and 433 stage 
 | lost-definition | 9 | 9 |
 | unmodelled-transfer | 5 | 5 |
 | unproved-memory-result | 17 | 314 |
-| unproved-strong-read | 2 | 29 |
+| unproved-strong-read | 1 | 1 |
+| unmodelled-scalar-publication | 1 | 28 |
 | spill / trace-budget / unreachable | 0 | 0 |
 
 The 27 dumped GTA/Kena programs retain the preceding measurement's nine accepted, fifteen refused
@@ -590,14 +593,21 @@ executed lane reads. Failed retries publish their actual refusal and no admissio
 - **An unloaded address alone makes every memory result Arbitrary.** The unchanged #5193
   atomic/store-return and cross-lane LDS refusal twins exposed a missing dependency in the
   diagnostic slice. The result's separate memory contract must be retained; an unproved result
-  now names `unproved-memory-result`. A loop's existing strong address/scalar-read obligation
+  now names `unproved-memory-result`. A loop's existing strong address-read obligation
   likewise names `unproved-strong-read`. Neither is silently reduced to its unloaded address
-  or back-edge registers.
+  or back-edge registers. Refs [#5497](https://github.com/mattias800/prosper/issues/5497).
 - **A never-loaded ordinary SGPR is a genuine Hard input fixture.** Several older fixtures used
   s30, s40 or s60 this way. Under the owner-approved policy those words are Arbitrary. Hard
   controls must instead name an unknown possible scratch-offset launch word, a genuinely
   unsupplied launch input or an untracked spill. Consumer and relative-branch positions are
-  retained when correcting these fixtures.
+  retained when correcting these fixtures. Refs [#5497](https://github.com/mattias800/prosper/issues/5497).
+
+- **Removing the loop's READFIRST guard only admits an Arbitrary value.** A synthetic loop
+  sets `v6 = lane + unloaded_zero + 7`, reads it into `s20` on the next trip, and stores that
+  scalar. With the guard removed, the interpreter and an actual exact64 GPU both store
+  `7 + lane` instead of the hardware's whole-wave scalar `7`. The legacy lowering returns
+  each lane's value instead of broadcasting the first active lane. This is a real missing
+  scalar publication, named `unmodelled-scalar-publication`, and stays Hard. Refs [#3596](https://github.com/mattias800/prosper/issues/3596), [#5497](https://github.com/mattias800/prosper/issues/5497).
 
 **Measurement before acceptance.**
 

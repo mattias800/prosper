@@ -273,7 +273,7 @@ TEST(LoadedArbitrary, AnUnboundedAddressReadNeedsTheHeaderDefined) {
 }
 
 TEST(LoadedArbitrary, ALoopThatReadsAVectorIntoAScalarDoesNotHoldWeakly) {
-    // v_readfirstlane_b32 s21, v6 in the body: a scalar can carry no arbitrary value.
+    // The legacy lane-local READFIRST lowering cannot supply a whole-wave scalar from this back edge.
     constexpr uint32_t readfirstlane_s21_v6 = 0x7e2a0506u;
     const auto in = decode({readfirstlane_s21_v6});
     ASSERT_EQ(in.at(0).fmt, Rdna2Format::VOP1);

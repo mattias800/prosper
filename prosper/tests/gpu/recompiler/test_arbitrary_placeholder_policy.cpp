@@ -28,11 +28,12 @@ PlaceholderRoots roots(PlaceholderOrigin kind) {
 TEST(ArbitraryPlaceholderPolicy, EveryOtherOriginIsAHardVeto) {
     EXPECT_TRUE(placeholder_roots_are_unloaded(roots(PlaceholderOrigin::Unloaded)));
     EXPECT_FALSE(placeholder_roots_are_unloaded({}));
-    for (auto kind : {PlaceholderOrigin::LaunchInput, PlaceholderOrigin::Spill,
-                      PlaceholderOrigin::UnknownLaunch, PlaceholderOrigin::LostDefinition,
-                      PlaceholderOrigin::UnmodelledTransfer, PlaceholderOrigin::TraceBudget,
-                      PlaceholderOrigin::Unreachable, PlaceholderOrigin::UnprovedMemoryResult,
-                      PlaceholderOrigin::UnprovedStrongRead})
+    for (auto kind :
+         {PlaceholderOrigin::LaunchInput, PlaceholderOrigin::Spill,
+          PlaceholderOrigin::UnknownLaunch, PlaceholderOrigin::LostDefinition,
+          PlaceholderOrigin::UnmodelledTransfer, PlaceholderOrigin::TraceBudget,
+          PlaceholderOrigin::Unreachable, PlaceholderOrigin::UnprovedMemoryResult,
+          PlaceholderOrigin::UnprovedStrongRead, PlaceholderOrigin::UnmodelledScalarPublication})
         EXPECT_FALSE(placeholder_roots_are_unloaded(roots(kind))) << static_cast<int>(kind);
 }
 
@@ -198,4 +199,18 @@ TEST(ArbitraryPlaceholderPolicy, AnUnboundedLoopReadRetainsItsStrongObligation) 
     EXPECT_TRUE(module.empty());
     const auto reason = last_terminal_reject_reason(address);
     EXPECT_NE(reason.find("origin=unproved-strong-read word=v6 at=2"), std::string::npos) << reason;
+}
+
+TEST(ArbitraryPlaceholderPolicy, AReadfirstLoopCannotInventTheMissingScalarPublication) {
+    namespace fixture = prosper::test::arbitrary_placeholder;
+    const auto words = fixture::readfirst_loop_relay();
+    const auto resources = fixture::table();
+    constexpr uint64_t address = 0x5497b00900ull;
+    const auto module = recompile_compute(words.data(), words.size(), &resources, fixture::config(),
+                                          {RecompileDiagnosticStage::Compute, address});
+    EXPECT_TRUE(module.empty());
+    const auto reason = last_terminal_reject_reason(address);
+    EXPECT_NE(reason.find("origin=unloaded word=s60"), std::string::npos) << reason;
+    EXPECT_NE(reason.find("origin=unmodelled-scalar-publication word=v6 at=2"), std::string::npos)
+        << reason;
 }

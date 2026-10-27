@@ -5,7 +5,8 @@ old values, scalar/vector loop carries and a real supplied scalar-buffer load th
 compiler and integer interpreter.
 `test_arbitrary_placeholder_policy` keeps every non-unloaded root Hard, including a lost operand
 beside an unloaded one, and checks strict-first retry/metadata selection. Missing launch and
-spill twins retain their separate refusal contracts.
+spill twins retain their separate refusal contracts. A lane-varying READFIRST loop keeps the
+missing whole-wave scalar publication Hard; dropping that guard produces a wrong observable value.
 
 `test_placeholder_origins` checks unloaded, unsupplied launch, unknown launch and spill roots,
 including relays, both merge predecessors and loop backedges. Public compiler refusals assert the

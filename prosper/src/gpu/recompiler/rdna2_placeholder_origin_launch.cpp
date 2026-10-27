@@ -57,7 +57,8 @@ std::string format_placeholder_origins(const PlaceholderRoots& roots) {
                                             "trace-budget",
                                             "unreachable",
                                             "unproved-memory-result",
-                                            "unproved-strong-read"};
+                                            "unproved-strong-read",
+                                            "unmodelled-scalar-publication"};
     std::string out;
     for (const auto& root : roots) {
         if (!out.empty()) out += ';';
