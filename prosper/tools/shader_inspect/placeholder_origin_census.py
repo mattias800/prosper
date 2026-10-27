@@ -2,13 +2,12 @@
 """Count diagnostic roots in an existing corpus survey; never run or modify shaders."""
 
 import argparse
-from collections import Counter
 import json
-from pathlib import Path
 import re
+from collections import Counter
+from pathlib import Path
 
 import shader_corpus
-
 
 ROOT = re.compile(r"\borigin=([a-z-]+) word=([^ ;\]]+) at=([^ ;\]]+)")
 
@@ -39,7 +38,7 @@ def census(survey: dict) -> dict:
         programs[name] = {
             "basis": basis,
             "origins": kinds,
-            "roots": [dict(zip(("origin", "word", "at"), root)) for root in roots],
+            "roots": [dict(zip(("origin", "word", "at"), root, strict=True)) for root in roots],
         }
     return {
         "entries_surveyed": len(survey["programs"]),
