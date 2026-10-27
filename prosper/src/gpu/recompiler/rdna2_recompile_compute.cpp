@@ -654,6 +654,9 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                                         const ShaderResourceTable* rt,
                                         const ComputeShaderConfig& config,
                                         RecompileDiagnosticContext diagnostic) {
+    if (!arbitrary_placeholder_attempt_active())
+        return recompile_with_arbitrary_placeholders(
+            diagnostic, [&] { return recompile_compute(code, dwords, rt, config, diagnostic); });
     // ADR 0006: the switch-type choices come from the request, not from the environment. Entries the
     // caller left unset still fall through to their live read until the other stages migrate too.
     CompilerChoiceScope request_choices(config.choices);

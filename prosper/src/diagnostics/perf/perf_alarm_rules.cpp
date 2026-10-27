@@ -1,4 +1,5 @@
 #include "diagnostics/perf/perf_alarm_rules.hpp"
+#include "diagnostics/perf/arbitrary_placeholder.hpp"
 #include "diagnostics/perf/frame_flicker.hpp"
 #include "diagnostics/perf/wave64_refusal.hpp"
 
@@ -124,6 +125,7 @@ const std::vector<const char*>& rule_names() {
         "gpu-present-stalled",
         "gpu-device-time-coverage",
         "rtt-colorless-publication",
+        "arbitrary-placeholder-admitted",
         "unsupported-wave64-shaders",
         "unverified-fragment-f32-arithmetic",
         "frame-flicker",
@@ -133,6 +135,10 @@ const std::vector<const char*>& rule_names() {
 
 bool rule_has_data(const char* rule, const WindowSample& w) {
     const std::string r = rule ? rule : "";
+    if (r == "arbitrary-placeholder-admitted")
+        return w.count(Counter::ArbitraryPlaceholderChecks) != 0 ||
+               w.count(Counter::ArbitraryPlaceholderPrograms) != 0 ||
+               w.count(Counter::ArbitraryPlaceholderReads) != 0;
     if (r == "unverified-fragment-f32-arithmetic")
         return w.count(Counter::FragmentArithmeticRequests) != 0 ||
                w.count(Counter::FragmentArithmeticKnownMode) != 0 ||
@@ -182,6 +188,7 @@ bool rule_has_data(const char* rule, const WindowSample& w) {
 
 uint32_t sustain_windows(const char* rule) {
     const std::string r = rule ? rule : "";
+    if (r == "arbitrary-placeholder-admitted") return kCorrectnessSustainWindows;
     if (r == "rtt-colorless-publication") return kRttColorlessPublicationSustainWindows;
     if (r == "dropped-draws" || r == "skipped-dispatches" || r == "gpu-memory-off-device" ||
         r == "unaccounted-draws" || r == "unimplemented-hle-calls" ||
@@ -262,6 +269,7 @@ void apply_reporting_deferrals(std::vector<AlarmFiring>& reported) {
 std::vector<AlarmFiring> evaluate_rules(const WindowSample& w, const RuleThresholds& t) {
     std::vector<AlarmFiring> out;
     if (w.seconds <= 0) return out;
+    append_arbitrary_placeholder_alarm(out, w);
     const double budget = w.budget_ms();
 
     // texture-cache-thrash (RATE + STATE). The refusal count is the signal; evictions and fill are

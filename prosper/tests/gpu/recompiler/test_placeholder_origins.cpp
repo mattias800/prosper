@@ -1,5 +1,5 @@
 // Diagnostic slices distinguish missing hardware inputs from unloaded words and spills.
-// These tests grant no admission; every public compiler fixture remains refused.
+// Hard public compiler fixtures remain refused; unloaded-only roots now have a separate policy.
 #include "fixtures/checked_compute_launch.hpp"
 #include "gpu/recompiler/rdna2_reg_state.hpp"
 #include "gpu/recompiler/rdna2_placeholder_origins.hpp"
@@ -119,18 +119,17 @@ TEST(PlaceholderOrigins, ARefusalWithNoMissingInputNamesTheLostDefinition) {
     EXPECT_EQ(roots(p, 1, {PlaceholderFile::Vector, 6}), "origin=lost-definition word=v6 at=1");
 }
 
-TEST(PlaceholderOrigins, PublicFreshMaskRefusalReportsAnUnloadedScalarRoot) {
+TEST(PlaceholderOrigins, PublicUnloadedScalarReadIsAdmittedWithoutAStaleRefusal) {
     const std::vector<uint32_t> words{0x7e0c023cu, 0x7d840d06u, 0xbf810000u};
     ComputeShaderConfig config;
     config.local_x = config.wave_size = config.native_subgroup_size = 64;
     prosper::test::complete_compute_launch(config);
     constexpr uint64_t address = 0x5497a00100ull;
-    EXPECT_TRUE(recompile_compute(words.data(), words.size(), nullptr, config,
-                                  {RecompileDiagnosticStage::Compute, address})
-                    .empty());
+    EXPECT_FALSE(recompile_compute(words.data(), words.size(), nullptr, config,
+                                   {RecompileDiagnosticStage::Compute, address})
+                     .empty());
     const auto reason = last_terminal_reject_reason(address);
-    EXPECT_NE(reason.find("fabricated-fresh-mask-source"), std::string::npos) << reason;
-    EXPECT_NE(reason.find("origin=unloaded word=s60 at=entry"), std::string::npos) << reason;
+    EXPECT_TRUE(reason.empty()) << reason;
 }
 
 TEST(PlaceholderOrigins, PublicUnknownScalarLaunchRemainsUnknown) {

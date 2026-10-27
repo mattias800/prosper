@@ -4,16 +4,27 @@
 envelope. Bounded compile-case records retain that identity; complete terminal diagnostics retain
 the roots. Neither changes compiler inputs or admission.
 
-`rdna2_placeholder_origins` diagnoses the roots of fabricated words without granting admission.
+`rdna2_placeholder_origins` identifies typed roots of fabricated words.
 The launch snapshot distinguishes absent inputs from words hardware never loads; the backward
 CFG slice follows joins and loops to those roots and keeps spill slots separate. Its query and
-formatter supply attempt-local refusal details; no validity consumer reads the diagnostic graph.
+formatter supply attempt-local refusal details. Each queried placeholder word retains its own
+lost-definition result; an unrelated unloaded operand cannot hide that gap.
 Existing native Input and genuine resource publications terminate their semantic input edges;
 an encoded interpolation parameter field is not automatically an ordinary VGPR read.
 The slice reports a conservative union of possible roots. Existing bounded-index observations
 limit relative banks; without a bound it visits the complete bank rather than only its base word.
 `rdna2_legacy_vcc_writes` shares the existing implicit VALU VCC-writer condition between the
 legacy loop liveness scan and diagnostic roots; it consumes no new effects-table fields.
+
+`rdna2_arbitrary_placeholder` implements the owner-approved ADR 0038 admission boundary.
+The original compiler routes run first; only a refused program with an unloaded-only read retries.
+Every admitted read must still have a nonempty, entirely unloaded typed root set. No value,
+domain, physical mask word or runtime validity fact is supplied. Owned packets retain their
+separate genuine-input contract. Inert module metadata identifies read sites in the selected
+module for the observer; failed attempts publish no admission count. Unknown, missing launch,
+spill and named trace-gap roots remain refused.
+Its output-only observation port is declared here and implemented beside compiler callers in
+`gpu/diagnostics`; the compiler includes neither that implementation nor performance observers.
 
 `rdna2_accumulator_cohort` runs the ordinary vector-word transfer once, then retains a
 broader existing cohort across a narrower, plain same-lane accumulation. It changes only the

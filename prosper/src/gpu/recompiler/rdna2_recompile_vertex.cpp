@@ -990,9 +990,11 @@ recompile_vertex(const uint32_t* code, size_t dwords, const ShaderResourceTable*
                  const PixelInputMapping* pixel_inputs, bool capture_position,
                  uint32_t virtual_lds_dwords, RecompileDiagnosticContext diagnostic,
                  FloatTransportConfig float_transport, GraphicsFloatMode float_mode) {
-    return recompile_vertex_impl(code, dwords, rt, pixel_inputs, capture_position,
-                                 virtual_lds_dwords, nullptr, false, false, diagnostic,
-                                 float_transport, float_mode);
+    return recompile_with_arbitrary_placeholders(diagnostic, [&] {
+        return recompile_vertex_impl(code, dwords, rt, pixel_inputs, capture_position,
+                                     virtual_lds_dwords, nullptr, false, false, diagnostic,
+                                     float_transport, float_mode);
+    });
 }
 
 std::vector<uint32_t> recompile_vertex_terminal_ngg_gate_for_test(

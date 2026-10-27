@@ -1,5 +1,9 @@
 # `diagnostics` — observation only
 
+`arbitrary_placeholder.cpp` implements the compiler-owned output observer port. It forwards
+only selected-program/read-site counts to `diagnostics/perf/arbitrary_placeholder`; it returns
+no value, changes no compiler fact and supplies no switch or guest input.
+
 **Nothing here is on a rendering path AT DEFAULT SETTINGS**, and that is the intended property:
 with nothing armed, code in this folder can be removed or rate-limited without changing a single
 rendered pixel.

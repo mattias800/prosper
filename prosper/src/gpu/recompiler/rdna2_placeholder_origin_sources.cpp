@@ -85,12 +85,7 @@ std::vector<PlaceholderWord> PlaceholderOriginTrace::sources(const Rdna2Inst& in
                 for (int reg : image_addresses(in)) words.push_back({PlaceholderFile::Vector, reg});
             } else if (((in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360u) ||
                         (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02u)) &&
-                       k == 0 &&
-                       std::any_of(program.instructions.begin(), program.instructions.end(),
-                                   [&](const auto& x) {
-                                       return x.fmt == Rdna2Format::VOP3 && x.opcode == 0x361u &&
-                                              x.dst.value == source.value;
-                                   })) {
+                       k == 0 && writelane_destinations.contains(source.value)) {
                 const int lane =
                     in.fmt == Rdna2Format::VOP3 && in.src[1].kind == OperandKind::InlineInt
                         ? in.src[1].value

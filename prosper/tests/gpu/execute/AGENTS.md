@@ -1,5 +1,9 @@
 # Execution-layer tests
 
+`test_arbitrary_placeholder_exec` runs the real exact64 production compute backend and checks
+both initialized low lanes and retained arbitrary high lanes. It keeps the actual device
+subgroup-contract gate and rejects CPU-fill substitution.
+
 These tests cover the contracts that turn decoded GPU work into executable operations: dependency
 ordering, draw realization, index interpretation, and compiled-shader cache identity. The cache tests
 compare emitted modules and warm-cache behavior without running a game; they are not visual or

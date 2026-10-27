@@ -1,5 +1,8 @@
 # `prosper/tests/fixtures/` — shared harnesses and hand-built inputs
 
+`arbitrary_placeholder.hpp` supplies synthetic integer programs and the explicit launch/output
+contract shared by the public-compiler interpreter witnesses and the exact64 GPU arm.
+
 Shared material that more than one test needs: the Vulkan/compute execution harnesses, and
 hand-constructed binary inputs (a synthetic PRX, an ATRAC9 vector, captured GTA V shader words) that
 would otherwise be pasted into each test that wants them. Nothing here is a test itself — every file

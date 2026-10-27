@@ -13,6 +13,7 @@ struct PlaceholderOriginTrace {
     ir::cfg::GuestCfg cfg;
     std::vector<std::vector<uint32_t>> predecessors;
     std::vector<bool> full_exec;
+    std::set<int> writelane_destinations;
     explicit PlaceholderOriginTrace(const PlaceholderOriginProgram&);
     bool writes(const Rdna2Inst&, PlaceholderWord) const;
     std::set<int> image_addresses(const Rdna2Inst&) const;

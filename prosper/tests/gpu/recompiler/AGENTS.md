@@ -1,5 +1,11 @@
 # `tests/gpu/recompiler` — translation tests and the legacy compute execution fixture
 
+`test_arbitrary_placeholder_execution` executes scalar relays, saved SDWA predicates, narrowed
+old values and repeated loop reads through the public compiler and integer interpreter.
+`test_arbitrary_placeholder_policy` keeps every non-unloaded root Hard, including a lost operand
+beside an unloaded one, and checks strict-first retry/metadata selection. Missing launch and
+spill twins retain their separate refusal contracts.
+
 `test_placeholder_origins` checks unloaded, unsupplied launch, unknown launch and spill roots,
 including relays, both merge predecessors and loop backedges. Public compiler refusals assert the
 same appended details while retaining their refusal class.

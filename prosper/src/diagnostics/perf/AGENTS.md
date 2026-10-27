@@ -7,6 +7,16 @@ sustain, logs and summaries. These observers must not change guest or renderer b
 Reuse existing counters at window close before adding event hooks. Rule tests construct both a
 failing population and an independent healthy control; an absent signal is NO DATA, not quiet.
 
+`arbitrary_placeholder` observes successful unloaded-only compiler retries (ADR 0038, #5497).
+`arbitrary-placeholder-admitted` fires in the first window with any program admission, with
+program and read-site counts. These are compilations and static sites in selected modules, not
+draws or executed lane reads. A checked population without admissions is quiet; no checked
+programs or admissions is NO DATA. The first admission of an address announces before flip
+windows too, and the registered exit report names every observed address and its totals.
+Unknown addresses remain unidentified. Window counters are independent relaxed observations;
+the mutex-protected inventory is a run snapshot, not guest-worker quiescence. Global alarm
+disable suppresses observation only and cannot change the compiler's admission policy.
+
 `rtt-colorless-publication` observes only slot-0 CPU pass-readback publications in the per-target
 loop. It counts an actual publication without a colour writer; legitimate extent aliases and
 prevented depth-only candidates are quiet. No evaluated candidates or violations means NO DATA.

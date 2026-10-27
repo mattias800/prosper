@@ -13,6 +13,9 @@ namespace prosper::gpu::detail {
 PlaceholderOriginTrace::PlaceholderOriginTrace(const PlaceholderOriginProgram& p)
     : program(p), cfg(ir::cfg::build_guest_cfg(p.instructions, {})),
       predecessors(p.instructions.size()), full_exec(p.instructions.size(), true) {
+    for (const auto& in : p.instructions)
+        if (in.fmt == Rdna2Format::VOP3 && in.opcode == 0x361u)
+            writelane_destinations.insert(in.dst.value);
     std::vector<bool> exits(cfg.blocks.size(), true);
     bool changed = true;
     while (changed) {
