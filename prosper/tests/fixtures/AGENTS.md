@@ -7,6 +7,8 @@ ordinary data/export and conditional-definition fixtures cover missing inputs af
 Written and missing spill fixtures distinguish a tracked arbitrary value from an untracked slot.
 ADDTID fixtures distinguish a provided LDS word from WRITELANE data lost by the ordinary VGPR
 representation; the wrong zero fallback is observable in the interpreter and exact64 GPU arm.
+Relative-bank fixtures keep unloaded alternatives beside a runtime-selected provided word;
+the erased-word twin distinguishes lost computation from genuinely unloaded storage.
 Partial-destination fixtures distinguish a provided old inactive word from a lost one, with a
 full-overwrite control and repeated named-slot writes to keep the domains separate.
 

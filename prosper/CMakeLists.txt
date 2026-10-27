@@ -2798,6 +2798,7 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_arbitrary_placeholder
     SOURCES tests/gpu/recompiler/test_arbitrary_placeholder_execution.cpp
             tests/gpu/recompiler/test_arbitrary_placeholder_policy.cpp
+            tests/gpu/recompiler/test_arbitrary_placeholder_relative.cpp
     INCLUDES tests tests/gpu/recompiler src
     LIBRARIES prosper_core)
   prosper_add_gtest(test_placeholder_origins

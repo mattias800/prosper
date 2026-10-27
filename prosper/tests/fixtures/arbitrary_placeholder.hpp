@@ -252,6 +252,23 @@ inline Words partial_old_expected() {
     result[0] = 22;
     return result;
 }
+
+inline Words relative_after_writelane(bool write_lane = true, bool provide_word = true) {
+    Words result{0x7e0a0285u};   // v5=5; M0 can also select explicitly unloaded v7/v8
+    if (provide_word) result.push_back(0x7e0c0287u);   // v6=7
+    if (write_lane) {
+        result.push_back(0xd7610006u);   // v_writelane v6,s0,0 retires ordinary v6 storage
+        result.push_back(0x00010000u);
+    }
+    const Words suffix{
+        0x877c8304u,   // M0=s4&3: runtime index, supplied s4=1 selects v6
+        0x7e028705u,   // v1=VGPR[5+M0]
+        0x7e12023cu, 0x7d841309u,   // independent unloaded s60 reflexive predicate
+        0xe0702000u, 0x80020100u, 0xbf810000u,
+    };
+    result.insert(result.end(), suffix.begin(), suffix.end());
+    return result;
+}
 inline Words expected(bool narrowed) {
     Words result(64, 11u);
     if (narrowed)

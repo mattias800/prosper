@@ -128,6 +128,7 @@ std::optional<bool> Vop1CaseRoutes::residual_routes(uint32_t& d, const bool& int
             // scheduling/hazard filler in real shaders)
 
         case 0x43: {   // v_movrels_b32: dst = VGPR[src0# + M0] (relative-indexed VGPR read)
+            if (refuse_arbitrary_placeholder_relative_source(b, rs, in, ok)) return true;
             // M0 is written by plain scalar ALU (s_mov/s_or m0, … decode dst as SGPR 124), so
             // its per-invocation value lives in rs.sreg[124]. The source register NUMBER is
             // src0# + M0 — a runtime value — so lower to a bounded select chain over every

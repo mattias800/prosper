@@ -620,6 +620,15 @@ executed lane reads. Failed retries publish their actual refusal and no admissio
 
 #### Ruled out during admission qualification (2026-10-27)
 
+- **An unloaded alternative authenticates an entire relative-register bank.** With runtime
+  `M0 = supplied_s4 & 3`, `v_movrels v1,v5` can select `v6` erased by a preceding WRITELANE.
+  Genuine `v5/v6` producers terminate their slices, while unloaded `v7/v8` alternatives leave
+  an unloaded-only root union at the later store. That union did not retain the lost selected
+  computation. The interpreter and exact64 GPU store 64 zeroes instead of `[13,7,...]`.
+  Check every potentially selected candidate at the actual bank reader, using the existing
+  bounded-index query and each word's independent provenance. Provided and genuinely unloaded
+  bank controls retain their values. [#5528](https://github.com/mattias800/prosper/pull/5528).
+
 - **Explicit operand guards cover implicit destination reads.** A partial EXEC write after
   WRITELANE preserves the ordinary old destination. Without an actual old-word guard, the
   interpreter and exact64 GPU observe `[22,0,...]` instead of `[22,7,...]`. The existing

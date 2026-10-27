@@ -43,6 +43,8 @@ addresses, predicates and route order remain with their family lowerings.
 `emit_alu` also checks ordinary old-destination reads before lowering, using the existing
 old-word predicate. This includes inactive-lane preservation, subword preservation and implicit
 accumulation; complete overwrites and slot-map writers retain their separate contracts.
+The legacy MOVRELS reader also checks every bounded bank candidate before its direct map read;
+an unloaded alternative cannot supply another candidate's lost provided value.
 
 `bvh_case_routes.*` owns the existing MIMG BVH branch, including guarded node loads, triangle
 and box calculations, sorting and destination predication. Its continuation methods keep original

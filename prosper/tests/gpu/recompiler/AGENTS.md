@@ -398,6 +398,10 @@ physical-width inventory covers every known VOP3P source through the canonical e
 Partial-launch native and dispatcher witnesses keep unrelated packed reads from demanding
 physical DATA for Bool-only mask logic; numeric VCC high words retain independent poison checks.
 
+`test_arbitrary_placeholder_relative` covers runtime bank selection beside unloaded alternatives.
+The lost provided candidate stays Hard; provided and genuinely unloaded selected words retain
+their interpreter values. Removing the actual bank guard must expose the lost computation.
+
 Hard-input controls use a launch word that is genuinely unknown (the possible scratch-offset
 SGPR), or an untracked spill. A never-loaded ordinary SGPR is Arbitrary under ADR 0038 and
 cannot stand in for a missing meaningful input. Keep the original consumer/branch positions

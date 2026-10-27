@@ -3,6 +3,8 @@
 `test_arbitrary_placeholder_exec` runs the real exact64 production compute backend and checks
 both initialized low lanes and retained arbitrary high lanes. It keeps the actual device
 subgroup-contract gate and rejects CPU-fill substitution.
+Runtime-relative bank cases retain provided or genuinely unloaded selected values and reject a
+lost provided candidate even when other possible candidates are unloaded.
 
 These tests cover the contracts that turn decoded GPU work into executable operations: dependency
 ordering, draw realization, index interpretation, and compiled-shader cache identity. The cache tests

@@ -1,5 +1,10 @@
 # `recompiler` — RDNA2 machine code → SPIR-V
 
+`rdna2_arbitrary_placeholder_relative` guards each potentially selected VGPR at the legacy
+MOVRELS bank reader during admission retries. The existing bounded-index query supplies no
+register values: every candidate retains its own provenance check, and an unbounded or
+out-of-range index keeps an explicit unmodelled-transfer refusal.
+
 `rdna2_diagnostic_identity` keeps the primary refusal identity separate from the printed root
 envelope. Bounded compile-case records retain that identity; complete terminal diagnostics retain
 the roots. Neither changes compiler inputs or admission.
