@@ -21,7 +21,7 @@ Compilation compile(const fixture::Words& words, const ComputeShaderConfig& laun
                                     {RecompileDiagnosticStage::Compute, address});
     return {std::move(result), last_terminal_reject_reason(address)};
 }
-void witness(const fixture::Words& words, bool narrowed = false) {
+void witness_values(const fixture::Words& words, const fixture::Words& expected) {
     const auto result = compile(words, fixture::config());
     ASSERT_FALSE(result.module.empty()) << result.reason;
     bpermute_oracle::Interpreter vm(result.module);
@@ -29,12 +29,23 @@ void witness(const fixture::Words& words, bool narrowed = false) {
     vm.supplied_push_constants = fixture::config().user_sgprs;
     const auto actual = vm.run(64, fixture::Words(64, 0xdeadbeefu));
     ASSERT_TRUE(vm.error.empty()) << vm.error;
-    EXPECT_EQ(actual, fixture::expected(narrowed));
+    EXPECT_EQ(actual, expected);
+}
+void witness(const fixture::Words& words, bool narrowed = false) {
+    witness_values(words, fixture::expected(narrowed));
 }
 } // namespace
 
 TEST(ArbitraryPlaceholderExecution, AScalarRelayRetainsOneConsistentValue) {
     witness(fixture::scalar_relay());
+}
+
+TEST(ArbitraryPlaceholderExecution, AFloatPredicateReadsTheSameZeroBits) {
+    witness(fixture::floating_predicate());
+}
+
+TEST(ArbitraryPlaceholderExecution, CmpxChangesExecAndPreservesInactiveOutput) {
+    witness_values(fixture::cmpx_predicate(), fixture::cmpx_expected());
 }
 
 TEST(ArbitraryPlaceholderExecution, ASdwaSavedPredicateRetainsTheSameArbitraryValue) {

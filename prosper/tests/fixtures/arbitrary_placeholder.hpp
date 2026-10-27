@@ -50,6 +50,27 @@ inline Words scalar_relay() {
     append_output(result);
     return result;
 }
+inline Words floating_predicate() {
+    Words result{0x7e0c023cu, 0x7c040c80u};   // v6=s60; v_cmp_eq_f32 vcc,0,v6
+    append_output(result);
+    return result;
+}
+inline Words cmpx_predicate() {
+    return {
+        0x7e020296u,   // v1=22 in every lane before EXEC changes
+        0x7e0c023cu,   // v6=s60, the existing zero placeholder
+        0xbe94047eu,   // save full EXEC in s[20:21]
+        0x7da40106u,   // v_cmpx_eq_u32 exec,v6,v0: only logical lane0 remains
+        0x7e02028bu,   // v1=11 only in that lane
+        0xbefe0414u,   // restore full EXEC
+        0xe0702000u, 0x80020100u, 0xbf810000u,
+    };
+}
+inline Words cmpx_expected() {
+    Words result(64, 22);
+    result[0] = 11;
+    return result;
+}
 inline Words narrowed_writer() {
     Words result{
         0x7e0c023cu,   // v_mov_b32 v6,s60: explicitly unloaded scalar relay

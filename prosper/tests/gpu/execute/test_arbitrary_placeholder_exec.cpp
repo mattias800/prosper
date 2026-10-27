@@ -9,7 +9,8 @@ namespace fixture = prosper::test::arbitrary_placeholder;
 namespace live = prosper::frontend;
 using namespace prosper::gpu;
 
-TEST(ArbitraryPlaceholderGpu, TheActualWaveKeepsBothHalvesOfTheRetainedValue) {
+namespace {
+void execute(const fixture::Words& code, const fixture::Words& expected, uint64_t address) {
     ASSERT_TRUE(prosper::test::render_vk_ctx().ok);
     const auto shared = shared_vulkan_context();
     ASSERT_TRUE(shared.valid());
@@ -21,9 +22,8 @@ TEST(ArbitraryPlaceholderGpu, TheActualWaveKeepsBothHalvesOfTheRetainedValue) {
     ASSERT_TRUE(device.adopted);
     fixture::Words output(64, 0xdeadbeefu);
     auto resources = fixture::table(reinterpret_cast<uint64_t>(output.data()));
-    const auto code = fixture::narrowed_writer();
     ComputeItem item;
-    item.code_addr = 0x5497b00200ull;
+    item.code_addr = address;
     item.spirv = recompile_compute(code.data(), code.size(), &resources, fixture::config(),
                                    {RecompileDiagnosticStage::Compute, item.code_addr});
     ASSERT_FALSE(item.spirv.empty()) << last_terminal_reject_reason(item.code_addr);
@@ -38,5 +38,14 @@ TEST(ArbitraryPlaceholderGpu, TheActualWaveKeepsBothHalvesOfTheRetainedValue) {
     const auto cpu = live::live_compute_cpu_fill_dispatches();
     ASSERT_TRUE(live::execute_live_compute_items({item}));
     EXPECT_EQ(live::live_compute_cpu_fill_dispatches(), cpu);
-    EXPECT_EQ(output, fixture::expected(true));
+    EXPECT_EQ(output, expected);
+}
+} // namespace
+
+TEST(ArbitraryPlaceholderGpu, TheActualWaveKeepsBothHalvesOfTheRetainedValue) {
+    execute(fixture::narrowed_writer(), fixture::expected(true), 0x5497b00200ull);
+}
+
+TEST(ArbitraryPlaceholderGpu, CmpxKeepsExactlyOneLogicalLaneActive) {
+    execute(fixture::cmpx_predicate(), fixture::cmpx_expected(), 0x5497b00600ull);
 }

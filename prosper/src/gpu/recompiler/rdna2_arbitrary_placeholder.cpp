@@ -44,8 +44,7 @@ recompile_with_arbitrary_placeholders(const RecompileDiagnosticContext& diagnost
     RecompileDiagnosticAttempt retry;
     module = compile();
     if (module.empty()) {
-        retry.discard();
-        original.commit();
+        original.replace_with(retry);
         return module;
     }
     original.replace_with(retry);

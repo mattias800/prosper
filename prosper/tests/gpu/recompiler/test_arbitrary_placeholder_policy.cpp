@@ -107,6 +107,29 @@ TEST(ArbitraryPlaceholderPolicy, SelectingANestedAttemptKeepsOnlyItsDiagnostics)
     EXPECT_EQ(records.front().second.find("original record"), std::string::npos);
 }
 
+TEST(ArbitraryPlaceholderPolicy, ARejectedRetryReportsItsActualHardCause) {
+    constexpr uint64_t address = 0x5497b00500ull;
+    const RecompileDiagnosticContext context{RecompileDiagnosticStage::Compute, address};
+    TerminalRejectCapture capture;
+    unsigned attempts = 0;
+    const auto result = recompile_with_arbitrary_placeholders(context, [&] {
+        SpirvCompute b;
+        const bool first = ++attempts == 1;
+        const auto input = roots(first ? PlaceholderOrigin::Unloaded : PlaceholderOrigin::Spill);
+        EXPECT_FALSE(
+            admit_arbitrary_placeholder_read(b, 7, ArbitraryPlaceholderRead::FreshMask, input));
+        log_recompile_diagnostic(context, "recompile-reject", "terminal",
+                                 first ? "original unloaded refusal" : "actual missing spill");
+        return std::vector<uint32_t>{};
+    });
+    EXPECT_TRUE(result.empty());
+    EXPECT_EQ(attempts, 2u);
+    const auto records = capture.take();
+    ASSERT_EQ(records.size(), 1u);
+    EXPECT_NE(records.front().second.find("actual missing spill"), std::string::npos);
+    EXPECT_EQ(records.front().second.find("original unloaded refusal"), std::string::npos);
+}
+
 TEST(ArbitraryPlaceholderPolicy, ActualCompilerAdmissionReachesTheWindowAndExitReport) {
     namespace fixture = prosper::test::arbitrary_placeholder;
     namespace perf = prosper::diagnostics::perf;
