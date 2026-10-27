@@ -22,8 +22,10 @@ bool lower_ds_case(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok,
     // existing wave_append model was landed and live-validated against exactly those
     // packets (#554/#580). Kept as a documented per-workgroup approximation of the
     // device-global counter (exact for the exercised dispatch shapes). CONFIDENCE: MED.
-    if (b.is_compute && in.ds_gds && in.opcode == 0x36)   // the plain GDS read (#4553)
+    if (b.is_compute && in.ds_gds && in.opcode == 0x36) { // the plain GDS read (#4553)
+        if (refuse_arbitrary_placeholder_operand(b, rs, in, in.src[0], &ok)) return true;
         return emit_compute_gds_read(b, rs, in);
+    }
     if (in.ds_gds && in.opcode != 0x3d && in.opcode != 0x3e &&
         !(b.is_compute && in.opcode == 0x0d)) {
         ok = false;
@@ -38,6 +40,8 @@ bool lower_ds_case(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok,
     // Astro Bot's world-map material kernel uses several such lane arrays before reducing
     // them through explicit DS reads and barriers.
     if (b.is_compute && (in.opcode == 0xb0 || in.opcode == 0xb1)) {
+        if (refuse_arbitrary_placeholder_operand(b, rs, in, {OperandKind::Special, 124}, &ok))
+            return true;
         auto m0 = rs.sreg.find(124);
         if (m0 == rs.sreg.end()) {
             ok = false;
@@ -54,9 +58,9 @@ bool lower_ds_case(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok,
                                           b.ibin(Op_ShiftLeftLogical, tid, b.uconst(2)));
         const uint32_t idx = b.ibin(Op_ShiftRightLogical, byte_addr, b.uconst(2));
         if (in.opcode == 0xb0) {
-            auto value = rs.vreg.find(in.src[1].value);
-            b.lds_store(idx, value == rs.vreg.end() ? b.uconst(0) : value->second, rs.exec_narrowed,
-                        rs.exec, b.atomicized_lds_store_pcs.contains(in.pc));
+            const auto value = read_vector_for_arbitrary_retry(b, rs, in, in.src[1].value, ok);
+            b.lds_store(idx, value, rs.exec_narrowed, rs.exec,
+                        b.atomicized_lds_store_pcs.contains(in.pc));
         } else {
             const uint32_t old = vreg_old(b, rs, in.dst.value);
             rs.vreg[in.dst.value] = b.lds_load(idx, rs.exec_narrowed, rs.exec, old);
@@ -73,8 +77,11 @@ bool lower_ds_case(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok,
     // 0xdac00000/0x00000f00 -> ds_write_addtid_b32 v15; llvm-mc gfx1030:
     // 0xdac40000/0x0f000000 -> ds_read_addtid_b32 v15).
     if (in.opcode == 0xb0 || in.opcode == 0xb1) {
+        if (refuse_arbitrary_placeholder_operand(b, rs, in, {OperandKind::Special, 124}, &ok))
+            return true;
         auto m0 = rs.sreg.find(124);
         if (in.opcode == 0xb0) {
+            if (refuse_arbitrary_placeholder_operand(b, rs, in, in.src[1], &ok)) return true;
             if (m0 != rs.sreg.end()) record_addtid_spill(b, rs, in, m0->second);
             return true;   // spill: unobservable beyond the tracked slot
         }
@@ -93,6 +100,8 @@ bool lower_ds_case(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok,
         return true;
     }
     if (in.opcode == 0x3d || in.opcode == 0x3e) {
+        if (refuse_arbitrary_placeholder_operand(b, rs, in, {OperandKind::Special, 124}, &ok))
+            return true;
         auto m0 = rs.sreg.find(124);
         if (!allow_wave || m0 == rs.sreg.end()) {
             ok = false;

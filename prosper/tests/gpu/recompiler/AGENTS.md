@@ -3,6 +3,9 @@
 `test_arbitrary_placeholder_execution` executes scalar relays, saved SDWA predicates, narrowed
 old values, scalar/vector loop carries and a real supplied scalar-buffer load through the public
 compiler and integer interpreter.
+Early DS reader controls keep lost WRITELANE data and unknown implicit M0 inputs Hard. The
+ADDTID mutation exposes zero instead of the initialized per-lane values through real LDS;
+the provided-word control still executes. Shuffle and plain GDS readers retain the same boundary.
 `test_arbitrary_placeholder_policy` keeps every non-unloaded root Hard, including a lost operand
 beside an unloaded one, and checks strict-first retry/metadata selection. Missing launch and
 spill twins retain their separate refusal contracts. Lane-varying READFIRST loops and straight-line

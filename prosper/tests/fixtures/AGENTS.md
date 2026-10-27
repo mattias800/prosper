@@ -5,6 +5,8 @@ contract shared by the public-compiler interpreter witnesses and the exact64 GPU
 fixtures distinguish varying, agreeing and admission-independent scalar publications. Independent
 ordinary data/export and conditional-definition fixtures cover missing inputs after admission.
 Written and missing spill fixtures distinguish a tracked arbitrary value from an untracked slot.
+ADDTID fixtures distinguish a provided LDS word from WRITELANE data lost by the ordinary VGPR
+representation; the wrong zero fallback is observable in the interpreter and exact64 GPU arm.
 
 Shared material that more than one test needs: the Vulkan/compute execution harnesses, and
 hand-constructed binary inputs (a synthetic PRX, an ATRAC9 vector, captured GTA V shader words) that

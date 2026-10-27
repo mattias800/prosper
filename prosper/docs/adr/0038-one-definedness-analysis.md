@@ -588,11 +588,11 @@ This does not establish that their retries reached the old predicate PCs. `ps_40
 `v0/v1` alongside unloaded roots. Fresh live captures and visible portrait verification remain
 necessary; these are not claimed as accepted modules.
 
-Thirteen synthetic interpreter witnesses fail against the merged diagnostic-only compiler and
+Fourteen synthetic interpreter witnesses fail against the merged diagnostic-only compiler and
 pass with admission. They cover integer/float predicates, CMPX, saved SDWA predicates, narrowed
 writes, vector/scalar loop carries, scalar and READLANE relays, implicit scalar compares, ordinary
 data reads beside an unloaded predicate, real scalar-buffer data, and a provided spill containing
-an unloaded value. Seven actual exact64 GPU dispatches exercise both wave halves, CMPX's active
+an unloaded value. Eight actual exact64 GPU dispatches exercise both wave halves, CMPX's active
 lane count, and the relay/data/spill paths. Five existing selector/loop fixtures also execute both
 scalar branch inputs; real missing spills remain refused. An agreeing READFIRST source retains its
 established proof. All exported synthetic modules validate. Three loop originals whose computed
@@ -617,6 +617,14 @@ summary. Window counts are successful retry compilations and static read sites, 
 executed lane reads. Failed retries publish their actual refusal and no admission count.
 
 #### Ruled out during admission qualification (2026-10-27)
+
+- **The ordinary LDS callback protects every DS input read.** Compute ADDTID returns before
+  that callback. After `v6=7; writelane v6,s0,0` with supplied `s0=13`, its direct store silently
+  substituted zero for the erased ordinary VGPR. A genuine ADDTID reload hid the lost source.
+  With an independent unloaded equality predicate, the interpreter stored zero in all 64 lanes,
+  rather than lane0=13 and the other lanes=7; the module still passed `spirv-val`. Guard the actual
+  early store. The audited early GDS/shuffle readers and implicit M0 reads use the same boundary.
+  Missing computations retain `lost-definition` even when their original operands were genuine.
 
 - **An unloaded predicate makes unrelated ordinary reads safe.** Synthetic retries still read an
   unknown possible scratch-offset `s12`, or export/store an unsupplied fragment launch `v0`.

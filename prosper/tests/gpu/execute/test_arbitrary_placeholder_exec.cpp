@@ -14,11 +14,12 @@ namespace live = prosper::frontend;
 using namespace prosper::gpu;
 
 namespace {
-void execute(const fixture::Words& code, const fixture::Words& expected, uint64_t address) {
+void execute(const fixture::Words& code, const fixture::Words& expected, uint64_t address,
+             const ComputeShaderConfig& launch = fixture::config()) {
     ASSERT_TRUE(prosper::test::render_vk_ctx().ok);
     const auto shared = shared_vulkan_context();
     ASSERT_TRUE(shared.valid());
-    if (select_native_compute_subgroup_size(shared, fixture::config(), false, false) != 64)
+    if (select_native_compute_subgroup_size(shared, launch, false, false) != 64)
         GTEST_SKIP() << "enabled exact64 subgroup contract unavailable";
     live::execute_live_compute_items({});
     const auto device = live::live_compute_storage_image_device();
@@ -28,14 +29,14 @@ void execute(const fixture::Words& code, const fixture::Words& expected, uint64_
     auto resources = fixture::table(reinterpret_cast<uint64_t>(output.data()));
     ComputeItem item;
     item.code_addr = address;
-    item.spirv = recompile_compute(code.data(), code.size(), &resources, fixture::config(),
+    item.spirv = recompile_compute(code.data(), code.size(), &resources, launch,
                                    {RecompileDiagnosticStage::Compute, item.code_addr});
     ASSERT_FALSE(item.spirv.empty()) << last_terminal_reject_reason(item.code_addr);
     item.required_subgroup_size = 64;
     item.resources = std::make_shared<ShaderResourceTable>(resources);
-    item.user_sgprs = fixture::config().user_sgprs;
+    item.user_sgprs = launch.user_sgprs;
     item.recompile_config_available = true;
-    item.recompile_config = fixture::config();
+    item.recompile_config = launch;
     item.launch.local_x = item.launch.threads_x = 64;
     item.launch.local_y = item.launch.local_z = item.launch.threads_y = item.launch.threads_z = 1;
     item.launch.groups_x = item.launch.groups_y = item.launch.groups_z = 1;
@@ -94,4 +95,32 @@ TEST(ArbitraryPlaceholderGpu, AnUnloadedImplicitScalarCompareKeepsTheSameWaveBra
 
 TEST(ArbitraryPlaceholderGpu, AnActuallyWrittenUnloadedSpillKeepsTheSameWordAcrossTheWave) {
     execute(fixture::written_unloaded_spill(), fixture::Words(64, 0), 0x5497b01600ull);
+}
+
+TEST(ArbitraryPlaceholderGpu, AProvidedAddtidStoreKeepsItsRealLdsData) {
+    auto launch = fixture::config();
+    launch.user_sgprs[0] = 13;
+    launch.lds_bytes = 256;
+    execute(fixture::addtid_after_writelane(false), fixture::Words(64, 7), 0x5497b02200ull, launch);
+}
+
+TEST(ArbitraryPlaceholderGpu, AnEarlyAddtidStoreCannotReplaceAWritelaneValueWithZero) {
+    const auto words = fixture::addtid_after_writelane();
+    const auto resources = fixture::table();
+    auto launch = fixture::config();
+    launch.user_sgprs[0] = 13;
+    launch.lds_bytes = 256;
+    constexpr uint64_t address = 0x5497b02300ull;
+    const auto module = recompile_compute(words.data(), words.size(), &resources, launch,
+                                          {RecompileDiagnosticStage::Compute, address});
+    EXPECT_TRUE(module.empty());
+    if (module.empty()) {
+        EXPECT_NE(last_terminal_reject_reason(address).find("origin=lost-definition word=v6"),
+                  std::string::npos);
+    } else {
+        // An unsafe guard-removal mutation must be detected by an actual exact64 dispatch.
+        fixture::Words expected(64, 7);
+        expected[0] = 13;
+        execute(words, expected, address, launch);
+    }
 }

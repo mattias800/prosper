@@ -36,6 +36,11 @@ set; the relocation preserves the direct-emission path.
 to the emitter's original locals. Descriptor resolution, access and disposition reporting remain
 in `emit_alu`; the classifier preserves the original unsupported-opcode refusal.
 
+The DS routes guard actual retry input reads before their early returns: compute/graphics ADDTID,
+plain GDS reads, implicit M0 readers, and DS shuffle inputs share the arbitrary-input boundary.
+The ordinary LDS callback alone cannot protect those early routes. Existing stored values,
+addresses, predicates and route order remain with their family lowerings.
+
 `bvh_case_routes.*` owns the existing MIMG BVH branch, including guarded node loads, triangle
 and box calculations, sorting and destination predication. Its continuation methods keep original
 local declarations alive while later stages borrow their references and existing callbacks.

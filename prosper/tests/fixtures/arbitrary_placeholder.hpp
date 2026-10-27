@@ -225,6 +225,17 @@ inline Words written_unloaded_spill() {
             0xd7600014u, 0x000101ffu,   // read that provided slot into s20
             0x7e020214u, 0xe0702000u, 0x80020100u, 0xbf810000u};
 }
+inline Words addtid_after_writelane(bool write_lane = true) {
+    Words result{0x7e0c0287u};   // v6 = 7
+    if (write_lane) result.insert(result.end(), {0xd7610006u, 0x00010000u});   // lane0 = s0
+    result.insert(result.end(),
+                  {0xb07c0000u, 0xdac00000u, 0x00000600u, 0xbf8cc07fu,   // M0=0; spill v6
+                   0xdac40000u, 0x01000000u, 0xbf8cc07fu,   // reload v1
+                   0x7e0e023cu, 0x7d840f07u,   // unloaded v7; VCC=(v7==v7)
+                   0xd1010001u, 0x01aa0296u,   // v1 = VCC ? v1 : 22
+                   0xe0702000u, 0x80020100u, 0xbf810000u});
+    return result;
+}
 inline Words expected(bool narrowed) {
     Words result(64, 11u);
     if (narrowed)

@@ -3,6 +3,7 @@
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/rdna2_diagnostic_attempt.hpp"
+#include "gpu/recompiler/ir/lower/ds_case_lowering.hpp"
 #include "diagnostics/perf/perf_ledger.hpp"
 #include <vector>
 #include <memory>
@@ -366,5 +367,89 @@ TEST(ArbitraryPlaceholderPolicy, ACarriedOrdinaryValueCannotHideAnUntrackedSpill
         std::string reason;
         for (const auto& [tag, payload] : capture.take()) reason += tag + payload;
         EXPECT_NE(reason.find("origin=spill word=spill-v255:0"), std::string::npos) << reason;
+    }
+}
+
+TEST(ArbitraryPlaceholderPolicy, AnEarlyAddtidStoreCannotReplaceARetainedWritelaneValueWithZero) {
+    namespace fixture = prosper::test::arbitrary_placeholder;
+    const auto words = fixture::addtid_after_writelane();
+    const auto resources = fixture::table();
+    auto launch = fixture::config();
+    launch.user_sgprs[0] = 13;
+    launch.lds_bytes = 256;
+    constexpr uint64_t address = 0x5497b02000ull;
+    const auto module = recompile_compute(words.data(), words.size(), &resources, launch,
+                                          {RecompileDiagnosticStage::Compute, address});
+    EXPECT_TRUE(module.empty());
+    if (module.empty()) {
+        const auto reason = last_terminal_reject_reason(address);
+        EXPECT_NE(reason.find("hard-placeholder-read pc=4"), std::string::npos) << reason;
+        EXPECT_NE(reason.find("origin=lost-definition word=v6"), std::string::npos) << reason;
+    } else {
+        // Removing the actual early-reader guard must expose the wrong LDS value, not just
+        // make a diagnostic disappear. WRITELANE preserves the other 63 initialized lanes.
+        bpermute_oracle::Interpreter vm(module);
+        vm.native_subgroup_width = 64;
+        vm.supplied_push_constants = launch.user_sgprs;
+        const auto actual = vm.run(64, fixture::Words(64, 0xdeadbeefu));
+        ASSERT_TRUE(vm.error.empty()) << vm.error;
+        fixture::Words expected(64, 7);
+        expected[0] = 13;
+        EXPECT_EQ(actual, expected);
+    }
+}
+
+TEST(ArbitraryPlaceholderPolicy, EarlyDsShuffleAndGdsReadersCannotPublishALostOrdinaryWord) {
+    namespace fixture = prosper::test::arbitrary_placeholder;
+    for (uint32_t operation : {0xdacc0000u, 0xd8d4801fu, 0xd8da0000u}) {
+        SCOPED_TRACE(operation);
+        auto words = fixture::addtid_after_writelane();
+        words[4] = operation;
+        words[5] = operation == 0xdacc0000u ? 0x01000600u : 0x01000006u;
+        words[7] = words[8] = 0xbf800000u; // use the direct result, without the ADDTID reload
+        const auto resources = fixture::table();
+        auto launch = fixture::config();
+        launch.user_sgprs[0] = 13;
+        launch.lds_bytes = 256;
+        const uint64_t address = 0x5497b02100ull + operation;
+        const auto module = recompile_compute(words.data(), words.size(), &resources, launch,
+                                              {RecompileDiagnosticStage::Compute, address});
+        EXPECT_TRUE(module.empty()) << operation;
+        const auto reason = last_terminal_reject_reason(address);
+        EXPECT_NE(reason.find("hard-placeholder-read pc=4"), std::string::npos) << reason;
+        EXPECT_NE(reason.find("origin=lost-definition word=v6"), std::string::npos) << reason;
+    }
+}
+
+TEST(ArbitraryPlaceholderPolicy, EarlyDsImplicitM0ReadersKeepAnUnknownLaunchRootHard) {
+    // Model a join's present but fabricated M0 SSA. A value in the map is not a supplied input.
+    for (unsigned family : {0u, 1u, 2u}) {
+        SCOPED_TRACE(family);
+        const uint32_t words[]{family == 2 ? 0xd8f40000u : 0xdac00000u, 0x00000600u};
+        auto program = std::make_shared<PlaceholderOriginProgram>();
+        ASSERT_EQ(rdna2_walk(words, 2, program->instructions), 2u);
+        std::string reason;
+        const auto module = recompile_with_arbitrary_placeholders({}, [&] {
+            SpirvCompute b;
+            b.begin(1, nullptr, 64, 1, 1, 64, 0, true, true);
+            b.native_subgroup_size = 64;
+            b.is_compute = family != 1;
+            b.is_fragment = family == 1;
+            RegState rs;
+            rs.exec = b.btrue();
+            rs.sreg[124] = b.uconst(0);
+            rs.sreg_merge_placeholder.insert(124);
+            rs.vreg[6] = b.uconst(7);
+            rs.placeholder_origin_program = program;
+            if (!admit_arbitrary_placeholder_read(b, 0, ArbitraryPlaceholderRead::FreshMask,
+                                                  roots(PlaceholderOrigin::Unloaded)))
+                return std::vector<uint32_t>{};
+            bool ok = true;
+            ir::lower_ds_case(b, rs, program->instructions[0], ok, true);
+            if (b.diagnostic.placeholder_origins) reason = *b.diagnostic.placeholder_origins;
+            return ok ? b.finish() : std::vector<uint32_t>{};
+        });
+        EXPECT_TRUE(module.empty()) << family;
+        EXPECT_NE(reason.find("origin=unknown-launch word=s124"), std::string::npos) << reason;
     }
 }

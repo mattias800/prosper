@@ -39,6 +39,22 @@ void witness(const fixture::Words& words, bool narrowed = false) {
 }
 } // namespace
 
+TEST(ArbitraryPlaceholderExecution, AProvidedAddtidStoreKeepsItsDataBesideAnUnloadedPredicate) {
+    const auto words = fixture::addtid_after_writelane(false);
+    const auto resources = fixture::table();
+    auto launch = fixture::config();
+    launch.user_sgprs[0] = 13;
+    launch.lds_bytes = 256;
+    const auto module = recompile_compute(words.data(), words.size(), &resources, launch);
+    ASSERT_FALSE(module.empty());
+    bpermute_oracle::Interpreter vm(module);
+    vm.native_subgroup_width = 64;
+    vm.supplied_push_constants = launch.user_sgprs;
+    const auto actual = vm.run(64, fixture::Words(64, 0xdeadbeefu));
+    ASSERT_TRUE(vm.error.empty()) << vm.error;
+    EXPECT_EQ(actual, fixture::Words(64, 7));
+}
+
 TEST(ArbitraryPlaceholderExecution, AScalarRelayRetainsOneConsistentValue) {
     witness(fixture::scalar_relay());
 }
