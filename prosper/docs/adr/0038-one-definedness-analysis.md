@@ -555,6 +555,10 @@ The same 4,000-entry corpus compares 3,567 recorded-input replays and 433 stage 
 | unmodelled-scalar-publication | 6 | 6 |
 | spill / trace-budget / unreachable | 0 | 0 |
 
+These counts use the recorded terminal identities. Some Wave64 dispatcher summaries omit a
+lowering's named cause even when its auxiliary diagnostic retains it (#5529). The table covers
+the 567 identified entries; it is not a complete inventory of every auxiliary policy refusal.
+
 The 27 dumped GTA/Kena programs retain the preceding measurement's nine accepted, fifteen refused
 and three missing-sidecar results. All nine accepted modules validate and retain their hashes.
 The remaining five fresh-mask GTA fragments report:
@@ -596,6 +600,12 @@ summary. Window counts are successful retry compilations and static read sites, 
 executed lane reads. Failed retries publish their actual refusal and no admission count.
 
 #### Ruled out during admission qualification (2026-10-27)
+
+- **The final public reason identifies every forced-dispatcher cause.** The delayed vector-body
+  fixture's default route reports `exec-loop-widens`; its forced Wave64 dispatcher separately
+  records the missing READFIRST publication at pc22. Its auxiliary record includes the origin,
+  but the final generic unresolved-operand record overwrites the named cause. Tests inspect
+  the full capture from the explicit route. Tracked separately in [#5529](https://github.com/mattias800/prosper/issues/5529).
 
 - **An unloaded address alone makes every memory result Arbitrary.** The unchanged #5193
   atomic/store-return and cross-lane LDS refusal twins exposed a missing dependency in the
