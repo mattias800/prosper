@@ -531,34 +531,36 @@ dispatcher broadcasts do not pass through that lane-local lowering.
 
 The same 4,000-entry corpus compares 3,567 recorded-input replays and 433 stage probes:
 
-- One compute entry becomes accepted, with unloaded-only roots at both fresh CMPX reads
-  (PCs 34 and 43). Its emitted module passes `spirv-val`.
+- No corpus entry becomes accepted. The compute entry that passed the fresh CMPX reads at
+  PCs 34 and 43 in an earlier candidate now reaches a Hard implicit old-destination read at
+  pc46, with unproved memory-result roots. Passing an unloaded predicate cannot waive this
+  separate obligation.
 - No accepted output changes and no accepted program becomes refused. The comparison hashes
   1,538 existing outputs; supplemental exports through the identical public table-less compute
   entry point hash the other five, also unchanged. All ten supplemental modules validate.
-- Ten entries remain refused with a changed reason: seven stop earlier and three reach later
+- Eleven entries remain refused with a changed reason: eight stop earlier and three reach later
   Hard reads. These retain lost definitions, missing scalar publications, memory-result or
   unresolved-operand obligations. One previously refused fragment replay becomes incomplete
   because its old semantic-read trace cannot supply the new compilation sequence. No missing
   choice is guessed.
-- The terminal policy-1 cohort has 570 entries. Origin groups overlap; none has only unloaded
+- The terminal policy-1 cohort has 571 entries. Origin groups overlap; none has only unloaded
   roots and none is unclassified.
 
 | Origin | Terminal entries | Terminal roots | Entries including auxiliary causes | Roots including auxiliary causes |
 | --- | ---: | ---: | ---: | ---: |
-| unloaded (mixed with Hard roots) | 35 | 1,343 | 138 | 3,669 |
+| unloaded (mixed with Hard roots) | 36 | 1,358 | 139 | 3,684 |
 | launch-input | 473 | 478 | 476 | 482 |
-| unknown-launch | 71 | 573 | 648 | 2,906 |
-| lost-definition | 12 | 12 | 31 | 34 |
+| unknown-launch | 72 | 585 | 649 | 2,918 |
+| lost-definition | 12 | 12 | 31 | 31 |
 | unmodelled-transfer | 5 | 5 | 8 | 8 |
-| unproved-memory-result | 17 | 333 | 42 | 1,088 |
+| unproved-memory-result | 18 | 357 | 43 | 1,113 |
 | unproved-strong-read | 1 | 1 | 1 | 1 |
 | unmodelled-scalar-publication | 3 | 3 | 3 | 3 |
 | spill / trace-budget / unreachable | 0 | 0 | 0 | 0 |
 
 Some Wave64 dispatcher summaries omit a lowering's named cause even when its auxiliary
 record retains it (#5529). Retaining the full `PROSPER_DBG=1` diagnostic stream from the same
-invocations identifies **957 refused entries with a named policy record**, including the 570
+invocations identifies **958 refused entries with a named policy record**, including the 571
 terminal entries and 387 additional auxiliary entries (330 recorded-input replays, 57 stage
 probes). Auxiliary roots include failed alternative lowering paths; they are not all the final
 refusal's dependencies. The last two columns union each refused entry's terminal and auxiliary
