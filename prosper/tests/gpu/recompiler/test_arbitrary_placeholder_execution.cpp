@@ -112,3 +112,7 @@ TEST(ArbitraryPlaceholderExecution, ALoadedButUnsuppliedPixelWordStillRefuses) {
     const auto reason = last_terminal_reject_reason(address);
     EXPECT_NE(reason.find("origin=launch-input word=v0"), std::string::npos) << reason;
 }
+
+TEST(ArbitraryPlaceholderExecution, AnAgreeingReadfirstSourceRetainsItsEstablishedProof) {
+    witness(fixture::agreeing_readfirst_relay());
+}

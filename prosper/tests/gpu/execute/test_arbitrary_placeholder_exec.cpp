@@ -57,3 +57,25 @@ TEST(ArbitraryPlaceholderGpu, CmpxKeepsExactlyOneLogicalLaneActive) {
 TEST(ArbitraryPlaceholderGpu, TheScalarPairLoopKeepsTheCurrentValueInBothHalves) {
     execute(fixture::scalar_loop_relay(), fixture::Words(64, 22), 0x5497b00700ull);
 }
+
+TEST(ArbitraryPlaceholderGpu, MissingReadfirstPublicationsStayHardInStraightAndLoopPrograms) {
+    for (bool loop : {false, true}) {
+        SCOPED_TRACE(loop ? "loop" : "straight");
+        const auto words =
+            loop ? fixture::readfirst_loop_relay() : fixture::readfirst_straight_relay();
+        const auto resources = fixture::table();
+        const uint64_t address = 0x5497b00c00ull + loop;
+        const auto module =
+            recompile_compute(words.data(), words.size(), &resources, fixture::config(),
+                              {RecompileDiagnosticStage::Compute, address});
+        EXPECT_TRUE(module.empty());
+        if (module.empty()) {
+            EXPECT_NE(
+                last_terminal_reject_reason(address).find("origin=unmodelled-scalar-publication"),
+                std::string::npos);
+            continue;
+        }
+        // Mutation control: any admitted module must still broadcast the first active lane.
+        execute(words, loop ? fixture::Words(64, 7) : fixture::cmpx_expected(), address);
+    }
+}

@@ -179,7 +179,9 @@ inline void log_recompile_diagnostic(const RecompileDiagnosticContext& diagnosti
     va_start(args, format);
     std::vsnprintf(detail.data(), detail.size() + 1, format, args);
     va_end(args);
-    const bool fabricated = (tag && std::strstr(tag, "fabricated-fresh-mask-source")) ||
+    const bool fabricated = (tag && std::strstr(tag, "unmodelled-scalar-publication")) ||
+                            detail.find("unmodelled-scalar-publication") != std::string::npos ||
+                            (tag && std::strstr(tag, "fabricated-fresh-mask-source")) ||
                             detail.find("fabricated-fresh-mask-source") != std::string::npos ||
                             detail.find("is fabricated on the back edge") != std::string::npos;
     if (fabricated && diagnostic.placeholder_origins && detail.find("origin=") == std::string::npos)
@@ -699,8 +701,7 @@ struct LoopBlanketCheck {
         if (!diagnostic_words.empty()) {
             diagnostic_roots = loop_placeholder_roots(rs, header_pc, diagnostic_words,
                                                       b.placeholder_origin_program.get());
-            append_unproved_loop_reads(diagnostic_roots, b, header_pc, diagnostic_words,
-                                       weak_allowed);
+            append_unproved_loop_reads(diagnostic_roots, b, header_pc, diagnostic_words);
             b.diagnostic.placeholder_origins =
                 std::make_shared<const std::string>(format_placeholder_origins(diagnostic_roots));
         }

@@ -524,31 +524,35 @@ scalar loads terminate a dependency slice only after their actual complete, non-
 publication; an unproved memory result or unsafe address-read obligation stays Hard. These name
 `unproved-memory-result` and `unproved-strong-read`, respectively. The legacy READFIRST scalar
 value, which the per-invocation lowering does not broadcast, names
-`unmodelled-scalar-publication` and also stays Hard.
+`unmodelled-scalar-publication` and also stays Hard. The admission retry guards the actual
+legacy lowering, including straight-line scalar relays and publications independent of the
+admitted read. Existing agreeing-source and local waterfall proofs remain applicable, and real
+dispatcher broadcasts do not pass through that lane-local lowering.
 
 The same 4,000-entry corpus compares 3,567 recorded-input replays and 433 stage probes:
 
-- Five compute entries become accepted, all with unloaded-only roots. Four use fresh predicates;
-  the fifth uses fresh predicates and loop-carried reads. Every emitted module passes `spirv-val`.
+- Three compute entries become accepted, all with unloaded-only roots. Two use fresh predicates;
+  the third uses fresh predicates and loop-carried reads. Every emitted module passes `spirv-val`.
 - No accepted output changes and no accepted program becomes refused. The comparison hashes
   1,538 existing outputs; supplemental exports through the identical public table-less compute
   entry point hash the other five, also unchanged. All ten supplemental modules validate.
-- Three entries reach later refusals: a remaining fabricated input, an unresolved MIMG address,
-  and an unresolved operand. One previously refused fragment replay becomes incomplete because
+- Eight entries remain refused with a changed reason: seven stop earlier and one reaches a later
+  MIMG address refusal. Six name missing scalar publications; the others retain an unresolved
+  operand or address. One previously refused fragment replay becomes incomplete because
   it needs a semantic choice absent from its old trace. No missing choice is guessed.
-- The remaining policy-1 cohort has 565 entries. Origin counts overlap when an entry has several
-  roots; none has only unloaded roots and none is unclassified.
+- The remaining policy-1 cohort has 567 entries, including the named scalar-publication boundary.
+  Origin counts overlap when an entry has several roots; none has only unloaded roots and none is unclassified.
 
 | Origin | Remaining entries | Roots |
 | --- | ---: | ---: |
-| unloaded (mixed with Hard roots) | 33 | 1,405 |
+| unloaded (mixed with Hard roots) | 32 | 1,284 |
 | launch-input | 473 | 478 |
-| unknown-launch | 72 | 574 |
-| lost-definition | 9 | 9 |
+| unknown-launch | 71 | 573 |
+| lost-definition | 12 | 12 |
 | unmodelled-transfer | 5 | 5 |
-| unproved-memory-result | 17 | 314 |
+| unproved-memory-result | 14 | 311 |
 | unproved-strong-read | 1 | 1 |
-| unmodelled-scalar-publication | 1 | 28 |
+| unmodelled-scalar-publication | 6 | 6 |
 | spill / trace-budget / unreachable | 0 | 0 |
 
 The 27 dumped GTA/Kena programs retain the preceding measurement's nine accepted, fifteen refused
@@ -571,12 +575,13 @@ so their old sidecars now report incomplete. `ps_4043ca3f00` still refuses with 
 `v0/v1` alongside unloaded roots. Fresh live captures and visible portrait verification remain
 necessary; these are not claimed as accepted modules.
 
-Eight synthetic interpreter witnesses fail against the merged diagnostic-only compiler and pass
+Nine synthetic interpreter witnesses fail against the merged diagnostic-only compiler and pass
 with admission. They cover integer/float predicates, CMPX, saved SDWA predicates, narrowed writes,
 vector/scalar loop carries, and real scalar-buffer data beside an unloaded root. Three actual
 exact64 GPU dispatches cover both wave halves and CMPX's active-lane count. The existing nine
 scalar-selector/loop originals now execute their consistent arbitrary values; same-consumer twins
-with genuine missing spills remain refused. All 26 exported synthetic modules validate.
+with genuine missing spills remain refused. An agreeing READFIRST source retains its established
+proof. All 27 exported synthetic modules validate.
 
 Mutation controls deny unloaded admission, admit Hard roots, lose scalar-load publication, keep
 a stale retry refusal, or disconnect the observer; each is detected. The actual #4943 missing-spill
@@ -601,6 +606,13 @@ executed lane reads. Failed retries publish their actual refusal and no admissio
   controls must instead name an unknown possible scratch-offset launch word, a genuinely
   unsupplied launch input or an untracked spill. Consumer and relative-branch positions are
   retained when correcting these fixtures. Refs [#5497](https://github.com/mattias800/prosper/issues/5497).
+
+- **Guarding only loop-carried READFIRST dependencies covers scalar publication.** A straight-line
+  `v6 = unloaded_zero + lane + 7; s20 = readfirstlane(v6); VCC = (s20 == v6)` also
+  exposes the missing broadcast: the interpreter and exact64 GPU must select 11 only in lane0
+  and 22 in the other 63 lanes. A lane-local copy instead selects 11 everywhere. The safeguard
+  belongs at the actual legacy producer, even before or after an independent admitted predicate.
+  An agreeing constant source retains its existing proof. Refs [#5497](https://github.com/mattias800/prosper/issues/5497).
 
 - **Removing the loop's READFIRST guard only admits an Arbitrary value.** A synthetic loop
   sets `v6 = lane + unloaded_zero + 7`, reads it into `s20` on the next trip, and stores that

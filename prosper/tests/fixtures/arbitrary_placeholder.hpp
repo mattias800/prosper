@@ -144,6 +144,29 @@ inline Words readfirst_loop_relay() {
         0xe0702000u, 0x80020100u, 0xbf810000u,
     };
 }
+inline Words readfirst_straight_relay() {
+    Words result{0x7e0c023cu, 0x4a0c0106u};   // v6 = unloaded s60 + logical lane
+    result.insert(result.end(), {0x4a0c0c87u, 0x7e280506u, 0x7d840c14u});
+    // v6 += 7; s20 = readfirstlane(v6); VCC = (s20 == v6)
+    append_output(result);
+    return result;
+}
+inline Words agreeing_readfirst_relay() {
+    Words result{0x7e0c0287u, 0x7e280506u,   // v6 = 7; s20 = readfirstlane(v6)
+                 0x7e0e023cu, 0x7d840f07u,   // v7 = unloaded s60; VCC = (v7 == v7)
+                 0x7d840c14u};   // VCC = (s20 == v6)
+    append_output(result);
+    return result;
+}
+inline Words readfirst_independent_relay(bool after) {
+    const Words predicate{0x7e0c023cu, 0x7d840d06u};   // v6 = s60; VCC = (v6 == v6)
+    const Words publication{0x4a0c0087u, 0x7e280506u};   // v6 = lane + 7; s20 = first(v6)
+    Words result = after ? predicate : publication;
+    const auto& second = after ? publication : predicate;
+    result.insert(result.end(), second.begin(), second.end());
+    result.insert(result.end(), {0x7e020214u, 0xe0702000u, 0x80020100u, 0xbf810000u});
+    return result;   // store s20 directly, independently of the admitted predicate
+}
 inline Words expected(bool narrowed) {
     Words result(64, 11u);
     if (narrowed)

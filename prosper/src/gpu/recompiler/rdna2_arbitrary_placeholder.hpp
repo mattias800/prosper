@@ -15,8 +15,10 @@ struct ArbitraryPlaceholderReads {
 };
 bool placeholder_roots_are_unloaded(const PlaceholderRoots&);
 void append_unproved_loop_reads(PlaceholderRoots&, const SpirvCompute&, uint32_t header,
-                                const std::vector<int>& words, bool weak_allowed);
+                                const std::vector<int>& words);
 bool arbitrary_placeholder_attempt_active();
+bool arbitrary_placeholder_retry_active();
+bool refuse_arbitrary_scalar_publication(SpirvCompute&, const RegState&, const Rdna2Inst&);
 std::vector<uint32_t>
 recompile_with_arbitrary_placeholders(const RecompileDiagnosticContext&,
                                       const std::function<std::vector<uint32_t>()>&);

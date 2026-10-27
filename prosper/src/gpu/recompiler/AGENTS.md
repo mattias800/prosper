@@ -23,6 +23,10 @@ domain, physical mask word or runtime validity fact is supplied. Owned packets r
 separate genuine-input contract. Inert module metadata identifies read sites in the selected
 module for the observer; failed attempts publish no admission count. Unknown, missing launch,
 spill and named trace-gap roots remain refused.
+`rdna2_arbitrary_placeholder_scalar` guards the actual legacy lane-local READFIRST lowering
+on retries, including straight-line operations before or after an admitted read. The existing
+agreeing-source and fragment waterfall proofs remain; real dispatcher broadcasts bypass this
+legacy site. A missing scalar publication stays Hard independently of the predicate's roots.
 If the retry still refuses, its actual later cause replaces the now-admitted unloaded refusal.
 Its output-only observation port is declared here and implemented beside compiler callers in
 `gpu/diagnostics`; the compiler includes neither that implementation nor performance observers.

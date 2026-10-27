@@ -33,6 +33,10 @@ bool arbitrary_placeholder_attempt_active() {
     return current != nullptr;
 }
 
+bool arbitrary_placeholder_retry_active() {
+    return current && current->allow;
+}
+
 std::vector<uint32_t>
 recompile_with_arbitrary_placeholders(const RecompileDiagnosticContext& diagnostic,
                                       const std::function<std::vector<uint32_t>()>& compile) {

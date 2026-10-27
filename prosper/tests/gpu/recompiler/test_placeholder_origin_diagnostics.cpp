@@ -85,6 +85,9 @@ TEST(PlaceholderOriginDiagnostics, ReplayIdentityExcludesOnlyTheDiagnosticEnvelo
         recompile_refusal_identity("loop-carried s10 is fabricated on the back edge "
                                    "placeholder-roots=[origin=spill word=spill-v20:3 at=entry]"),
         "loop-carried s10 is fabricated on the back edge");
+    EXPECT_EQ(recompile_refusal_identity("unmodelled-scalar-publication pc=3 "
+                                         "placeholder-roots=[origin=unloaded word=s60 at=entry]"),
+              "unmodelled-scalar-publication pc=3");
 }
 
 TEST(PlaceholderOriginDiagnostics, ReplayIdentityPreservesTheReasonSiteAndMalformedSuffix) {

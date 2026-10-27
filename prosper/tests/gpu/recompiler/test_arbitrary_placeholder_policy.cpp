@@ -12,6 +12,7 @@
 #include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "fixtures/arbitrary_placeholder.hpp"
+#include "bpermute_spirv_oracle.hpp"
 #include "diagnostics/perf/arbitrary_placeholder.hpp"
 #include "diagnostics/perf/perf_alarms.hpp"
 #include "diagnostics/exit_reports.hpp"
@@ -150,7 +151,7 @@ TEST(ArbitraryPlaceholderPolicy, ActualCompilerAdmissionReachesTheWindowAndExitR
     engine.on_flip(1'000'000'000, ledger, 60);
     const auto words = fixture::scalar_relay();
     const auto resources = fixture::table();
-    constexpr uint64_t address = 0x5497b00400ull;
+    constexpr uint64_t address = 0x5497b10400ull;
     testing::internal::CaptureStderr();
     const auto module = recompile_compute(words.data(), words.size(), &resources, fixture::config(),
                                           {RecompileDiagnosticStage::Compute, address});
@@ -166,9 +167,9 @@ TEST(ArbitraryPlaceholderPolicy, ActualCompilerAdmissionReachesTheWindowAndExitR
     ASSERT_NE(alarm, alarms.end());
     EXPECT_EQ(alarm->value, 1);
     EXPECT_NE(alarm->detail.find("reads=" + std::to_string(reads.total())), std::string::npos);
-    EXPECT_NE(output.find("rule=arbitrary-placeholder-admitted program=0x5497b00400"),
+    EXPECT_NE(output.find("rule=arbitrary-placeholder-admitted program=0x5497b10400"),
               std::string::npos);
-    EXPECT_NE(output.find("summary observer=arbitrary-placeholder-admitted program=0x5497b00400"),
+    EXPECT_NE(output.find("summary observer=arbitrary-placeholder-admitted program=0x5497b10400"),
               std::string::npos);
 }
 
@@ -211,6 +212,47 @@ TEST(ArbitraryPlaceholderPolicy, AReadfirstLoopCannotInventTheMissingScalarPubli
     EXPECT_TRUE(module.empty());
     const auto reason = last_terminal_reject_reason(address);
     EXPECT_NE(reason.find("origin=unloaded word=s60"), std::string::npos) << reason;
-    EXPECT_NE(reason.find("origin=unmodelled-scalar-publication word=v6 at=2"), std::string::npos)
+    EXPECT_NE(reason.find("origin=unmodelled-scalar-publication word=s20 at=2"), std::string::npos)
         << reason;
+}
+
+TEST(ArbitraryPlaceholderPolicy, AStraightReadfirstCannotInventTheMissingScalarPublication) {
+    namespace fixture = prosper::test::arbitrary_placeholder;
+    const auto words = fixture::readfirst_straight_relay();
+    const auto resources = fixture::table();
+    constexpr uint64_t address = 0x5497b00a00ull;
+    const auto module = recompile_compute(words.data(), words.size(), &resources, fixture::config(),
+                                          {RecompileDiagnosticStage::Compute, address});
+    EXPECT_TRUE(module.empty());
+    if (!module.empty()) {
+        // Mutation witness: a missing safeguard produces all11, while a real broadcast
+        // makes only lane0 equal to its original vector value.
+        bpermute_oracle::Interpreter vm(module);
+        vm.native_subgroup_width = 64;
+        vm.supplied_push_constants = fixture::config().user_sgprs;
+        const auto actual = vm.run(64, fixture::Words(64, 0xdeadbeefu));
+        ASSERT_TRUE(vm.error.empty()) << vm.error;
+        EXPECT_EQ(actual, fixture::cmpx_expected());
+    }
+    const auto reason = last_terminal_reject_reason(address);
+    EXPECT_NE(reason.find("origin=unloaded word=s60"), std::string::npos) << reason;
+    EXPECT_NE(reason.find("origin=unmodelled-scalar-publication word=s20 at=3"), std::string::npos)
+        << reason;
+}
+
+TEST(ArbitraryPlaceholderPolicy, AnIndependentPublicationIsHardBeforeAndAfterAdmission) {
+    namespace fixture = prosper::test::arbitrary_placeholder;
+    for (bool after : {false, true}) {
+        const auto words = fixture::readfirst_independent_relay(after);
+        const auto resources = fixture::table();
+        const uint64_t address = 0x5497b00b00ull + after;
+        const auto module =
+            recompile_compute(words.data(), words.size(), &resources, fixture::config(),
+                              {RecompileDiagnosticStage::Compute, address});
+        EXPECT_TRUE(module.empty());
+        const auto reason = last_terminal_reject_reason(address);
+        const auto expected =
+            "origin=unmodelled-scalar-publication word=s20 at=" + std::to_string(after ? 3 : 1);
+        EXPECT_NE(reason.find(expected), std::string::npos) << reason;
+    }
 }
