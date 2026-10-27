@@ -6535,6 +6535,12 @@ endif()
         INCLUDES tests
         LIBRARIES prosper_core Vulkan::Vulkan)
 
+      prosper_add_gtest(test_dispatch_scalar_value
+        SOURCES tests/gpu/recompiler/test_dispatch_scalar_value.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan
+        LABELS gpu)
+
       # A Wave64 mask rebuilt from its two spilled halves stays a mask across a CFG-dispatcher
       # block edge (Kena 0x5008ec0000); executed only where a 64-lane subgroup can be required.
       prosper_add_gtest(test_cfg_spilled_mask_halves
