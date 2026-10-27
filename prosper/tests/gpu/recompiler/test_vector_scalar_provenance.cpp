@@ -199,8 +199,17 @@ TEST(VectorScalarProvenance, OneArmVectorOverwriteCannotEraseTheOtherArmsMark) {
 
 TEST(VectorScalarProvenance, LoopBackedgeChecksTheVectorAssumptionUsedByLaneBits) {
     const Words fabricated = {0x7e0c0232u, 0x7e0e0233u};   // absent s50/s51
-    for (Stage stage : {Stage::Fragment, Stage::Compute})
-        expect_refused(stage, loop(stage, fabricated), "fabricated on the back edge");
+    for (Stage stage : {Stage::Fragment, Stage::Compute}) {
+        // A complete compute launch names s50/s51 as unloaded. Its retry must still supply
+        // the READFIRST broadcast; a partial fragment profile retains the old Hard hold.
+        expect_refused(stage, loop(stage, fabricated),
+                       stage == Stage::Compute ? "unmodelled-scalar-publication pc=12"
+                                               : "fabricated on the back edge");
+        // Preserve the original back-edge check with an actual unknown launch input, saved
+        // before the prefix overwrites s0. Admission cannot waive this Hard root.
+        expect_refused(stage, cat({{0xbeb20300u, 0xbeb30300u}, loop(stage, fabricated)}),
+                       "fabricated on the back edge");
+    }
 }
 
 TEST(VectorScalarProvenance, DefinedVectorLoopCarryKeepsCompiling) {
@@ -258,20 +267,24 @@ TEST(VectorScalarProvenance, Mad64ChargesTheHighWordOfItsVectorAddend) {
         EXPECT_EQ(rdna2_vgpr_source_span(instruction, 2), 2u);
         const Words read = {0x7e58050bu, 0xbead03c1u};   // s44=first(v11); s45=-1
         for (Stage stage : {Stage::Fragment, Stage::Compute}) {
-            expect_refused(stage,
-                           cat({prefix(), {0x7e0c0280u, 0x7e0e0233u}, mad, read, restore(stage)}),
-                           "fabricated-fresh-mask-source");
-            EXPECT_NE(terminal_reason.find("pc=" + std::to_string(prefix().size() + 2u) + " "),
+            auto stage_prefix = prefix();
+            // Preserve the unsupplied scratch offset before the compute prefix overwrites s0.
+            if (stage == Stage::Compute)
+                stage_prefix.insert(stage_prefix.begin(), {0xbeb30300u, 0xbeb50300u});
+            expect_refused(
+                stage, cat({stage_prefix, {0x7e0c0280u, 0x7e0e0233u}, mad, read, restore(stage)}),
+                "fabricated-fresh-mask-source");
+            EXPECT_NE(terminal_reason.find("pc=" + std::to_string(stage_prefix.size() + 2u) + " "),
                       std::string::npos)
                 << terminal_reason;
             EXPECT_FALSE(
                 compile(stage,
-                        cat({prefix(), {0x7e0c0280u, 0x7e0e02c1u}, mad, read, restore(stage)}))
+                        cat({stage_prefix, {0x7e0c0280u, 0x7e0e02c1u}, mad, read, restore(stage)}))
                     .empty())
                 << terminal_reason;
             // Only the addend is a pair: missing s51/s53 cannot poison genuine B32 multipliers.
             const Words scalar_mad = {mad[0], 50u | (52u << 9u) | (262u << 18u)};
-            EXPECT_FALSE(compile(stage, cat({prefix(),
+            EXPECT_FALSE(compile(stage, cat({stage_prefix,
                                              {0xbeb203c1u, 0xbeb40381u, 0x7e0c0280u, 0x7e0e02c1u},
                                              scalar_mad,
                                              read,
@@ -280,12 +293,12 @@ TEST(VectorScalarProvenance, Mad64ChargesTheHighWordOfItsVectorAddend) {
                 << terminal_reason;
             const Words scalar_addend = {mad[0], 129u | (129u << 9u) | (50u << 18u)};
             expect_refused(stage,
-                           cat({prefix(), {0xbeb20380u}, scalar_addend, read, restore(stage)}),
+                           cat({stage_prefix, {0xbeb20380u}, scalar_addend, read, restore(stage)}),
                            "fabricated-fresh-mask-source");
-            EXPECT_NE(terminal_reason.find("pc=" + std::to_string(prefix().size() + 1u) + " "),
+            EXPECT_NE(terminal_reason.find("pc=" + std::to_string(stage_prefix.size() + 1u) + " "),
                       std::string::npos)
                 << terminal_reason;
-            EXPECT_FALSE(compile(stage, cat({prefix(),
+            EXPECT_FALSE(compile(stage, cat({stage_prefix,
                                              {0xbeb20380u, 0xbeb303c1u},
                                              scalar_addend,
                                              read,

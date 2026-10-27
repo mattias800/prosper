@@ -5,6 +5,10 @@ state and the distinction between an observed zero and absent coverage. Tests of
 or formatter do not certify its production call route. Keep coarse event populations and the
 actual report path in controls, with discriminating mutations for missing or substituted signals.
 
+`test_arbitrary_placeholder_alarm` checks immediate window reporting, quiet/no-data populations
+and address-naming summaries. The actual public-compiler-to-observer route is exercised by
+`ArbitraryPlaceholderPolicy.ActualCompilerAdmissionReachesTheWindowAndExitReport`.
+
 ## Ruled out
 
 - Waiting past the deferred timeout after initial packet folding does not by itself age a barrier.

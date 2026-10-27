@@ -85,12 +85,7 @@ std::vector<PlaceholderWord> PlaceholderOriginTrace::sources(const Rdna2Inst& in
                 for (int reg : image_addresses(in)) words.push_back({PlaceholderFile::Vector, reg});
             } else if (((in.fmt == Rdna2Format::VOP3 && in.opcode == 0x360u) ||
                         (in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02u)) &&
-                       k == 0 &&
-                       std::any_of(program.instructions.begin(), program.instructions.end(),
-                                   [&](const auto& x) {
-                                       return x.fmt == Rdna2Format::VOP3 && x.opcode == 0x361u &&
-                                              x.dst.value == source.value;
-                                   })) {
+                       k == 0 && writelane_destinations.contains(source.value)) {
                 const int lane =
                     in.fmt == Rdna2Format::VOP3 && in.src[1].kind == OperandKind::InlineInt
                         ? in.src[1].value
@@ -104,8 +99,7 @@ std::vector<PlaceholderWord> PlaceholderOriginTrace::sources(const Rdna2Inst& in
                     source.value != 125)) {
             if (genuine_resource &&
                 ((in.fmt == Rdna2Format::MIMG && (k == 1 || k == 2)) ||
-                 ((in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF) &&
-                  (k == 1 || k == 2))))
+                 ((in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF) && k == 1)))
                 continue;
             auto width = scalar_alu_source_words(in, k, program.wave_size);
             if (width == UINT32_MAX) continue;
@@ -128,7 +122,7 @@ std::vector<PlaceholderWord> PlaceholderOriginTrace::sources(const Rdna2Inst& in
     if (effects.implicit_reads & kRdna2ImplicitVcc)
         add(PlaceholderFile::Scalar, 106, program.wave_size == 32 ? 1 : 2);
     if (effects.implicit_reads & kRdna2ImplicitScc) words.push_back({PlaceholderFile::Scc});
-    if (result.file == PlaceholderFile::Scalar)
+    if (result.file == PlaceholderFile::Scalar || result.file == PlaceholderFile::Scc)
         add(PlaceholderFile::Scalar, in.dst.value, scalar_implicit_destination_read_width(in));
     return words;
 }

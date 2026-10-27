@@ -141,12 +141,11 @@ void empty(const std::vector<uint32_t>& code, uint64_t address) {
 
 TEST(ExecSpillData, MissingVectorInputIsNotRepairedByTheMaskEquality) {
     auto code = persisted(Reduction::Ff1);
-    // The v1 producer reads s30, which no launch loads: its value is hard on every route. (A
-    // never-written v1 would not do: under #5185 it is arbitrary on every route, #5039.) The mask
-    // transport is otherwise complete.
-    code[10] = 0x7e02021eu;   // v_mov_b32 v1, s30
+    // Preserve entry s0's possible unsupplied scratch offset before the dispatcher defines s0.
+    code[10] = 0x7e02021eu;   // v_mov_b32 v1, saved entry s0
+    code.insert(code.begin(), 0xbe9e0300u); // s30 = entry s0
     empty(code, 0x5127001010ull);
-    EXPECT_NE(last_terminal_reject_reason(0x5127001010ull).find("pc=24 "), std::string::npos);
+    EXPECT_NE(last_terminal_reject_reason(0x5127001010ull).find("pc=25 "), std::string::npos);
 }
 TEST(ExecSpillData, RealTwoWordTransportProvesTheRestoreIsUnchanged) {
     ExecSpillEquality state;
@@ -397,10 +396,9 @@ TEST(ExecSpillData, CurrentWordTransportAfterTheTransitionHasAUsableComparison) 
     retain(module, 0x5127002010ull);
     EXPECT_FALSE(module.empty()) << last_terminal_reject_reason(0x5127002010ull);
 }
-// v1 outside the lane40 writer holds a hard value: s30 is never loaded. A never-written v1 would
-// be arbitrary on every route under #5185 (#5039). Shifts every pc by one.
-std::vector<uint32_t> hard_old_v1(std::vector<uint32_t> code) {
-    code.insert(code.begin(), 0x7e02021eu);   // v_mov_b32 v1, s30
+// Preserve a genuine Hard scratch-offset input outside the lane40 writer. Shifts every PC by one.
+std::vector<uint32_t> hard_old_v1(std::vector<uint32_t> code, uint32_t scalar = 0) {
+    code.insert(code.begin(), 0x7e020200u | scalar);   // v_mov_b32 v1, scratch offset
     return code;
 }
 TEST(ExecSpillData, MixedGenerationRestoreCannotExposeAnUninitializedLowerLane) {
@@ -594,7 +592,7 @@ TEST(ExecSpillData, NumericPushWordsDoNotOriginateCurrentEquality) {
     code[1] = 0x00014a00u;
     code[5] = 0x00014a00u;
     code[7] = 0x00015001u;
-    code = hard_old_v1(code);
+    code = hard_old_v1(code, 2);
     const auto table = resources();
     auto c = dispatcher_config();
     c.user_sgprs = {0, 256};

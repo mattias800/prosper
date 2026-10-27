@@ -4,6 +4,7 @@
 #include "gpu/recompiler/ir/ops/ds_shuffle.hpp"
 
 #include "gpu/recompiler/rdna2_alu_support.hpp"
+#include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
@@ -32,6 +33,9 @@ std::optional<bool> DsCrossLaneLowering::route_bpermute() {
             ok = false;
             return true;
         }
+        if (refuse_arbitrary_placeholder_operand(b, rs, in, in.src[0], &ok) ||
+            refuse_arbitrary_placeholder_operand(b, rs, in, in.src[1], &ok))
+            return true;
         const auto address = rs.vreg.find(in.src[0].value);
         const auto source = rs.vreg.find(in.src[1].value);
         const uint32_t old = vreg_old(b, rs, in.dst.value);
@@ -54,6 +58,7 @@ std::optional<bool> DsCrossLaneLowering::route_swizzle() {
             ok = false;
             return true;
         }
+        if (refuse_arbitrary_placeholder_operand(b, rs, in, in.src[0], &ok)) return true;
         const uint32_t result = emit_ds_swizzle_b32(
             b, in.literal,
             [&] {

@@ -78,7 +78,8 @@ TEST(PackedScalarWidth, FreshPredicateAndPackedValuesExecuteWithoutAnUnusedSibli
 
 TEST(PackedScalarWidth, AnActuallyMissingPackedScalarStillRefuses) {
     auto code = program();
-    code[0] = 0xbeac03ffu; // define s44 instead; actual source s42 remains absent
+    code[0] = 0xbeaa0310u; // s42 = possible unsupplied scratch offset s16
+    code[1] = 0xbf800000u; // retain the original two-word producer footprint
     const uint64_t address = 0x5497500200ull;
     EXPECT_TRUE(compile(code, address).empty());
     EXPECT_NE(last_terminal_reject_reason(address).find("fabricated-fresh-mask-source pc=8"),
@@ -215,7 +216,7 @@ TEST(PackedScalarWidth, MissingPackedHighDataCannotBorrowAnotherMask) {
 
 TEST(PackedScalarWidth, MissingNumericVccHighStillCannotSupplyPackedData) {
     auto code = program();
-    code[0] = 0xbeeb033cu; // VCC_HI = missing s60, not a genuine numeric value
+    code[0] = 0xbeeb0310u; // VCC_HI = possible unsupplied scratch offset s16
     code[1] = 0xbf800000u;
     code[7] = 0x1c0cd701u;
     const uint64_t address = 0x5497500800ull;

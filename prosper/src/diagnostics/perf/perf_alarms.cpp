@@ -524,6 +524,12 @@ std::vector<AlarmFiring> AlarmEngine::close_window(const WindowSample& w, double
                      n(Counter::GpuGraphicsDeferred), n(Counter::GpuGraphicsDeferredBlocked));
         std::fprintf(jsonl_, ",\"cpu_rtt_publication_checks\":%llu,\"cpu_rtt_colorless_publications\":%llu",
                      n(Counter::CpuRttPublicationChecks), n(Counter::CpuRttColorlessPublications));
+        std::fprintf(jsonl_,
+                     ",\"arbitrary_placeholder_checks\":%llu,"
+                     "\"arbitrary_placeholder_programs\":%llu,\"arbitrary_placeholder_reads\":%llu",
+                     n(Counter::ArbitraryPlaceholderChecks),
+                     n(Counter::ArbitraryPlaceholderPrograms),
+                     n(Counter::ArbitraryPlaceholderReads));
         // frame-flicker (#5152): presented frames signed, compared, voting flicker, sustained.
         std::fprintf(jsonl_,
                      ",\"flicker_presented\":%llu,\"flicker_compared\":%llu,"

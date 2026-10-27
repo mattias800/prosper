@@ -53,7 +53,7 @@ std::vector<uint32_t> uniform_counter_program() {
         0x7e020280u, // output count = 0
         0x7e0e0281u, // genuine carried v7
         0xbe84047eu, // save full EXEC
-        0x7e12023cu, // v9 = absent s60 outside the eventual cohort
+        0x7e120211u, // v9 = absent s17 outside the eventual cohort
         0x7da6009fu, // EXEC = (31 <= lane)
         0xe0302000u, 0x80030902u, // v9 = input[lane], in this cohort only
         0xbf8c3f70u,
@@ -66,7 +66,7 @@ std::vector<uint32_t> uniform_counter_program() {
         0xbf880006u, // EXECZ -> pc23
         0x4a060281u, // v3 = count + 1
         0x02020701u, // count = VCC ? v3 : count
-        0x7e00023cu, // unavailable old v0, dead before the next active read
+        0x7e000211u, // unavailable old v0, dead before the next active read
         0x7e0e0281u, // genuine v7 on the back edge
         0x81298129u, // s41 += 1
         0xbf82fff3u, // back to pc10
@@ -126,7 +126,7 @@ TEST(UniformCmpxLoopData, AUniformCounterExitKeepsThePreheaderDataCohort) {
 
 TEST(UniformCmpxLoopData, AnUnavailableActiveLoadStillRefuses) {
     auto code = uniform_counter_program();
-    code[6] = 0x7e12023cu;
+    code[6] = 0x7e120211u;
     code[7] = 0xbf800000u;
     const auto c = config();
     const auto table = counter_resources();
@@ -141,7 +141,7 @@ TEST(UniformCmpxLoopData, AnUnavailableActiveLoadStillRefuses) {
 
 TEST(UniformCmpxLoopData, ARequiredBackedgeInputStillRefuses) {
     auto code = uniform_counter_program();
-    code[20] = 0x7e0e023du; // v7 = absent s61, required before the next rewrite
+    code[20] = 0x7e0e0211u; // v7 = absent s61, required before the next rewrite
     const auto c = config();
     const auto table = counter_resources();
     constexpr uint64_t address = 0x5497120300ull;
@@ -242,7 +242,7 @@ TEST(UniformCmpxLoopData, ADataCmpxCanExitEarlyBeforeTheSeparateScalarCap) {
 
 TEST(UniformCmpxLoopData, ADataCmpxStillRefusesItsMissingLoadedOperand) {
     auto code = counter_capped_data_program();
-    code[7] = 0x7e12023cu;
+    code[7] = 0x7e120211u;
     code[8] = 0xbf800000u;
     const auto c = config();
     const auto table = counter_resources();
@@ -257,7 +257,7 @@ TEST(UniformCmpxLoopData, ADataCmpxStillRefusesItsMissingLoadedOperand) {
 
 TEST(UniformCmpxLoopData, ADataCmpxStillRefusesItsRequiredBackedgeInput) {
     auto code = counter_capped_data_program();
-    code[21] = 0x7e0e023du; // v7 = absent s61, needed by the next current-lane rewrite
+    code[21] = 0x7e0e0211u; // v7 = absent s61, needed by the next current-lane rewrite
     const auto c = config();
     const auto table = counter_resources();
     constexpr uint64_t address = 0x5497120b00ull;

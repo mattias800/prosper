@@ -1,5 +1,19 @@
 # `prosper/tests/fixtures/` — shared harnesses and hand-built inputs
 
+`arbitrary_placeholder.hpp` supplies synthetic integer programs and the explicit launch/output
+contract shared by the public-compiler interpreter witnesses and the exact64 GPU arm. READFIRST
+fixtures distinguish varying, agreeing and admission-independent scalar publications. Independent
+ordinary data/export and conditional-definition fixtures cover missing inputs after admission.
+Written and missing spill fixtures distinguish a tracked arbitrary value from an untracked slot.
+ADDTID fixtures distinguish a provided LDS word from WRITELANE data lost by the ordinary VGPR
+representation; the wrong zero fallback is observable in the interpreter and exact64 GPU arm.
+Relative-bank fixtures keep unloaded alternatives beside a runtime-selected provided word;
+the erased-word twin distinguishes lost computation from genuinely unloaded storage.
+Partial-destination fixtures distinguish a provided old inactive word from a lost one, with a
+full-overwrite control and repeated named-slot writes to keep the domains separate.
+Wide-scalar and implicit-SCC fixtures feed EXEC directly, distinguishing absent real inputs from
+supplied bits and genuinely unloaded roots without a later scalar-destination read.
+
 Shared material that more than one test needs: the Vulkan/compute execution harnesses, and
 hand-constructed binary inputs (a synthetic PRX, an ATRAC9 vector, captured GTA V shader words) that
 would otherwise be pasted into each test that wants them. Nothing here is a test itself — every file

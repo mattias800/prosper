@@ -21,7 +21,9 @@ and destination predication. Its tail methods preserve the original else-chain o
 
 `vop1_case_routes.*` owns the remaining VOP1 orchestration and early, SDWA and residual-switch
 routes. It borrows the original operand callback and register map; source setup, route order and
-final destination predication remain together in this family.
+final destination predication remain together in this family. Its legacy lane-local READFIRST
+route asks `rdna2_arbitrary_placeholder_scalar` before a new arbitrary admission can expose a
+missing broadcast; real dispatcher broadcasts do not use this lane-local route.
 
 Keep extracted files at most 500 lines and functions around 80 lines. Use the refactor tools for
 moves, preserve emission order, and qualify relocations with token read-back and the corpus gate.
@@ -33,6 +35,19 @@ set; the relocation preserves the direct-emission path.
 `buffer_opcode_case_routes.*` classifies the existing MUBUF/MTBUF opcode groups using references
 to the emitter's original locals. Descriptor resolution, access and disposition reporting remain
 in `emit_alu`; the classifier preserves the original unsupported-opcode refusal.
+
+The DS routes guard actual retry input reads before their early returns: compute/graphics ADDTID,
+plain GDS reads, implicit M0 readers, and DS shuffle inputs share the arbitrary-input boundary.
+The ordinary LDS callback alone cannot protect those early routes. Existing stored values,
+addresses, predicates and route order remain with their family lowerings.
+`emit_alu` also checks ordinary old-destination reads before lowering, using the existing
+old-word predicate. This includes inactive-lane preservation, subword preservation and implicit
+accumulation; complete overwrites and slot-map writers retain their separate contracts.
+The legacy MOVRELS reader also checks every bounded bank candidate before its direct map read;
+an unloaded alternative cannot supply another candidate's lost provided value.
+Wide scalar shift/BFE readers check each physical source word before direct map access. The
+emitter checks implicit SCC readers through canonical effects, including selectors that feed EXEC
+without a later ordinary read of their scalar destination.
 
 `bvh_case_routes.*` owns the existing MIMG BVH branch, including guarded node loads, triangle
 and box calculations, sorting and destination predication. Its continuation methods keep original

@@ -1,4 +1,5 @@
 #include "gpu/recompiler/rdna2_placeholder_origins.hpp"
+#include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
 #pragma once
 #include "gpu/recompiler/rdna2_reg_state.hpp" // IWYU pragma: export
 #include "gpu/recompiler/rdna2_scalar_condition_marks.hpp"
@@ -178,7 +179,11 @@ inline void log_recompile_diagnostic(const RecompileDiagnosticContext& diagnosti
     va_start(args, format);
     std::vsnprintf(detail.data(), detail.size() + 1, format, args);
     va_end(args);
-    const bool fabricated = (tag && std::strstr(tag, "fabricated-fresh-mask-source")) ||
+    const bool fabricated = (tag && std::strstr(tag, "hard-placeholder-read")) ||
+                            detail.find("hard-placeholder-read") != std::string::npos ||
+                            (tag && std::strstr(tag, "unmodelled-scalar-publication")) ||
+                            detail.find("unmodelled-scalar-publication") != std::string::npos ||
+                            (tag && std::strstr(tag, "fabricated-fresh-mask-source")) ||
                             detail.find("fabricated-fresh-mask-source") != std::string::npos ||
                             detail.find("is fabricated on the back edge") != std::string::npos;
     if (fabricated && diagnostic.placeholder_origins && detail.find("origin=") == std::string::npos)
@@ -694,10 +699,14 @@ struct LoopBlanketCheck {
             if (violated.contains(blanket_root(header_pc, entry.first)) &&
                 b.loop_blanket_roots_read.contains(blanket_root(header_pc, entry.first)))
                 diagnostic_words.push_back(entry.first);
-        if (!diagnostic_words.empty())
+        PlaceholderRoots diagnostic_roots;
+        if (!diagnostic_words.empty()) {
+            diagnostic_roots = loop_placeholder_roots(rs, header_pc, diagnostic_words,
+                                                      b.placeholder_origin_program.get());
+            append_unproved_loop_reads(diagnostic_roots, b, header_pc, diagnostic_words);
             b.diagnostic.placeholder_origins =
-                std::make_shared<const std::string>(loop_placeholder_origins(
-                    rs, header_pc, diagnostic_words, b.placeholder_origin_program.get()));
+                std::make_shared<const std::string>(format_placeholder_origins(diagnostic_roots));
+        }
         // Both actual exit edges may still depend on the header's assumptions. Demote the whole
         // assumption when any required root failed; keep its placeholder and unrelated valid roots.
         const auto invalid = [&](const auto& roots) {
@@ -723,6 +732,9 @@ struct LoopBlanketCheck {
         if (scalar_invalid(exits.scc_blanket)) exits.scc_blanket.clear();
         if (scalar_invalid(rs.scc_loop_blanket)) rs.scc_loop_blanket.clear();
         if (read_word < 0) return true;
+        if (admit_arbitrary_placeholder_read(b, header_pc, ArbitraryPlaceholderRead::LoopCarry,
+                                             diagnostic_roots))
+            return true;
         log_recompile_diagnostic(b.diagnostic, "recompile-reject", "terminal",
                                  "loop-carried %c%d is fabricated on the back edge but was read as "
                                  "lane bits in the loop (header pc=%u)",

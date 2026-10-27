@@ -1,6 +1,7 @@
 #include <string>
 #include <memory>
 #include "gpu/recompiler/rdna2_placeholder_origins.hpp"
+#include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
 #pragma once
 #include "gpu/recompiler/rdna2_scalar_condition_marks.hpp"
 #include "gpu/recompiler/rdna2_native_launch.hpp"
@@ -327,6 +328,7 @@ inline bool mimg_single_level_implicit_form(const Rdna2Inst& in, const ShaderRes
 // untracked Specials silently read as 0 and the shader computed
 // garbage (#134); now it rejects, matching the SDWA/DPP reject-rather-than-miscompute discipline.
 inline uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const Operand& o, bool* ok = nullptr) {
+    if (refuse_arbitrary_placeholder_operand(b, rs, in, o, ok)) return b.uconst(0);
     switch (o.kind) {
         case OperandKind::VGPR: {
             // A scalar-spill vgpr (v_writelane slots) has no per-lane data value — reject, don't read 0.
@@ -538,7 +540,7 @@ inline bool scalar_source_projectable(const SpirvCompute& b, const RegState& rs,
                                       const Rdna2Inst& in, uint32_t k) {
     const Operand& o = in.src[k];
     if (b.wave_size == 32 && o.kind == OperandKind::Special && o.value == 253)
-        return scalar_condition_source_defined(b, rs);
+        return scalar_condition_source_defined(b, rs, in.pc);
     const bool special_data = o.kind == OperandKind::Special && o.value >= 106 && o.value < 124;
     // EXEC is the live lane mask, never data. Admitting it is sound because rs.exec cannot hold a
     // fabricated word: every EXEC writer refuses a non-projectable source at the write rather than
@@ -561,7 +563,7 @@ inline bool scalar_data_sources_projectable_into_mask(const SpirvCompute& b, con
                                                       const Rdna2Inst& in) {
     if (!(b.is_compute || b.is_fragment) || (b.wave_size != 64 && b.wave_size != 32)) return true;
     if (!writes_lane_mask_register(in)) return true;
-    if (b.wave_size == 32 && scalar_reads_scc(in) && !scalar_condition_source_defined(b, rs))
+    if (b.wave_size == 32 && scalar_reads_scc(in) && !scalar_condition_source_defined(b, rs, in.pc))
         return false;
     for (uint32_t k = 0; k < 4; ++k)
         if (!scalar_source_projectable(b, rs, in, k)) return false;
@@ -619,14 +621,18 @@ inline bool refuse_mask_write(SpirvCompute& b, const RegState& rs, const Rdna2In
         return true;
     }
     if (!fresh_mask_sources_defined(b, rs, in)) {
-        b.diagnostic.placeholder_origins = std::make_shared<const std::string>(
-            fresh_placeholder_origins(rs, in, b.placeholder_origin_program.get()));
-        b.stage_reject_pc = in.pc;
-        b.stage_reject_reason = "fabricated-fresh-mask-source";
-        log_recompile_diagnostic(b.diagnostic, "fabricated-fresh-mask-source", "alu",
-                                 "pc=%u a fresh predicate requires defined inputs", in.pc);
-        ok = false;
-        return true;
+        const auto roots = fresh_placeholder_roots(rs, in, b.placeholder_origin_program.get());
+        if (!admit_arbitrary_placeholder_read(b, in.pc, ArbitraryPlaceholderRead::FreshMask,
+                                              roots)) {
+            b.diagnostic.placeholder_origins =
+                std::make_shared<const std::string>(format_placeholder_origins(roots));
+            b.stage_reject_pc = in.pc;
+            b.stage_reject_reason = "fabricated-fresh-mask-source";
+            log_recompile_diagnostic(b.diagnostic, "fabricated-fresh-mask-source", "alu",
+                                     "pc=%u a fresh predicate requires defined inputs", in.pc);
+            ok = false;
+            return true;
+        }
     }
     if (in.fmt != Rdna2Format::SOP1 && in.fmt != Rdna2Format::SOP2) return false;
     const auto roots_before =

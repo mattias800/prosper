@@ -1,4 +1,4 @@
-// Diagnostic roots of fabricated words. No result from this module grants admission.
+// Named roots of fabricated words; admission consumes typed roots, never diagnostic strings.
 #pragma once
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_launch_vgprs.hpp"
@@ -21,7 +21,10 @@ enum class PlaceholderOrigin {
     LostDefinition,
     UnmodelledTransfer,
     TraceBudget,
-    Unreachable
+    Unreachable,
+    UnprovedMemoryResult,
+    UnprovedStrongRead,
+    UnmodelledScalarPublication
 };
 enum class PlaceholderFile { Scalar, Vector, Spill, Scc };
 struct PlaceholderWord {
@@ -45,6 +48,7 @@ struct PlaceholderOriginObservations {
     std::map<uint32_t, std::set<int>> image_addresses;
     std::map<uint32_t, std::set<int>> relative_words;
     std::set<uint32_t> unbounded_relative;
+    std::map<uint32_t, bool> arbitrary_memory_results;
 };
 struct PlaceholderOriginProgram {
     std::vector<Rdna2Inst> instructions;
@@ -65,9 +69,16 @@ void configure_pixel_placeholder_origins(RegState&, const std::vector<LaunchVgpr
 void note_placeholder_resources(const SpirvCompute&, const RegState&, const Rdna2Inst&);
 void note_placeholder_native_input(const SpirvCompute&, const RegState&, const Rdna2Inst&);
 void note_placeholder_image_addresses(const RegState&, const Rdna2Inst&);
+void note_placeholder_memory_contract(const SpirvCompute&, const RegState&, const Rdna2Inst&,
+                                      const struct ScalarSourceMarks&);
 PlaceholderRoots placeholder_roots_before(const PlaceholderOriginProgram&, uint32_t pc,
                                           const std::vector<PlaceholderWord>&);
 std::string format_placeholder_origins(const PlaceholderRoots&);
+PlaceholderRoots fresh_placeholder_roots(const RegState&, const Rdna2Inst&,
+                                         const PlaceholderOriginProgram* fallback = nullptr);
+PlaceholderRoots loop_placeholder_roots(const RegState&, uint32_t header,
+                                        const std::vector<int>& words,
+                                        const PlaceholderOriginProgram* fallback = nullptr);
 std::string fresh_placeholder_origins(const RegState&, const Rdna2Inst&,
                                       const PlaceholderOriginProgram* fallback = nullptr);
 std::string loop_placeholder_origins(const RegState&, uint32_t header,

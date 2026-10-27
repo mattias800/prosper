@@ -486,7 +486,10 @@ TEST(NativeNumericVccMove, ACurrentUniformOverwriteRetiresTheNonuniformLoopWord)
     loop_values(numeric_loop({0x4a040081u, 0x7e1c0502u, mov(14, 130), mov(15, 128)}), 2);
 }
 TEST(NativeNumericVccMove, AUniformAbsentBackedgeStillViolatesTheReadRoot) {
-    const auto r = compile(numeric_loop({mov(14, 60, true)}));
+    auto words = numeric_loop({mov(14, 60, true)});
+    // Preserve the possible unsupplied entry scratch word before the prefix overwrites s0.
+    words.insert(words.begin(), mov(60, 0, true));
+    const auto r = compile(words);
     EXPECT_TRUE(r.module.empty());
     EXPECT_NE(r.reasons.find("fabricated on the back edge"), std::string::npos) << r.reasons;
 }

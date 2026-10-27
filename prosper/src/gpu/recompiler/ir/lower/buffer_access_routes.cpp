@@ -4,6 +4,7 @@
 #include "gpu/recompiler/ir/lower/buffer_format_values.hpp"
 #include "gpu/recompiler/ir/lower/buffer_store_values.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
+#include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/resources/shader_resources.hpp"
@@ -129,9 +130,8 @@ bool BufferAccessRoutes::lower() {
         const int d = in.dst.value;
         const uint32_t old_lo = vreg_old(b, rs, d);
         const uint32_t old_hi = vreg_old(b, rs, d + 1);
-        const auto lo_it = rs.vreg.find(d), hi_it = rs.vreg.find(d + 1);
-        const uint32_t value_lo = lo_it == rs.vreg.end() ? b.uconst(0) : lo_it->second;
-        const uint32_t value_hi = hi_it == rs.vreg.end() ? b.uconst(0) : hi_it->second;
+        const uint32_t value_lo = read_vector_for_arbitrary_retry(b, rs, in, d, ok);
+        const uint32_t value_hi = read_vector_for_arbitrary_retry(b, rs, in, d + 1, ok);
         const uint32_t value = b.u64_from_lohi(value_lo, value_hi);
         // Range-check the original qword record index against this dispatch's concrete V#.
         // Each valid index addresses its natural eight-byte record; larger indices are OOB.
@@ -159,8 +159,7 @@ bool BufferAccessRoutes::lower() {
         }
         const int d = in.dst.value;
         const uint32_t old = vreg_old(b, rs, d);
-        const auto it = rs.vreg.find(d);
-        const uint32_t value = it == rs.vreg.end() ? b.uconst(0) : it->second;
+        const uint32_t value = read_vector_for_arbitrary_retry(b, rs, in, d, ok);
         const uint32_t pre =
             is_atomic_fminmax
                 ? b.cbuf_atomic_fminmax_rtn(idx, value, binding, atomic_fmin, rs.exec_narrowed,
@@ -173,10 +172,7 @@ bool BufferAccessRoutes::lower() {
         return true;
     }
     if (is_store) {
-        auto vread = [&](int r) {
-            auto it = rs.vreg.find(r);
-            return it == rs.vreg.end() ? b.uconst(0) : it->second;
-        };
+        auto vread = [&](int r) { return read_vector_for_arbitrary_retry(b, rs, in, r, ok); };
         if (coherent_store) b.mark_cbuf_coherent(binding);
         // As with loads, keep Volatile propagation shared by raw and packed ordinary stores.
         auto store_dword = [&](uint32_t dword_idx, uint32_t value) {

@@ -30,6 +30,8 @@ public:
     RecompileDiagnosticAttempt& operator=(const RecompileDiagnosticAttempt&) = delete;
     void commit();
     void discard();
+    // Select a directly nested attempt, discarding this attempt's earlier records.
+    void replace_with(RecompileDiagnosticAttempt& selected);
 
 private:
     std::vector<DeferredRecompileDiagnostic> records_;

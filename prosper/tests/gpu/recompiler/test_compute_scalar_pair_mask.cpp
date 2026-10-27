@@ -662,6 +662,12 @@ const Words kBlanketLaneRead = {0xbeea0410u, 0xd5010003u, 0x01a9e480u};
 const Words kNoLaneRead = {0x7e0602f2u, 0xbf800000u, 0xbf800000u};
 // s_mov_b64 s[16:17], s[24:25]: s24/s25 are never written, so the back edge carries the zero
 const Words kRewriteFabricated = {0xbe900418u};
+Words hard_loop_input(Stage stage, Words code) {
+    // Preserve the unknown possible scratch-offset s0 before kPrefix overwrites s0.
+    // Fragment scalar launch state is already unknown; its original words are unchanged.
+    if (stage == Stage::Compute) code.insert(code.begin(), 0xbe980300u);   // s24 = entry s0
+    return code;
+}
 // s_mov_b64 s[16:17], -1
 const Words kRewriteDefined = {0xbe9004c1u};
 // s_cmp_eq_u32 s0, 0 | s_cbranch_scc1 +2 | s_mov_b32 s16, -1 | s_mov_b32 s17, -1: rewritten on ONE
@@ -688,7 +694,9 @@ const Words kDefineS20S21 = {0xbe940387u, 0xbe950387u};
 TEST(ScalarPairMask, ALoopCarriedWordFabricatedOnTheBackEdgeRefusesItsLaneRead) {
     for (Stage stage : {Stage::Compute, Stage::Fragment}) {
         EXPECT_TRUE(
-            compile_whole(stage, blanket_loop(stage, kBlanketLaneRead, kRewriteFabricated)).empty())
+            compile_whole(stage, hard_loop_input(stage, blanket_loop(stage, kBlanketLaneRead,
+                                                                     kRewriteFabricated)))
+                .empty())
             << name(stage);
         const std::string reason = last_terminal_reject_reason(kAddress);
         EXPECT_NE(reason.find("fabricated on the back edge"), std::string::npos)
@@ -775,7 +783,9 @@ TEST(ScalarPairMask, ABottomTestedLoopChecksTheBlanketAtItsBackEdgeToo) {
     for (Stage stage : {Stage::Compute, Stage::Fragment}) {
         EXPECT_FALSE(compile_whole(stage, loop(stage, kRewriteDefined)).empty())
             << name(stage) << ": " << last_terminal_reject_reason(kAddress);
-        EXPECT_TRUE(compile_whole(stage, loop(stage, kRewriteFabricated)).empty()) << name(stage);
+        EXPECT_TRUE(
+            compile_whole(stage, hard_loop_input(stage, loop(stage, kRewriteFabricated))).empty())
+            << name(stage);
         const std::string reason = last_terminal_reject_reason(kAddress);
         EXPECT_NE(reason.find("fabricated on the back edge"), std::string::npos)
             << name(stage) << ": refused for another reason: " << reason;
@@ -802,7 +812,8 @@ TEST(ScalarPairMask, ACarriedWordCopiedFromAViolatedOneIsViolatedToo) {
     const Words rewrite = {0xbe900414u, 0xbe940418u};
     for (Stage stage : {Stage::Compute, Stage::Fragment}) {
         EXPECT_TRUE(
-            compile_whole(stage, blanket_loop(stage, kBlanketLaneRead, rewrite, kDefineS20S21))
+            compile_whole(stage, hard_loop_input(stage, blanket_loop(stage, kBlanketLaneRead,
+                                                                     rewrite, kDefineS20S21)))
                 .empty())
             << name(stage);
         const std::string reason = last_terminal_reject_reason(kAddress);

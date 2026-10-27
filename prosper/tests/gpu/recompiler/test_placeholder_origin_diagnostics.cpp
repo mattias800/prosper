@@ -85,9 +85,16 @@ TEST(PlaceholderOriginDiagnostics, ReplayIdentityExcludesOnlyTheDiagnosticEnvelo
         recompile_refusal_identity("loop-carried s10 is fabricated on the back edge "
                                    "placeholder-roots=[origin=spill word=spill-v20:3 at=entry]"),
         "loop-carried s10 is fabricated on the back edge");
+    EXPECT_EQ(recompile_refusal_identity("unmodelled-scalar-publication pc=3 "
+                                         "placeholder-roots=[origin=unloaded word=s60 at=entry]"),
+              "unmodelled-scalar-publication pc=3");
 }
 
 TEST(PlaceholderOriginDiagnostics, ReplayIdentityPreservesTheReasonSiteAndMalformedSuffix) {
+    EXPECT_EQ(
+        recompile_refusal_identity("hard-placeholder-read pc=3 "
+                                   "placeholder-roots=[origin=unknown-launch word=s12 at=entry]"),
+        "hard-placeholder-read pc=3");
     EXPECT_NE(
         recompile_refusal_identity("fabricated-fresh-mask-source pc=3 placeholder-roots=[x]"),
         recompile_refusal_identity("fabricated-fresh-mask-source pc=4 placeholder-roots=[x]"));

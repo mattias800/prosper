@@ -104,9 +104,9 @@ TEST(FlatActiveWord, CompleteLoadedActiveLanesCanSupplyTheComparison) {
 TEST(FlatActiveWord, RestoringInactiveLanesDoesNotDefineTheirLoadedWord) {
     auto code = program();
     code.insert(code.begin() + 6, 0xbefe0404u); // restore saved full EXEC before the comparison
-    // The inactive lanes must hold a HARD old v3: v3 = s30 (no launch loads it). Never written,
+    // The inactive lanes must hold a HARD old v3: v3 = s14 (the scratch-offset profile is unknown). Never written,
     // they would be arbitrary, which the restored compare may read (#5185, #5193).
-    code.insert(code.begin(), 0x7e06021eu);
+    code.insert(code.begin(), 0x7e06020eu);
     missing(compile(code, true), 8, true);
 }
 
@@ -289,7 +289,8 @@ TEST(FlatActiveWord, BoundBufferAlsoRequiresTheActualCurrentAddressWord) {
 
 TEST(FlatActiveWord, ABufferBindingCannotInventTheMissingAddressWord) {
     auto code = buffer_address();
-    code[2] = 0x7e02021eu;   // v1 = s30, never loaded: hard (never written, v1 is arbitrary, #5193)
+    code[2] =
+        0x7e02020eu;   // v1 = s14, unknown scratch-offset input: hard (never written, v1 is arbitrary, #5193)
     missing(compile(code, true), 8, true);
 }
 
@@ -301,7 +302,7 @@ TEST(FlatActiveWord, GenuineScalarBufferOffsetIsRetained) {
 
 TEST(FlatActiveWord, MissingScalarBufferOffsetIsNotCurrentData) {
     auto code = buffer_address();
-    code[4] = 0x14030301u; // absent SOFFSET=s20
+    code[4] = 0x0e030301u;   // absent SOFFSET=s20
     missing(compile(code, true), 8, true);
 }
 
@@ -315,7 +316,7 @@ TEST(FlatActiveWord, FusedShiftAddDefinesItsActualActiveAddressWord) {
 TEST(FlatActiveWord, FusedShiftAddCannotInventItsMissingScalarSource) {
     auto code = program();
     code.erase(code.begin());
-    code.insert(code.begin() + 3, {0xd7460001u, 0x04010014u}); // absent s20
+    code.insert(code.begin() + 3, {0xd7460001u, 0x0401000eu});   // absent s20
     missing(compile(code, true), 7, true);
 }
 
@@ -378,10 +379,10 @@ void accepted(const Compilation& result, bool dispatcher) {
 
 std::vector<uint32_t> whole_entry_buffer(bool typed, bool missing_address) {
     return {
-        0x7e060281u, // whole-entry genuine old v3
-        // A missing address is v1 = s30, which no launch loads: hard on every route. A never-
+        0x7e060281u,   // whole-entry genuine old v3
+        // A missing address is v1 = s14, the possible scratch-offset input: hard on every route. A never-
         // written v1 would be arbitrary, and a bounded read there admissible (#5193).
-        missing_address ? 0x7e02021eu : 0x7e020280u,
+        missing_address ? 0x7e02020eu : 0x7e020280u,
         0xbe84047eu,
         0x7daa0080u,
         typed ? 0xe8b01000u : 0xe0301000u,
@@ -499,10 +500,10 @@ TEST(FlatActiveWord, BothSelectedBufferAddressWordsMustBeCurrentBeforeOverwrite)
             for (unsigned destination : {3u, 0u})
                 for (unsigned missing_word : {0u, 1u, 2u}) {
                     std::vector<uint32_t> code{
-                        // A missing word relays s30 (no launch loads it): hard on every route,
+                        // A missing word relays s14 (the scratch-offset profile is unknown): hard on every route,
                         // where a never-written word would be arbitrary (#5193).
-                        missing_word == 1 ? 0x7e02021eu : 0x7e020280u,
-                        missing_word == 2 ? 0x7e04021eu : 0x7e040280u,
+                        missing_word == 1 ? 0x7e02020eu : 0x7e020280u,
+                        missing_word == 2 ? 0x7e04020eu : 0x7e040280u,
                         0xbe84047eu,
                         0x7daa0080u,
                         typed ? 0xe8b03000u : 0xe0303000u,

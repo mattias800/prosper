@@ -1,4 +1,5 @@
 #include "gpu/recompiler/rdna2_placeholder_origins.hpp"
+#include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include "gpu/recompiler/rdna2_current_word_roots.hpp"
 #include "gpu/recompiler/ir/cfg/exec_value_census.hpp"
@@ -332,10 +333,11 @@ void seed_vector_word_definedness(RegState& rs, const std::vector<Rdna2Inst>& in
                    in.n_src >= 3 && in.src[2].kind == OperandKind::Special &&
                    in.src[2].value == 253;
         });
-    if (scc_offset) rs.track_scc_definition = true;
-    if (wave_size == 32 || scc_offset) {
+    const bool track_scc = scc_offset || arbitrary_placeholder_retry_active();
+    if (track_scc) rs.track_scc_definition = true;
+    if (wave_size == 32 || track_scc) {
         // These producing entries supply no architectural SCC input; bfalse is storage only.
-        // A numeric buffer offset requires its actual producer even in ordinary Wave64.
+        // Numeric offsets and admission retries require its actual producer in Wave64 too.
         rs.scc_merge_placeholder = true;
         rs.scc_loop_blanket.clear();
     }

@@ -2,6 +2,7 @@
 // A false Bool slot disables live lanes; promoting one dword to a B64 alias invents its sibling.
 #include "bpermute_spirv_oracle.hpp"
 #include "fixtures/checked_compute_launch.hpp"
+#include "fixtures/arbitrary_placeholder.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
 
@@ -545,7 +546,11 @@ TEST(NativeCfgSavedMaskData, EarlyDirectBreakCannotInventAProducerThatHasNotRun)
     loop_refuses(1);
 }
 TEST(NativeCfgSavedMaskData, DirectBreakBodyCannotBorrowPreheaderAuthorityAfterScalarFabrication) {
-    loop_refuses(2);
+    routed_loop_refuses(numeric_direct_break_loop(2), 2, "wave-scalar-loop-live-out",
+                        "origin=lost-definition word=s0 at=11");
+    routed_loop_refuses(prosper::test::arbitrary_placeholder::with_missing_spill_root(
+                            numeric_direct_break_loop(2), 60),
+                        2);
 }
 TEST(NativeCfgSavedMaskData, OneArmReadlaneCannotReplaceAGenuineLoopScalar) {
     loop_refuses(3);
@@ -557,7 +562,11 @@ TEST(NativeCfgSavedMaskData, CurrentOverwriteEndsFabricatedBodyScalarGeneration)
     loop_values(5, 7);
 }
 TEST(NativeCfgSavedMaskData, DirectBreakCannotBorrowDifferentRootForAFabricatedCurrentWord) {
-    loop_refuses(6);
+    routed_loop_refuses(numeric_direct_break_loop(6), 6, "wave-scalar-loop-live-out",
+                        "origin=lost-definition word=s0 at=13");
+    routed_loop_refuses(prosper::test::arbitrary_placeholder::with_missing_spill_root(
+                            numeric_direct_break_loop(6), 60),
+                        6);
 }
 
 namespace {
@@ -858,10 +867,14 @@ std::vector<uint32_t> absent_scalar_selector_program(bool selector, bool edge,
 }   // namespace
 
 TEST(NativeCfgSavedMaskData, AnAbsentScalarSelectorRefusesWithinTheCase) {
-    lane_selector_refuses(absent_scalar_selector_program(false, false), 3);
+    const auto p = absent_scalar_selector_program(false, false);
+    lane_selector_values(p, 0, 0);
+    lane_selector_refuses(prosper::test::arbitrary_placeholder::with_missing_spill_root(p, 40), 9);
 }
 TEST(NativeCfgSavedMaskData, AnAbsentScalarSelectorRefusesAcrossAnEdge) {
-    lane_selector_refuses(absent_scalar_selector_program(false, true), 5);
+    const auto p = absent_scalar_selector_program(false, true);
+    lane_selector_values(p, 0, 0);
+    lane_selector_refuses(prosper::test::arbitrary_placeholder::with_missing_spill_root(p, 40), 11);
 }
 TEST(NativeCfgSavedMaskData, ADefinedScalarSelectorKeepsActualValueWithinTheCase) {
     lane_selector_values(absent_scalar_selector_program(true, false), 0, 0);
@@ -873,13 +886,17 @@ TEST(NativeCfgSavedMaskData, ACurrentResultOverwriteEndsAbsentSelectorAcrossAnEd
     lane_selector_values(absent_scalar_selector_program(false, true, 1), 0, 0);
 }
 TEST(NativeCfgSavedMaskData, AnAbsentOverwriteEndsOlderDefinedSelectorAcrossAnEdge) {
-    lane_selector_refuses(absent_scalar_selector_program(true, true, 2), 7);
+    const auto p = absent_scalar_selector_program(true, true, 2);
+    lane_selector_values(p, 0, 0);
+    lane_selector_refuses(prosper::test::arbitrary_placeholder::with_missing_spill_root(p, 41), 13);
 }
 TEST(NativeCfgSavedMaskData, ACurrentSelectorOverwriteEndsAbsentGenerationAcrossAnEdge) {
     lane_selector_values(absent_scalar_selector_program(true, true, 3), 0, 0);
 }
 TEST(NativeCfgSavedMaskData, ARelayedAbsentSelectorRefusesAcrossAnEdge) {
-    lane_selector_refuses(absent_scalar_selector_program(false, true, 4), 6);
+    const auto p = absent_scalar_selector_program(false, true, 4);
+    lane_selector_values(p, 0, 0);
+    lane_selector_refuses(prosper::test::arbitrary_placeholder::with_missing_spill_root(p, 40), 12);
 }
 TEST(NativeCfgSavedMaskData, ADefinedConstantSlotDoesNotInheritAnotherSlotsMark) {
     auto p = absent_scalar_selector_program(false, true);
@@ -932,7 +949,9 @@ void delayed_body_root_values(unsigned variant, uint32_t expected) {
 }
 }   // namespace
 TEST(NativeCfgSavedMaskData, DelayedBodyRootCannotBorrowAValidCheckRootAtLoopExit) {
-    routed_loop_refuses(delayed_body_root_loop(0), 6);
+    const auto p = delayed_body_root_loop(0);
+    routed_loop_refuses(p, 6, "wave-scalar-loop-live-out", "origin=lost-definition word=s17 at=14");
+    routed_loop_refuses(prosper::test::arbitrary_placeholder::with_missing_spill_root(p, 60), 6);
 }
 TEST(NativeCfgSavedMaskData, GenuineDelayedBodyRootKeepsTheActualZeroValue) {
     delayed_body_root_values(1, 0);
@@ -983,17 +1002,20 @@ void delayed_vector_body_root_values(unsigned variant, uint32_t expected) {
 }
 }   // namespace
 TEST(NativeCfgSavedMaskData, DelayedVectorBodyRootCannotBorrowACleanCheckWordAtLoopExit) {
-    routed_loop_refuses(delayed_vector_body_root_loop(0), 6, "exec-loop-widens",
-                        "fabricated-fresh-mask-sourcepc=23");
+    const auto p = delayed_vector_body_root_loop(0);
+    // The exact route's auxiliary refusal retains the missing broadcast. Its final
+    // Wave64 summary currently drops the named cause (#5529), so inspect the full capture.
+    routed_loop_refuses(p, 6, "exec-loop-widens",
+                        "origin=unmodelled-scalar-publication word=s17 at=22");
+    routed_loop_refuses(prosper::test::arbitrary_placeholder::with_missing_spill_root(p, 60), 6,
+                        "exec-loop-widens", "fabricated-fresh-mask-sourcepc=29");
 }
 TEST(NativeCfgSavedMaskData, GenuineDelayedVectorBodyRootKeepsTheActualZeroValue) {
     delayed_vector_body_root_values(1, 0);
 }
 TEST(NativeCfgSavedMaskData, FullCurrentVectorReplacementEndsTheDelayedInvalidBodyRoot) {
-    // CONFIDENCE: HIGH (coverage cost, #5206) -- this loop's exits are wave-uniform, so its
-    // structured module was exact, but the widening proof is code-only and cannot see uniformity.
-    // The exact route's data proof does not yet see the full v6 replacement after the restore,
-    // so the program is refused on both routes. Before #5206 it compiled with value 7.
-    routed_loop_refuses(delayed_vector_body_root_loop(2), 6, "exec-loop-widens",
-                        "fabricated-fresh-mask-sourcepc=24");
+    const auto p = delayed_vector_body_root_loop(2);
+    delayed_vector_body_root_values(2, 7);
+    routed_loop_refuses(prosper::test::arbitrary_placeholder::with_missing_spill_root(p, 60), 6,
+                        "exec-loop-widens", "fabricated-fresh-mask-sourcepc=30");
 }

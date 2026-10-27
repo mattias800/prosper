@@ -138,6 +138,7 @@ SavedB64MaskSnapshot snapshot_saved_b64_masks(SpirvCompute& b, const RegState& r
     snapshot.scalar_first_lane_agrees = scalar_scope_first_lane_agrees(b, rs, in);
     snapshot.scalar_local_index_waterfall = scalar_scope_local_index_waterfall(b, in);
     note_memory_address(b, rs, in, snapshot.source_marks);   // #5193, before the roots are cleared
+    note_placeholder_memory_contract(b, rs, in, snapshot.source_marks);
     if (in.fmt == Rdna2Format::FLAT || in.fmt == Rdna2Format::MUBUF ||
         in.fmt == Rdna2Format::MTBUF) {
         // Address assumptions are read before an aliasing write. Keep them on the loaded value:

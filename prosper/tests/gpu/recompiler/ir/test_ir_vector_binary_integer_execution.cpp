@@ -187,6 +187,7 @@ TEST(IrVectorBinaryIntegerExecution, HardScalarSourcesCannotBecomeMasksAfterRest
                 (slot == 0 ? f.s0 : f.s1) = 50;
                 auto bad = words(def.opcode, f);
                 bad.insert(bad.end(), {0xbefe04c1, 0x7d8a0280});   // Full EXEC; compare result v1.
+                bad.insert(bad.begin(), 0xbeb20300u);   // s50 = unknown possible scratch offset s0
                 const auto refused = run_vector_op_per_lane(bad, lane_inputs(7), wave);
                 EXPECT_NE(refused.error.find("fabricated-fresh-mask-source"), std::string::npos)
                     << refused.error << " opcode " << def.opcode;
@@ -210,7 +211,7 @@ TEST(IrVectorBinaryIntegerExecution, OneArmWordsKeepTheirHardObligationWithBothE
                 code.insert(code.end(), op.begin(), op.end());
                 code.insert(code.end(), {0xbefe04c1, 0x7d8a0280});
                 auto program = lane_program(code, 64, wave);
-                program.config.user_sgprs.resize(8);   // Genuine dynamic branch selector s4.
+                seed_lane_hard_scalar(program, 8);   // Genuine dynamic branch selector s4.
                 const auto address = lane_harness_address();
                 const auto module =
                     recompile_compute(program.code.data(), program.code.size(), &program.table,

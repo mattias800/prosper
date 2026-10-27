@@ -1,3 +1,5 @@
+#include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
+#include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_native_image_results.hpp"
 // rdna2_emit_alu.cpp — emit_alu: the RDNA2 instruction-family translator, split out of
 // rdna2_to_spirv.cpp. Shared state lives in gpu/recompiler/rdna2_to_spirv_internal.hpp.
@@ -205,6 +207,12 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
     auto val = [&](const Operand& o) { return operand_bits(b, rs, in, o, &ok); };
     // SDWA/DPP forms carry a sub-dword select or cross-lane control word we don't model. The decoder
     // flags them (and gets their length right); reject here rather than compute with a wrong operand.
+    if (refuse_arbitrary_placeholder_export(b, rs, in, ok) ||
+        refuse_arbitrary_placeholder_old_destination(b, rs, in, ok))
+        return true;
+    if ((rdna2_instruction_effects(in).implicit_reads & kRdna2ImplicitScc) &&
+        refuse_arbitrary_placeholder_operand(b, rs, in, {OperandKind::Special, 253}, &ok))
+        return true;
     PortableMaskHalfInstruction portable_halves(b, rs, in, ok);
     if (!ok || portable_halves.handled()) return true;
     VccMaskViewDrop drop(b, rs);   // takes VCC's lane view away at exit when armed
@@ -1060,7 +1068,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
             const uint32_t SQ_DIM_2D_ARRAY = 5u;   // (x, y, layer) -- #2265
             rs.native_image_result_publication = {};
             begin_mimg_source_proof(rs, in.pc);
-            auto vread = [&](int r) { return read_mimg_source_word(b, rs, r); };
+            auto vread = [&](int r) {
+                return read_mimg_source_for_arbitrary_retry(b, rs, in, r, ok);
+            };
 
             // IMAGE_BVH_INTERSECT_RAY (GFX10 opcode 0xe6) has an image encoding but consumes a
             // four-dword BVH descriptor and eleven NSA VGPR operands. Vulkan ray-query support is

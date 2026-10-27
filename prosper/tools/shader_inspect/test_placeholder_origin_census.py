@@ -46,3 +46,23 @@ def test_live_replay_is_the_measurement_instead_of_the_synthetic_stage():
     report = poc.census({"programs": {"compute/a.bin": row}})
     assert report["entries_surveyed"] == 1
     assert report["policy_one_refusals"] == 0
+
+
+def test_missing_scalar_publication_stays_in_the_policy_origin_census():
+    reason = (
+        "unmodelled-scalar-publication placeholder-roots=["
+        "origin=unmodelled-scalar-publication word=s20 at=3;"
+        "origin=unloaded word=s60 at=entry]"
+    )
+    report = poc.census({"programs": {"compute/a.bin": entry(reason)}})
+    assert report["policy_one_refusals"] == 1
+    assert report["programs_by_origin"] == {"unloaded": 1, "unmodelled-scalar-publication": 1}
+    assert report["unclassified"] == []
+
+
+def test_unrelated_hard_data_read_remains_visible_in_the_policy_census():
+    reason = "hard-placeholder-read placeholder-roots=[origin=unknown-launch word=s12 at=entry]"
+    report = poc.census({"programs": {"compute/a.bin": entry(reason)}})
+    assert report["policy_one_refusals"] == 1
+    assert report["programs_by_origin"] == {"unknown-launch": 1}
+    assert report["unclassified"] == []

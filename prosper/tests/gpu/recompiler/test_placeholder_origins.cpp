@@ -1,8 +1,9 @@
 // Diagnostic slices distinguish missing hardware inputs from unloaded words and spills.
-// These tests grant no admission; every public compiler fixture remains refused.
+// Hard public compiler fixtures remain refused; unloaded-only roots now have a separate policy.
 #include "fixtures/checked_compute_launch.hpp"
 #include "gpu/recompiler/rdna2_reg_state.hpp"
 #include "gpu/recompiler/rdna2_placeholder_origins.hpp"
+#include "gpu/recompiler/rdna2_placeholder_origin_memory.hpp"
 #include "gpu/recompiler/rdna2_placeholder_origin_trace.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -88,8 +89,10 @@ TEST(PlaceholderOrigins, AProvedDescriptorDoesNotHideAMissingVectorAddress) {
     auto p = program({0xe0302000u, 0x80030604u, 0x7d840d06u, 0xbf810000u});
     for (int word = 12; word < 16; ++word) p.loaded_scalars.insert(word);
     p.observations->genuine_resources[0] = true;
+    p.observations->arbitrary_memory_results[0] = true;
     EXPECT_EQ(roots(p, 2, {PlaceholderFile::Vector, 6}), "origin=unloaded word=v4 at=entry");
     p.observations->genuine_resources[0] = false;
+    p.observations->arbitrary_memory_results[0] = false;
     EXPECT_NE(roots(p, 2, {PlaceholderFile::Vector, 6}).find("origin=launch-input word=s12"),
               std::string::npos);
 }
@@ -119,18 +122,17 @@ TEST(PlaceholderOrigins, ARefusalWithNoMissingInputNamesTheLostDefinition) {
     EXPECT_EQ(roots(p, 1, {PlaceholderFile::Vector, 6}), "origin=lost-definition word=v6 at=1");
 }
 
-TEST(PlaceholderOrigins, PublicFreshMaskRefusalReportsAnUnloadedScalarRoot) {
+TEST(PlaceholderOrigins, PublicUnloadedScalarReadIsAdmittedWithoutAStaleRefusal) {
     const std::vector<uint32_t> words{0x7e0c023cu, 0x7d840d06u, 0xbf810000u};
     ComputeShaderConfig config;
     config.local_x = config.wave_size = config.native_subgroup_size = 64;
     prosper::test::complete_compute_launch(config);
     constexpr uint64_t address = 0x5497a00100ull;
-    EXPECT_TRUE(recompile_compute(words.data(), words.size(), nullptr, config,
-                                  {RecompileDiagnosticStage::Compute, address})
-                    .empty());
+    EXPECT_FALSE(recompile_compute(words.data(), words.size(), nullptr, config,
+                                   {RecompileDiagnosticStage::Compute, address})
+                     .empty());
     const auto reason = last_terminal_reject_reason(address);
-    EXPECT_NE(reason.find("fabricated-fresh-mask-source"), std::string::npos) << reason;
-    EXPECT_NE(reason.find("origin=unloaded word=s60 at=entry"), std::string::npos) << reason;
+    EXPECT_TRUE(reason.empty()) << reason;
 }
 
 TEST(PlaceholderOrigins, PublicUnknownScalarLaunchRemainsUnknown) {
@@ -265,11 +267,58 @@ TEST(PlaceholderOrigins, AnImplicitLdsReadDoesNotInventAnUnloadedAddressRoot) {
     ASSERT_EQ(p.instructions[1].opcode, 0xb1u);
     const auto text = roots(p, 3, {PlaceholderFile::Vector, 6});
     // Legacy memory-state inventory is deliberately not consumed as a new validity proof.
-    EXPECT_EQ(text, "origin=unmodelled-transfer word=v6 at=1");
+    EXPECT_NE(text.find("origin=unmodelled-transfer word=v6 at=1"), std::string::npos) << text;
+    EXPECT_NE(text.find("origin=unproved-memory-result word=v6 at=1"), std::string::npos) << text;
 }
 
 TEST(PlaceholderOrigins, AWordBeyondThePhysicalVectorFileIsNotAnUnloadedRegister) {
     const auto p = program({0xbf810000u});
     EXPECT_EQ(roots(p, 0, {PlaceholderFile::Vector, 256}),
               "origin=unmodelled-transfer word=v256 at=entry");
+}
+
+TEST(PlaceholderOrigins, AnAtomicResultDoesNotInheritOnlyItsUnloadedAddress) {
+    auto p = program({0xd8800000u, 0x06000007u, 0x7d840d06u, 0xbf810000u});
+    p.observations->arbitrary_memory_results[0] = false;
+    const auto text = roots(p, 2, {PlaceholderFile::Vector, 6});
+    EXPECT_NE(text.find("origin=unproved-memory-result word=v6 at=0"), std::string::npos) << text;
+    EXPECT_NE(text.find("origin=unloaded word=v7 at=entry"), std::string::npos) << text;
+}
+
+TEST(PlaceholderOrigins, ABufferBindingDoesNotSupplyItsScalarOffset) {
+    auto p = program({0xe0302000u, 0x00030604u, 0x7d840d06u, 0xbf810000u});
+    p.observations->genuine_resources[0] = true;
+    p.observations->arbitrary_memory_results[0] = true;
+    const auto text = roots(p, 2, {PlaceholderFile::Vector, 6});
+    EXPECT_NE(text.find("origin=unknown-launch word=s0 at=entry"), std::string::npos) << text;
+    EXPECT_NE(text.find("origin=unloaded word=v4 at=entry"), std::string::npos) << text;
+}
+
+TEST(PlaceholderOrigins, ScalarLoadPublicationCannotAuthenticateAMissingResult) {
+    auto p = std::make_shared<PlaceholderOriginProgram>(
+        program({0xf4200502u, 0xfa000000u, 0xbf810000u}));
+    RegState rs;
+    SpirvCompute b;
+    rs.placeholder_origin_program = p;
+    const auto& in = p->instructions.front();
+    note_placeholder_scalar_load(b, rs, in);
+    EXPECT_FALSE(p->observations->native_inputs.contains(0));
+    rs.sreg[20] = 0;
+    note_placeholder_scalar_load(b, rs, in);
+    EXPECT_FALSE(p->observations->native_inputs.contains(0));
+    rs.sreg[20] = 1;
+    rs.sreg_merge_placeholder.insert(20);
+    note_placeholder_scalar_load(b, rs, in);
+    EXPECT_FALSE(p->observations->native_inputs.contains(0));
+    rs.sreg_merge_placeholder.clear();
+    note_placeholder_scalar_load(b, rs, in);
+    EXPECT_FALSE(p->observations->native_inputs.contains(0))
+        << "every observed path must supply it";
+    p->observations =
+        std::make_shared<PlaceholderOriginObservations>(); // fresh producing attempt
+    note_placeholder_scalar_load(b, rs, in);
+    EXPECT_TRUE(p->observations->native_inputs.contains(0));
+    rs.sreg_merge_placeholder.insert(20);
+    note_placeholder_scalar_load(b, rs, in);
+    EXPECT_FALSE(p->observations->native_inputs.contains(0));
 }

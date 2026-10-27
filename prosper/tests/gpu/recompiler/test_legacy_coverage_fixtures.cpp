@@ -115,17 +115,17 @@ TEST(LegacyCoverageFixtures, NorValuHasTheInputWordItsPrefixConsumes) {
 
 TEST(LegacyCoverageFixtures, MissingB32SecondVectorInputStillRejectsAtTheComparison) {
     auto code = fixtures::b32_alias();
-    code[0] = 0x7e02021eu;   // v1 = s30: never loaded, so hard on every route (#5039)
+    code[0] = 0x7e020201u;   // v1 = unknown scratch-offset s1: Hard
     reject(code, fixtures::wave32(false), 0x5125000110ull, 1, "fabricated-fresh-mask-source");
 }
 TEST(LegacyCoverageFixtures, MissingCndmaskComparisonInputStillRejectsAtTheComparison) {
     auto code = fixtures::cndmask_scalar();
-    code[0] = 0x7e14021eu;   // v10 = s30: never loaded, so hard on every route (#5039)
+    code[0] = 0x7e140201u;   // v10 = unknown scratch-offset s1: Hard
     reject(code, fixtures::branch_wave64(), 0x5125000120ull, 10, "mode=unresolved-operand");
 }
 TEST(LegacyCoverageFixtures, MissingLshlOrTailInputStillRejectsAtTheComparison) {
     auto code = fixtures::lshl_or_scalar();
-    code[0] = 0x7e0e021eu;   // v7 = s30: never loaded, so hard on every route (#5039)
+    code[0] = 0x7e0e0201u;   // v7 = unknown scratch-offset s1: Hard
     reject(code, fixtures::branch_wave64(), 0x5125000130ull, fixtures::lshl_or_tail_word + 15,
            "mode=unresolved-operand");
 }

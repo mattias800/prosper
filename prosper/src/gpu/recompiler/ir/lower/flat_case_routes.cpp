@@ -2,6 +2,7 @@
 #include "gpu/recompiler/ir/lower/flat_case_routes.hpp"
 #include "gpu/recompiler/ir/lower/flat_window_lowering.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
+#include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_packed_pointer.hpp"
@@ -63,8 +64,9 @@ std::optional<bool> FlatCaseRoutes::relocated() {
             return true;
         }
         const int address_vgpr = static_cast<int>(relocated_access->address_vgpr);
-        const uint32_t address_lo = vreg_old(b, rs, address_vgpr);
-        const uint32_t address_hi = vreg_old(b, rs, address_vgpr + 1);
+        const uint32_t address_lo = read_vector_for_arbitrary_retry(b, rs, in, address_vgpr, ok);
+        const uint32_t address_hi =
+            read_vector_for_arbitrary_retry(b, rs, in, address_vgpr + 1, ok);
         const uint32_t value =
             descriptor_range ? b.relocated_indirect_descriptor_load_dword(
                                    address_lo, address_hi, relocated_access->immediate_byte_offset)
@@ -93,8 +95,8 @@ std::optional<bool> FlatCaseRoutes::packed() {
             ok = false;
             return true;
         }
-        const uint32_t address_lo = vreg_old(b, rs, 0);
-        const uint32_t address_hi = vreg_old(b, rs, 1);
+        const uint32_t address_lo = read_vector_for_arbitrary_retry(b, rs, in, 0, ok);
+        const uint32_t address_hi = read_vector_for_arbitrary_retry(b, rs, in, 1, ok);
         const uint32_t relative =
             b.ibin(Op_ISub, address_lo,
                    b.uconst(b.indirect_buffer_source_bytes + b.indirect_buffer_header_bytes));
@@ -204,7 +206,8 @@ bool FlatCaseRoutes::scratch() {
         }
         const int reg = in.dst.value + static_cast<int>(component);
         if (access.store) {
-            b.guest_scratch_store_bits(byte_offset, access.bits, vreg_old(b, rs, reg),
+            b.guest_scratch_store_bits(byte_offset, access.bits,
+                                       read_vector_for_arbitrary_retry(b, rs, in, reg, ok),
                                        rs.exec_narrowed, rs.exec);
         } else {
             const uint32_t old_value = vreg_old(b, rs, reg);

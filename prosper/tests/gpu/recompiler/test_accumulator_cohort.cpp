@@ -18,9 +18,9 @@ std::vector<uint32_t> program() {
         0x7e020300u, // v1 = lane, output index
         0x7e0c0280u, // v6 = flag 0 globally
         0x7e0e0281u, // v7 = selection 1 globally
-        0x7e04023cu, // old v2 = absent s60
-        0x7e06023cu, // old v3 = absent s60
-        0x7e08023cu, // old v4 = absent s60
+        0x7e040210u, // old v2 = absent s16
+        0x7e060210u, // old v3 = absent s16
+        0x7e080210u, // old v4 = absent s16
         0xbe84047eu, // s[4:5] = whole EXEC
         0x7da6009fu, // C = lanes 31..63
         0x7e0402ffu, 0x3f800000u, // v2 = 1.0 in C
@@ -89,13 +89,13 @@ TEST(AccumulatorCohort, NativeWave64ObservesBothCohortsAndInactiveOutput) {
 }
 TEST(AccumulatorCohort, AMissingActiveSourceStillRefuses) {
     auto code = program();
-    code[12] = 0x7e06023cu;
+    code[12] = 0x7e060210u;
     code[13] = 0xbf800000u;
     EXPECT_TRUE(compile(code, 0x5497090300ull).empty());
 }
 TEST(AccumulatorCohort, AMissingOldAccumulatorStillRefuses) {
     auto code = program();
-    code[8] = 0x7e04023cu;
+    code[8] = 0x7e040210u;
     code[9] = 0xbf800000u;
     EXPECT_TRUE(compile(code, 0x5497090400ull).empty());
 }

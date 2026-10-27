@@ -119,16 +119,16 @@ TEST(CurrentCarryInputs, MissingNumericSourceCannotBorrowItsNeighbor) {
         SCOPED_TRACE(op);
         auto code = program(op);
         code[2] = 0xbe920381u; // s18 present, but actual s17 absent
-        refused(compile(code), 5);
+        code.insert(code.begin() + 3, 0xbe910302u); // s17 = unknown scratch-offset s2
+        refused(compile(code), 6);
     }
 }
 TEST(CurrentCarryInputs, MissingVectorSourceCannotBorrowTheFreshPredicate) {
     for (uint32_t op : carry_ops) {
         SCOPED_TRACE(op);
         auto code = program(op);
-        // The second source is the absent s18: never loaded, so hard on every route. (A never-
-        // written v2 would not do: under #5185 it is arbitrary on every route, #5039.)
-        code[6] = 17u | (18u << 9u) | (12u << 18u);
+        // The numeric source depends on the unknown possible scratch-offset s2, not its neighbor.
+        code[6] = 17u | (2u << 9u) | (12u << 18u);   // actual numeric SRC1 is unknown s2
         refused(compile(code), 5);
     }
 }
@@ -230,7 +230,8 @@ TEST(CurrentCarryInputs, MissingScalarNumericSrc1CannotBorrowItsNeighbor) {
         auto code = program(op);
         code[2] = 0xbe920381u;
         code[6] = 257u | (17u << 9u) | (12u << 18u);
-        refused(compile(code), 5);
+        code.insert(code.begin() + 3, 0xbe910302u);   // s17 retains an unknown launch dependency
+        refused(compile(code), 6);
     }
 }
 TEST(CurrentCarryInputs, AnUnrelatedDirtyNumericNeighborDoesNotPoisonTheRealSource) {
@@ -251,7 +252,7 @@ TEST(CurrentCarryInputs, ANewMissingNumericGenerationCannotUseAnEarlierGenuineVa
     for (uint32_t op : carry_ops) {
         SCOPED_TRACE(op);
         auto code = program(op);
-        code.insert(code.begin() + 5, 0xbe910309u);   // replace actual s17 with missing s9
+        code.insert(code.begin() + 5, 0xbe910302u);   // replace s17 with unknown scratch-offset s2
         refused(compile(code), 6);
     }
 }
@@ -260,14 +261,14 @@ std::vector<uint32_t> numeric_join(uint32_t op, bool genuine) {
     auto code = program(op);
     code.erase(code.begin() + 2);   // the original numeric definition is supplied by the two arms
     code.insert(code.begin() + 2, {0xbf068001u, 0xbf840002u, 0xbe910381u, 0xbf820001u,
-                                   genuine ? 0xbe910381u : 0xbe910309u});
+                                   genuine ? 0xbe910381u : 0xbe910302u});
     return code;
 }
 std::vector<uint32_t> numeric_loop(uint32_t op, bool genuine) {
     auto code = program(op);
     code.insert(code.begin() + 5, 0xbe860380u);   // genuine counter before the header carry
     code.insert(code.end() - 1,
-                {genuine ? 0xbe910381u : 0xbe910309u, 0x80068106u, 0xbf0a8206u, 0xbf85fffau});
+                {genuine ? 0xbe910381u : 0xbe910302u, 0x80068106u, 0xbf0a8206u, 0xbf85fffau});
     return code;
 }
 }   // namespace

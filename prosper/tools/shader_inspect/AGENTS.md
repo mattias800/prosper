@@ -6,5 +6,6 @@ verdicts and accepted module hashes, and group changes for review. They do not r
 
 `placeholder_origin_census.py` reads a survey's recorded origin details. It counts each program
 once per origin and each distinct root separately, so mixed-origin groups overlap visibly.
+The policy cohort also includes a retry stopped at an unmodelled scalar publication.
 Missing diagnostics stay unclassified; the tool cannot turn them into unloaded words or change
 the compiler's admission policy.

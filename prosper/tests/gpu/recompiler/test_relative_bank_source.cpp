@@ -372,9 +372,16 @@ TEST(RelativeBankSource, DeferredM0CannotSkipAnExplicitOrImplicitM0OrIndexRead) 
         code[code.size() - 2] = 0x28282828u;   // observe v40 when that form supplies it
         const uint64_t address = 0x54970c0200ull + word;
         EXPECT_TRUE(compile(code, address).empty()) << word;
-        EXPECT_NE(last_terminal_reject_reason(address).find("fabricated-fresh-mask-source pc=12"),
+        EXPECT_NE(last_terminal_reject_reason(address).find("hard-placeholder-read pc=1"),
                   std::string::npos)
             << word;
+        EXPECT_NE(last_terminal_reject_reason(address).find("origin=unknown-launch word=s60"),
+                  std::string::npos);
+        // The public retry rejects the unrelated missing input first. Check the actual packet
+        // certificate too, so that early refusal cannot mask a missing retirement guard.
+        std::vector<Rdna2Inst> ins;
+        ASSERT_EQ(rdna2_walk(code.data(), code.size(), ins), code.size());
+        EXPECT_EQ(local_index_waterfall_latch(ins, 11), UINT32_MAX) << word;
     }
 }
 TEST(RelativeBankSource, DeferredM0MissingBankAndExpandedReaderStillRefuse) {
@@ -395,8 +402,12 @@ TEST(RelativeBankSource, DeferredM0RequiresAnIndependentUnconditionalOverwrite) 
         code[22] = word;   // M0 itself, the per-lane index, or a conditional replacement
         const uint64_t address = 0x54970c0400ull + word;
         EXPECT_TRUE(compile(code, address).empty());
-        EXPECT_NE(last_terminal_reject_reason(address).find("fabricated-fresh-mask-source pc=12"),
-                  std::string::npos);
+        const auto reason = last_terminal_reject_reason(address);
+        EXPECT_NE(reason.find("hard-placeholder-read pc=1"), std::string::npos) << reason;
+        EXPECT_NE(reason.find("origin=unknown-launch word=s60"), std::string::npos) << reason;
+        std::vector<Rdna2Inst> ins;
+        ASSERT_EQ(rdna2_walk(code.data(), code.size(), ins), code.size());
+        EXPECT_EQ(local_index_waterfall_latch(ins, 11), UINT32_MAX) << reason;
     }
 }
 TEST(RelativeBankSource, DeferredM0DoesNotCrossABranchOrAnUnboundedTail) {

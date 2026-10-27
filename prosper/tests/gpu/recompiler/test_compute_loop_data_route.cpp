@@ -124,12 +124,12 @@ void wave_maximum(const Result& r) {
         EXPECT_EQ(stores[lane], lane - 1u)
             << "lane " << lane << " retains its own final masked iteration";
 }
-// The old value of `vgpr` in every lane before the program: hard on every route. s30 is neither a
-// user SGPR nor written by the programs here, so hardware never loads it. A never-written VGPR
+// The old value of `vgpr` in every lane before the program: hard on every route. s17 follows sixteen
+// user SGPRs and TGID_X; SCRATCH_EN is unknown, so its launch value is unknown. A never-written VGPR
 // would not do: under #5185 it holds an arbitrary value hardware could hold, which a fresh
 // predicate may read on any route (#5039). Shifts every pc by one.
 Program hard_old(Program p, uint32_t vgpr) {
-    p.words.insert(p.words.begin(), 0x7e00021eu | (vgpr << 17u));   // v_mov_b32 vN, s30
+    p.words.insert(p.words.begin(), 0x7e000211u | (vgpr << 17u));   // v_mov_b32 vN, s17
     ++p.header;
     return p;
 }
@@ -187,22 +187,25 @@ TEST(ComputeLoopDataRoute, UnwrittenPreheaderWordStaysMissing) {
 }
 TEST(ComputeLoopDataRoute, FabricatedPreheaderRelayStaysMissing) {
     auto p = program();
-    p.words[2] = 0x7e02021eu;   // v1 = s30, never loaded: hard on every route (#5039)
+    p.words[2] =
+        0x7e020211u;   // v1 = s17, unknown scratch-offset input: hard on every route (#5039)
     missing(compile(p), p.header);
 }
 TEST(ComputeLoopDataRoute, MissingScalarBoundIsNotVectorData) {
     auto p = program();
-    p.words[3] = 0x7e04021eu;
+    p.words[3] = 0x7e040211u;
     missing(compile(p), p.header);
 }
 TEST(ComputeLoopDataRoute, UnwrittenBackedgeWordStaysMissing) {
     auto p = program();
-    p.words[11] = 0x7e02021eu;   // v1 = s30, never loaded: hard on every route (#5039)
+    p.words[11] =
+        0x7e020211u;   // v1 = s17, unknown scratch-offset input: hard on every route (#5039)
     missing(compile(p), p.header);
 }
 TEST(ComputeLoopDataRoute, ExplicitDispatcherDoesNotInventBackedgeData) {
     auto p = program();
-    p.words[11] = 0x7e02021eu;   // v1 = s30, never loaded: hard on every route (#5039)
+    p.words[11] =
+        0x7e020211u;   // v1 = s17, unknown scratch-offset input: hard on every route (#5039)
     const auto result = compile(p, config(true));
     EXPECT_TRUE(result.module.empty());
     EXPECT_NE(
@@ -213,17 +216,20 @@ TEST(ComputeLoopDataRoute, ExplicitDispatcherDoesNotInventBackedgeData) {
 TEST(ComputeLoopDataRoute, WideningBackedgeDoesNotUseNarrowingRetry) {
     auto p = program();
     p.words[8] = 0xbefe04c1u;
+    p = hard_old(p, 1);
     missing(compile(p), p.header);
 }
 TEST(ComputeLoopDataRoute, NativeWidthWithoutActualLaunchDoesNotGrantRetry) {
     auto c = config();
     c.dispatch_launch.known = 0;
-    missing(compile(program(), c), 6);
+    const auto p = hard_old(program(), 1);
+    missing(compile(p, c), p.header);
 }
 TEST(ComputeLoopDataRoute, MalformedLaunchDoesNotGrantRetry) {
     auto c = config();
     c.dispatch_launch.initiator |= 0x80000000ull;
-    missing(compile(program(), c), 6);
+    const auto p = hard_old(program(), 1);
+    missing(compile(p, c), p.header);
 }
 
 TEST(ComputeLoopDataRoute, BothPredecessorsSupplyTheCurrentGeneration) {
@@ -263,10 +269,13 @@ TEST(ComputeLoopDataRoute, AFormatLoadStillNeedsItsActualFormat) {
     EXPECT_TRUE(r.module.empty());
     EXPECT_NE(r.reason.find("pc=3 words=e0002000"), std::string::npos) << r.reason;
 }
-TEST(ComputeLoopDataRoute, FailedExactAttemptRetainsTheOriginalHeaderReason) {
+TEST(ComputeLoopDataRoute, FailedArbitraryAttemptNamesTheActualMissingStoreResource) {
     auto t = table();
     t.resources.pop_back();
-    missing(compile(program(), config(), t), 6);
+    const auto result = compile(program(), config(), t);
+    EXPECT_TRUE(result.module.empty());
+    EXPECT_NE(result.reason.find("mode=unresolved-operand pc=9 words=e0102000"), std::string::npos)
+        << result.reason;
 }
 TEST(ComputeLoopDataRoute, ExactStoreStillNeedsItsActualResource) {
     auto t = table();
@@ -288,26 +297,30 @@ TEST(ComputeLoopDataRoute, RestoredExecCannotReadInactiveBoundWords) {
 TEST(ComputeLoopDataRoute, AStatusBearingStoreDoesNotSelectThisRetry) {
     auto p = program();
     p.words[10] |= 1u << 23;
-    missing(compile(p), 6);
+    const auto hard = hard_old(p, 1);
+    missing(compile(hard), hard.header);
     cfg_missing(compile(p, config(true)), 9, 0xe0102000u);
 }
 TEST(ComputeLoopDataRoute, PartialLocalWaveCannotSelectThisRetry) {
     auto c = config();
     c.local_x = 65;
     prosper::test::complete_compute_launch(c);
-    missing(compile(program(), c), 6);
+    const auto p = hard_old(program(), 1);
+    missing(compile(p, c), p.header);
 }
 TEST(ComputeLoopDataRoute, APartialWorkgroupCannotSelectThisRetry) {
     auto c = config();
     c.exact_thread_extent = true;
     c.threads_x = 65;
     prosper::test::complete_compute_launch(c);
-    missing(compile(program(), c), 6);
+    const auto p = hard_old(program(), 1);
+    missing(compile(p, c), p.header);
 }
 TEST(ComputeLoopDataRoute, AnUncertifiedPortableWaveKeepsTheOriginalRefusal) {
     auto c = config();
     c.native_subgroup_size = 0;
-    missing(compile(program(), c), 6);
+    const auto p = hard_old(program(), 1);
+    missing(compile(p, c), p.header);
 }
 
 TEST(ComputeLoopDataRoute, AnEstablishedPureLoopKeepsItsStructuredRoute) {
@@ -324,6 +337,7 @@ TEST(ComputeLoopDataRoute, AnOriginalExtraHeaderEdgeCannotBorrowItsFoldedAlias) 
     p.words[5] = 0xbf068080u;
     p.words.insert(p.words.begin() + 6, 0xbf840000u);
     p.header += 1;
+    p = hard_old(p, 1);
     missing(compile(p), p.header);
 }
 TEST(ComputeLoopDataRoute, AClosedOriginalWithTheSameConstantConditionCanRetry) {

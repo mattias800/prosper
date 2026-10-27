@@ -1,19 +1,54 @@
 # `recompiler` — RDNA2 machine code → SPIR-V
 
+`rdna2_arbitrary_placeholder_relative` guards each potentially selected VGPR at the legacy
+MOVRELS bank reader during admission retries. The existing bounded-index query supplies no
+register values: every candidate retains its own provenance check, and an unbounded or
+out-of-range index keeps an explicit unmodelled-transfer refusal.
+
 `rdna2_diagnostic_identity` keeps the primary refusal identity separate from the printed root
 envelope. Bounded compile-case records retain that identity; complete terminal diagnostics retain
 the roots. Neither changes compiler inputs or admission.
 
-`rdna2_placeholder_origins` diagnoses the roots of fabricated words without granting admission.
+`rdna2_placeholder_origins` identifies typed roots of fabricated words.
 The launch snapshot distinguishes absent inputs from words hardware never loads; the backward
 CFG slice follows joins and loops to those roots and keeps spill slots separate. Its query and
-formatter supply attempt-local refusal details; no validity consumer reads the diagnostic graph.
+formatter supply attempt-local refusal details. Each queried placeholder word retains its own
+lost-definition result; an unrelated unloaded operand cannot hide that gap.
 Existing native Input and genuine resource publications terminate their semantic input edges;
 an encoded interpolation parameter field is not automatically an ordinary VGPR read.
 The slice reports a conservative union of possible roots. Existing bounded-index observations
 limit relative banks; without a bound it visits the complete bank rather than only its base word.
 `rdna2_legacy_vcc_writes` shares the existing implicit VALU VCC-writer condition between the
 legacy loop liveness scan and diagnostic roots; it consumes no new effects-table fields.
+
+`rdna2_arbitrary_placeholder` implements the owner-approved ADR 0038 admission boundary.
+The original compiler routes run first; only a refused program with an unloaded-only read retries.
+Every admitted read must still have a nonempty, entirely unloaded typed root set. No value,
+domain, physical mask word or runtime validity fact is supplied. Owned packets retain their
+separate genuine-input contract. Inert module metadata identifies read sites in the selected
+module for the observer; failed attempts publish no admission count. Unknown, missing launch,
+spill and named trace-gap roots remain refused.
+`rdna2_arbitrary_placeholder_scalar` guards the actual legacy lane-local READFIRST lowering
+on retries, including straight-line operations before or after an admitted read. The existing
+agreeing-source and fragment waterfall proofs remain; real dispatcher broadcasts bypass this
+legacy site. A missing scalar publication stays Hard independently of the predicate's roots.
+`rdna2_arbitrary_placeholder_inputs` checks actual ordinary operand reads and direct exports
+on retries, including direct memory readers and READLANE spill sources. Missing launch/spill inputs stay Hard even when unrelated to the admitted predicate.
+A zero fallback for a reaching computed definition names `lost-definition`; an unloaded input
+does not authorize discarding that computation. Existing loop assumptions retain their own
+back-edge check; no new value or validity fact is supplied.
+The early DS readers use the same boundary, including ADDTID data, GDS/shuffle inputs and
+implicit M0. A missing computed value stays Hard even when its original operands were genuine;
+knowing the inputs does not supply a computation that the ordinary representation lost.
+The same input boundary charges implicit old destinations through the existing
+`vector_write_depends_on_old_word` predicate and write footprint. Full overwrites do not read
+the old word; WRITELANE owns its separate slot-map update. No new transfer facts are inferred.
+Wide scalar readers check both consumed words before their direct map lookups. Implicit SCC
+readers use the canonical effects table. Retry entry SCC starts as storage only; the existing
+condition tracking follows real writers and retains unloaded-only conditions at their read PCs.
+If the retry still refuses, its actual later cause replaces the now-admitted unloaded refusal.
+Its output-only observation port is declared here and implemented beside compiler callers in
+`gpu/diagnostics`; the compiler includes neither that implementation nor performance observers.
 
 `rdna2_accumulator_cohort` runs the ordinary vector-word transfer once, then retains a
 broader existing cohort across a narrower, plain same-lane accumulation. It changes only the
@@ -461,3 +496,14 @@ the original payload at its original class site.
 `rdna2_scalar_source_words` consumes the canonical effects table for VOP3P as well as ordinary
 VALU forms. A packed pair of halves is one physical scalar word; absent adjacent SGPRs do not
 supply an operand or justify poisoning that word.
+
+`rdna2_placeholder_origin_memory` observes successful scalar-load publication as a supplied input.
+Missing/fabricated scalar results cannot terminate a trace. It also retains the separate memory-result obligation in an origin
+slice. An unloaded address does not authorize an atomic, cross-lane result or unproved read;
+`unproved-memory-result` stays Hard. Read contracts observe the existing bounded/actual-address
+lowering and conjoin observations across attempts.
+`rdna2_arbitrary_placeholder_loop` retains existing strong address-read obligations: an unloaded
+back edge cannot authorize an unbounded or writing address. The legacy lane-local scalar
+publication also remains Hard as `unmodelled-scalar-publication`: a real whole-wave value
+is required, and no broadcast is invented by the origin inventory.
+Those dependencies report `unproved-strong-read` and stay Hard.

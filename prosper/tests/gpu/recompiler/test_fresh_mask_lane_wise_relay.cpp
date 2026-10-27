@@ -212,11 +212,10 @@ TEST(FreshMaskLaneWiseRelay, PublicCompilerAdmitsTheLoopRelayAndRefusesItsWiderT
     // v7 is rewritten every iteration, so the loop carries it; v6 is complete only under A.
     accepted(compile(counted_loop({mov7}, {cmpx_a, mov6, xor8, compare8, full_exec, mov7})));
     // The same relay read after EXEC was widened again observes v6's missing lanes. They must
-    // be HARD: v6 = s30 (no launch loads it) first. Never written, they would be arbitrary, which
-    // the loop header now keeps (#5193).
-    refused(compile(counted_loop({0x7e0c021eu, mov7},
-                                 {cmpx_a, mov6, full_exec, xor8, compare8, mov7})),
-            10);
+    // be Hard: seed v6 from unknown scratch-offset s5 first. Never-loaded words are Arbitrary.
+    refused(
+        compile(counted_loop({0x7e0c0205u, mov7}, {cmpx_a, mov6, full_exec, xor8, compare8, mov7})),
+        10);
 }
 
 // ---- 2. Ordinary memory reads complete their active lanes --------------------------------------

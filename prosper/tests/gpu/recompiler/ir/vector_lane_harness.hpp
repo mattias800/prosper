@@ -17,9 +17,11 @@
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <string>
+#include <stdexcept>
 #include <vector>
 #include <utility>
 
@@ -81,6 +83,16 @@ struct LaneProgram {
     prosper::gpu::ShaderResourceTable table;
     prosper::gpu::ComputeShaderConfig config;
 };
+// Opt in only for Hard-input controls. Ordinary lane programs keep their original guest PCs.
+inline void seed_lane_hard_scalar(LaneProgram& program, uint32_t user_words) {
+    program.config.user_sgprs.resize(user_words);
+    const auto& c = program.config;
+    const uint32_t scratch = user_words + c.tgid_x_en + c.tgid_y_en + c.tgid_z_en + c.tg_size_en;
+    const auto cmpx = std::find(program.code.begin(), program.code.end(), 0x7daa0880u);
+    if (cmpx == program.code.end() || scratch >= 50)
+        throw std::logic_error("Hard scalar fixture requires the ordinary lane prefix");
+    program.code.insert(cmpx + 1, 0xbeb20300u | scratch);   // s50 = unknown scratch offset
+}
 inline LaneProgram lane_program(const std::vector<uint32_t>& op_words, uint32_t lanes,
                                 uint32_t wave, bool third_source = false,
                                 bool fourth_source = false) {

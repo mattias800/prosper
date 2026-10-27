@@ -31,7 +31,7 @@ std::vector<uint32_t> loop_program(bool project = false) {
         0x4a060281u, // v3 = v1 + 1
         0x7d840014u, // vcc = s20 == v0
         0x02020701u, // v1 = VCC ? v3 : v1
-        0x7e00023cu, // dead back-edge generation: v0 = never-written s60
+        0x7e000210u, // dead back-edge generation: v0 = never-written s16
         0xd4c1006au, 0x00018104u, // vcc = v4 < 64
         0x87fe6a7eu, // EXEC &= vcc
         0xbf880002u, // execz -> exit

@@ -1,5 +1,9 @@
 # src/diagnostics — observing prosper's own startup
 
+`perf/arbitrary_placeholder` reports unloaded-only compiler admissions with the always-on
+`arbitrary-placeholder-admitted` rule and an address-naming run summary. Only the recompiler
+decides admission; this observer receives the selected module's read counts and changes no value.
+
 This folder holds the **observer-only** layer for prosper's boot: the seven `BootPhase`
 transitions `boot_program()` records, the in-memory history of those events, and the JSON report
 written from it. Nothing here participates in loading, linking, mapping or running the guest — if

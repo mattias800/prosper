@@ -1,3 +1,4 @@
+#include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
 #include "gpu/recompiler/rdna2_placeholder_origins.hpp"
 // rdna2_to_spirv.cpp — see rdna2_to_spirv.hpp. Internal SpirvCompute builder + the VALU translator.
 #include <atomic>
@@ -714,9 +715,12 @@ recompile_fragment(const uint32_t* code, size_t dwords, const ShaderResourceTabl
                    FloatTransportConfig float_transport, FragmentFloatFlags float_flags,
                    FragmentExportFormats export_formats) {
     FragmentArithmeticObservation observation;
-    auto result = recompile_fragment_impl(
-        code, dwords, rt, system_inputs, pcrel_dispatch_target, interpolation, wave32 ? 32u : 64u,
-        diagnostic, float_mode, &observation, float_transport, float_flags, export_formats);
+    auto result = recompile_with_arbitrary_placeholders(diagnostic, [&] {
+        observation = {};
+        return recompile_fragment_impl(code, dwords, rt, system_inputs, pcrel_dispatch_target,
+                                       interpolation, wave32 ? 32u : 64u, diagnostic, float_mode,
+                                       &observation, float_transport, float_flags, export_formats);
+    });
     if (arithmetic_observation) *arithmetic_observation = observation;
     else observe_fragment_arithmetic(observation, diagnostic.program_address, !result.empty());
     return result;

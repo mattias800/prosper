@@ -44,6 +44,14 @@ void RecompileDiagnosticAttempt::commit() {
     records_.clear();
 }
 
+void RecompileDiagnosticAttempt::replace_with(RecompileDiagnosticAttempt& selected) {
+    assert(active_ && selected.active_ && selected.previous_ == &records_);
+    assert(pending == &selected.records_);
+    records_.clear();
+    selected.commit();
+    commit();
+}
+
 bool defer_recompile_diagnostic(const RecompileDiagnosticContext& context, const char* tag,
                                 const char* role, const char* payload) {
     if (!pending) return false;

@@ -1,6 +1,7 @@
 // Remaining VOP1 direct-emission routes.
 #include "gpu/recompiler/ir/lower/vop1_case_routes.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
+#include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/ir/lower/vop1_integer_lowering.hpp"
@@ -42,6 +43,10 @@ bool Vop1CaseRoutes::lower() {
 
 std::optional<bool> Vop1CaseRoutes::early_routes(uint32_t& a) {
     if (in.opcode == 0x02) {   // v_readfirstlane_b32: SGPR dst = value of the lowest active lane
+        if (refuse_arbitrary_scalar_publication(b, rs, in)) {
+            ok = false;
+            return true;
+        }
         // Cross-lane broadcast. Our per-lane scalar model has no cross-lane reduction, so we use
         // THIS lane's value. SPECULATIVE(confidence: med): exact only when src0 is wave-uniform —
         // which is the standard use (reading a uniformly-computed VGPR into an SGPR, e.g. the
@@ -123,6 +128,7 @@ std::optional<bool> Vop1CaseRoutes::residual_routes(uint32_t& d, const bool& int
             // scheduling/hazard filler in real shaders)
 
         case 0x43: {   // v_movrels_b32: dst = VGPR[src0# + M0] (relative-indexed VGPR read)
+            if (refuse_arbitrary_placeholder_relative_source(b, rs, in, ok)) return true;
             // M0 is written by plain scalar ALU (s_mov/s_or m0, … decode dst as SGPR 124), so
             // its per-invocation value lives in rs.sreg[124]. The source register NUMBER is
             // src0# + M0 — a runtime value — so lower to a bounded select chain over every

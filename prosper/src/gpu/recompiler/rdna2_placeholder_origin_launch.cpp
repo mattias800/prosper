@@ -48,9 +48,17 @@ void configure_pixel_placeholder_origins(RegState& rs, const std::vector<LaunchV
 }
 
 std::string format_placeholder_origins(const PlaceholderRoots& roots) {
-    static constexpr const char* names[] = {
-        "unloaded",        "launch-input",        "spill",        "unknown-launch",
-        "lost-definition", "unmodelled-transfer", "trace-budget", "unreachable"};
+    static constexpr const char* names[] = {"unloaded",
+                                            "launch-input",
+                                            "spill",
+                                            "unknown-launch",
+                                            "lost-definition",
+                                            "unmodelled-transfer",
+                                            "trace-budget",
+                                            "unreachable",
+                                            "unproved-memory-result",
+                                            "unproved-strong-read",
+                                            "unmodelled-scalar-publication"};
     std::string out;
     for (const auto& root : roots) {
         if (!out.empty()) out += ';';

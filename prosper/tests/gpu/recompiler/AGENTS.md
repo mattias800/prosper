@@ -1,5 +1,29 @@
 # `tests/gpu/recompiler` — translation tests and the legacy compute execution fixture
 
+`test_arbitrary_placeholder_scalar_words` keeps missing high scalar words and unknown entry SCC
+Hard when they select EXEC. Supplied and genuinely unloaded twins execute through the interpreter;
+the high-word selector observes both possible supplied bits without assuming a missing input value.
+
+`test_arbitrary_placeholder_execution` executes scalar relays, saved SDWA predicates, narrowed
+old values, scalar/vector loop carries and a real supplied scalar-buffer load through the public
+compiler and integer interpreter.
+Early DS reader controls keep lost WRITELANE data and unknown implicit M0 inputs Hard. The
+ADDTID mutation exposes zero instead of the initialized per-lane values through real LDS;
+the provided-word control still executes. Shuffle and plain GDS readers retain the same boundary.
+Implicit old-destination reads retain their real inactive values or refuse before substituting
+zero. The provided partial-write and complete-overwrite controls execute; a slot-domain mutation
+must not reject the tracked repeated WRITELANE/READLANE round trip.
+`test_arbitrary_placeholder_policy` keeps every non-unloaded root Hard, including a lost operand
+beside an unloaded one, and checks strict-first retry/metadata selection. Missing launch and
+spill twins retain their separate refusal contracts. Lane-varying READFIRST loops and straight-line
+relays keep missing whole-wave scalar publication Hard, including independent publications before
+and after admission. Dropping that guard produces wrong observable values; an agreeing-source
+interpreter witness retains the existing valid proof. Ordinary unknown data reads before/after
+admission, direct unsupplied pixel exports, and dropped conditional definitions remain Hard.
+The conditional-definition mutation has an observable wrong-value interpreter arm. A carried
+ordinary value cannot hide an untracked spill read; an actually written unloaded spill retains
+its chosen word in the interpreter and on the GPU.
+
 `test_placeholder_origins` checks unloaded, unsupplied launch, unknown launch and spill roots,
 including relays, both merge predecessors and loop backedges. Public compiler refusals assert the
 same appended details while retaining their refusal class.
@@ -377,3 +401,13 @@ unused scalar sibling. Missing actual operands and missing lane spills still ref
 physical-width inventory covers every known VOP3P source through the canonical effects table.
 Partial-launch native and dispatcher witnesses keep unrelated packed reads from demanding
 physical DATA for Bool-only mask logic; numeric VCC high words retain independent poison checks.
+
+`test_arbitrary_placeholder_relative` covers runtime bank selection beside unloaded alternatives.
+The lost provided candidate stays Hard; provided and genuinely unloaded selected words retain
+their interpreter values. Removing the actual bank guard must expose the lost computation.
+Destination-alias variants keep an empty reserved map entry distinct from a supplied SSA value.
+
+Hard-input controls use a launch word that is genuinely unknown (the possible scratch-offset
+SGPR), or an untracked spill. A never-loaded ordinary SGPR is Arbitrary under ADR 0038 and
+cannot stand in for a missing meaningful input. Keep the original consumer/branch positions
+when correcting such a fixture.

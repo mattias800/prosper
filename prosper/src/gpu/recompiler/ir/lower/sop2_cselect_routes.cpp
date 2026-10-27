@@ -4,6 +4,7 @@
 // IR does not model yet. Each returns nullopt when the instruction is not its shape.
 #include "gpu/recompiler/ir/lower/scalar_lowering_internal.hpp"
 #include "gpu/recompiler/ir/ops/scalar_integer64_values.hpp"
+#include "gpu/recompiler/rdna2_scalar_condition_marks.hpp"
 
 namespace prosper::gpu::ir {
 
@@ -27,7 +28,7 @@ std::optional<bool> Sop2Lowering::route_wave64_vcc_lo_cselect() {
              !(complete_scalar_pair && rs.sreg.contains(107) &&
                is_wave64_vcc_lo_cselect_reading_vcc_hi(in))) ||
             (!complete_scalar_pair && !b.vcc_b32_low_only_pcs.contains(in.pc)) || !rs.scc ||
-            (b.is_fragment && !scalar_condition_source_defined(b, rs))) {
+            (b.is_fragment && !scalar_condition_source_defined(b, rs, in.pc))) {
             ok = false; return true;
         }
         const uint32_t selected = b.sel(

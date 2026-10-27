@@ -29,7 +29,7 @@ std::vector<uint32_t> program() {
         0x4a060281u, // v3 = output count + 1
         0x7d840100u, // vcc = v0 == v0, observes only active lanes
         0x02020701u, // increment output in active lanes
-        0x7e00023cu, // missing back-edge v0, dead before the next active read
+        0x7e000210u, // missing back-edge v0, dead before the next active read
         0x7e0e0281u, // v7 = 1 on the back edge
         0xd4c1006au, 0x00018104u, // vcc = counter < 64
         0x87fe6a7eu, // EXEC &= vcc
@@ -108,7 +108,7 @@ TEST(NativeLoopHardActiveRoots, AReadBeforeTheHeaderRewriteStillNeedsTheBackEdge
 
 TEST(NativeLoopHardActiveRoots, AMissingActiveOperandStillRefuses) {
     auto code = program();
-    code[3] = 0x7e0e023cu; // v7 = never-written s60
+    code[3] = 0x7e0e0210u; // v7 = unknown possible scratch-offset s16
     const auto c = config();
     const auto table = resources();
     const uint64_t address = 0x5497300300ull;

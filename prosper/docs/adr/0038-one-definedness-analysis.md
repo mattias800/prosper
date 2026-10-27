@@ -515,6 +515,213 @@ python3 prosper/tools/shader_inspect/placeholder_origin_census.py \
 shader_inspect <program.bin> --inputs <program.inputs> # add --stage compute for CS
 ```
 
+#### Admission measurements (2026-10-27)
+
+The admission candidate first preserves every successful strict compilation unchanged. A refusal
+may retry only when an actual read has a nonempty root set consisting entirely of `unloaded`.
+The retry supplies no new values, physical mask words or runtime validity facts. Successful
+scalar loads terminate a dependency slice only after their actual complete, non-fabricated
+publication; an unproved memory result or unsafe address-read obligation stays Hard. These name
+`unproved-memory-result` and `unproved-strong-read`, respectively. The legacy READFIRST scalar
+value, which the per-invocation lowering does not broadcast, names
+`unmodelled-scalar-publication` and also stays Hard. The admission retry guards the actual
+legacy lowering, including straight-line scalar relays and publications independent of the
+admitted read. Existing agreeing-source and local waterfall proofs remain applicable, and real
+dispatcher broadcasts do not pass through that lane-local lowering.
+Runtime-relative bank readers check each potentially selected word independently; a bounded
+index supplies no register value, and unloaded alternatives cannot hide a lost provided word.
+
+The same 4,000-entry corpus compares 3,567 recorded-input replays and 433 stage probes:
+
+- No corpus entry becomes accepted. The compute entry that passed the fresh CMPX reads at
+  PCs 34 and 43 in an earlier candidate now reaches a Hard implicit old-destination read at
+  pc46, with unproved memory-result roots. Passing an unloaded predicate cannot waive this
+  separate obligation.
+- No accepted output changes and no accepted program becomes refused. The comparison hashes
+  1,538 existing outputs; supplemental exports through the identical public table-less compute
+  entry point hash the other five, also unchanged. All ten supplemental modules validate.
+- Eleven entries remain refused with a changed reason: eight stop earlier and three reach later
+  Hard reads. These retain lost definitions, missing scalar publications, memory-result or
+  unresolved-operand obligations. One previously refused fragment replay becomes incomplete
+  because its old semantic-read trace cannot supply the new compilation sequence. No missing
+  choice is guessed.
+- The terminal policy-1 cohort has 571 entries. Origin groups overlap; none has only unloaded
+  roots and none is unclassified.
+
+| Origin | Terminal entries | Terminal roots | Entries including auxiliary causes | Roots including auxiliary causes |
+| --- | ---: | ---: | ---: | ---: |
+| unloaded (mixed with Hard roots) | 36 | 1,358 | 139 | 3,684 |
+| launch-input | 473 | 478 | 476 | 482 |
+| unknown-launch | 72 | 585 | 649 | 2,918 |
+| lost-definition | 12 | 12 | 31 | 31 |
+| unmodelled-transfer | 5 | 5 | 8 | 8 |
+| unproved-memory-result | 18 | 357 | 43 | 1,113 |
+| unproved-strong-read | 1 | 1 | 1 | 1 |
+| unmodelled-scalar-publication | 3 | 3 | 3 | 3 |
+| spill / trace-budget / unreachable | 0 | 0 | 0 | 0 |
+
+Some Wave64 dispatcher summaries omit a lowering's named cause even when its auxiliary
+record retains it (#5529). Retaining the full `PROSPER_DBG=1` diagnostic stream from the same
+invocations identifies **958 refused entries with a named policy record**, including the 571
+terminal entries and 387 additional auxiliary entries (330 recorded-input replays, 57 stage
+probes). Auxiliary roots include failed alternative lowering paths; they are not all the final
+refusal's dependencies. The last two columns union each refused entry's terminal and auxiliary
+roots, without counting duplicate roots within an entry. Stage diagnostics reuse the corpus
+runner's representative for identical stage/code hashes. Independent token accounting agrees,
+and substituting an origin in a real diagnostic changes the aggregate. These wider counts are
+separate from the terminal-only census command above.
+
+The 27 dumped GTA/Kena programs retain the preceding measurement's nine accepted, fifteen refused
+and three missing-sidecar results. All nine accepted modules validate and retain their hashes.
+The remaining five fresh-mask GTA fragments report:
+
+| Program | Hard roots retained alongside any unloaded roots |
+| --- | --- |
+| `ps_405ac25e00`, `ps_405ac2ba00` | unproved memory result at MIMG pc150 |
+| `ps_405b253400`, `ps_405b257e00` | launch-input `v2`, unknown launch, unmodelled transfer, unproved memory result |
+| `ps_405b3ddc00` | launch-input `v0/v1/v2`, unknown launch, unproved memory results |
+
+The already tracked launch-input bugs are #5518 (`v2`) and #5519 (`v0/v1`); these remain Hard.
+The other refused game programs retain the earlier table's separate MIMG, VCC-exit or MBCNT
+reasons. This is an offline census, with no game run.
+
+The three MOUSE UI captures add a further replay limitation: `ps_403f306100` and
+`ps_4043ba9200` encounter unloaded-only predicates on the strict attempt, but their old semantic
+read traces cannot replay the new strict-then-retry compilation sequence and now report incomplete.
+This does not establish that their retries reached the old predicate PCs. `ps_4043ca3f00` still refuses with launch-input
+`v0/v1` alongside unloaded roots. Fresh live captures and visible portrait verification remain
+necessary; these are not claimed as accepted modules.
+
+Twenty-four synthetic interpreter witnesses fail against the merged diagnostic-only compiler and
+pass with admission. They cover integer/float predicates, CMPX, saved SDWA predicates, narrowed
+writes, vector/scalar loop carries, scalar and READLANE relays, implicit scalar compares, ordinary
+data reads beside an unloaded predicate, real scalar-buffer data, a provided spill containing
+an unloaded value, and wide-word/implicit-SCC selectors of EXEC. Nineteen actual exact64 GPU
+dispatches exercise both wave halves, CMPX's active lane count, the relay/data/spill paths and
+both supplied condition values. Five existing selector/loop fixtures also execute both
+scalar branch inputs; real missing spills remain refused. An agreeing READFIRST source retains its
+established proof. All 38 exported synthetic modules validate. Three loop originals whose computed
+scalar values are discarded retain `lost-definition`; the delayed vector-body original remains
+Hard at its legacy READFIRST publication. Their genuine and complete-replacement controls retain
+the existing successful output.
+
+The final source qualification at `0f6e16f7e` builds the complete app/test configuration and
+registers 7,144 CTests: 7,131 pass, ten skip, one is disabled, and only the existing
+`indirect_pointer_descriptor_range` and `rdna2_to_spirv_exec` fail (exit 8). All 7,062 baseline
+registrations remain with two documented policy/diagnostic renames. The 208 focused cases pass.
+The high-word/SCC corrections leave the corpus and game census above unchanged; no game run.
+
+Mutation controls deny unloaded admission, admit Hard roots, lose scalar-load publication, keep
+a stale retry refusal, or disconnect the observer; each is detected. The actual #4943 missing-spill
+twin also detects the relaxed-Hard mutation. Ordinary lane-harness instruction tapes match main
+byte-for-byte, with a deliberate instruction mutation detected. Old Hard-input controls now use
+an unknown possible scratch-offset launch word instead of an explicitly unloaded SGPR.
+
+Four existing refusal assertions now name the actual earlier producer or missing ordinary input.
+The loop fixtures also keep genuine Hard-input back-edge twins. The two M0 fixtures check the
+actual local-index packet certificate independently of their earlier public input refusal;
+replacing the real deferred M0 retirement guard with `true` makes both tests fail. These changes
+preserve the guards' coverage rather than treating any refusal as sufficient.
+
+`arbitrary-placeholder-admitted` is a default-on correctness alarm with a program-address run
+summary. Window counts are successful retry compilations and static read sites, not draws or
+executed lane reads. Failed retries publish their actual refusal and no admission count.
+
+#### Ruled out during admission qualification (2026-10-27)
+
+- **Checking a wide operand's low word covers its SCC/EXEC dependency.** BFE read its high
+  word directly, substituting zero for unknown launch `s13`. A following CSELECT used SCC to
+  select EXEC without reading the BFE destination. The missing-high regression fails before
+  the guards; supplied high bits 0/1 produce 11/7 in the interpreter and on the exact64 GPU,
+  and an unloaded pair retains 11. Both consumed words require the actual input boundary.
+  An independent entry-SCC fixture also exposed stored `false` being mistaken for a launch
+  input. Retry-only condition tracking distinguishes that unknown input from real SCC writers;
+  unloaded-only computed conditions retain their roots at the actual read PC. #5528.
+
+- **Register-map membership establishes that an actual source value exists.** MOVRELS reserves
+  its destination before reading the bank. When that destination aliases a lost provided
+  candidate, the temporary entry has ID 0 and hides the absence from a membership-only guard.
+  The interpreter and exact64 GPU again store 64 zeroes instead of `[13,7,...]`. Treat an empty
+  ID as missing at the shared VGPR input boundary. Provided and genuinely unloaded alias twins
+  retain their values; a real zero-valued constant has a nonzero SPIR-V ID. #5528.
+
+- **An unloaded alternative authenticates an entire relative-register bank.** With runtime
+  `M0 = supplied_s4 & 3`, `v_movrels v1,v5` can select `v6` erased by a preceding WRITELANE.
+  Genuine `v5/v6` producers terminate their slices, while unloaded `v7/v8` alternatives leave
+  an unloaded-only root union at the later store. That union did not retain the lost selected
+  computation. The interpreter and exact64 GPU store 64 zeroes instead of `[13,7,...]`.
+  Check every potentially selected candidate at the actual bank reader, using the existing
+  bounded-index query and each word's independent provenance. Provided and genuinely unloaded
+  bank controls retain their values. [#5528](https://github.com/mattias800/prosper/pull/5528).
+
+- **Explicit operand guards cover implicit destination reads.** A partial EXEC write after
+  WRITELANE preserves the ordinary old destination. Without an actual old-word guard, the
+  interpreter and exact64 GPU observe `[22,0,...]` instead of `[22,7,...]`. The existing
+  `vector_write_depends_on_old_word` predicate identifies those reads, including accumulation
+  and subword preservation; no new transfer facts are added. A complete overwrite must still
+  compile, and named lane-slot updates must not be treated as ordinary old-VGPR reads. Both
+  false-positive mutations are detected. The underlying producer loss also reproduces on
+  strict merged main without an unloaded predicate; it remains separately tracked as
+  [#5530](https://github.com/mattias800/prosper/issues/5530). This policy preserves strict successes.
+
+- **The ordinary LDS callback protects every DS input read.** Compute ADDTID returns before
+  that callback. After `v6=7; writelane v6,s0,0` with supplied `s0=13`, its direct store silently
+  substituted zero for the erased ordinary VGPR. A genuine ADDTID reload hid the lost source.
+  With an independent unloaded equality predicate, the interpreter stored zero in all 64 lanes,
+  rather than lane0=13 and the other lanes=7; the module still passed `spirv-val`. Guard the actual
+  early store. The audited early GDS/shuffle readers and implicit M0 reads use the same boundary.
+  Missing computations retain `lost-definition` even when their original operands were genuine.
+  The existing tracer already names that loss; reverting a proposed extra empty-root rule does
+  not change this regression. That unnecessary rule was removed.
+
+- **An unloaded predicate makes unrelated ordinary reads safe.** Synthetic retries still read an
+  unknown possible scratch-offset `s12`, or export/store an unsupplied fragment launch `v0`.
+  Bypassing the actual operand and direct-memory/export guards admits these real missing inputs.
+  Both instruction orders and an implicit SOPK operand are covered. The provided unloaded twins
+  retain their existing values; the unrelated Hard roots still veto admission.
+- **A reaching computed value can be replaced by its unloaded input's storage zero.** A conditional
+  `s40 = 7` is discarded at a join. Without retaining that lost definition, the retry traces the
+  other path to an unloaded word and admits zero on both paths. The interpreter observes 22 instead
+  of the required 11 on the written path. This remains `lost-definition`, independently of the
+  missing path's Arbitrary value. Refs [#4560](https://github.com/mattias800/prosper/issues/4560).
+- **Loop lane-bit checks cover ordinary carried spill reads.** A loop can store a previous scalar
+  and then READLANE an untracked slot, without ever using that scalar as a predicate. The ordinary
+  carried value hid the missing spill. Guarding the actual READLANE producer retains `spill` on
+  both branch inputs. A slot actually written from an unloaded word remains admitted and executes
+  in the interpreter and on the GPU.
+
+- **The final public reason identifies every forced-dispatcher cause.** The delayed vector-body
+  fixture's default route reports `exec-loop-widens`; its forced Wave64 dispatcher separately
+  records the missing READFIRST publication at pc22. Its auxiliary record includes the origin,
+  but the final generic unresolved-operand record overwrites the named cause. Tests inspect
+  the full capture from the explicit route. Tracked separately in [#5529](https://github.com/mattias800/prosper/issues/5529).
+
+- **An unloaded address alone makes every memory result Arbitrary.** The unchanged #5193
+  atomic/store-return and cross-lane LDS refusal twins exposed a missing dependency in the
+  diagnostic slice. The result's separate memory contract must be retained; an unproved result
+  now names `unproved-memory-result`. A loop's existing strong address-read obligation
+  likewise names `unproved-strong-read`. Neither is silently reduced to its unloaded address
+  or back-edge registers. Refs [#5497](https://github.com/mattias800/prosper/issues/5497).
+- **A never-loaded ordinary SGPR is a genuine Hard input fixture.** Several older fixtures used
+  s30, s40 or s60 this way. Under the owner-approved policy those words are Arbitrary. Hard
+  controls must instead name an unknown possible scratch-offset launch word, a genuinely
+  unsupplied launch input or an untracked spill. Consumer and relative-branch positions are
+  retained when correcting these fixtures. Refs [#5497](https://github.com/mattias800/prosper/issues/5497).
+
+- **Guarding only loop-carried READFIRST dependencies covers scalar publication.** A straight-line
+  `v6 = unloaded_zero + lane + 7; s20 = readfirstlane(v6); VCC = (s20 == v6)` also
+  exposes the missing broadcast: the interpreter and exact64 GPU must select 11 only in lane0
+  and 22 in the other 63 lanes. A lane-local copy instead selects 11 everywhere. The safeguard
+  belongs at the actual legacy producer, even before or after an independent admitted predicate.
+  An agreeing constant source retains its existing proof. Refs [#5497](https://github.com/mattias800/prosper/issues/5497).
+
+- **Removing the loop's READFIRST guard only admits an Arbitrary value.** A synthetic loop
+  sets `v6 = lane + unloaded_zero + 7`, reads it into `s20` on the next trip, and stores that
+  scalar. With the guard removed, the interpreter and an actual exact64 GPU both store
+  `7 + lane` instead of the hardware's whole-wave scalar `7`. The legacy lowering returns
+  each lane's value instead of broadcasting the first active lane. This is a real missing
+  scalar publication, named `unmodelled-scalar-publication`, and stays Hard. Refs [#3596](https://github.com/mattias800/prosper/issues/3596), [#5497](https://github.com/mattias800/prosper/issues/5497).
+
 **Measurement before acceptance.**
 
 1. **Kena's three programs.** For each fabricated word, name its origin: never written, a launch

@@ -2744,6 +2744,9 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_frame_breakdown
     SOURCES tests/diagnostics/test_frame_breakdown.cpp
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_arbitrary_placeholder_alarm
+    SOURCES tests/diagnostics/test_arbitrary_placeholder_alarm.cpp
+    LIBRARIES prosper_core)
   # frame-flicker (#5152): the alternation detector over synthetic signature sequences (alternation
   # fires; steady, pans, fades, cuts, 30-at-60 and sub-second strobes do not) and its rule.
   prosper_add_gtest(test_frame_flicker
@@ -2791,6 +2794,13 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_fresh_mask_lane_wise_relay
     SOURCES tests/gpu/recompiler/test_fresh_mask_lane_wise_relay.cpp
     INCLUDES tests
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_arbitrary_placeholder
+    SOURCES tests/gpu/recompiler/test_arbitrary_placeholder_execution.cpp
+            tests/gpu/recompiler/test_arbitrary_placeholder_policy.cpp
+            tests/gpu/recompiler/test_arbitrary_placeholder_relative.cpp
+            tests/gpu/recompiler/test_arbitrary_placeholder_scalar_words.cpp
+    INCLUDES tests tests/gpu/recompiler src
     LIBRARIES prosper_core)
   prosper_add_gtest(test_placeholder_origins
     SOURCES tests/gpu/recompiler/test_placeholder_origins.cpp
@@ -4846,7 +4856,9 @@ endif()
   # the validator was absent, which is how #1711 shipped invalid SPIR-V past a gate CLAUDE.md and
   # both READMEs describe as strict. The source root is passed so the tool can read the emitter
   # headers and fail when a new emitter is added without a module here.
-  add_executable(spv_validate tools/spv_validate/spv_validate.cpp)
+  add_executable(spv_validate tools/spv_validate/spv_validate.cpp
+    tools/spv_validate/arbitrary_placeholder_witness.cpp)
+  target_include_directories(spv_validate PRIVATE tests)
   target_link_libraries(spv_validate PRIVATE prosper_core)
   add_test(NAME spv_validate
            COMMAND spv_validate ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
@@ -8415,6 +8427,11 @@ if(TARGET prosper_live_renderer AND TARGET Vulkan::Vulkan)
     LABELS gpu PROPERTIES TIMEOUT 60)
   prosper_add_gtest(test_readlane_barrier_exec
     SOURCES tests/gpu/execute/test_readlane_barrier.cpp
+    INCLUDES frontends tests
+    LIBRARIES prosper_core prosper_live_renderer Vulkan::Vulkan
+    LABELS gpu PROPERTIES TIMEOUT 60)
+  prosper_add_gtest(test_arbitrary_placeholder_exec
+    SOURCES tests/gpu/execute/test_arbitrary_placeholder_exec.cpp
     INCLUDES frontends tests
     LIBRARIES prosper_core prosper_live_renderer Vulkan::Vulkan
     LABELS gpu PROPERTIES TIMEOUT 60)
