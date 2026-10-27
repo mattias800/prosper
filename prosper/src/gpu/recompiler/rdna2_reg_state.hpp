@@ -6,6 +6,7 @@
 #include "gpu/recompiler/rdna2_portable_mask_slots.hpp"
 #include "gpu/recompiler/rdna2_native_image_results.hpp"
 #include <cstdint>
+#include <memory>
 #include <map>
 #include <set>
 #include <unordered_map>
@@ -29,7 +30,11 @@ bool scalar_is_lane_local(const struct RegState& rs, int sgpr);
 struct RegState;
 void seed_smem_pointer_provenance(RegState& rs, const std::vector<Rdna2Inst>& ins);
 
+struct PlaceholderOriginProgram;
+
 struct RegState {
+    // Immutable diagnostic input only; no admission consumer reads it.
+    mutable std::shared_ptr<const PlaceholderOriginProgram> placeholder_origin_program;
     PortableMaskHalfTypes portable_mask_half_types;
     std::unordered_map<int, uint32_t> vreg, sreg;
     VectorWordMarks vreg_source_marks;

@@ -1,3 +1,4 @@
+#include "gpu/recompiler/rdna2_placeholder_origins.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include "gpu/recompiler/rdna2_current_word_roots.hpp"
 #include "gpu/recompiler/ir/cfg/exec_value_census.hpp"
@@ -324,6 +325,7 @@ void seed_vector_word_definedness(RegState& rs, const std::vector<Rdna2Inst>& in
     // later complete writers retire the mark, while preserved old bits/lanes retain it.
     const int highest = shader_max_vgpr(instructions);
     rs.vector_wave_size = wave_size;
+    seed_placeholder_origins(rs, instructions, launch, native_interpolation);
     const bool scc_offset =
         std::any_of(instructions.begin(), instructions.end(), [](const auto& in) {
             return (in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF) &&
@@ -646,10 +648,12 @@ void record_native_interpolation_publication(const SpirvCompute& b, RegState& rs
     const auto value = rs.vreg.find(in.dst.value);
     if (value == rs.vreg.end() || !value->second) return;
     rs.native_interpolation_publication = {in.pc, in.dst.value, rs.exec, value->second};
+    note_placeholder_native_input(b, rs, in);
 }
 
 void record_vector_word_marks(RegState& rs, const Rdna2Inst& in, const ScalarSourceMarks& source) {
     const auto current_roots = snapshot_current_word_roots(rs, in, source, source_roots_in_exec);
+    note_placeholder_image_addresses(rs, in);
     const auto interpolation = std::exchange(rs.native_interpolation_publication, {});
     const bool native_image = consume_native_image_result(rs, in);
     const auto value = rs.vreg.find(in.dst.value);

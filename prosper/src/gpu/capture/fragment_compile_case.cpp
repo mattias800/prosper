@@ -1,9 +1,12 @@
+#include "gpu/recompiler/rdna2_diagnostic_identity.hpp"
 #include "gpu/recompiler/compiler_choices.hpp"
 #include "gpu/capture/fragment_compile_case.hpp"
 #include "build_revision.hpp"
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/recompiler/compiler_resource_access.hpp"
 #include "diagnostics/perf/perf_ledger.hpp"
+#include <string>
+#include <string_view>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -306,8 +309,11 @@ std::vector<uint32_t> replay_fragment_compile_case(const FragmentCompileCase& c,
     if (result.empty()) {
         require(!reject_records.empty(), "INCOMPLETE: actual compiler refusal diagnostic absent");
         const std::string reject = reject_records.back().first + " " + reject_records.back().second;
-        require(reject.size() <= 256, "INCOMPLETE: actual compiler refusal diagnostic budget");
-        if (baseline) require(reject == c.expected_reject, "baseline refusal diagnostic differs");
+        const std::string_view identity = recompile_refusal_identity(reject);
+        require(identity.size() <= 256, "INCOMPLETE: actual compiler refusal diagnostic budget");
+        if (baseline)
+            require(identity == recompile_refusal_identity(c.expected_reject),
+                    "baseline refusal diagnostic differs");
         if (actual_refusal) *actual_refusal = reject;
     }
     return result;
@@ -316,6 +322,8 @@ std::vector<uint32_t> replay_fragment_compile_case(const FragmentCompileCase& c,
 void finish_fragment_compile_case(FragmentCompileCase& c, std::vector<uint32_t> source) {
     c.source = std::move(source);
     c.expected_produced = !c.source.empty();
+    if (!c.expected_produced)
+        c.expected_reject = std::string(recompile_refusal_identity(c.expected_reject));
     if (c.expected_produced) c.expected_reject.clear();
     else if (c.expected_reject.empty()) incomplete(c, "compiler-refusal-diagnostic-unavailable");
     else if (c.expected_reject.size() > 256) {

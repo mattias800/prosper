@@ -9,6 +9,8 @@ into a `.prgbundle` / `.prgcap` that `tools/gpu_replay` can reproduce offline an
 - `fragment_compile_case` — opt-in owned inputs for one fragment compiler attempt and CPU-only
   SOURCE/refusal reproduction. Its `.prfc` schema, semantic read transcript and compiler identity
   are independent of frame/resource execution capture; they confer no draw or Wave64 authority.
+  Its bounded refusal identity excludes the separately printed placeholder-root envelope; complete
+  terminal diagnostics still retain every root, and the existing record-size limits stay in force.
 - `gpu_capture` — the capture lifecycle: begin, finish, materialize, and the pending-capture
   plumbing behind the F9 grab and the scheduled triggers.
 - `capture_collect` — gathering a frame's contents: intervals, tables, submit items, raw shader

@@ -1,3 +1,6 @@
+#include <string>
+#include <memory>
+#include "gpu/recompiler/rdna2_placeholder_origins.hpp"
 #pragma once
 #include "gpu/recompiler/rdna2_scalar_condition_marks.hpp"
 #include "gpu/recompiler/rdna2_native_launch.hpp"
@@ -616,6 +619,8 @@ inline bool refuse_mask_write(SpirvCompute& b, const RegState& rs, const Rdna2In
         return true;
     }
     if (!fresh_mask_sources_defined(b, rs, in)) {
+        b.diagnostic.placeholder_origins = std::make_shared<const std::string>(
+            fresh_placeholder_origins(rs, in, b.placeholder_origin_program.get()));
         b.stage_reject_pc = in.pc;
         b.stage_reject_reason = "fabricated-fresh-mask-source";
         log_recompile_diagnostic(b.diagnostic, "fabricated-fresh-mask-source", "alu",

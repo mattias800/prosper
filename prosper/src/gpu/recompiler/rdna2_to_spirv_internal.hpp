@@ -1,3 +1,4 @@
+#include "gpu/recompiler/rdna2_placeholder_origins.hpp"
 #pragma once
 #include "gpu/recompiler/rdna2_reg_state.hpp" // IWYU pragma: export
 #include "gpu/recompiler/rdna2_scalar_condition_marks.hpp"
@@ -168,13 +169,21 @@ inline void log_recompile_diagnostic(const RecompileDiagnosticContext& diagnosti
                               const char* tag, const char* role, const char* format, ...) {
     // Formatted BEFORE the PROSPER_DBG gate: the terminal reason has to be recorded whether or not
     // anyone is reading the verbose stream.
-    char payload[1536];
     va_list args;
     va_start(args, format);
-    const int body = std::vsnprintf(payload, sizeof payload, format, args);
+    const int body = std::vsnprintf(nullptr, 0, format, args);
     va_end(args);
     if (body < 0) return;
-    payload[sizeof(payload) - 1] = '\0';
+    std::string detail(static_cast<size_t>(body), '\0');
+    va_start(args, format);
+    std::vsnprintf(detail.data(), detail.size() + 1, format, args);
+    va_end(args);
+    const bool fabricated = (tag && std::strstr(tag, "fabricated-fresh-mask-source")) ||
+                            detail.find("fabricated-fresh-mask-source") != std::string::npos ||
+                            detail.find("is fabricated on the back edge") != std::string::npos;
+    if (fabricated && diagnostic.placeholder_origins && detail.find("origin=") == std::string::npos)
+        detail += " placeholder-roots=[" + *diagnostic.placeholder_origins + "]";
+    char* payload = detail.data();
     if (defer_recompile_diagnostic(diagnostic, tag, role, payload)) return;
     // Record every role EXCEPT "consequent". A consequent line only restates that an empty result
     // was returned -- it names the effect, never the cause -- so letting it overwrite a terminal or
@@ -192,21 +201,18 @@ inline void log_recompile_diagnostic(const RecompileDiagnosticContext& diagnosti
 
     // Preserve the established `[tag] payload` prefix consumed by issue-census scripts. Provenance
     // is an appended field group, not an insertion between the tag and its historical first field.
-    char line[2048];
-    const int written = diagnostic.program_address
-        ? std::snprintf(line, sizeof line,
-                        "[%s] %s stage=%s program=0x%llx role=%s\n",
-                        tag, payload, recompile_diagnostic_stage_name(diagnostic.stage),
-                        static_cast<unsigned long long>(diagnostic.program_address), role)
-        : std::snprintf(line, sizeof line,
-                        "[%s] %s stage=%s program=none role=%s\n",
-                        tag, payload, recompile_diagnostic_stage_name(diagnostic.stage), role);
+    std::vector<char> line(detail.size() + 512);
+    const int written =
+        diagnostic.program_address
+            ? std::snprintf(line.data(), line.size(), "[%s] %s stage=%s program=0x%llx role=%s\n",
+                            tag, payload, recompile_diagnostic_stage_name(diagnostic.stage),
+                            static_cast<unsigned long long>(diagnostic.program_address), role)
+            : std::snprintf(line.data(), line.size(), "[%s] %s stage=%s program=none role=%s\n",
+                            tag, payload, recompile_diagnostic_stage_name(diagnostic.stage), role);
     if (written < 0) return;
-    const size_t used = std::min(static_cast<size_t>(written), sizeof(line) - 1);
-    if (used == sizeof(line) - 1) {
-        line[sizeof(line) - 2] = '\n';
-    }
-    std::fwrite(line, 1, used, stderr);
+    const size_t used = std::min(static_cast<size_t>(written), line.size() - 1);
+    if (used == line.size() - 1) { line[line.size() - 2] = '\n'; }
+    std::fwrite(line.data(), 1, used, stderr);
 }
 enum : uint32_t {
     Op_Extension=10, Op_ExtInstImport=11, Op_ExtInst=12, Op_MemoryModel=14, Op_EntryPoint=15, Op_ExecutionMode=16,
@@ -678,11 +684,20 @@ struct LoopBlanketCheck {
         const LoopRootVerdicts verdict =
             loop_root_verdicts(b, rs, header_pc, carried, confined, arbitrary, weak_allowed);
         const std::set<uint64_t>& violated = verdict.violated;
+        std::vector<int> diagnostic_words;
         int read_word = -1;
         for (const auto& entry : carried)
             if (read_word < 0 && violated.contains(blanket_root(header_pc, entry.first)) &&
                 b.loop_blanket_roots_read.contains(blanket_root(header_pc, entry.first)))
                 read_word = entry.first;
+        for (const auto& entry : carried)
+            if (violated.contains(blanket_root(header_pc, entry.first)) &&
+                b.loop_blanket_roots_read.contains(blanket_root(header_pc, entry.first)))
+                diagnostic_words.push_back(entry.first);
+        if (!diagnostic_words.empty())
+            b.diagnostic.placeholder_origins =
+                std::make_shared<const std::string>(loop_placeholder_origins(
+                    rs, header_pc, diagnostic_words, b.placeholder_origin_program.get()));
         // Both actual exit edges may still depend on the header's assumptions. Demote the whole
         // assumption when any required root failed; keep its placeholder and unrelated valid roots.
         const auto invalid = [&](const auto& roots) {

@@ -339,7 +339,8 @@ std::vector<uint32_t> slot_mask_program(FreshMaskUse use, bool all_paths,
     p.insert(p.begin() + at, mask.begin(), mask.end());
     return p;
 }
-void mask_refuses(const std::vector<uint32_t>& p, const ComputeShaderConfig& base = config()) {
+void mask_refuses(const std::vector<uint32_t>& p, const ComputeShaderConfig& base = config(),
+                  const char* origin = nullptr) {
     const auto t = table();
     for (uint32_t path : {0u, 1u}) {
         auto c = base;
@@ -349,6 +350,7 @@ void mask_refuses(const std::vector<uint32_t>& p, const ComputeShaderConfig& bas
         std::string reason;
         for (const auto& [tag, payload] : capture.take()) reason += tag + payload;
         EXPECT_NE(reason.find("fabricated-fresh-mask-source"), std::string::npos) << reason;
+        if (origin) EXPECT_NE(reason.find(origin), std::string::npos) << reason;
     }
 }
 void mask_values(const std::vector<uint32_t>& p, bool carry = false, bool first_lane = false) {
@@ -376,7 +378,7 @@ void mask_values(const std::vector<uint32_t>& p, bool carry = false, bool first_
 } // namespace
 
 TEST(NativeCfgSavedMaskData, MissingSlotCannotObtainMaskAuthorityThroughFreshVectorCompare) {
-    mask_refuses(slot_mask_program(FreshMaskUse::Immediate, false));
+    mask_refuses(slot_mask_program(FreshMaskUse::Immediate, false), config(), "origin=spill");
 }
 TEST(NativeCfgSavedMaskData, MissingSlotScalarRelayCannotEstablishFreshMask) {
     mask_refuses(slot_mask_program(FreshMaskUse::ScalarRelay, false));

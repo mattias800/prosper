@@ -1,5 +1,9 @@
 # `tests/gpu/recompiler` — translation tests and the legacy compute execution fixture
 
+`test_placeholder_origins` checks unloaded, unsupplied launch, unknown launch and spill roots,
+including relays, both merge predecessors and loop backedges. Public compiler refusals assert the
+same appended details while retaining their refusal class.
+
 `test_native_loop_exec_data` executes genuine cohort inputs across native SCC-loop EXEC
 PHIs. Missing inputs and live back-edge dependencies remain refused. The certificate's saved
 mask joins, physical-word overlap and original-profile checks are separate from route admission.

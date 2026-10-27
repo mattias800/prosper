@@ -93,6 +93,7 @@
     uint32_t t_f64();
     uint32_t fcmp64(uint32_t cmpop, uint32_t a64, uint32_t b64);   // U64 words -> Bool
     std::unordered_map<uint32_t, uint32_t> fconst_cache, uconst_cache;
+    std::shared_ptr<const PlaceholderOriginProgram> placeholder_origin_program;
     uint32_t next_id = 1;
     uint32_t stride = 1;
     bool raw_output_words = false;
