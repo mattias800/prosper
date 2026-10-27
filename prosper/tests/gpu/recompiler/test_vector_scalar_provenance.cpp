@@ -199,8 +199,17 @@ TEST(VectorScalarProvenance, OneArmVectorOverwriteCannotEraseTheOtherArmsMark) {
 
 TEST(VectorScalarProvenance, LoopBackedgeChecksTheVectorAssumptionUsedByLaneBits) {
     const Words fabricated = {0x7e0c0232u, 0x7e0e0233u};   // absent s50/s51
-    for (Stage stage : {Stage::Fragment, Stage::Compute})
-        expect_refused(stage, loop(stage, fabricated), "fabricated on the back edge");
+    for (Stage stage : {Stage::Fragment, Stage::Compute}) {
+        // A complete compute launch names s50/s51 as unloaded. Its retry must still supply
+        // the READFIRST broadcast; a partial fragment profile retains the old Hard hold.
+        expect_refused(stage, loop(stage, fabricated),
+                       stage == Stage::Compute ? "unmodelled-scalar-publication pc=12"
+                                               : "fabricated on the back edge");
+        // Preserve the original back-edge check with an actual unknown launch input, saved
+        // before the prefix overwrites s0. Admission cannot waive this Hard root.
+        expect_refused(stage, cat({{0xbeb20300u, 0xbeb30300u}, loop(stage, fabricated)}),
+                       "fabricated on the back edge");
+    }
 }
 
 TEST(VectorScalarProvenance, DefinedVectorLoopCarryKeepsCompiling) {

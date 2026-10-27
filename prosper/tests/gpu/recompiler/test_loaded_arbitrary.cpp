@@ -279,7 +279,13 @@ TEST(LoadedArbitrary, ALoopThatReadsAVectorIntoAScalarDoesNotHoldWeakly) {
     ASSERT_EQ(in.at(0).fmt, Rdna2Format::VOP1);
     ASSERT_EQ(in.at(0).opcode, 0x02u);
     accepted(compile_compute(cat({{mov6_3}, loop_over_v6({readfirstlane_s21_v6, mov6_3})})));
-    refused(compile_compute(cat({{mov6_3}, loop_over_v6({readfirstlane_s21_v6, mov6_v7})})),
+    const auto unloaded =
+        compile_compute(cat({{mov6_3}, loop_over_v6({readfirstlane_s21_v6, mov6_v7})}));
+    refused(unloaded, "unmodelled-scalar-publication pc=6");
+    EXPECT_NE(unloaded.reason.find("origin=unloaded word=v7"), std::string::npos);
+    EXPECT_NE(unloaded.reason.find("origin=unmodelled-scalar-publication word=s21 at=6"),
+              std::string::npos);
+    refused(compile_compute(cat({{mov6_3}, loop_over_v6({readfirstlane_s21_v6, mov6_s8})})),
             "fabricated on the back edge");
 }
 

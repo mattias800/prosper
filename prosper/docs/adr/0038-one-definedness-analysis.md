@@ -597,6 +597,12 @@ twin also detects the relaxed-Hard mutation. Ordinary lane-harness instruction t
 byte-for-byte, with a deliberate instruction mutation detected. Old Hard-input controls now use
 an unknown possible scratch-offset launch word instead of an explicitly unloaded SGPR.
 
+Four existing refusal assertions now name the actual earlier producer or missing ordinary input.
+The loop fixtures also keep genuine Hard-input back-edge twins. The two M0 fixtures check the
+actual local-index packet certificate independently of their earlier public input refusal;
+replacing the real deferred M0 retirement guard with `true` makes both tests fail. These changes
+preserve the guards' coverage rather than treating any refusal as sufficient.
+
 `arbitrary-placeholder-admitted` is a default-on correctness alarm with a program-address run
 summary. Window counts are successful retry compilations and static read sites, not draws or
 executed lane reads. Failed retries publish their actual refusal and no admission count.
