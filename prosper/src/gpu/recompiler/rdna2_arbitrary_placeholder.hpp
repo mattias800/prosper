@@ -8,6 +8,8 @@
 
 namespace prosper::gpu {
 struct RecompileDiagnosticContext;
+struct Rdna2Inst;
+struct RegState;
 enum class ArbitraryPlaceholderRead { FreshMask, LoopCarry };
 struct ArbitraryPlaceholderReads {
     uint64_t fresh_mask = 0, loop_carry = 0;

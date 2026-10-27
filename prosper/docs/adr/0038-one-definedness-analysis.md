@@ -578,10 +578,12 @@ necessary; these are not claimed as accepted modules.
 Nine synthetic interpreter witnesses fail against the merged diagnostic-only compiler and pass
 with admission. They cover integer/float predicates, CMPX, saved SDWA predicates, narrowed writes,
 vector/scalar loop carries, and real scalar-buffer data beside an unloaded root. Three actual
-exact64 GPU dispatches cover both wave halves and CMPX's active-lane count. The existing nine
+exact64 GPU dispatches cover both wave halves and CMPX's active-lane count. Eight existing
 scalar-selector/loop originals now execute their consistent arbitrary values; same-consumer twins
 with genuine missing spills remain refused. An agreeing READFIRST source retains its established
-proof. All 27 exported synthetic modules validate.
+proof. All 25 exported synthetic modules validate. The delayed vector-body original remains Hard at
+its legacy READFIRST publication; its genuine and complete-replacement controls retain their
+existing successful output.
 
 Mutation controls deny unloaded admission, admit Hard roots, lose scalar-load publication, keep
 a stale retry refusal, or disconnect the observer; each is detected. The actual #4943 missing-spill

@@ -1001,7 +1001,19 @@ void delayed_vector_body_root_values(unsigned variant, uint32_t expected) {
 }   // namespace
 TEST(NativeCfgSavedMaskData, DelayedVectorBodyRootCannotBorrowACleanCheckWordAtLoopExit) {
     const auto p = delayed_vector_body_root_loop(0);
-    delayed_vector_body_root_values(0, 0);
+    const auto resources = table();
+    for (uint32_t path : {0u, 1u}) {
+        const uint64_t address = 0x5497b00d00ull + path;
+        const auto module = recompile_compute(p.data(), p.size(), &resources, loop_config(6, path),
+                                              {RecompileDiagnosticStage::Compute, address});
+        EXPECT_TRUE(module.empty());
+        // The original absent-value fixture also reaches legacy READFIRST after the loop.
+        // Unloaded roots do not supply its missing whole-wave scalar publication.
+        EXPECT_NE(last_terminal_reject_reason(address).find(
+                      "origin=unmodelled-scalar-publication word=s17"),
+                  std::string::npos)
+            << last_terminal_reject_reason(address);
+    }
     routed_loop_refuses(prosper::test::arbitrary_placeholder::with_missing_spill_root(p, 60), 6,
                         "exec-loop-widens", "fabricated-fresh-mask-sourcepc=29");
 }

@@ -1,5 +1,7 @@
 // A new arbitrary admission cannot make a lane-local READFIRST into a scalar broadcast.
 #include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_placeholder_origins.hpp"
 #include "gpu/recompiler/rdna2_scalar_exec_scopes.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <memory>
