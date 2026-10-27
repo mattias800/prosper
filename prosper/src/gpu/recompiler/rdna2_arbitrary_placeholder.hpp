@@ -26,6 +26,8 @@ bool refuse_arbitrary_placeholder_operand(SpirvCompute&, const RegState&, const 
                                           const Operand&, bool* ok);
 bool refuse_arbitrary_placeholder_export(SpirvCompute&, const RegState&, const Rdna2Inst&,
                                          bool& ok);
+bool refuse_arbitrary_placeholder_old_destination(SpirvCompute&, const RegState&, const Rdna2Inst&,
+                                                  bool& ok);
 std::vector<uint32_t>
 recompile_with_arbitrary_placeholders(const RecompileDiagnosticContext&,
                                       const std::function<std::vector<uint32_t>()>&);

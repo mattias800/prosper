@@ -206,7 +206,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
     auto val = [&](const Operand& o) { return operand_bits(b, rs, in, o, &ok); };
     // SDWA/DPP forms carry a sub-dword select or cross-lane control word we don't model. The decoder
     // flags them (and gets their length right); reject here rather than compute with a wrong operand.
-    if (refuse_arbitrary_placeholder_export(b, rs, in, ok)) return true;
+    if (refuse_arbitrary_placeholder_export(b, rs, in, ok) ||
+        refuse_arbitrary_placeholder_old_destination(b, rs, in, ok))
+        return true;
     PortableMaskHalfInstruction portable_halves(b, rs, in, ok);
     if (!ok || portable_halves.handled()) return true;
     VccMaskViewDrop drop(b, rs);   // takes VCC's lane view away at exit when armed

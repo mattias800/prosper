@@ -222,6 +222,7 @@ inline Words untracked_spill_in_loop() {
 inline Words written_unloaded_spill() {
     return {0x7e0c023cu, 0x7d840d06u,   // unloaded-only predicate
             0xd76100ffu, 0x0001003cu,   // actually write slot0 from unloaded s60
+            0xd76100ffu, 0x0001023cu,   // preserve slot0 while also writing slot1
             0xd7600014u, 0x000101ffu,   // read that provided slot into s20
             0x7e020214u, 0xe0702000u, 0x80020100u, 0xbf810000u};
 }
@@ -234,6 +235,21 @@ inline Words addtid_after_writelane(bool write_lane = true) {
                    0x7e0e023cu, 0x7d840f07u,   // unloaded v7; VCC=(v7==v7)
                    0xd1010001u, 0x01aa0296u,   // v1 = VCC ? v1 : 22
                    0xe0702000u, 0x80020100u, 0xbf810000u});
+    return result;
+}
+inline Words partial_old_after_writelane(bool write_lane = true) {
+    Words result{0x7e0c0287u};   // v6 = 7
+    if (write_lane) result.insert(result.end(), {0xd7610006u, 0x00010000u});
+    result.insert(result.end(),
+                  {0x7da40080u, 0x7e0c0296u,   // only lane0 overwrites v6 with 22
+                   0xbefe04c1u, 0x7e0e023cu, 0x7d840f07u,   // full EXEC; unloaded equality
+                   0xd1010001u, 0x01aa0c96u,   // select v6, including its old inactive lanes
+                   0xe0702000u, 0x80020100u, 0xbf810000u});
+    return result;
+}
+inline Words partial_old_expected() {
+    Words result(64, 7);
+    result[0] = 22;
     return result;
 }
 inline Words expected(bool narrowed) {

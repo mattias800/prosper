@@ -40,6 +40,9 @@ The DS routes guard actual retry input reads before their early returns: compute
 plain GDS reads, implicit M0 readers, and DS shuffle inputs share the arbitrary-input boundary.
 The ordinary LDS callback alone cannot protect those early routes. Existing stored values,
 addresses, predicates and route order remain with their family lowerings.
+`emit_alu` also checks ordinary old-destination reads before lowering, using the existing
+old-word predicate. This includes inactive-lane preservation, subword preservation and implicit
+accumulation; complete overwrites and slot-map writers retain their separate contracts.
 
 `bvh_case_routes.*` owns the existing MIMG BVH branch, including guarded node loads, triangle
 and box calculations, sorting and destination predication. Its continuation methods keep original

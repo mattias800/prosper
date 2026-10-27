@@ -124,3 +124,25 @@ TEST(ArbitraryPlaceholderGpu, AnEarlyAddtidStoreCannotReplaceAWritelaneValueWith
         execute(words, expected, address, launch);
     }
 }
+
+TEST(ArbitraryPlaceholderGpu, APartialWriteKeepsTheProvidedInactiveLanes) {
+    execute(fixture::partial_old_after_writelane(false), fixture::partial_old_expected(),
+            0x5497b02500ull);
+}
+
+TEST(ArbitraryPlaceholderGpu, APartialWriteCannotInventTheLostInactiveDestination) {
+    const auto words = fixture::partial_old_after_writelane();
+    const auto resources = fixture::table();
+    auto launch = fixture::config();
+    launch.user_sgprs[0] = 13;
+    constexpr uint64_t address = 0x5497b02600ull;
+    const auto module = recompile_compute(words.data(), words.size(), &resources, launch,
+                                          {RecompileDiagnosticStage::Compute, address});
+    EXPECT_TRUE(module.empty());
+    if (module.empty()) {
+        EXPECT_NE(last_terminal_reject_reason(address).find("origin=lost-definition word=v6"),
+                  std::string::npos);
+    } else {
+        execute(words, fixture::partial_old_expected(), address, launch);
+    }
+}

@@ -35,6 +35,9 @@ back-edge check; no new value or validity fact is supplied.
 The early DS readers use the same boundary, including ADDTID data, GDS/shuffle inputs and
 implicit M0. A missing computed value stays Hard even when its original operands were genuine;
 knowing the inputs does not supply a computation that the ordinary representation lost.
+The same input boundary charges implicit old destinations through the existing
+`vector_write_depends_on_old_word` predicate and write footprint. Full overwrites do not read
+the old word; WRITELANE owns its separate slot-map update. No new transfer facts are inferred.
 If the retry still refuses, its actual later cause replaces the now-admitted unloaded refusal.
 Its output-only observation port is declared here and implemented beside compiler callers in
 `gpu/diagnostics`; the compiler includes neither that implementation nor performance observers.

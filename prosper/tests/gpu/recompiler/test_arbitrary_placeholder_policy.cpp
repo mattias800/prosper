@@ -453,3 +453,27 @@ TEST(ArbitraryPlaceholderPolicy, EarlyDsImplicitM0ReadersKeepAnUnknownLaunchRoot
         EXPECT_NE(reason.find("origin=unknown-launch word=s124"), std::string::npos) << reason;
     }
 }
+
+TEST(ArbitraryPlaceholderPolicy, APartialWriteCannotInventTheLostInactiveDestinationValue) {
+    namespace fixture = prosper::test::arbitrary_placeholder;
+    const auto words = fixture::partial_old_after_writelane();
+    const auto resources = fixture::table();
+    auto launch = fixture::config();
+    launch.user_sgprs[0] = 13;
+    constexpr uint64_t address = 0x5497b02400ull;
+    const auto module = recompile_compute(words.data(), words.size(), &resources, launch,
+                                          {RecompileDiagnosticStage::Compute, address});
+    EXPECT_TRUE(module.empty());
+    if (module.empty()) {
+        const auto reason = last_terminal_reject_reason(address);
+        EXPECT_NE(reason.find("hard-placeholder-read pc=4"), std::string::npos) << reason;
+        EXPECT_NE(reason.find("origin=lost-definition word=v6"), std::string::npos) << reason;
+    } else {
+        bpermute_oracle::Interpreter vm(module);
+        vm.native_subgroup_width = 64;
+        vm.supplied_push_constants = launch.user_sgprs;
+        const auto actual = vm.run(64, fixture::Words(64, 0xdeadbeefu));
+        ASSERT_TRUE(vm.error.empty()) << vm.error;
+        EXPECT_EQ(actual, fixture::partial_old_expected());
+    }
+}

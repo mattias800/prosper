@@ -55,6 +55,16 @@ TEST(ArbitraryPlaceholderExecution, AProvidedAddtidStoreKeepsItsDataBesideAnUnlo
     EXPECT_EQ(actual, fixture::Words(64, 7));
 }
 
+TEST(ArbitraryPlaceholderExecution, APartialWriteKeepsAProvidedInactiveDestination) {
+    witness_values(fixture::partial_old_after_writelane(false), fixture::partial_old_expected());
+}
+
+TEST(ArbitraryPlaceholderExecution, ACompleteOverwriteDoesNotReadALostOrdinaryDestination) {
+    auto words = fixture::partial_old_after_writelane();
+    words[3] = 0xbf800000u; // no narrowing: v6=22 replaces the entire old word
+    witness_values(words, fixture::Words(64, 22));
+}
+
 TEST(ArbitraryPlaceholderExecution, AScalarRelayRetainsOneConsistentValue) {
     witness(fixture::scalar_relay());
 }

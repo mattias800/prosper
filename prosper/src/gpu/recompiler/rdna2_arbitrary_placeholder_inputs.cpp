@@ -6,6 +6,9 @@
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
+#include "gpu/recompiler/rdna2_cfg_registers.hpp"
+#include "gpu/recompiler/rdna2_instruction_effects.hpp"
+#include "gpu/recompiler/rdna2_vector_old_word.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <memory>
@@ -138,6 +141,23 @@ bool refuse_arbitrary_placeholder_export(SpirvCompute& b, const RegState& rs, co
             return true;
     }
     return false;
+}
+bool refuse_arbitrary_placeholder_old_destination(SpirvCompute& b, const RegState& rs,
+                                                  const Rdna2Inst& in, bool& ok) {
+    if (!arbitrary_placeholder_retry_active() || b.is_fragment_packet() ||
+        vector_write_leaves_old_word(in, rs.vector_native_interpolation) ||
+        !vector_write_depends_on_old_word(in, !rs.exec_narrowed) ||
+        rdna2_instruction_effects(in).lane_flow == Rdna2LaneFlow::WriteLane)
+        return false;
+    // The existing predicate names actual old-word reads, including inactive lanes, partial
+    // words and accumulators. Lane-slot writers preserve their slot map, not ordinary SSA.
+    bool refused = false;
+    for_each_possible_vector_write(in, 255, [&](int reg) {
+        if (!refused)
+            refused =
+                refuse_arbitrary_placeholder_operand(b, rs, in, {OperandKind::VGPR, reg}, &ok);
+    });
+    return refused;
 }
 uint32_t read_vector_for_arbitrary_retry(SpirvCompute& b, RegState& rs, const Rdna2Inst& in,
                                          int reg, bool& ok) {

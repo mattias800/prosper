@@ -588,11 +588,11 @@ This does not establish that their retries reached the old predicate PCs. `ps_40
 `v0/v1` alongside unloaded roots. Fresh live captures and visible portrait verification remain
 necessary; these are not claimed as accepted modules.
 
-Fourteen synthetic interpreter witnesses fail against the merged diagnostic-only compiler and
+Sixteen synthetic interpreter witnesses fail against the merged diagnostic-only compiler and
 pass with admission. They cover integer/float predicates, CMPX, saved SDWA predicates, narrowed
 writes, vector/scalar loop carries, scalar and READLANE relays, implicit scalar compares, ordinary
 data reads beside an unloaded predicate, real scalar-buffer data, and a provided spill containing
-an unloaded value. Eight actual exact64 GPU dispatches exercise both wave halves, CMPX's active
+an unloaded value. Nine actual exact64 GPU dispatches exercise both wave halves, CMPX's active
 lane count, and the relay/data/spill paths. Five existing selector/loop fixtures also execute both
 scalar branch inputs; real missing spills remain refused. An agreeing READFIRST source retains its
 established proof. All exported synthetic modules validate. Three loop originals whose computed
@@ -617,6 +617,16 @@ summary. Window counts are successful retry compilations and static read sites, 
 executed lane reads. Failed retries publish their actual refusal and no admission count.
 
 #### Ruled out during admission qualification (2026-10-27)
+
+- **Explicit operand guards cover implicit destination reads.** A partial EXEC write after
+  WRITELANE preserves the ordinary old destination. Without an actual old-word guard, the
+  interpreter and exact64 GPU observe `[22,0,...]` instead of `[22,7,...]`. The existing
+  `vector_write_depends_on_old_word` predicate identifies those reads, including accumulation
+  and subword preservation; no new transfer facts are added. A complete overwrite must still
+  compile, and named lane-slot updates must not be treated as ordinary old-VGPR reads. Both
+  false-positive mutations are detected. The underlying producer loss also reproduces on
+  strict merged main without an unloaded predicate; it remains separately tracked as
+  [#5530](https://github.com/mattias800/prosper/issues/5530). This policy preserves strict successes.
 
 - **The ordinary LDS callback protects every DS input read.** Compute ADDTID returns before
   that callback. After `v6=7; writelane v6,s0,0` with supplied `s0=13`, its direct store silently
