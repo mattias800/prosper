@@ -528,6 +528,8 @@ value, which the per-invocation lowering does not broadcast, names
 legacy lowering, including straight-line scalar relays and publications independent of the
 admitted read. Existing agreeing-source and local waterfall proofs remain applicable, and real
 dispatcher broadcasts do not pass through that lane-local lowering.
+Runtime-relative bank readers check each potentially selected word independently; a bounded
+index supplies no register value, and unloaded alternatives cannot hide a lost provided word.
 
 The same 4,000-entry corpus compares 3,567 recorded-input replays and 433 stage probes:
 
@@ -590,11 +592,11 @@ This does not establish that their retries reached the old predicate PCs. `ps_40
 `v0/v1` alongside unloaded roots. Fresh live captures and visible portrait verification remain
 necessary; these are not claimed as accepted modules.
 
-Sixteen synthetic interpreter witnesses fail against the merged diagnostic-only compiler and
+Eighteen synthetic interpreter witnesses fail against the merged diagnostic-only compiler and
 pass with admission. They cover integer/float predicates, CMPX, saved SDWA predicates, narrowed
 writes, vector/scalar loop carries, scalar and READLANE relays, implicit scalar compares, ordinary
 data reads beside an unloaded predicate, real scalar-buffer data, and a provided spill containing
-an unloaded value. Nine actual exact64 GPU dispatches exercise both wave halves, CMPX's active
+an unloaded value. Eleven actual exact64 GPU dispatches exercise both wave halves, CMPX's active
 lane count, and the relay/data/spill paths. Five existing selector/loop fixtures also execute both
 scalar branch inputs; real missing spills remain refused. An agreeing READFIRST source retains its
 established proof. All exported synthetic modules validate. Three loop originals whose computed
