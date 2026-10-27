@@ -406,25 +406,25 @@ Hard. Policy 2 is out of scope. The first PR adds origins and measurements witho
 admission; the admission PR follows only after the measurements merge. This direction does not
 accept the proposed unified-analysis migration above.
 
-#### Measurements (2026-10-26)
+#### Measurements (2026-10-27)
 
-Diagnostics-only branch based on `4728b5abf2c1`; #5511 is merged, while #5512 and #5515
-are not included. No game run. This is a conservative union of possible original-CFG roots,
+Diagnostics-only branch based on `0f6b8dd3ecd0`, including #5511, #5512, #5515 and #5526.
+No game run. This is a conservative union of possible original-CFG roots,
 not dynamic read counts or evidence that every path executes. Merge and loop nodes are traced
 through; they are not origin categories. Supplied native Input publications and genuine resource
 bindings terminate their respective dependency edges.
 
 All 4,000 current corpus entries were surveyed: 3,567 use recorded-input replay and 433 fall
-back to the stage probe. The effective policy-1 subset is **663 entries: 617 fresh-mask and 46
+back to the stage probe. The effective policy-1 subset is **572 entries: 564 fresh-mask and eight
 loop-carried refusals**. The earlier 642 above is a historical measurement, not a current filter.
 No entry in this subset lacks an origin. Counts are entries, not distinct guest programs.
-Of these, 596 use recorded replay and 67 use a stage probe. A raw stage probe lacks the producing
+Of these, 505 use recorded replay and 67 use a stage probe. A raw stage probe lacks the producing
 launch/resources: its origins describe the supplied probe configuration, not demonstrated original
-hardware inputs. Of the 115 unloaded-only slices, 114 use replay and one uses a stage probe.
+hardware inputs. Of the 24 unloaded-only slices, 23 use replay and one uses a stage probe.
 
 | Origin | Entries containing it | Distinct roots |
 | --- | ---: | ---: |
-| `unloaded` | 131 | 3505 |
+| `unloaded` | 40 | 1373 |
 | `launch-input` | 473 | 478 |
 | `spill` | 0 | 0 |
 | `unknown-launch` | 71 | 573 |
@@ -433,7 +433,7 @@ hardware inputs. Of the 115 unloaded-only slices, 114 use replay and one uses a 
 | `trace-budget` | 0 | 0 |
 | `unreachable` | 0 | 0 |
 
-**115 entries have only `unloaded` roots**; 548 contain another origin. Entry counts in the
+**24 entries have only `unloaded` roots**; 548 contain another origin. Entry counts in the
 table overlap when a read has mixed roots. A root is a distinct origin/word/lane/site tuple
 within one entry. `lost-definition` means the compiler retained a fabricated mark but the slice
 found only supplied values/constants, so it has no demonstrated unloaded root.
@@ -449,6 +449,7 @@ scratch-offset SGPR following its known user/system prefix remains unknown as sp
 Special-register initialization is also not inferred from that ordinary SGPR prefix.
 
 All supplied game dump directories were checked: 27 binaries, 24 sidecars, no additional binaries.
+Both builds replayed every sidecar; all nine accepted modules validate and match byte for byte.
 The table covers every program, including unrelated refusals and missing sidecars. Origin
 numbers count distinct roots in that program; a dash is not an unloaded classification.
 
@@ -477,15 +478,16 @@ numbers count distinct roots in that program; a dash is not an unloaded classifi
 | GTA `ps_405b257e00` | Fresh-mask, PC 154 | `launch-input` 1, `unknown-launch` 17, `unmodelled-transfer` 1 |
 | GTA `ps_405b26ca00` | MIMG address, PC 372 | — |
 | GTA `ps_405b3ddc00` | Fresh-mask, PC 1184 | `launch-input` 3, `unknown-launch` 53 |
-| Kena `cs_50071e0000` | Fresh-mask, PC 189 | `unloaded` 23 |
-| Kena `cs_500a540000` | Loop-carried, header 279 | `unloaded` 24 |
+| Kena `cs_50071e0000` | VCC exit, header 166 | — |
+| Kena `cs_500a540000` | Accepted | — |
 | Kena `ps_500aed0000` | Accepted | — |
 | Kena `vs_5009400000` | Vertex MBCNT, PC 378 | — |
 
-For GTA, two policy-1 programs have only unloaded roots; three have mixed roots. Kena has
-two unloaded-only compute refusals on this base; its fragment program already accepts. Across
-the seven game policy-1 refusals, four contain unloaded roots, three launch inputs, three unknown
-launch roots and two unmodelled transfers (overlapping groups); none contains a spill root.
+For GTA, two policy-1 programs have only unloaded roots; three have mixed roots. Kena has no
+policy-1 refusal on this base: two programs accept and one compute program reaches the separate
+VCC-exit refusal. Across the five game policy-1 refusals, two contain unloaded roots, three launch
+inputs, three unknown launch roots and two unmodelled transfers (overlapping groups); none contains
+a spill root.
 
 The mixed GTA inputs remain Hard: [#5518](https://github.com/mattias800/prosper/issues/5518)
 tracks partial ANCILLARY v2, including an actual bit-8 extraction outside the supplied layer bits;
@@ -494,9 +496,10 @@ tracks partial ANCILLARY v2, including an actual bit-8 extraction outside the su
 WQM/DPP proof loss, MIMG-address/unresolved-operand refusals, VCC exits and vertex MBCNT are
 not made admissible by this census.
 
-The corpus comparison reports **`changes: none`**. All 1,493 comparable accepted-module hashes
-match; five previously accepted entries have no comparable module hash. A valid-module generator
-mutation is detected as one `output-changed` entry (exit 1), and that mutated module passes
+The corpus comparison reports **`changes: none`**. All 1,538 comparable accepted-module hashes
+match; five previously accepted entries have no comparable module hash. Both surveys also have
+388 incomplete answers and one unchanged inspector error; these are coverage limits. A valid-module
+generator mutation is detected as one `output-changed` entry (exit 1), and that mutated module passes
 `spirv-val`. Diagnostic details do not participate in verdict tags or module identity.
 Replay compile-cases retain the primary refusal identity under their existing 256-byte bound;
 complete terminal diagnostics retain the separate origin envelope.
