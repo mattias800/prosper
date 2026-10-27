@@ -214,3 +214,30 @@ TEST(ArbitraryPlaceholderGpu, AnAliasedUnloadedBankWordRetainsItsPlaceholder) {
     execute(fixture::relative_after_writelane(false, false, true), fixture::Words(64, 0),
             0x5497b03b00ull, launch);
 }
+
+TEST(ArbitraryPlaceholderGpu, AProvidedHighWordControlsExecThroughScc) {
+    for (uint32_t high : {0u, 1u}) {
+        auto launch = fixture::config();
+        launch.user_sgprs.resize(14);
+        launch.user_sgprs[13] = high;
+        execute(fixture::bfe_scc_exec(), fixture::Words(64, high ? 7 : 11), 0x5497b04200ull + high,
+                launch);
+    }
+}
+
+TEST(ArbitraryPlaceholderGpu, AnUnloadedHighWordKeepsTheSameExecSelection) {
+    execute(fixture::bfe_scc_exec(true), fixture::Words(64, 11), 0x5497b04300ull);
+}
+
+TEST(ArbitraryPlaceholderGpu, AProvidedSccSelectsExecForEveryLane) {
+    for (uint32_t input : {0u, 1u}) {
+        auto launch = fixture::config();
+        launch.user_sgprs[4] = input;
+        execute(fixture::implicit_scc_exec(1), fixture::Words(64, input ? 11 : 7),
+                0x5497b04400ull + input, launch);
+    }
+}
+
+TEST(ArbitraryPlaceholderGpu, AnUnloadedSccRetainsItsComputedExecSelection) {
+    execute(fixture::implicit_scc_exec(2), fixture::Words(64, 7), 0x5497b04500ull);
+}

@@ -273,6 +273,30 @@ inline Words relative_after_writelane(bool write_lane = true, bool provide_word 
     result.insert(result.end(), suffix.begin(), suffix.end());
     return result;
 }
+inline Words bfe_scc_exec(bool unloaded_pair = false) {
+    Words result{0x7e0c023cu, 0x7d840d06u, 0xd1010001u, 0x01a91696u};
+    const Words suffix{
+        0x9494ff00u | (unloaded_pair ? 60u : 12u),
+        0x00010020u,   // extract bit32 into s[20:21]
+        0x85fe80c1u,   // SCC selects full EXEC or zero EXEC
+        0x7e020287u,
+        0xbefe04c1u,   // v1=7 under EXEC, then restore full EXEC
+        0xe0702000u,
+        0x80020100u,
+        0xbf810000u,
+    };
+    result.insert(result.end(), suffix.begin(), suffix.end());
+    return result;
+}
+inline Words implicit_scc_exec(unsigned producer = 0) {
+    Words result{0x7e0c023cu, 0x7d840d06u, 0xd1010001u, 0x01a91696u};
+    if (producer == 1) result.push_back(0xbf068004u);   // SCC=(supplied s4==0)
+    if (producer == 2) result.push_back(0xbf063c3cu);   // SCC=(unloaded s60==itself)
+    const Words suffix{0x85fe80c1u, 0x7e020287u, 0xbefe04c1u,
+                       0xe0702000u, 0x80020100u, 0xbf810000u};
+    result.insert(result.end(), suffix.begin(), suffix.end());
+    return result;
+}
 inline Words expected(bool narrowed) {
     Words result(64, 11u);
     if (narrowed)

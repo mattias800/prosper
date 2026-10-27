@@ -45,6 +45,9 @@ old-word predicate. This includes inactive-lane preservation, subword preservati
 accumulation; complete overwrites and slot-map writers retain their separate contracts.
 The legacy MOVRELS reader also checks every bounded bank candidate before its direct map read;
 an unloaded alternative cannot supply another candidate's lost provided value.
+Wide scalar shift/BFE readers check each physical source word before direct map access. The
+emitter checks implicit SCC readers through canonical effects, including selectors that feed EXEC
+without a later ordinary read of their scalar destination.
 
 `bvh_case_routes.*` owns the existing MIMG BVH branch, including guarded node loads, triangle
 and box calculations, sorting and destination predication. Its continuation methods keep original

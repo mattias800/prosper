@@ -122,7 +122,7 @@ std::vector<PlaceholderWord> PlaceholderOriginTrace::sources(const Rdna2Inst& in
     if (effects.implicit_reads & kRdna2ImplicitVcc)
         add(PlaceholderFile::Scalar, 106, program.wave_size == 32 ? 1 : 2);
     if (effects.implicit_reads & kRdna2ImplicitScc) words.push_back({PlaceholderFile::Scc});
-    if (result.file == PlaceholderFile::Scalar)
+    if (result.file == PlaceholderFile::Scalar || result.file == PlaceholderFile::Scc)
         add(PlaceholderFile::Scalar, in.dst.value, scalar_implicit_destination_read_width(in));
     return words;
 }

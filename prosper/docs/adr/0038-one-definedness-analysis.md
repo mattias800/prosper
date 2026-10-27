@@ -622,6 +622,15 @@ executed lane reads. Failed retries publish their actual refusal and no admissio
 
 #### Ruled out during admission qualification (2026-10-27)
 
+- **Checking a wide operand's low word covers its SCC/EXEC dependency.** BFE read its high
+  word directly, substituting zero for unknown launch `s13`. A following CSELECT used SCC to
+  select EXEC without reading the BFE destination. The missing-high regression fails before
+  the guards; supplied high bits 0/1 produce 11/7 in the interpreter and on the exact64 GPU,
+  and an unloaded pair retains 11. Both consumed words require the actual input boundary.
+  An independent entry-SCC fixture also exposed stored `false` being mistaken for a launch
+  input. Retry-only condition tracking distinguishes that unknown input from real SCC writers;
+  unloaded-only computed conditions retain their roots at the actual read PC. #5528.
+
 - **Register-map membership establishes that an actual source value exists.** MOVRELS reserves
   its destination before reading the bank. When that destination aliases a lost provided
   candidate, the temporary entry has ID 0 and hides the absence from a membership-only guard.

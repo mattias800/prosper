@@ -540,7 +540,7 @@ inline bool scalar_source_projectable(const SpirvCompute& b, const RegState& rs,
                                       const Rdna2Inst& in, uint32_t k) {
     const Operand& o = in.src[k];
     if (b.wave_size == 32 && o.kind == OperandKind::Special && o.value == 253)
-        return scalar_condition_source_defined(b, rs);
+        return scalar_condition_source_defined(b, rs, in.pc);
     const bool special_data = o.kind == OperandKind::Special && o.value >= 106 && o.value < 124;
     // EXEC is the live lane mask, never data. Admitting it is sound because rs.exec cannot hold a
     // fabricated word: every EXEC writer refuses a non-projectable source at the write rather than
@@ -563,7 +563,7 @@ inline bool scalar_data_sources_projectable_into_mask(const SpirvCompute& b, con
                                                       const Rdna2Inst& in) {
     if (!(b.is_compute || b.is_fragment) || (b.wave_size != 64 && b.wave_size != 32)) return true;
     if (!writes_lane_mask_register(in)) return true;
-    if (b.wave_size == 32 && scalar_reads_scc(in) && !scalar_condition_source_defined(b, rs))
+    if (b.wave_size == 32 && scalar_reads_scc(in) && !scalar_condition_source_defined(b, rs, in.pc))
         return false;
     for (uint32_t k = 0; k < 4; ++k)
         if (!scalar_source_projectable(b, rs, in, k)) return false;

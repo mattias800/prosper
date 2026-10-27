@@ -1,4 +1,5 @@
 #include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
+#include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_native_image_results.hpp"
 // rdna2_emit_alu.cpp — emit_alu: the RDNA2 instruction-family translator, split out of
 // rdna2_to_spirv.cpp. Shared state lives in gpu/recompiler/rdna2_to_spirv_internal.hpp.
@@ -208,6 +209,9 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
     // flags them (and gets their length right); reject here rather than compute with a wrong operand.
     if (refuse_arbitrary_placeholder_export(b, rs, in, ok) ||
         refuse_arbitrary_placeholder_old_destination(b, rs, in, ok))
+        return true;
+    if ((rdna2_instruction_effects(in).implicit_reads & kRdna2ImplicitScc) &&
+        refuse_arbitrary_placeholder_operand(b, rs, in, {OperandKind::Special, 253}, &ok))
         return true;
     PortableMaskHalfInstruction portable_halves(b, rs, in, ok);
     if (!ok || portable_halves.handled()) return true;

@@ -11,6 +11,8 @@ Relative-bank fixtures keep unloaded alternatives beside a runtime-selected prov
 the erased-word twin distinguishes lost computation from genuinely unloaded storage.
 Partial-destination fixtures distinguish a provided old inactive word from a lost one, with a
 full-overwrite control and repeated named-slot writes to keep the domains separate.
+Wide-scalar and implicit-SCC fixtures feed EXEC directly, distinguishing absent real inputs from
+supplied bits and genuinely unloaded roots without a later scalar-destination read.
 
 Shared material that more than one test needs: the Vulkan/compute execution harnesses, and
 hand-constructed binary inputs (a synthetic PRX, an ATRAC9 vector, captured GTA V shader words) that

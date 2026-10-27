@@ -1,4 +1,7 @@
 #include "gpu/recompiler/rdna2_scalar_condition_marks.hpp"
+#include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
+#include "gpu/recompiler/rdna2_placeholder_origin_trace.hpp"
+#include "gpu/recompiler/rdna2_placeholder_origins.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
@@ -34,7 +37,7 @@ void record_wave32_scalar_condition(RegState& rs, const Rdna2Inst& in,
     else
         rs.scc_loop_blanket.clear();
 }
-bool scalar_condition_source_defined(const SpirvCompute& b, const RegState& rs) {
+bool scalar_condition_source_defined(const SpirvCompute& b, const RegState& rs, uint32_t pc) {
     if (!(b.is_compute || b.is_fragment) || (b.wave_size != 32 && !rs.track_scc_definition))
         return rs.scc != 0;
     if (rs.scc && !rs.scc_merge_placeholder) return true;
@@ -43,10 +46,17 @@ bool scalar_condition_source_defined(const SpirvCompute& b, const RegState& rs) 
         b.loop_blanket_roots_read.insert(rs.scc_loop_blanket.begin(), rs.scc_loop_blanket.end());
         return true;
     }
+    if (rs.scc && arbitrary_placeholder_retry_active() && !b.is_fragment_packet()) {
+        const auto* program = rs.placeholder_origin_program ? rs.placeholder_origin_program.get()
+                                                            : b.placeholder_origin_program.get();
+        if (program)
+            return placeholder_roots_are_unloaded(
+                detail::PlaceholderOriginTrace(*program).before(pc, {{PlaceholderFile::Scc}}));
+    }
     return false;
 }
 bool scalar_condition_defined(SpirvCompute& b, const RegState& rs, uint32_t pc) {
-    if (scalar_condition_source_defined(b, rs)) return true;
+    if (scalar_condition_source_defined(b, rs, pc)) return true;
     if (b.wave_size == 32) {
         b.stage_reject_pc = pc;
         b.stage_reject_reason = "poisoned-scc";

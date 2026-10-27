@@ -1,5 +1,9 @@
 # `tests/gpu/recompiler` — translation tests and the legacy compute execution fixture
 
+`test_arbitrary_placeholder_scalar_words` keeps missing high scalar words and unknown entry SCC
+Hard when they select EXEC. Supplied and genuinely unloaded twins execute through the interpreter;
+the high-word selector observes both possible supplied bits without assuming a missing input value.
+
 `test_arbitrary_placeholder_execution` executes scalar relays, saved SDWA predicates, narrowed
 old values, scalar/vector loop carries and a real supplied scalar-buffer load through the public
 compiler and integer interpreter.

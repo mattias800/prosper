@@ -5,6 +5,7 @@
 #include "gpu/recompiler/ir/lower/scalar_lowering_internal.hpp"
 #include "gpu/recompiler/ir/ops/integer64_shifts.hpp"
 #include "gpu/recompiler/ir/ops/scalar_integer64_values.hpp"
+#include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
 
 namespace prosper::gpu::ir {
 
@@ -222,10 +223,18 @@ std::optional<bool> Sop2Lowering::route_shift_b64() {
         // compute shaders frequently borrow VCC_LO/HI for 64-bit address arithmetic; that
         // lifetime coexists with VCC's per-lane predicate view, so retain both exactly.
         auto scalar_word = [&](int reg, uint32_t& value) {
+            if (refuse_arbitrary_placeholder_operand(b, rs, in, {OperandKind::SGPR, reg}, &ok))
+                return false;
             auto current = rs.sreg.find(reg);
-            if (current != rs.sreg.end()) { value = current->second; return true; }
+            if (current != rs.sreg.end()) {
+                value = current->second;
+                return true;
+            }
             auto input = rs.sreg_input.find(reg);
-            if (input != rs.sreg_input.end()) { value = input->second; return true; }
+            if (input != rs.sreg_input.end()) {
+                value = input->second;
+                return true;
+            }
             return false;
         };
         uint32_t source_lo = 0, source_hi = 0;
@@ -301,6 +310,11 @@ std::optional<bool> Sop2Lowering::route_bfe_u64() {
         // lane for that vertex; compute/fragment shells retain their real wave lane.
         auto high = [&]() -> uint32_t {
             const Operand& source = in.src[0];
+            if ((source.kind == OperandKind::SGPR || (source.kind == OperandKind::Special &&
+                                                      source.value >= 106 && source.value < 124)) &&
+                refuse_arbitrary_placeholder_operand(b, rs, in, {source.kind, source.value + 1},
+                                                     &ok))
+                return b.uconst(0);
             if (source.kind == OperandKind::SGPR) {
                 auto value = rs.sreg.find(source.value + 1);
                 if (value != rs.sreg.end()) return value->second;
@@ -311,12 +325,14 @@ std::optional<bool> Sop2Lowering::route_bfe_u64() {
                 source.value >= 106 && source.value < 124) {
                 auto value = rs.sreg.find(source.value + 1);
                 if (value != rs.sreg.end()) return value->second;
-                ok = false; return b.uconst(0);
+                ok = false;
+                return b.uconst(0);
             }
             if (source.kind == OperandKind::InlineInt)
                 return b.uconst(source.value < 0 ? UINT32_MAX : 0u);
             if (source.kind == OperandKind::Literal) return b.uconst(0);
-            ok = false; return b.uconst(0);
+            ok = false;
+            return b.uconst(0);
         };
         const uint32_t source_lo = val(in.src[0]);
         const uint32_t source_hi = high();
