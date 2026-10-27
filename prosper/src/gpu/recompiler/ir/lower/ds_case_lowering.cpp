@@ -3,6 +3,7 @@
 #include "gpu/recompiler/ir/lower/ds_cross_lane_lowering.hpp"
 #include "gpu/recompiler/ir/lower/ds_address_lowering.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
+#include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
@@ -129,10 +130,7 @@ bool lower_ds_case(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok,
         ok = false;
         return true;
     }
-    auto vread = [&](int r) {
-        auto it = rs.vreg.find(r);
-        return it == rs.vreg.end() ? b.uconst(0) : it->second;
-    };
+    auto vread = [&](int r) { return read_vector_for_arbitrary_retry(b, rs, in, r, ok); };
     const bool atomicize_store = b.atomicized_lds_store_pcs.contains(in.pc);
     // The st64 forms multiply their 8-bit offsets by 64, so their CONSTANT index alone
     // reaches 255*64 = 16320 dwords where every other DS form stops at a few hundred. The

@@ -8,7 +8,11 @@ beside an unloaded one, and checks strict-first retry/metadata selection. Missin
 spill twins retain their separate refusal contracts. Lane-varying READFIRST loops and straight-line
 relays keep missing whole-wave scalar publication Hard, including independent publications before
 and after admission. Dropping that guard produces wrong observable values; an agreeing-source
-interpreter witness retains the existing valid proof.
+interpreter witness retains the existing valid proof. Ordinary unknown data reads before/after
+admission, direct unsupplied pixel exports, and dropped conditional definitions remain Hard.
+The conditional-definition mutation has an observable wrong-value interpreter arm. A carried
+ordinary value cannot hide an untracked spill read; an actually written unloaded spill retains
+its chosen word in the interpreter and on the GPU.
 
 `test_placeholder_origins` checks unloaded, unsupplied launch, unknown launch and spill roots,
 including relays, both merge predecessors and loop backedges. Public compiler refusals assert the

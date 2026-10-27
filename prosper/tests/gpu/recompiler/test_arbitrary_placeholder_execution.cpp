@@ -116,3 +116,19 @@ TEST(ArbitraryPlaceholderExecution, ALoadedButUnsuppliedPixelWordStillRefuses) {
 TEST(ArbitraryPlaceholderExecution, AnAgreeingReadfirstSourceRetainsItsEstablishedProof) {
     witness(fixture::agreeing_readfirst_relay());
 }
+
+TEST(ArbitraryPlaceholderExecution, AnUnloadedDataReadKeepsTheSameValueAfterThePredicate) {
+    witness_values(fixture::data_after_predicate(), fixture::Words(64, 0));
+}
+
+TEST(ArbitraryPlaceholderExecution, AnUnloadedReadlaneResultRetainsItsRealScalarPublication) {
+    witness(fixture::readlane_relay());
+}
+
+TEST(ArbitraryPlaceholderExecution, AnUnloadedImplicitScalarCompareKeepsItsConsistentValue) {
+    witness_values(fixture::implicit_compare_after_predicate(), fixture::Words(64, 22));
+}
+
+TEST(ArbitraryPlaceholderExecution, AnUnloadedSpillValueIsRetainedWhenTheSlotWasActuallyWritten) {
+    witness_values(fixture::written_unloaded_spill(), fixture::Words(64, 0));
+}

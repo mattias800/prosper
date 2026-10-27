@@ -179,7 +179,9 @@ inline void log_recompile_diagnostic(const RecompileDiagnosticContext& diagnosti
     va_start(args, format);
     std::vsnprintf(detail.data(), detail.size() + 1, format, args);
     va_end(args);
-    const bool fabricated = (tag && std::strstr(tag, "unmodelled-scalar-publication")) ||
+    const bool fabricated = (tag && std::strstr(tag, "hard-placeholder-read")) ||
+                            detail.find("hard-placeholder-read") != std::string::npos ||
+                            (tag && std::strstr(tag, "unmodelled-scalar-publication")) ||
                             detail.find("unmodelled-scalar-publication") != std::string::npos ||
                             (tag && std::strstr(tag, "fabricated-fresh-mask-source")) ||
                             detail.find("fabricated-fresh-mask-source") != std::string::npos ||

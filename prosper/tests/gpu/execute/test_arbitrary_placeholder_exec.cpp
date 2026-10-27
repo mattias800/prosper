@@ -79,3 +79,19 @@ TEST(ArbitraryPlaceholderGpu, MissingReadfirstPublicationsStayHardInStraightAndL
         execute(words, loop ? fixture::Words(64, 7) : fixture::cmpx_expected(), address);
     }
 }
+
+TEST(ArbitraryPlaceholderGpu, AnUnloadedDataReadAfterThePredicateStillStoresEveryLane) {
+    execute(fixture::data_after_predicate(), fixture::Words(64, 0), 0x5497b01000ull);
+}
+
+TEST(ArbitraryPlaceholderGpu, AnUnloadedReadlaneResultPublishesTheSameValueAcrossTheWave) {
+    execute(fixture::readlane_relay(), fixture::expected(false), 0x5497b01100ull);
+}
+
+TEST(ArbitraryPlaceholderGpu, AnUnloadedImplicitScalarCompareKeepsTheSameWaveBranch) {
+    execute(fixture::implicit_compare_after_predicate(), fixture::Words(64, 22), 0x5497b01300ull);
+}
+
+TEST(ArbitraryPlaceholderGpu, AnActuallyWrittenUnloadedSpillKeepsTheSameWordAcrossTheWave) {
+    execute(fixture::written_unloaded_spill(), fixture::Words(64, 0), 0x5497b01600ull);
+}

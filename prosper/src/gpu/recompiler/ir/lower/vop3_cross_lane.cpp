@@ -7,6 +7,7 @@
 #include "gpu/recompiler/ir/ops/vector_permlane.hpp"
 
 #include "gpu/recompiler/rdna2_alu_support.hpp"
+#include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
 #include "gpu/recompiler/rdna2_native_launch.hpp"
 #include "gpu/recompiler/rdna2_saved_mask_words.hpp"
 
@@ -130,6 +131,7 @@ std::optional<bool> Vop3CrossLaneLowering::route_writelane() {
 
 std::optional<bool> Vop3CrossLaneLowering::route_readlane() {
     if (in.opcode == 0x360) {                                 // v_readlane_b32 sDST, vSRC, lane
+        if (refuse_arbitrary_placeholder_lane_read(b, rs, in, ok)) return true;
         // V_READLANE is an architectural scalar write.  Drop an older dedicated half
         // before selecting this read's source domain; only the exact CFG-proven mask-slot
         // path below may publish a replacement.  record_scalar_write consequently knows

@@ -167,6 +167,64 @@ inline Words readfirst_independent_relay(bool after) {
     result.insert(result.end(), {0x7e020214u, 0xe0702000u, 0x80020100u, 0xbf810000u});
     return result;   // store s20 directly, independently of the admitted predicate
 }
+inline Words data_after_predicate(bool unknown = false, bool before = false) {
+    const uint32_t data = 0x7e020200u | (unknown ? 12u : 60u);   // v1 = real-unknown / unloaded
+    Words result{0x7e0c023cu, 0x7d840d06u};   // unloaded-only fresh predicate
+    result.insert(before ? result.begin() : result.end(), data);
+    result.insert(result.end(), {0xe0702000u, 0x80020100u, 0xbf810000u});
+    return result;
+}
+inline Words readlane_relay() {
+    Words result{0x7e0c0302u, 0xd7600014u, 0x00010106u,   // v6=v2; s20=readlane(v6,0)
+                 0x7d840c14u};   // VCC=(s20==v6), a scalar relay of the unloaded word
+    append_output(result);
+    return result;
+}
+inline Words pixel_export_after_predicate(bool unknown) {
+    return {0x7e0c0302u, 0xd7600014u,
+            0x00010106u, 0x7d840c14u,
+            0xd1010006u, 0x01a91696u,   // v6 = VCC ? 11 : 22
+            0xf8000803u, unknown ? 0x00000006u : 0x00000206u,   // R=v6, G=launch v0 / unloaded v2
+            0xbf810000u};
+}
+inline Words implicit_compare_after_predicate(bool unknown = false) {
+    return {0x7e020296u,
+            0x7e0c023cu,
+            0x7d840d06u,
+            0xb4800000u | ((unknown ? 12u : 60u) << 16u),   // s_cmpk_eq_u32 s12/s60,0
+            0xbf850001u,
+            0x7e02028bu,   // keep22 if zero, otherwise write11
+            0xe0702000u,
+            0x80020100u,
+            0xbf810000u};
+}
+inline Words pixel_store_after_predicate(bool unknown) {
+    return {0x7e0c0302u, 0xd7600014u,
+            0x00010106u, 0x7d840c14u,
+            0xd1010007u, 0x01a90081u,   // v7 = VCC ? 0 : 1, the owned output index
+            0xe0702000u, unknown ? 0x80020007u : 0x80020207u,   // store launch v0 / unloaded v2
+            0xf800080fu, 0x06060606u,
+            0xbf810000u};
+}
+inline Words dropped_definition_after_join() {
+    Words result{0xbf068004u, 0xbf850001u, 0xbea80387u,   // if (s4 != 0) s40=7
+                 0x7e0c0228u, 0x7d840c87u};   // v6=s40; VCC=(v6==7)
+    append_output(result);
+    return result;
+}
+inline Words untracked_spill_in_loop() {
+    return {0xbf068004u, 0xbf840002u, 0xd76100ffu, 0x00010000u,   // one path writes slot0 from s0
+            0x7e0c023cu, 0x7d840d06u, 0xbe940380u, 0xbe9e0380u,   // unloaded predicate, s20=s30=0
+            0x7e020214u, 0xe0702000u, 0x80020100u,   // loop: output previous s20
+            0xd7600014u, 0x000101ffu,   // s20 = possibly missing spill slot0
+            0x801e811eu, 0xbf0a831eu, 0xbf85fff8u, 0xbf810000u};
+}
+inline Words written_unloaded_spill() {
+    return {0x7e0c023cu, 0x7d840d06u,   // unloaded-only predicate
+            0xd76100ffu, 0x0001003cu,   // actually write slot0 from unloaded s60
+            0xd7600014u, 0x000101ffu,   // read that provided slot into s20
+            0x7e020214u, 0xe0702000u, 0x80020100u, 0xbf810000u};
+}
 inline Words expected(bool narrowed) {
     Words result(64, 11u);
     if (narrowed)

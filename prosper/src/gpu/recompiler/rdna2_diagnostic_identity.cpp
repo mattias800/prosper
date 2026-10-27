@@ -8,7 +8,8 @@ std::string_view recompile_refusal_identity(std::string_view reason) {
     const auto identity = reason.substr(0, at);
     if (identity.find("fabricated-fresh-mask-source") != std::string_view::npos ||
         identity.find("is fabricated on the back edge") != std::string_view::npos ||
-        identity.find("unmodelled-scalar-publication") != std::string_view::npos)
+        identity.find("unmodelled-scalar-publication") != std::string_view::npos ||
+        identity.find("hard-placeholder-read") != std::string_view::npos)
         return identity;
     return reason;
 }

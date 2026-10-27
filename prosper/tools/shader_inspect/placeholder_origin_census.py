@@ -26,6 +26,7 @@ def census(survey: dict) -> dict:
         policy_one = (
             "fabricated-fresh-mask-source" in reason
             or "unmodelled-scalar-publication" in reason
+            or "hard-placeholder-read" in reason
             or ("loop-carried" in reason and "fabricated" in reason)
         )
         if answer["verdict"] != shader_corpus.REFUSED or not policy_one:

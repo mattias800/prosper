@@ -1,6 +1,7 @@
 // rdna2_emit_image_lod.cpp -- IMAGE_GET_LOD (MIMG 0x60) in the graphics emitter, moved out of
 // rdna2_emit_alu.cpp (its line cap) when the NSA form was admitted (#4808).
 #include "gpu/recompiler/rdna2_alu_support.hpp"
+#include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
 
 namespace prosper::gpu {
 
@@ -19,13 +20,14 @@ bool emit_image_get_lod(SpirvCompute& b, RegState& rs, const Rdna2Inst& in,
         (in.mimg_dmask & ~0x3u) || res.unnormalized || res.depth_compare ||
         !b.declare_texture(res.binding, Dim_2D, uint_texture))
         return false;
+    bool inputs_ok = true;
     const auto vread = [&](int r) {
-        const auto it = rs.vreg.find(r);
-        return it == rs.vreg.end() ? b.uconst(0) : it->second;
+        return read_vector_for_arbitrary_retry(b, rs, in, r, inputs_ok);
     };
     const int second = nsa ? static_cast<int>(in.words[2] & 0xffu) : in.src[0].value + 1;
     uint32_t out[2];
     b.image_get_lod_2d(res.binding, vread(in.src[0].value), vread(second), out);
+    if (!inputs_ok) return false;
     int written = 0;
     for (uint32_t component = 0; component < 2; ++component) {
         if (!(in.mimg_dmask & (1u << component))) continue;

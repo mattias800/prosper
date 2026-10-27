@@ -27,6 +27,11 @@ spill and named trace-gap roots remain refused.
 on retries, including straight-line operations before or after an admitted read. The existing
 agreeing-source and fragment waterfall proofs remain; real dispatcher broadcasts bypass this
 legacy site. A missing scalar publication stays Hard independently of the predicate's roots.
+`rdna2_arbitrary_placeholder_inputs` checks actual ordinary operand reads and direct exports
+on retries, including direct memory readers and READLANE spill sources. Missing launch/spill inputs stay Hard even when unrelated to the admitted predicate.
+A zero fallback for a reaching computed definition names `lost-definition`; an unloaded input
+does not authorize discarding that computation. Existing loop assumptions retain their own
+back-edge check; no new value or validity fact is supplied.
 If the retry still refuses, its actual later cause replaces the now-admitted unloaded refusal.
 Its output-only observation port is declared here and implemented beside compiler callers in
 `gpu/diagnostics`; the compiler includes neither that implementation nor performance observers.

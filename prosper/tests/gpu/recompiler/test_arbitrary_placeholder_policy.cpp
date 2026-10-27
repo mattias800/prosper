@@ -256,3 +256,115 @@ TEST(ArbitraryPlaceholderPolicy, AnIndependentPublicationIsHardBeforeAndAfterAdm
         EXPECT_NE(reason.find(expected), std::string::npos) << reason;
     }
 }
+
+TEST(ArbitraryPlaceholderPolicy, AnUnrelatedUnknownLaunchReadStaysHardBeforeAndAfterThePredicate) {
+    namespace fixture = prosper::test::arbitrary_placeholder;
+    const auto resources = fixture::table();
+    for (bool before : {false, true}) {
+        const auto words = fixture::data_after_predicate(true, before);
+        const uint64_t address = 0x5497b00e00ull + before;
+        const auto module =
+            recompile_compute(words.data(), words.size(), &resources, fixture::config(),
+                              {RecompileDiagnosticStage::Compute, address});
+        EXPECT_TRUE(module.empty());
+        EXPECT_NE(last_terminal_reject_reason(address).find("origin=unknown-launch word=s12"),
+                  std::string::npos)
+            << last_terminal_reject_reason(address);
+    }
+}
+
+TEST(ArbitraryPlaceholderPolicy, ADirectExportCannotPublishAnUnsuppliedLaunchWordAfterAdmission) {
+    namespace fixture = prosper::test::arbitrary_placeholder;
+    PixelSystemInputMapping inputs;
+    inputs.ena = inputs.addr = 1; // raw perspective v0/v1 are real, unsupplied launch inputs
+    for (bool unknown : {false, true}) {
+        const auto words = fixture::pixel_export_after_predicate(unknown);
+        const uint64_t address = 0x5497b00f00ull + unknown;
+        const auto module =
+            recompile_fragment(words.data(), words.size(), nullptr, &inputs, UINT32_MAX, nullptr,
+                               false, {RecompileDiagnosticStage::Fragment, address});
+        EXPECT_EQ(module.empty(), unknown) << last_terminal_reject_reason(address);
+        if (!unknown) EXPECT_GT(arbitrary_placeholder_reads(module).total(), 0u);
+        if (unknown)
+            EXPECT_NE(last_terminal_reject_reason(address).find("origin=launch-input word=v0"),
+                      std::string::npos)
+                << last_terminal_reject_reason(address);
+    }
+}
+
+TEST(ArbitraryPlaceholderPolicy, ADroppedDefinitionDoesNotBecomeUnloadedAtTheJoin) {
+    namespace fixture = prosper::test::arbitrary_placeholder;
+    const auto words = fixture::dropped_definition_after_join();
+    const auto resources = fixture::table();
+    for (uint32_t path : {0u, 1u}) {
+        auto launch = fixture::config();
+        launch.user_sgprs[4] = path;
+        launch.force_exchange_dispatcher = true;
+        TerminalRejectCapture capture;
+        const auto module = recompile_compute(words.data(), words.size(), &resources, launch);
+        EXPECT_TRUE(module.empty());
+        if (!module.empty()) {
+            bpermute_oracle::Interpreter vm(module);
+            vm.native_subgroup_width = 64;
+            vm.supplied_push_constants = launch.user_sgprs;
+            const auto actual = vm.run(64, fixture::Words(64, 0xdeadbeefu));
+            ASSERT_TRUE(vm.error.empty()) << vm.error;
+            EXPECT_EQ(actual, fixture::Words(64, path ? 11 : 22));
+        } else {
+            std::string reason;
+            for (const auto& [tag, payload] : capture.take()) reason += tag + payload;
+            EXPECT_NE(reason.find("origin=lost-definition word=s40 at=2"), std::string::npos)
+                << reason;
+        }
+    }
+}
+
+TEST(ArbitraryPlaceholderPolicy, ImplicitScalarOperandsRemainHardOnTheRetry) {
+    namespace fixture = prosper::test::arbitrary_placeholder;
+    const auto words = fixture::implicit_compare_after_predicate(true);
+    const auto resources = fixture::table();
+    constexpr uint64_t address = 0x5497b01200ull;
+    const auto module = recompile_compute(words.data(), words.size(), &resources, fixture::config(),
+                                          {RecompileDiagnosticStage::Compute, address});
+    EXPECT_TRUE(module.empty());
+    EXPECT_NE(last_terminal_reject_reason(address).find("origin=unknown-launch word=s12"),
+              std::string::npos)
+        << last_terminal_reject_reason(address);
+}
+
+TEST(ArbitraryPlaceholderPolicy, ABufferStoreCannotPublishAnUnsuppliedLaunchWordAfterAdmission) {
+    namespace fixture = prosper::test::arbitrary_placeholder;
+    PixelSystemInputMapping inputs;
+    inputs.ena = inputs.addr = 1;
+    const auto resources = fixture::table();
+    for (bool unknown : {false, true}) {
+        const auto words = fixture::pixel_store_after_predicate(unknown);
+        const uint64_t address = 0x5497b01400ull + unknown;
+        const auto module =
+            recompile_fragment(words.data(), words.size(), &resources, &inputs, UINT32_MAX, nullptr,
+                               false, {RecompileDiagnosticStage::Fragment, address});
+        EXPECT_EQ(module.empty(), unknown) << last_terminal_reject_reason(address);
+        if (!unknown) EXPECT_GT(arbitrary_placeholder_reads(module).total(), 0u);
+        if (unknown)
+            EXPECT_NE(last_terminal_reject_reason(address).find("origin=launch-input word=v0"),
+                      std::string::npos)
+                << last_terminal_reject_reason(address);
+    }
+}
+
+TEST(ArbitraryPlaceholderPolicy, ACarriedOrdinaryValueCannotHideAnUntrackedSpillRead) {
+    namespace fixture = prosper::test::arbitrary_placeholder;
+    const auto words = fixture::untracked_spill_in_loop();
+    const auto resources = fixture::table();
+    for (uint32_t path : {0u, 1u}) {
+        auto launch = fixture::config();
+        launch.user_sgprs[0] = 7;
+        launch.user_sgprs[4] = path;
+        TerminalRejectCapture capture;
+        const auto module = recompile_compute(words.data(), words.size(), &resources, launch);
+        EXPECT_TRUE(module.empty());
+        std::string reason;
+        for (const auto& [tag, payload] : capture.take()) reason += tag + payload;
+        EXPECT_NE(reason.find("origin=spill word=spill-v255:0"), std::string::npos) << reason;
+    }
+}

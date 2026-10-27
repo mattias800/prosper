@@ -328,6 +328,7 @@ inline bool mimg_single_level_implicit_form(const Rdna2Inst& in, const ShaderRes
 // untracked Specials silently read as 0 and the shader computed
 // garbage (#134); now it rejects, matching the SDWA/DPP reject-rather-than-miscompute discipline.
 inline uint32_t operand_bits(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, const Operand& o, bool* ok = nullptr) {
+    if (refuse_arbitrary_placeholder_operand(b, rs, in, o, ok)) return b.uconst(0);
     switch (o.kind) {
         case OperandKind::VGPR: {
             // A scalar-spill vgpr (v_writelane slots) has no per-lane data value — reject, don't read 0.

@@ -91,6 +91,10 @@ TEST(PlaceholderOriginDiagnostics, ReplayIdentityExcludesOnlyTheDiagnosticEnvelo
 }
 
 TEST(PlaceholderOriginDiagnostics, ReplayIdentityPreservesTheReasonSiteAndMalformedSuffix) {
+    EXPECT_EQ(
+        recompile_refusal_identity("hard-placeholder-read pc=3 "
+                                   "placeholder-roots=[origin=unknown-launch word=s12 at=entry]"),
+        "hard-placeholder-read pc=3");
     EXPECT_NE(
         recompile_refusal_identity("fabricated-fresh-mask-source pc=3 placeholder-roots=[x]"),
         recompile_refusal_identity("fabricated-fresh-mask-source pc=4 placeholder-roots=[x]"));

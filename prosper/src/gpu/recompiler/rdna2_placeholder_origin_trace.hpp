@@ -1,4 +1,4 @@
-// Source-private backward diagnostic slice; never queried by an admitting proof.
+// Typed backward root slice for diagnostics and the ADR 0038 admission boundary.
 #pragma once
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include <vector>

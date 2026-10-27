@@ -58,3 +58,11 @@ def test_missing_scalar_publication_stays_in_the_policy_origin_census():
     assert report["policy_one_refusals"] == 1
     assert report["programs_by_origin"] == {"unloaded": 1, "unmodelled-scalar-publication": 1}
     assert report["unclassified"] == []
+
+
+def test_unrelated_hard_data_read_remains_visible_in_the_policy_census():
+    reason = "hard-placeholder-read placeholder-roots=[origin=unknown-launch word=s12 at=entry]"
+    report = poc.census({"programs": {"compute/a.bin": entry(reason)}})
+    assert report["policy_one_refusals"] == 1
+    assert report["programs_by_origin"] == {"unknown-launch": 1}
+    assert report["unclassified"] == []

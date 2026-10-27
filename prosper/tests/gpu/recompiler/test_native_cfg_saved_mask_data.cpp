@@ -546,7 +546,8 @@ TEST(NativeCfgSavedMaskData, EarlyDirectBreakCannotInventAProducerThatHasNotRun)
     loop_refuses(1);
 }
 TEST(NativeCfgSavedMaskData, DirectBreakBodyCannotBorrowPreheaderAuthorityAfterScalarFabrication) {
-    loop_values(2, 0);   // The original s60 root is explicitly unloaded under the known launch.
+    routed_loop_refuses(numeric_direct_break_loop(2), 2, "wave-scalar-loop-live-out",
+                        "origin=lost-definition word=s0 at=11");
     routed_loop_refuses(prosper::test::arbitrary_placeholder::with_missing_spill_root(
                             numeric_direct_break_loop(2), 60),
                         2);
@@ -561,7 +562,8 @@ TEST(NativeCfgSavedMaskData, CurrentOverwriteEndsFabricatedBodyScalarGeneration)
     loop_values(5, 7);
 }
 TEST(NativeCfgSavedMaskData, DirectBreakCannotBorrowDifferentRootForAFabricatedCurrentWord) {
-    loop_values(6, 0);
+    routed_loop_refuses(numeric_direct_break_loop(6), 6, "wave-scalar-loop-live-out",
+                        "origin=lost-definition word=s0 at=13");
     routed_loop_refuses(prosper::test::arbitrary_placeholder::with_missing_spill_root(
                             numeric_direct_break_loop(6), 60),
                         6);
@@ -948,7 +950,7 @@ void delayed_body_root_values(unsigned variant, uint32_t expected) {
 }   // namespace
 TEST(NativeCfgSavedMaskData, DelayedBodyRootCannotBorrowAValidCheckRootAtLoopExit) {
     const auto p = delayed_body_root_loop(0);
-    delayed_body_root_values(0, 0);
+    routed_loop_refuses(p, 6, "wave-scalar-loop-live-out", "origin=lost-definition word=s17 at=14");
     routed_loop_refuses(prosper::test::arbitrary_placeholder::with_missing_spill_root(p, 60), 6);
 }
 TEST(NativeCfgSavedMaskData, GenuineDelayedBodyRootKeepsTheActualZeroValue) {

@@ -2,7 +2,9 @@
 
 `arbitrary_placeholder.hpp` supplies synthetic integer programs and the explicit launch/output
 contract shared by the public-compiler interpreter witnesses and the exact64 GPU arm. READFIRST
-fixtures distinguish varying, agreeing and admission-independent scalar publications.
+fixtures distinguish varying, agreeing and admission-independent scalar publications. Independent
+ordinary data/export and conditional-definition fixtures cover missing inputs after admission.
+Written and missing spill fixtures distinguish a tracked arbitrary value from an untracked slot.
 
 Shared material that more than one test needs: the Vulkan/compute execution harnesses, and
 hand-constructed binary inputs (a synthetic PRX, an ATRAC9 vector, captured GTA V shader words) that
