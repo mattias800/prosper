@@ -33,8 +33,8 @@ A zero fallback for a reaching computed definition names `lost-definition`; an u
 does not authorize discarding that computation. Existing loop assumptions retain their own
 back-edge check; no new value or validity fact is supplied.
 The early DS readers use the same boundary, including ADDTID data, GDS/shuffle inputs and
-implicit M0. A missing computed value retains a lost-definition root even when every original
-operand was genuine; an empty input-root slice cannot supply that missing computation.
+implicit M0. A missing computed value stays Hard even when its original operands were genuine;
+knowing the inputs does not supply a computation that the ordinary representation lost.
 If the retry still refuses, its actual later cause replaces the now-admitted unloaded refusal.
 Its output-only observation port is declared here and implemented beside compiler callers in
 `gpu/diagnostics`; the compiler includes neither that implementation nor performance observers.

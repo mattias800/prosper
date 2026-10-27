@@ -79,7 +79,6 @@ void retain_dropped_definition(PlaceholderRoots& roots, const detail::Placeholde
         const auto& predecessors = trace.predecessors[index];
         work.insert(work.end(), predecessors.begin(), predecessors.end());
     }
-    if (roots.empty()) roots.insert({PlaceholderOrigin::LostDefinition, word});
 }
 }   // namespace
 
@@ -95,7 +94,7 @@ bool refuse_arbitrary_placeholder_operand(SpirvCompute& b, const RegState& rs, c
     if (program) {
         const detail::PlaceholderOriginTrace trace(*program);
         roots = trace.before(in.pc, {word});
-        if (missing && (roots.empty() || placeholder_roots_are_unloaded(roots)))
+        if (missing && placeholder_roots_are_unloaded(roots))
             retain_dropped_definition(roots, trace, in.pc, word);
     } else {
         roots.insert({PlaceholderOrigin::UnknownLaunch, word});

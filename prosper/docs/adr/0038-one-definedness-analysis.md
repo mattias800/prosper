@@ -625,6 +625,8 @@ executed lane reads. Failed retries publish their actual refusal and no admissio
   rather than lane0=13 and the other lanes=7; the module still passed `spirv-val`. Guard the actual
   early store. The audited early GDS/shuffle readers and implicit M0 reads use the same boundary.
   Missing computations retain `lost-definition` even when their original operands were genuine.
+  The existing tracer already names that loss; reverting a proposed extra empty-root rule does
+  not change this regression. That unnecessary rule was removed.
 
 - **An unloaded predicate makes unrelated ordinary reads safe.** Synthetic retries still read an
   unknown possible scratch-offset `s12`, or export/store an unsupplied fragment launch `v0`.
