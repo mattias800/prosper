@@ -28,3 +28,9 @@ The buffer address, format, store and PC-relative bounds execution fixtures cont
 `recompile_compute` after opcode classification moves to `lower/buffer_opcode_case_routes.*`.
 That mechanical move adds no semantic assertions; token read-back controls and the full corpus
 comparison qualify relocation, alongside these existing execution cases.
+
+`vector_lane_harness` leaves ordinary instruction tapes and guest PCs unchanged. Hard controls
+opt into `seed_lane_hard_scalar` to seed s50 from the possible scratch-offset
+launch word. Its user-word argument keeps the seed after the actual
+launch prefix; an unwritten, explicitly unloaded s50 would be Arbitrary under ADR 0038.
+Explicit scalar producers in a tested body replace this seed normally.

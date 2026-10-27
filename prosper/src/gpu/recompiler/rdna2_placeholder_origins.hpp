@@ -21,7 +21,9 @@ enum class PlaceholderOrigin {
     LostDefinition,
     UnmodelledTransfer,
     TraceBudget,
-    Unreachable
+    Unreachable,
+    UnprovedMemoryResult,
+    UnprovedStrongRead
 };
 enum class PlaceholderFile { Scalar, Vector, Spill, Scc };
 struct PlaceholderWord {
@@ -45,6 +47,7 @@ struct PlaceholderOriginObservations {
     std::map<uint32_t, std::set<int>> image_addresses;
     std::map<uint32_t, std::set<int>> relative_words;
     std::set<uint32_t> unbounded_relative;
+    std::map<uint32_t, bool> arbitrary_memory_results;
 };
 struct PlaceholderOriginProgram {
     std::vector<Rdna2Inst> instructions;
@@ -65,6 +68,8 @@ void configure_pixel_placeholder_origins(RegState&, const std::vector<LaunchVgpr
 void note_placeholder_resources(const SpirvCompute&, const RegState&, const Rdna2Inst&);
 void note_placeholder_native_input(const SpirvCompute&, const RegState&, const Rdna2Inst&);
 void note_placeholder_image_addresses(const RegState&, const Rdna2Inst&);
+void note_placeholder_memory_contract(const SpirvCompute&, const RegState&, const Rdna2Inst&,
+                                      const struct ScalarSourceMarks&);
 PlaceholderRoots placeholder_roots_before(const PlaceholderOriginProgram&, uint32_t pc,
                                           const std::vector<PlaceholderWord>&);
 std::string format_placeholder_origins(const PlaceholderRoots&);

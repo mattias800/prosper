@@ -1,4 +1,5 @@
 #include "gpu/recompiler/rdna2_saved_mask_words.hpp"
+#include "gpu/recompiler/rdna2_placeholder_origin_memory.hpp"
 #include "gpu/recompiler/rdna2_native_launch.hpp"
 #include "gpu/recompiler/rdna2_partial_vcc_word.hpp"
 
@@ -416,6 +417,7 @@ void prepare_saved_mask_word_write(SpirvCompute& b, RegState& rs, const Rdna2Ins
 }
 
 void retain_saved_mask_words(SpirvCompute& b, RegState& rs, const Rdna2Inst& in) {
+    note_placeholder_scalar_load(b, rs, in);
     if (!uses_native_saved_mask_words(b)) return;
     if (is_native_b64_logical(b, in)) {
         record_native_logical_word_gaps(b, rs, in);

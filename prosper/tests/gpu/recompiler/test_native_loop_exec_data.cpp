@@ -33,7 +33,7 @@ std::vector<uint32_t> program() {
         0x4a060281u, // v3 = output count + 1
         0x7d840100u, // vcc = v0 == v0, observes only active lanes
         0x02020701u, // increment output in active lanes
-        0x7e00023cu, // missing back-edge v0, dead before the next active read
+        0x7e000211u, // missing back-edge v0, dead before the next active read
         0x7e0e0281u, // v7 = 1 on the back edge
         0xd4c1006au, 0x00018104u, // vcc = counter < 64
         0x87fe6a7eu, // EXEC &= vcc
@@ -104,7 +104,7 @@ std::vector<uint32_t> cohort_program() {
                     0x80030902u, // v9 = input[lane], s[12:15]
                     0xbf8c3f70u,
                 });
-    code.insert(code.begin() + 8, 0x7e12023cu); // old v9 = absent s60 before the partial load
+    code.insert(code.begin() + 8, 0x7e120211u); // old v9 = absent s17 before the partial load
     return code;
 }
 ShaderResourceTable cohort_resources() {
@@ -161,7 +161,7 @@ TEST(NativeLoopExecData, ARequiredActiveOperandStillNeedsItsBackEdge) {
     auto code = cohort_program();
     const auto write = std::find(code.rbegin(), code.rend(), 0x7e0e0281u);
     ASSERT_NE(write, code.rend());
-    *write = 0x7e0e023du; // v7 = absent s61 on the back edge; v0's current value needs v7
+    *write = 0x7e0e0211u; // v7 = unknown scratch-offset s17 on the back edge; v0 needs v7
     const auto c = config();
     const auto table = cohort_resources();
     constexpr uint64_t address = 0x5497080400ull;
@@ -204,7 +204,7 @@ TEST(NativeLoopExecData, ARealCmpxBackedgeKeepsOnlyItsOriginalEntryCohort) {
 }
 TEST(NativeLoopExecData, AnUnavailableCohortLoadCannotBorrowTheExecProof) {
     auto code = cohort_program();
-    code[10] = 0x7e12023cu;
+    code[10] = 0x7e120211u;
     code[11] = 0xbf800000u;
     const auto c = config();
     const auto table = cohort_resources();
@@ -218,7 +218,7 @@ TEST(NativeLoopExecData, AnUnavailableCohortLoadCannotBorrowTheExecProof) {
 
 TEST(NativeLoopExecData, AnAlreadyAcceptedGlobalControlKeepsItsValues) {
     auto code = cohort_program();
-    const auto poison = std::find(code.begin(), code.end(), 0x7e12023cu);
+    const auto poison = std::find(code.begin(), code.end(), 0x7e120211u);
     ASSERT_NE(poison, code.end());
     *poison = 0xbf800000u;
     const auto c = config();

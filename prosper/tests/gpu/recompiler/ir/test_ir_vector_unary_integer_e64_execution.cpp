@@ -147,6 +147,7 @@ TEST(IrVectorUnaryIntegerE64Execution, HardScalarWordsCannotBecomeMasksAfterRest
             f.source = 50;
             auto bad = words(def.opcode, f);
             bad.insert(bad.end(), {0xbefe04c1, 0x7d8a0280});
+            bad.insert(bad.begin(), 0xbeb20300u); // s50 = unknown possible scratch offset s0
             const auto refused = run_vector_op_per_lane(bad, lane_inputs(7), wave);
             ASSERT_NE(refused.error.find("fabricated-fresh-mask-source"), std::string::npos)
                 << refused.error;
@@ -171,7 +172,7 @@ TEST(IrVectorUnaryIntegerE64Execution, OneArmWordsKeepTheirObligationWithBothEdg
                 code.insert(code.end(), op.begin(), op.end());
                 code.insert(code.end(), {0xbefe04c1, 0x7d8a0280});
                 auto program = lane_program(code, 64, wave);
-                program.config.user_sgprs.resize(8); // Genuine dynamic s4 branch selector.
+                seed_lane_hard_scalar(program, 8); // Genuine dynamic s4 branch selector.
                 const auto address = lane_harness_address();
                 const auto module =
                     recompile_compute(program.code.data(), program.code.size(), &program.table,

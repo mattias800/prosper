@@ -36,8 +36,8 @@ constexpr uint32_t end = 0xbf810000u;
 constexpr uint32_t compare6 = 0x7d840d06u;   // v_cmp_eq_u32 vcc, v6, v6 (a fresh predicate)
 constexpr uint32_t mov6_3 = 0x7e0c0283u;     // v_mov_b32 v6, 3
 constexpr uint32_t mov6_v7 = 0x7e0c0307u;    // v_mov_b32 v6, v7 (never written: arbitrary)
-constexpr uint32_t mov6_s20 = 0x7e0c0214u;   // v_mov_b32 v6, s20 (never written: fabricated)
-constexpr uint32_t mov7_s20 = 0x7e0e0214u;   // v_mov_b32 v7, s20
+constexpr uint32_t mov6_s8 = 0x7e0c0208u;   // v_mov_b32 v6, s8 (unknown scratch-offset input)
+constexpr uint32_t mov7_s8 = 0x7e0e0208u;   // v_mov_b32 v7, s8
 constexpr uint32_t add6_v6_v7 = 0x4a0c0f06u;   // v_add_nc_u32 v6, v6, v7 (accumulates)
 // DS packets: word0 selects the opcode, word1 = vdst<<24 | data0<<8 | addr.
 constexpr uint32_t ds_read_b32 = 0xd8d80000u;
@@ -172,8 +172,8 @@ TEST(LoadedArbitrary, AnLdsReadAtAnArbitraryAddressIsArbitrary) {
 }
 
 TEST(LoadedArbitrary, AnLdsReadAtAHardAddressStaysHard) {
-    // v7 = s20, which nothing wrote: a fabricated scalar, so every lane of the address is hard.
-    refused(compile_compute(cat({{mov7_s20}, ds(ds_read_b32, 6, 7), {compare6}})));
+    // v7 = s8, which nothing wrote: a fabricated scalar, so every lane of the address is hard.
+    refused(compile_compute(cat({{mov7_s8}, ds(ds_read_b32, 6, 7), {compare6}})));
 }
 
 TEST(LoadedArbitrary, AnAtomicOrStoreAtAnArbitraryAddressStaysHard) {
@@ -248,7 +248,7 @@ TEST(LoadedArbitrary, AHeaderKeepsAnArbitraryWordWhoseBackEdgeIsArbitraryOrDefin
 }
 
 TEST(LoadedArbitrary, ABackEdgeThatBringsInAHardLaneRefusesTheArbitraryHeader) {
-    refused(compile_compute(loop_over_v6({mov6_s20})), "fabricated on the back edge");
+    refused(compile_compute(loop_over_v6({mov6_s8})), "fabricated on the back edge");
     refused(compile_compute(loop_over_v6(ds(ds_add_rtn_u32, 6, 7))), "fabricated on the back edge");
 }
 
@@ -259,7 +259,7 @@ TEST(LoadedArbitrary, ADefinedHeaderWordHoldsWeaklyThroughAnArbitraryBackEdge) {
     accepted(compile_compute(cat({{mov6_3}, loop_over_v6({mov6_v7})})));
     accepted(compile_compute(cat({{mov6_3}, loop_over_v6({add6_v6_v7})})));
     // A hard back edge breaks it.
-    refused(compile_compute(cat({{mov6_3}, loop_over_v6({mov6_s20})})),
+    refused(compile_compute(cat({{mov6_3}, loop_over_v6({mov6_s8})})),
             "fabricated on the back edge");
 }
 

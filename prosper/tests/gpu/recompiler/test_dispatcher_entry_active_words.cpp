@@ -92,16 +92,17 @@ struct Result {
     std::string reason;
 };
 
-// Every VGPR but the v0 launch input starts with a hard value: s40 is not a user SGPR, so hardware
-// never loads it and its value is real but unknown. That is what a "never-written" word below
-// stands for. A truly never-written VGPR would not do: under #5185 it holds an arbitrary value
+// Every VGPR but the v0 launch input starts with a Hard value: s24 is the possible
+// scratch-offset word after the 24 user SGPRs. SCRATCH_EN is unknown, so it is not an
+// unloaded word. That is what a "never-written" word below stands for. A truly never-written VGPR would not do: under #5185 it holds an arbitrary value
 // hardware could hold, which a fresh predicate may read on any route (#5039). Every pc a test
 // names is relative to the body, after this prefix.
 const Words& hard_prefix() {
     static const Words prefix = [] {
         Words words;
         for (uint32_t vgpr = 1; vgpr < 32; ++vgpr)
-            words.push_back(0x7e000200u | (vgpr << 17u) | 40u);   // v_mov_b32 vN, s40
+            words.push_back(0x7e000200u | (vgpr << 17u) |
+                            24u);   // v_mov_b32 vN, possible scratch-offset s24
         return words;
     }();
     return prefix;

@@ -101,7 +101,7 @@ void require_mask_result(const std::vector<uint32_t>& code, uint32_t wave, bool 
                          bool good) {
     auto program = lane_program(code, 64, wave);
     if (missing_old) program.code.erase(program.code.begin() + 4, program.code.begin() + 6);
-    program.config.user_sgprs.resize(8);
+    seed_lane_hard_scalar(program, 8);
     const auto address = lane_harness_address();
     const auto module =
         recompile_compute(program.code.data(), program.code.size(), &program.table, program.config,

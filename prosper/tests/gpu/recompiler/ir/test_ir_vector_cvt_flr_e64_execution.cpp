@@ -58,7 +58,7 @@ std::vector<uint32_t> compile(const std::vector<uint32_t>& words, uint32_t wave 
 void check_mask_source(const std::vector<uint32_t>& code, uint32_t wave, bool genuine,
                        bool branch = false) {
     auto p = lane_program(code, 64, wave);
-    if (branch) p.config.user_sgprs.resize(8);
+    seed_lane_hard_scalar(p, branch ? 8 : 0);
     std::vector<Rdna2Inst> decoded;
     rdna2_walk(p.code.data(), p.code.size(), decoded);
     std::optional<uint32_t> consumer;

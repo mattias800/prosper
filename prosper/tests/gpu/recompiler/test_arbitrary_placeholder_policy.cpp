@@ -1,4 +1,14 @@
 // One Hard root vetoes admission; empty/lost/unknown slices must never become unloaded.
+#include "gpu/recompiler/rdna2_placeholder_origins.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/rdna2_diagnostic_attempt.hpp"
+#include "diagnostics/perf/perf_ledger.hpp"
+#include <vector>
+#include <memory>
+#include <cstdint>
+#include <algorithm>
+#include <string>
 #include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "fixtures/arbitrary_placeholder.hpp"
@@ -21,7 +31,8 @@ TEST(ArbitraryPlaceholderPolicy, EveryOtherOriginIsAHardVeto) {
     for (auto kind : {PlaceholderOrigin::LaunchInput, PlaceholderOrigin::Spill,
                       PlaceholderOrigin::UnknownLaunch, PlaceholderOrigin::LostDefinition,
                       PlaceholderOrigin::UnmodelledTransfer, PlaceholderOrigin::TraceBudget,
-                      PlaceholderOrigin::Unreachable})
+                      PlaceholderOrigin::Unreachable, PlaceholderOrigin::UnprovedMemoryResult,
+                      PlaceholderOrigin::UnprovedStrongRead})
         EXPECT_FALSE(placeholder_roots_are_unloaded(roots(kind))) << static_cast<int>(kind);
 }
 
@@ -86,7 +97,7 @@ TEST(ArbitraryPlaceholderPolicy, ASuccessfulOriginalAttemptIsNeverRetried) {
         SpirvCompute b;
         EXPECT_FALSE(admit_arbitrary_placeholder_read(b, 7, ArbitraryPlaceholderRead::FreshMask,
                                                       roots(PlaceholderOrigin::Unloaded)));
-        return original;
+        return std::vector<uint32_t>(original);
     });
     EXPECT_EQ(result, original);
     EXPECT_EQ(attempts, 1u);
@@ -158,4 +169,33 @@ TEST(ArbitraryPlaceholderPolicy, ActualCompilerAdmissionReachesTheWindowAndExitR
               std::string::npos);
     EXPECT_NE(output.find("summary observer=arbitrary-placeholder-admitted program=0x5497b00400"),
               std::string::npos);
+}
+
+TEST(ArbitraryPlaceholderPolicy, AnAtomicAtAnUnloadedAddressKeepsItsResultHard) {
+    namespace fixture = prosper::test::arbitrary_placeholder;
+    auto words = fixture::Words{0xd8800000u, 0x06000007u, 0x7d840d06u};
+    fixture::append_output(words);
+    const auto resources = fixture::table();
+    constexpr uint64_t address = 0x5497b00600ull;
+    const auto module = recompile_compute(words.data(), words.size(), &resources, fixture::config(),
+                                          {RecompileDiagnosticStage::Compute, address});
+    EXPECT_TRUE(module.empty());
+    const auto reason = last_terminal_reject_reason(address);
+    EXPECT_NE(reason.find("origin=unproved-memory-result word=v6 at=0"), std::string::npos)
+        << reason;
+}
+
+TEST(ArbitraryPlaceholderPolicy, AnUnboundedLoopReadRetainsItsStrongObligation) {
+    namespace fixture = prosper::test::arbitrary_placeholder;
+    auto words = fixture::loop_relay();
+    words.insert(words.begin(), 0x7e0c0283u); // genuine preheader v6=3
+    words.insert(words.begin() + 2, {0xd8d80000u, 0x08000006u}); // unbounded LDS address v6
+    words[8] = 0xbf85fff9u; // back edge to the LDS read at header2
+    const auto resources = fixture::table();
+    constexpr uint64_t address = 0x5497b00700ull;
+    const auto module = recompile_compute(words.data(), words.size(), &resources, fixture::config(),
+                                          {RecompileDiagnosticStage::Compute, address});
+    EXPECT_TRUE(module.empty());
+    const auto reason = last_terminal_reject_reason(address);
+    EXPECT_NE(reason.find("origin=unproved-strong-read word=v6 at=2"), std::string::npos) << reason;
 }

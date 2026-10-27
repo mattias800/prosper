@@ -1,4 +1,8 @@
 // Compile-time read sites in the chosen module; this parser grants no admission.
+#include <cstdint>
+#include <span>
+#include <cstddef>
+#include <utility>
 #include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
 #include <set>
 #include <string>

@@ -96,11 +96,11 @@ void missing(const Result& result, uint32_t pc) {
 
 // #5039 / #5193: a lane no write reaches is ARBITRARY, which a fresh predicate may read, and a
 // loop header keeps that property. The refusals below are about HARD lanes, so these arms first
-// relay s30 -- which no launch loads -- into v1 and v9 under the full entry EXEC: every lane the
+// relay the possible scratch-offset input s2 -- not supplied by this launch model -- into v1 and v9 under the full entry EXEC: every lane the
 // program never writes is then hard on every route. The prefix shifts each pc by two.
 Result compile_hard(const std::vector<uint32_t>& code, uint32_t native_width = 64,
                     bool complete_launch = true, uint32_t wave_size = 64) {
-    std::vector<uint32_t> prefixed{0x7e02021eu, 0x7e12021eu};   // v1 = s30; v9 = s30
+    std::vector<uint32_t> prefixed{0x7e020202u, 0x7e120202u};   // v1 = s2; v9 = s2
     prefixed.insert(prefixed.end(), code.begin(), code.end());
     return compile(prefixed, native_width, complete_launch, wave_size);
 }
@@ -234,7 +234,7 @@ TEST(NarrowingLoopExec, MissingPreheaderSourceIsNotCreatedByAnExecPhi) {
 
 TEST(NarrowingLoopExec, APreheaderScalarPlaceholderIsNotLaneData) {
     auto code = program();
-    code[2] = 0x7e020209u;   // v1 = absent s9
+    code[2] = 0x7e020202u;   // v1 = absent s9
     missing(compile(code), 3);
 }
 

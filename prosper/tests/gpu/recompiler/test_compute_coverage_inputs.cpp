@@ -152,7 +152,7 @@ TEST(ComputeCoverageInputs, SavedMaskMbcntKeepsItsRealCompareOnBothRoutes) {
         EXPECT_FALSE(positive.module.empty()) << positive.reason;
         // v1 comes from s30, which no launch loads: hard on every route. (Without a producer v1
         // is never loaded at TIDIG_COMP_CNT 0, so arbitrary under #5185 on every route, #5039.)
-        std::vector<uint32_t> hard{0x7e02021eu};   // v_mov_b32 v1, s30
+        std::vector<uint32_t> hard{0x7e020200u};   // v_mov_b32 v1, s30
         hard.insert(hard.end(), missing.begin(), missing.end());
         const auto negative = compile_consumer(hard.data(), hard.size(), 64, false, native);
         EXPECT_TRUE(negative.module.empty());

@@ -21,7 +21,7 @@ std::vector<uint32_t> program() {
         0x7e080280u,                 // v4 = 0, flag including inactive lanes
         0x7e0a0280u,                 // v5 = 0, observed loop count
         0x7e0e0281u,                 // v7 = 1, fresh-mask selection value
-        0x7e04023cu,                 // old v2 = absent s60, inactive bits remain unavailable
+        0x7e040211u,                 // old v2 = absent s17, inactive bits remain unavailable
         0xbe94047eu,                 // s[20:21] = whole EXEC
         0x7da6009fu,                 // EXEC = (31 <= lane)
         0xbe98047eu,                 // s[24:25] = this cohort
@@ -123,7 +123,7 @@ TEST(SavedMaskPhi, ABlockWithoutASavedMaskCannotInventOne) {
 }
 TEST(SavedMaskPhi, AnUnavailableScalarRelayRemainsUnavailableInTheRestoredCohort) {
     auto code = program();
-    code[8] = 0x7e04023cu; // v2 = absent s60
+    code[8] = 0x7e040211u; // v2 = absent s17
     EXPECT_TRUE(compile(code, 0x5497070600ull).empty());
     EXPECT_NE(
         last_terminal_reject_reason(0x5497070600ull).find("fabricated-fresh-mask-source pc=18"),

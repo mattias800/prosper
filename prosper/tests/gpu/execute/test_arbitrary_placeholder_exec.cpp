@@ -1,4 +1,8 @@
 // A real exact64 dispatch must preserve the initialized low half and arbitrary old high half.
+#include <cstdint>
+#include "gpu/execute/gpu_execute.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include "fixtures/arbitrary_placeholder.hpp"
 #include "fixtures/render_runner.h"
 #include "shared/live/live_compute.hpp"
@@ -48,4 +52,8 @@ TEST(ArbitraryPlaceholderGpu, TheActualWaveKeepsBothHalvesOfTheRetainedValue) {
 
 TEST(ArbitraryPlaceholderGpu, CmpxKeepsExactlyOneLogicalLaneActive) {
     execute(fixture::cmpx_predicate(), fixture::cmpx_expected(), 0x5497b00600ull);
+}
+
+TEST(ArbitraryPlaceholderGpu, TheScalarPairLoopKeepsTheCurrentValueInBothHalves) {
+    execute(fixture::scalar_loop_relay(), fixture::Words(64, 22), 0x5497b00700ull);
 }

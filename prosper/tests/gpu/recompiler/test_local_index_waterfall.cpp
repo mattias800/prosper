@@ -107,7 +107,7 @@ TEST(LocalIndexWaterfall, CurrentCohortIndexReachesTheFragmentExport) {
 
 TEST(LocalIndexWaterfall, NeverWrittenIndexStillRefusesAtThePredicate) {
     auto code = program();
-    code[11] = 0xbf800000u;
+    code[11] = 0x7e44023cu;   // v34 = unsupplied s60; the actual index relay still reads it
     EXPECT_TRUE(compile(code, 0x5497030200ull).empty());
     EXPECT_NE(
         last_terminal_reject_reason(0x5497030200ull).find("fabricated-fresh-mask-source pc=13"),

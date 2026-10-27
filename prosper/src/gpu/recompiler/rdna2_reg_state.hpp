@@ -33,7 +33,7 @@ void seed_smem_pointer_provenance(RegState& rs, const std::vector<Rdna2Inst>& in
 struct PlaceholderOriginProgram;
 
 struct RegState {
-    // Immutable diagnostic input only; no admission consumer reads it.
+    // Original launch/dependency inventory; admission consumes its typed roots, never log text.
     mutable std::shared_ptr<const PlaceholderOriginProgram> placeholder_origin_program;
     PortableMaskHalfTypes portable_mask_half_types;
     std::unordered_map<int, uint32_t> vreg, sreg;

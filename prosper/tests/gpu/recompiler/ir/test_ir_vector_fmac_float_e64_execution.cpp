@@ -275,7 +275,10 @@ TEST(IrVectorFmacFloatE64Execution, HardScalarInputsAndOldDStillCannotSupplyAFre
         for (uint32_t wave : {32u, 64u})
             for (bool genuine : {false, true}) {
                 auto op = words(form);
-                if (!genuine) op.erase(op.begin(), op.begin() + 2);
+                if (!genuine) {
+                    op.erase(op.begin(), op.begin() + 2);
+                    op.insert(op.begin(), 0xbeb20300u); // unknown possible scratch offset s0
+                }
                 op.insert(op.end(), {0xbefe04c1u, 0x7d8a0280u});
                 const auto run = run_vector_op_per_lane(op, inputs(1), wave);
                 if (genuine)
@@ -289,6 +292,7 @@ TEST(IrVectorFmacFloatE64Execution, HardScalarInputsAndOldDStillCannotSupplyAFre
         if (genuine) op.insert(op.begin(), {0xbeb203ffu, 0x3f800000u});
         op.insert(op.begin() + (genuine ? 2 : 0), 0x7e020232u); // v_mov_b32 v1,s50
         op.insert(op.end(), {0xbefe04c1u, 0x7d8a0280u});
+        if (!genuine) op.insert(op.begin(), 0xbeb20300u); // retain a real Hard root
         const auto run = run_vector_op_per_lane(op, inputs(1));
         if (genuine)
             ASSERT_TRUE(run.error.empty()) << run.error;
@@ -308,7 +312,7 @@ TEST(IrVectorFmacFloatE64Execution, OneArmScalarSourceKeepsItsExistingMustObliga
                 op.insert(op.end(), fmac.begin() + 2, fmac.end());
                 op.insert(op.end(), {0xbefe04c1u, 0x7d8a0280u});
                 auto p = lane_program(op, 64, wave);
-                p.config.user_sgprs.resize(8);
+                seed_lane_hard_scalar(p, 8);
                 const auto address = lane_harness_address();
                 const auto module =
                     recompile_compute(p.code.data(), p.code.size(), &p.table, p.config,

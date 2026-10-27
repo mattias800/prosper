@@ -372,9 +372,11 @@ TEST(RelativeBankSource, DeferredM0CannotSkipAnExplicitOrImplicitM0OrIndexRead) 
         code[code.size() - 2] = 0x28282828u;   // observe v40 when that form supplies it
         const uint64_t address = 0x54970c0200ull + word;
         EXPECT_TRUE(compile(code, address).empty()) << word;
-        EXPECT_NE(last_terminal_reject_reason(address).find("fabricated-fresh-mask-source pc=12"),
+        EXPECT_NE(last_terminal_reject_reason(address).find("fabricated-fresh-mask-source pc=23"),
                   std::string::npos)
             << word;
+        EXPECT_NE(last_terminal_reject_reason(address).find("origin=unknown-launch word=s60"),
+                  std::string::npos);
     }
 }
 TEST(RelativeBankSource, DeferredM0MissingBankAndExpandedReaderStillRefuse) {
@@ -395,8 +397,14 @@ TEST(RelativeBankSource, DeferredM0RequiresAnIndependentUnconditionalOverwrite) 
         code[22] = word;   // M0 itself, the per-lane index, or a conditional replacement
         const uint64_t address = 0x54970c0400ull + word;
         EXPECT_TRUE(compile(code, address).empty());
-        EXPECT_NE(last_terminal_reject_reason(address).find("fabricated-fresh-mask-source pc=12"),
-                  std::string::npos);
+        const auto reason = last_terminal_reject_reason(address);
+        if (word == 0xbefc0580u) {
+            EXPECT_NE(reason.find("mode=unresolved-operand pc=22"), std::string::npos) << reason;
+        } else {
+            EXPECT_NE(reason.find("fabricated-fresh-mask-source pc=23"), std::string::npos)
+                << reason;
+            EXPECT_NE(reason.find("origin=unknown-launch word=s60"), std::string::npos) << reason;
+        }
     }
 }
 TEST(RelativeBankSource, DeferredM0DoesNotCrossABranchOrAnUnboundedTail) {

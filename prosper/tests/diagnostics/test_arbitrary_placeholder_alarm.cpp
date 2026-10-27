@@ -1,4 +1,9 @@
 // A real admission fires immediately; a checked program with no admission is quiet.
+#include <vector>
+#include <string_view>
+#include <cstddef>
+#include "diagnostics/perf/perf_ledger.hpp"
+#include "diagnostics/perf/perf_alarm_rules.hpp"
 #include "diagnostics/perf/arbitrary_placeholder.hpp"
 #include "diagnostics/perf/perf_alarms.hpp"
 #include <gtest/gtest.h>

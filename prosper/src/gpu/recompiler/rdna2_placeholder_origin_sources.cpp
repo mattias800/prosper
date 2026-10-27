@@ -99,8 +99,7 @@ std::vector<PlaceholderWord> PlaceholderOriginTrace::sources(const Rdna2Inst& in
                     source.value != 125)) {
             if (genuine_resource &&
                 ((in.fmt == Rdna2Format::MIMG && (k == 1 || k == 2)) ||
-                 ((in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF) &&
-                  (k == 1 || k == 2))))
+                 ((in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF) && k == 1)))
                 continue;
             auto width = scalar_alu_source_words(in, k, program.wave_size);
             if (width == UINT32_MAX) continue;

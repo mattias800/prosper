@@ -1,4 +1,5 @@
 // rdna2_to_spirv.cpp — see rdna2_to_spirv.hpp. Internal SpirvCompute builder + the VALU translator.
+#include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
 #include <atomic>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/diagnostics/diagnostic_selectors.hpp"

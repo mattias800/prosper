@@ -20,7 +20,8 @@ using namespace prosper::gpu;
 // A never-written VGPR would not do: under #5185 it holds an arbitrary value hardware could hold,
 // which a fresh predicate may read on any route (#5039). Shifts every pc by one.
 std::vector<uint32_t> hard_old(std::vector<uint32_t> code, uint32_t vgpr) {
-    code.insert(code.begin(), 0x7e000200u | (vgpr << 17u) | 30u);   // v_mov_b32 vN, s30
+    code.insert(code.begin(),
+                0x7e000200u | (vgpr << 17u) | 1u);   // v_mov_b32 vN, unknown scratch-offset s1
     return code;
 }
 struct Result {

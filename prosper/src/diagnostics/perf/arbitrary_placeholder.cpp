@@ -1,3 +1,8 @@
+#include <cinttypes>
+#include <cstdint>
+#include <string>
+#include <vector>
+#include <utility>
 #include "diagnostics/perf/arbitrary_placeholder.hpp"
 #include "diagnostics/perf/perf_ledger.hpp"
 #include "diagnostics/perf/perf_alarm_rules.hpp"
@@ -50,12 +55,10 @@ void note_arbitrary_placeholder_admission(uint64_t program, uint64_t fresh, uint
     if (first) {
         const char* identity = program ? "program" : "unidentified-program";
         std::fprintf(stderr,
-                     "[perf-alarm] rule=arbitrary-placeholder-admitted %s=0x%llx "
-                     "reads=%llu fresh-mask=%llu loop-carry=%llu "
+                     "[perf-alarm] rule=arbitrary-placeholder-admitted %s=0x%" PRIx64 " "
+                     "reads=%" PRIu64 " fresh-mask=%" PRIu64 " loop-carry=%" PRIu64 " "
                      "origin=unloaded scope=compiler-read-sites\n",
-                     identity, static_cast<unsigned long long>(program),
-                     static_cast<unsigned long long>(fresh + loop),
-                     static_cast<unsigned long long>(fresh), static_cast<unsigned long long>(loop));
+                     identity, program, fresh + loop, fresh, loop);
     }
 }
 
@@ -65,14 +68,12 @@ std::string format_arbitrary_placeholder_summary(const ArbitraryPlaceholderInven
         char line[384];
         std::snprintf(line, sizeof line,
                       "[perf-alarm] summary observer=arbitrary-placeholder-admitted "
-                      "%s=0x%llx compilations=%llu reads=%llu fresh-mask=%llu loop-carry=%llu "
+                      "%s=0x%" PRIx64 " compilations=%" PRIu64 " reads=%" PRIu64
+                      " fresh-mask=%" PRIu64 " loop-carry=%" PRIu64 " "
                       "origin=unloaded scope=compiler-read-sites\n",
-                      program ? "program" : "unidentified-program",
-                      static_cast<unsigned long long>(program),
-                      static_cast<unsigned long long>(row.compilations),
-                      static_cast<unsigned long long>(row.fresh_mask_reads + row.loop_carry_reads),
-                      static_cast<unsigned long long>(row.fresh_mask_reads),
-                      static_cast<unsigned long long>(row.loop_carry_reads));
+                      program ? "program" : "unidentified-program", program, row.compilations,
+                      row.fresh_mask_reads + row.loop_carry_reads, row.fresh_mask_reads,
+                      row.loop_carry_reads);
         out += line;
     }
     return out;
@@ -90,7 +91,8 @@ void append_arbitrary_placeholder_alarm(std::vector<AlarmFiring>& out, const Win
     alarm.detail = "reads=" + std::to_string(reads) + " origin=unloaded scope=compiler-read-sites";
     alarm.hint =
         "the compiler retained consistent arbitrary values for explicitly unloaded roots; "
-        "the run summary names program addresses. Counts are compilations and static "
+        "the run summary names program addresses; inspect their captured sidecars with "
+        "shader_inspect. Counts are compilations and static "
         "read sites, not draws or executed lane reads; missing inputs/spills remain refused";
     out.push_back(std::move(alarm));
 }

@@ -132,21 +132,20 @@ TEST(Wave32MaskScc, NativeIntersectionPublishesAnActualCondition) {
 
 TEST(Wave32MaskScc, MissingComparedScalarCannotBecomeAMaskCondition) {
     auto code = program();
-    code[1] = 0xbf800000u;   // remove only s25's actual producer
+    code[1] = 0xbe990301u;   // s25 = unknown possible scratch-offset s1
     missing_source(compile(code), 6);
 }
 
 TEST(Wave32MaskScc, MissingComparedVectorCannotBecomeAMaskCondition) {
     auto code = program();
-    // Replace only v5's actual producer by a relay of s30, which no launch loads: hard on every
-    // route. (A never-written v5 would be arbitrary under #5185 on every route, #5039.)
-    code[3] = 0x7e0a021eu;   // v_mov_b32 v5, s30
+    // Replace v5's producer by the possible unsupplied scratch-offset s1.
+    code[3] = 0x7e0a0201u;   // v_mov_b32 v5, unknown scratch-offset s1
     missing_source(compile(code), 5);
 }
 
 TEST(Wave32MaskScc, AOnePathWordRemainsMissingAtTheCompare) {
     auto code = program();
-    code[1] = 0xbf800000u;
+    code[1] = 0xbe990301u;   // the unrefreshed edge retains unknown scratch-offset s1
     code.insert(code.begin() + 4, {0xbf060000u, 0xbf850001u, 0xbe990381u});
     missing_source(compile(code), 9);
 }
@@ -176,9 +175,9 @@ TEST(Wave32MaskScc, AVectorRelayCannotAuthenticateAnAbsentScalarSource) {
     auto code = program();
     code[1] = 0xbf800000u;
     code.insert(code.begin() + 4,
-                {0x7e3c0228u, 0x7e32051eu});   // v30 = s40; s25 = readfirstlane(v30)
+                {0x7e3c0201u, 0x7e32051eu});   // v30 = unknown s1; s25 = readfirstlane(v30)
     missing_source(compile(code), 8);
-    code.insert(code.begin() + 4, 0xbea80381u);   // genuine s40 = 1 before the identical relay
+    code.insert(code.begin() + 4, 0xbe810381u);   // genuine s1 = 1 before the identical relay
     actual_native_condition(compile(code));
 }
 

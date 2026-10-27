@@ -699,6 +699,8 @@ struct LoopBlanketCheck {
         if (!diagnostic_words.empty()) {
             diagnostic_roots = loop_placeholder_roots(rs, header_pc, diagnostic_words,
                                                       b.placeholder_origin_program.get());
+            append_unproved_loop_reads(diagnostic_roots, b, header_pc, diagnostic_words,
+                                       weak_allowed);
             b.diagnostic.placeholder_origins =
                 std::make_shared<const std::string>(format_placeholder_origins(diagnostic_roots));
         }

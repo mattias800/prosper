@@ -173,7 +173,7 @@ std::vector<uint32_t> compile(const uint32_t (&prefix)[N], uint32_t native_subgr
     // Keep all branch offsets identical in the control: it replaces the producer by a relay of
     // s30, which no launch loads, so v1 is hard on every route. (Omitting it would leave v1
     // arbitrary under #5185 on every route, #5039.)
-    code.push_back(define_tail_input ? 0x7e020280u : 0x7e02021eu);
+    code.push_back(define_tail_input ? 0x7e020280u : 0x7e020200u);
     code.insert(code.end(), std::begin(kTail), std::end(kTail));
     ComputeShaderConfig config;
     config.local_x = 64;

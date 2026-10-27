@@ -248,8 +248,12 @@ TEST(IrVectorMad64Execution, HighOnlyFabricatedScalarAddendCannotBecomeAFreshCar
         for (uint32_t wave : {32u, 64u}) {
             const auto good = m::program(opcode, m::Form::PairSgpr, 20, wave, 2);
             ASSERT_FALSE(compile(good).empty());
-            auto bad = good; // omit only S_MOV_B32 s55, literal; low addend remains genuine
-            bad.code.erase(bad.code.begin() + 16, bad.code.begin() + 18);
+            auto bad = good; // replace only the high producer by an unknown launch input
+            const auto high = std::find(bad.code.begin(), bad.code.end(), 0xbeb703ffu);
+            ASSERT_NE(high, bad.code.end());
+            ASSERT_NE(high + 1, bad.code.end());
+            *high = 0xbeb70300u; // s55 = possible scratch-offset s0; low s54 remains genuine
+            *(high + 1) = 0xbf800000u; // preserve both instruction positions
             const auto address = lane_harness_address();
             const auto out =
                 recompile_compute(bad.code.data(), bad.code.size(), &bad.table, bad.config,
@@ -257,7 +261,11 @@ TEST(IrVectorMad64Execution, HighOnlyFabricatedScalarAddendCannotBecomeAFreshCar
             EXPECT_TRUE(out.empty());
             const auto reason = last_terminal_reject_reason(address);
             EXPECT_NE(reason.find("fabricated-fresh-mask-source"), std::string::npos) << reason;
-            EXPECT_NE(reason.find("pc=16 "), std::string::npos) << reason;
+            const auto consumer = std::find(bad.code.begin(), bad.code.end(),
+                                            0xd4000001u | (opcode << 16u) | (20u << 8u));
+            ASSERT_NE(consumer, bad.code.end());
+            const auto pc = static_cast<uint32_t>(consumer - bad.code.begin());
+            EXPECT_NE(reason.find("pc=" + std::to_string(pc) + " "), std::string::npos) << reason;
         }
 }
 TEST(IrVectorMad64Execution, ExportsEveryAcceptedAttributeAndExecutesTheSavedModules) {

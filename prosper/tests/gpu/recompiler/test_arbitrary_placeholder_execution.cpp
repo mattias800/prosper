@@ -1,5 +1,8 @@
 // Removing unloaded-only admission must refuse these real compiler/interpreter witnesses.
 // Unknown launch and genuinely unsupplied pixel launch words remain refused twins.
+#include <string>
+#include <cstdint>
+#include <utility>
 #include "bpermute_spirv_oracle.hpp"
 #include "fixtures/arbitrary_placeholder.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
@@ -58,6 +61,25 @@ TEST(ArbitraryPlaceholderExecution, TheNarrowedWriterKeepsOldValuesInTheOtherHal
 
 TEST(ArbitraryPlaceholderExecution, ARepeatedLoopReadRetainsItsCarriedValue) {
     witness(fixture::loop_relay());
+}
+
+TEST(ArbitraryPlaceholderExecution, AScalarPairLoopUsesItsCurrentArbitraryBackEdge) {
+    witness_values(fixture::scalar_loop_relay(), fixture::Words(64, 22));
+}
+
+TEST(ArbitraryPlaceholderExecution, ASuppliedScalarLoadRetainsItsRealDataBesideAnUnloadedRoot) {
+    const auto words = fixture::loaded_scalar_relay();
+    const auto resources = fixture::scalar_input_table();
+    constexpr uint64_t address = 0x5497b00800ull;
+    const auto module = recompile_compute(words.data(), words.size(), &resources, fixture::config(),
+                                          {RecompileDiagnosticStage::Compute, address});
+    ASSERT_FALSE(module.empty()) << last_terminal_reject_reason(address);
+    bpermute_oracle::Interpreter vm(module);
+    vm.native_subgroup_width = 64;
+    vm.supplied_push_constants = fixture::config().user_sgprs;
+    const auto actual = vm.run_buffers(64, {{2, {13}}, {3, fixture::Words(64, 0xdeadbeefu)}}, 3);
+    ASSERT_TRUE(vm.error.empty()) << vm.error;
+    EXPECT_EQ(actual, fixture::Words(64, 13));
 }
 
 TEST(ArbitraryPlaceholderExecution, RemovingTheLaunchInventoryKeepsTheSameRelayHard) {

@@ -4854,7 +4854,9 @@ endif()
   # the validator was absent, which is how #1711 shipped invalid SPIR-V past a gate CLAUDE.md and
   # both READMEs describe as strict. The source root is passed so the tool can read the emitter
   # headers and fail when a new emitter is added without a module here.
-  add_executable(spv_validate tools/spv_validate/spv_validate.cpp)
+  add_executable(spv_validate tools/spv_validate/spv_validate.cpp
+    tools/spv_validate/arbitrary_placeholder_witness.cpp)
+  target_include_directories(spv_validate PRIVATE tests)
   target_link_libraries(spv_validate PRIVATE prosper_core)
   add_test(NAME spv_validate
            COMMAND spv_validate ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR})

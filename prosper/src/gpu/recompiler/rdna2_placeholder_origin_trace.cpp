@@ -85,6 +85,16 @@ PlaceholderRoots PlaceholderOriginTrace::before(uint32_t pc,
             continue;
         }
         const auto inputs = sources(in, word);
+        const bool memory = in.fmt == Rdna2Format::DS || in.fmt == Rdna2Format::FLAT ||
+                            in.fmt == Rdna2Format::MUBUF || in.fmt == Rdna2Format::MTBUF ||
+                            in.fmt == Rdna2Format::MIMG || in.fmt == Rdna2Format::SMEM;
+        const bool supplied_scalar_load = in.fmt == Rdna2Format::SMEM && program.observations &&
+                                          program.observations->native_inputs.contains(in.pc);
+        if (memory && !supplied_scalar_load &&
+            (!program.observations ||
+             !program.observations->arbitrary_memory_results.contains(in.pc) ||
+             !program.observations->arbitrary_memory_results.at(in.pc)))
+            roots.insert({PlaceholderOrigin::UnprovedMemoryResult, word, in.pc});
         // The legacy read inventory intentionally declines uninventoried image forms and
         // implicit LDS/GDS sources. Name that gap instead of inventing an unloaded root.
         if ((in.fmt == Rdna2Format::MIMG && image_addresses(in).empty()) ||

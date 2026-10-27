@@ -98,14 +98,15 @@ void check_values(uint32_t opcode, bool dispatcher = false) {
     }
 }
 
-void refuses(const std::vector<uint32_t>& program, uint64_t address) {
+void refuses(const std::vector<uint32_t>& program, uint64_t address,
+             const char* cause = "reason=fabricated-fresh-mask-source pc=6") {
     const auto c = config();
     const auto table = resources();
     EXPECT_TRUE(recompile_compute(program.data(), program.size(), &table, c,
                                   {RecompileDiagnosticStage::Compute, address})
                     .empty());
     const auto reason = last_terminal_reject_reason(address);
-    EXPECT_NE(reason.find("reason=fabricated-fresh-mask-source pc=6"), std::string::npos) << reason;
+    EXPECT_NE(reason.find(cause), std::string::npos) << reason;
 }
 } // namespace
 
@@ -132,7 +133,7 @@ TEST(NativeLoopCarryMask, DispatcherExecutesCurrentReverseBorrowMask) {
 TEST(NativeLoopCarryMask, NeverWrittenMaskStillRefuses) {
     auto program = loop_program();
     program[7] = (program[7] & ~(511u << 18u)) | (30u << 18u); // no producer for s[30:31]
-    refuses(program, 0x5497000200ull);
+    refuses(program, 0x5497000200ull, "mode=unresolved-operand pc=6");
 }
 
 TEST(NativeLoopCarryMask, MaskPhysicalWordsRemainDataInOtherOperands) {

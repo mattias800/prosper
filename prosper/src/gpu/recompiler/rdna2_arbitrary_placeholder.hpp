@@ -14,6 +14,8 @@ struct ArbitraryPlaceholderReads {
     uint64_t total() const { return fresh_mask + loop_carry; }
 };
 bool placeholder_roots_are_unloaded(const PlaceholderRoots&);
+void append_unproved_loop_reads(PlaceholderRoots&, const SpirvCompute&, uint32_t header,
+                                const std::vector<int>& words, bool weak_allowed);
 bool arbitrary_placeholder_attempt_active();
 std::vector<uint32_t>
 recompile_with_arbitrary_placeholders(const RecompileDiagnosticContext&,

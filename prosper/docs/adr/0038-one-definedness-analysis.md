@@ -515,6 +515,90 @@ python3 prosper/tools/shader_inspect/placeholder_origin_census.py \
 shader_inspect <program.bin> --inputs <program.inputs> # add --stage compute for CS
 ```
 
+#### Admission measurements (2026-10-27)
+
+The admission candidate first preserves every successful strict compilation unchanged. A refusal
+may retry only when an actual read has a nonempty root set consisting entirely of `unloaded`.
+The retry supplies no new values, physical mask words or runtime validity facts. Successful
+scalar loads terminate a dependency slice only after their actual complete, non-fabricated
+publication; an unproved memory result or strong loop-read obligation stays Hard. These name
+`unproved-memory-result` and `unproved-strong-read`, respectively.
+
+The same 4,000-entry corpus compares 3,567 recorded-input replays and 433 stage probes:
+
+- Five compute entries become accepted, all with unloaded-only roots. Four use fresh predicates;
+  the fifth uses fresh predicates and loop-carried reads. Every emitted module passes `spirv-val`.
+- No accepted output changes and no accepted program becomes refused. The comparison hashes
+  1,538 existing outputs; supplemental exports through the identical public table-less compute
+  entry point hash the other five, also unchanged. All ten supplemental modules validate.
+- Three entries reach later refusals: a remaining fabricated input, an unresolved MIMG address,
+  and an unresolved operand. One previously refused fragment replay becomes incomplete because
+  it needs a semantic choice absent from its old trace. No missing choice is guessed.
+- The remaining policy-1 cohort has 565 entries. Origin counts overlap when an entry has several
+  roots; none has only unloaded roots and none is unclassified.
+
+| Origin | Remaining entries | Roots |
+| --- | ---: | ---: |
+| unloaded (mixed with Hard roots) | 33 | 1,405 |
+| launch-input | 473 | 478 |
+| unknown-launch | 72 | 574 |
+| lost-definition | 9 | 9 |
+| unmodelled-transfer | 5 | 5 |
+| unproved-memory-result | 17 | 314 |
+| unproved-strong-read | 2 | 29 |
+| spill / trace-budget / unreachable | 0 | 0 |
+
+The 27 dumped GTA/Kena programs retain the preceding measurement's nine accepted, fifteen refused
+and three missing-sidecar results. All nine accepted modules validate and retain their hashes.
+The remaining five fresh-mask GTA fragments report:
+
+| Program | Hard roots retained alongside any unloaded roots |
+| --- | --- |
+| `ps_405ac25e00`, `ps_405ac2ba00` | unproved memory result at MIMG pc150 |
+| `ps_405b253400`, `ps_405b257e00` | launch-input `v2`, unknown launch, unmodelled transfer, unproved memory result |
+| `ps_405b3ddc00` | launch-input `v0/v1/v2`, unknown launch, unproved memory results |
+
+The already tracked launch-input bugs are #5518 (`v2`) and #5519 (`v0/v1`); these remain Hard.
+The other refused game programs retain the earlier table's separate MIMG, VCC-exit or MBCNT
+reasons. This is an offline census, with no game run.
+
+The three MOUSE UI captures add a further replay limitation: `ps_403f306100` and
+`ps_4043ba9200` pass their unloaded-only predicate but need additional recorded semantic choices,
+so their old sidecars now report incomplete. `ps_4043ca3f00` still refuses with launch-input
+`v0/v1` alongside unloaded roots. Fresh live captures and visible portrait verification remain
+necessary; these are not claimed as accepted modules.
+
+Eight synthetic interpreter witnesses fail against the merged diagnostic-only compiler and pass
+with admission. They cover integer/float predicates, CMPX, saved SDWA predicates, narrowed writes,
+vector/scalar loop carries, and real scalar-buffer data beside an unloaded root. Three actual
+exact64 GPU dispatches cover both wave halves and CMPX's active-lane count. The existing nine
+scalar-selector/loop originals now execute their consistent arbitrary values; same-consumer twins
+with genuine missing spills remain refused. All 26 exported synthetic modules validate.
+
+Mutation controls deny unloaded admission, admit Hard roots, lose scalar-load publication, keep
+a stale retry refusal, or disconnect the observer; each is detected. The actual #4943 missing-spill
+twin also detects the relaxed-Hard mutation. Ordinary lane-harness instruction tapes match main
+byte-for-byte, with a deliberate instruction mutation detected. Old Hard-input controls now use
+an unknown possible scratch-offset launch word instead of an explicitly unloaded SGPR.
+
+`arbitrary-placeholder-admitted` is a default-on correctness alarm with a program-address run
+summary. Window counts are successful retry compilations and static read sites, not draws or
+executed lane reads. Failed retries publish their actual refusal and no admission count.
+
+#### Ruled out during admission qualification (2026-10-27)
+
+- **An unloaded address alone makes every memory result Arbitrary.** The unchanged #5193
+  atomic/store-return and cross-lane LDS refusal twins exposed a missing dependency in the
+  diagnostic slice. The result's separate memory contract must be retained; an unproved result
+  now names `unproved-memory-result`. A loop's existing strong address/scalar-read obligation
+  likewise names `unproved-strong-read`. Neither is silently reduced to its unloaded address
+  or back-edge registers.
+- **A never-loaded ordinary SGPR is a genuine Hard input fixture.** Several older fixtures used
+  s30, s40 or s60 this way. Under the owner-approved policy those words are Arbitrary. Hard
+  controls must instead name an unknown possible scratch-offset launch word, a genuinely
+  unsupplied launch input or an untracked spill. Consumer and relative-branch positions are
+  retained when correcting these fixtures.
+
 **Measurement before acceptance.**
 
 1. **Kena's three programs.** For each fabricated word, name its origin: never written, a launch

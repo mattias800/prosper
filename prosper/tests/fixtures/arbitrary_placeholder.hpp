@@ -50,6 +50,25 @@ inline Words scalar_relay() {
     append_output(result);
     return result;
 }
+inline gpu::ShaderResourceTable scalar_input_table() {
+    auto result = table();
+    auto input = result.resources.front();
+    input.binding = 2;
+    input.sgpr_base = 4;
+    input.size = sizeof(uint32_t);
+    result.resources.push_back(input);
+    return result;
+}
+inline Words loaded_scalar_relay() {
+    return {
+        0xf4200502u, 0xfa000000u,   // s20 = actual scalar-buffer input at binding2[0]
+        0x7e0c023cu,   // v6 = unloaded s60
+        0x4a0c0c14u,   // v6 = s20 + v6
+        0x7d840c14u,   // VCC = (s20 == v6)
+        0xd1010001u, 0x01aa0c96u,   // v1 = VCC ? v6 : 22
+        0xe0702000u, 0x80020100u, 0xbf810000u,
+    };
+}
 inline Words floating_predicate() {
     Words result{0x7e0c023cu, 0x7c040c80u};   // v6=s60; v_cmp_eq_f32 vcc,0,v6
     append_output(result);
@@ -101,6 +120,17 @@ inline Words loop_relay() {
     };
     append_output(result);
     return result;
+}
+inline Words scalar_loop_relay() {
+    return {
+        0xbe9003c1u, 0xbe9103c1u,   // initial s[16:17] = all lanes
+        0xbe9e0380u,   // s30 = counter0, outside the output descriptor
+        0xbeea0410u,   // loop: VCC = s[16:17]
+        0xd1010001u, 0x01a91696u,   // v1 = VCC ? 11 : 22
+        0xbe90043cu,   // s[16:17] = unloaded s[60:61], consistently zero
+        0x801e811eu, 0xbf0a831eu, 0xbf85fff9u,   // three trips, back to pc3
+        0xe0702000u, 0x80020100u, 0xbf810000u,
+    };
 }
 inline Words expected(bool narrowed) {
     Words result(64, 11u);

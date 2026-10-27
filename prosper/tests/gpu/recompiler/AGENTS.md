@@ -1,7 +1,8 @@
 # `tests/gpu/recompiler` — translation tests and the legacy compute execution fixture
 
 `test_arbitrary_placeholder_execution` executes scalar relays, saved SDWA predicates, narrowed
-old values and repeated loop reads through the public compiler and integer interpreter.
+old values, scalar/vector loop carries and a real supplied scalar-buffer load through the public
+compiler and integer interpreter.
 `test_arbitrary_placeholder_policy` keeps every non-unloaded root Hard, including a lost operand
 beside an unloaded one, and checks strict-first retry/metadata selection. Missing launch and
 spill twins retain their separate refusal contracts.
@@ -383,3 +384,8 @@ unused scalar sibling. Missing actual operands and missing lane spills still ref
 physical-width inventory covers every known VOP3P source through the canonical effects table.
 Partial-launch native and dispatcher witnesses keep unrelated packed reads from demanding
 physical DATA for Bool-only mask logic; numeric VCC high words retain independent poison checks.
+
+Hard-input controls use a launch word that is genuinely unknown (the possible scratch-offset
+SGPR), or an untracked spill. A never-loaded ordinary SGPR is Arbitrary under ADR 0038 and
+cannot stand in for a missing meaningful input. Keep the original consumer/branch positions
+when correcting such a fixture.

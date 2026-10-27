@@ -312,6 +312,7 @@ TEST(IrVectorRoundFloatExecution, FabricatedScalarWordsCannotBecomeFreshCompareM
                 bad[1] = 50;   // Missing scalar s50 is hard, unlike an arbitrary unloaded VGPR.
                 if (restore) bad.push_back(0xbefe04c1);
                 bad.push_back(0x7d8a0280);   // v_cmp_ne_u32_e32 vcc,0,v1
+                bad.insert(bad.begin(), 0xbeb20300u);   // s50 = unknown possible scratch offset s0
                 const auto refused = run_vector_op_per_lane(bad, inputs(7), wave);
                 EXPECT_NE(refused.error.find("fabricated-fresh-mask-source"), std::string::npos)
                     << refused.error << " opcode " << def.opcode;
@@ -335,7 +336,7 @@ TEST(IrVectorRoundFloatExecution, OneArmScalarDefinitionsKeepTheirHardSourceObli
                 code.insert(code.end(), op.begin(), op.end());
                 code.push_back(0x7d8a0280);
                 auto program = lane_program(code, 64, wave);
-                program.config.user_sgprs.resize(8);   // genuine dynamic scalar branch selector s4
+                seed_lane_hard_scalar(program, 8);   // genuine dynamic scalar branch selector s4
                 const auto address = lane_harness_address();
                 const auto module =
                     recompile_compute(program.code.data(), program.code.size(), &program.table,

@@ -452,7 +452,7 @@ TEST(UnloadedLaunchVgpr, PublicComputeLoadedDataIsAsHardAsItsAddress) {
     // loads a value hardware could have loaded, #5193), and at v7 = the fabricated s20 (hard).
     accepted(compile_compute({0xd8d80000u, 0x06000000u, compare6}));
     accepted(compile_compute({0xd8d80000u, 0x06000007u, compare6}));
-    refused(compile_compute({0x7e0e0214u, 0xd8d80000u, 0x06000007u, compare6}));
+    refused(compile_compute({0x7e0e0208u, 0xd8d80000u, 0x06000007u, compare6}));
 }
 
 TEST(UnloadedLaunchVgpr, PublicFragmentRelayChainsAreAsHardAsTheirLaunchWord) {

@@ -1,4 +1,5 @@
 // Adapt the compiler-owned observation port to the always-on performance observer.
+#include <cstdint>
 #include "gpu/recompiler/rdna2_arbitrary_placeholder_observation.hpp"
 #include "diagnostics/perf/arbitrary_placeholder.hpp"
 

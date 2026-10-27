@@ -1,3 +1,8 @@
+#include <cstdint>
+#include "gpu/recompiler/rdna2_placeholder_origins.hpp"
+#include <vector>
+#include <functional>
+#include <string>
 #include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
 #include "gpu/recompiler/rdna2_diagnostic_attempt.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"

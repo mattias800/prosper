@@ -473,3 +473,12 @@ the original payload at its original class site.
 `rdna2_scalar_source_words` consumes the canonical effects table for VOP3P as well as ordinary
 VALU forms. A packed pair of halves is one physical scalar word; absent adjacent SGPRs do not
 supply an operand or justify poisoning that word.
+
+`rdna2_placeholder_origin_memory` observes successful scalar-load publication as a supplied input.
+Missing/fabricated scalar results cannot terminate a trace. It also retains the separate memory-result obligation in an origin
+slice. An unloaded address does not authorize an atomic, cross-lane result or unproved read;
+`unproved-memory-result` stays Hard. Read contracts observe the existing bounded/actual-address
+lowering and conjoin observations across attempts.
+`rdna2_arbitrary_placeholder_loop` retains existing strong loop-read obligations: an unloaded
+back edge cannot authorize an unbounded/writing address or an unproved scalar publication.
+Those dependencies report `unproved-strong-read` and stay Hard.
