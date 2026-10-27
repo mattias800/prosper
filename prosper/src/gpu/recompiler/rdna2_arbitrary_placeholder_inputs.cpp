@@ -33,7 +33,10 @@ bool hard_operand(const RegState& rs, const Operand& operand, PlaceholderWord& w
                   bool& missing) {
     if (operand.kind == OperandKind::VGPR) {
         word = {PlaceholderFile::Vector, operand.value};
-        missing = !rs.vreg.contains(operand.value);
+        const auto value = rs.vreg.find(operand.value);
+        // A lowering may reserve VDST before reading an aliased source. ID 0 reserves storage;
+        // it is no SSA value. A real constant with zero bits still has a nonzero SPIR-V ID.
+        missing = value == rs.vreg.end() || !value->second;
         const auto mark = rs.vreg_source_marks.find(operand.value);
         return missing || (mark != rs.vreg_source_marks.end() && mark->second.hard &&
                            !vector_word_defined_in_exec(rs, mark->second, rs.exec));

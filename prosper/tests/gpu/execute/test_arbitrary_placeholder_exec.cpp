@@ -180,3 +180,37 @@ TEST(ArbitraryPlaceholderGpu, APartialWriteCannotInventTheLostInactiveDestinatio
         execute(words, fixture::partial_old_expected(), address, launch);
     }
 }
+
+TEST(ArbitraryPlaceholderGpu, AnAliasedBankDestinationCannotInventItsLostSource) {
+    const auto words = fixture::relative_after_writelane(true, true, true);
+    const auto resources = fixture::table();
+    auto launch = fixture::config();
+    launch.user_sgprs[0] = 13;
+    launch.user_sgprs[4] = 1;
+    constexpr uint64_t address = 0x5497b03700ull;
+    const auto module = recompile_compute(words.data(), words.size(), &resources, launch,
+                                          {RecompileDiagnosticStage::Compute, address});
+    EXPECT_TRUE(module.empty());
+    if (module.empty()) {
+        EXPECT_NE(last_terminal_reject_reason(address).find("origin=lost-definition word=v6"),
+                  std::string::npos);
+    } else {
+        auto expected = fixture::Words(64, 7);
+        expected[0] = 13;
+        execute(words, expected, address, launch);
+    }
+}
+
+TEST(ArbitraryPlaceholderGpu, AnAliasedProvidedBankWordRetainsItsValue) {
+    auto launch = fixture::config();
+    launch.user_sgprs[4] = 1;
+    execute(fixture::relative_after_writelane(false, true, true), fixture::Words(64, 7),
+            0x5497b03a00ull, launch);
+}
+
+TEST(ArbitraryPlaceholderGpu, AnAliasedUnloadedBankWordRetainsItsPlaceholder) {
+    auto launch = fixture::config();
+    launch.user_sgprs[4] = 1;
+    execute(fixture::relative_after_writelane(false, false, true), fixture::Words(64, 0),
+            0x5497b03b00ull, launch);
+}

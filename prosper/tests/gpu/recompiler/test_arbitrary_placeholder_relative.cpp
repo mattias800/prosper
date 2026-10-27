@@ -9,8 +9,8 @@
 namespace {
 namespace fixture = prosper::test::arbitrary_placeholder;
 using namespace prosper::gpu;
-void witness(bool provide_word, uint64_t address) {
-    const auto words = fixture::relative_after_writelane(false, provide_word);
+void witness(bool provide_word, uint64_t address, bool alias_destination = false) {
+    const auto words = fixture::relative_after_writelane(false, provide_word, alias_destination);
     const auto resources = fixture::table();
     auto launch = fixture::config();
     launch.user_sgprs[4] = 1;
@@ -57,4 +57,37 @@ TEST(ArbitraryPlaceholderRelative, AProvidedRuntimeSelectedWordKeepsItsValue) {
 
 TEST(ArbitraryPlaceholderRelative, AnActuallyUnloadedSelectedWordKeepsItsPlaceholder) {
     witness(false, 0x5497b03200ull);
+}
+
+TEST(ArbitraryPlaceholderRelative, ALostSelectedWordStaysHardWhenTheDestinationAliasesIt) {
+    const auto words = fixture::relative_after_writelane(true, true, true);
+    const auto resources = fixture::table();
+    auto launch = fixture::config();
+    launch.user_sgprs[0] = 13;
+    launch.user_sgprs[4] = 1;
+    constexpr uint64_t address = 0x5497b03600ull;
+    const auto module = recompile_compute(words.data(), words.size(), &resources, launch,
+                                          {RecompileDiagnosticStage::Compute, address});
+    EXPECT_TRUE(module.empty());
+    if (module.empty()) {
+        EXPECT_NE(last_terminal_reject_reason(address).find("origin=lost-definition word=v6"),
+                  std::string::npos);
+    } else {
+        bpermute_oracle::Interpreter vm(module);
+        vm.native_subgroup_width = 64;
+        vm.supplied_push_constants = launch.user_sgprs;
+        auto expected = fixture::Words(64, 7);
+        expected[0] = 13;
+        const auto actual = vm.run(64, fixture::Words(64, 0xdeadbeefu));
+        ASSERT_TRUE(vm.error.empty()) << vm.error;
+        EXPECT_EQ(actual, expected);
+    }
+}
+
+TEST(ArbitraryPlaceholderRelative, AnAliasedProvidedWordKeepsItsRuntimeValue) {
+    witness(true, 0x5497b03800ull, true);
+}
+
+TEST(ArbitraryPlaceholderRelative, AnAliasedUnloadedWordKeepsItsPlaceholder) {
+    witness(false, 0x5497b03900ull, true);
 }

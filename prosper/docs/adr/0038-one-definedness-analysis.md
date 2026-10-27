@@ -622,6 +622,13 @@ executed lane reads. Failed retries publish their actual refusal and no admissio
 
 #### Ruled out during admission qualification (2026-10-27)
 
+- **Register-map membership establishes that an actual source value exists.** MOVRELS reserves
+  its destination before reading the bank. When that destination aliases a lost provided
+  candidate, the temporary entry has ID 0 and hides the absence from a membership-only guard.
+  The interpreter and exact64 GPU again store 64 zeroes instead of `[13,7,...]`. Treat an empty
+  ID as missing at the shared VGPR input boundary. Provided and genuinely unloaded alias twins
+  retain their values; a real zero-valued constant has a nonzero SPIR-V ID. #5528.
+
 - **An unloaded alternative authenticates an entire relative-register bank.** With runtime
   `M0 = supplied_s4 & 3`, `v_movrels v1,v5` can select `v6` erased by a preceding WRITELANE.
   Genuine `v5/v6` producers terminate their slices, while unloaded `v7/v8` alternatives leave

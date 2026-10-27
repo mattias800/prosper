@@ -401,6 +401,7 @@ physical DATA for Bool-only mask logic; numeric VCC high words retain independen
 `test_arbitrary_placeholder_relative` covers runtime bank selection beside unloaded alternatives.
 The lost provided candidate stays Hard; provided and genuinely unloaded selected words retain
 their interpreter values. Removing the actual bank guard must expose the lost computation.
+Destination-alias variants keep an empty reserved map entry distinct from a supplied SSA value.
 
 Hard-input controls use a launch word that is genuinely unknown (the possible scratch-offset
 SGPR), or an untracked spill. A never-loaded ordinary SGPR is Arbitrary under ADR 0038 and
