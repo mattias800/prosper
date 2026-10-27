@@ -4175,6 +4175,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_native_compute_launch.cpp
     INCLUDES tests tests/gpu/recompiler
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_saved_mask_implicit_reads
+    SOURCES tests/gpu/recompiler/test_saved_mask_implicit_reads.cpp
+    INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_native_indirect_entry
     SOURCES tests/gpu/recompiler/test_native_indirect_entry.cpp
     INCLUDES tests tests/gpu/recompiler

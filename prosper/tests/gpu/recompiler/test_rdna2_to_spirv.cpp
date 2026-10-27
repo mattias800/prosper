@@ -13,6 +13,7 @@
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/agc/agc_shader_layout.hpp"
 #include "gpu/resources/shader_resources.hpp"
+#include "fixtures/checked_compute_launch.hpp"
 #include "fixtures/compute_runner.h"
 #include "fixtures/gta5_compute_cfg_fixture.hpp"
 #include "fixtures/native_execution_launch.hpp"
@@ -8367,25 +8368,22 @@ int main() {
     // The same physical pair cannot be reconstructed at a join when one predecessor owns a saved
     // wave mask and the other owns ordinary scalar data. Portable dispatch has separate Bool/u32
     // backing variables but no runtime domain tag, so consuming s[4:5] at the join must reject
-    // instead of silently reading either variable's zero placeholder. Exact native Wave64 can
-    // materialize VCC as ballot low/high words, so both predecessors also define scalar data there.
+    // instead of silently reading either variable's zero placeholder. Exact native Wave64
+    // retains the entry producer's ballot words, so both predecessors define scalar data there.
     const uint32_t code38_pair_ambiguous_join[] = {
-        0x7e040280u,              // irreducible dispatcher prefix (same shape as kernel 17d)
-        0x7d840100u,
-        0xbf860001u,
-        0x7e040281u,
-        0x7d840100u,
-        0xbf870001u,
-        0xbf82fffdu,
-        0xbe80038bu,              // s_mov_b32 s0,11
-        0xbe81038cu,              // s_mov_b32 s1,12
-        0xbf800000u,              // s12 remains a dynamic entry user SGPR
-        0xbf07800cu,              // SCC=(s12 != 0), so both CFG successors remain reachable
-        0xbf840002u,              // s_cbranch_scc0 +2 -> scalar-data predecessor
-        0xbe84046au,              // mask predecessor: s_mov_b64 s[4:5],vcc
-        0xbf820001u,              // -> join
-        0xbe840400u,              // data predecessor: s_mov_b64 s[4:5],s[0:1]
-        0xbf138004u,              // join consumer: s_cmp_lg_u64 s[4:5],0
+        // Retain the physical ballot at a genuine entry producer, before dispatcher control.
+        0x7d8400f9u, 0x06069400u,   // v_cmp_eq_u32_sdwa s[20:21], v0, v0
+        0x7e040280u,   // irreducible dispatcher prefix (same shape as kernel 17d)
+        0x7d840100u, 0xbf860001u, 0x7e040281u, 0x7d840100u, 0xbf870001u, 0xbf82fffdu,
+        0xbe80038bu,   // s_mov_b32 s0,11
+        0xbe81038cu,   // s_mov_b32 s1,12
+        0xbf800000u,   // s12 remains a dynamic entry user SGPR
+        0xbf07800cu,   // SCC=(s12 != 0), so both CFG successors remain reachable
+        0xbf840002u,   // s_cbranch_scc0 +2 -> scalar-data predecessor
+        0xbe840414u,   // mask predecessor: s_mov_b64 s[4:5],s[20:21]
+        0xbf820001u,   // -> join
+        0xbe840400u,   // data predecessor: s_mov_b64 s[4:5],s[0:1]
+        0xbf138004u,   // join consumer: s_cmp_lg_u64 s[4:5],0
         0xbf810000u,
     };
     const std::vector<uint32_t> pair_ambiguous_join_words(
@@ -8394,6 +8392,12 @@ int main() {
     pair_ambiguous_portable_config.user_sgprs.resize(13);
     ComputeShaderConfig pair_ambiguous_native_config = cselect_native_config;
     pair_ambiguous_native_config.user_sgprs.resize(13);
+    const auto pair_ambiguous_missing_launch = pair_ambiguous_native_config;
+    // Ballot DATA requires raw launch words proving complete guest waves; a required host
+    // subgroup width alone supplies no guest entry EXEC. Keep that missing-input twin refused.
+    prosper::test::complete_compute_launch(pair_ambiguous_native_config);
+    CHECK(compile_cselect_pair(pair_ambiguous_join_words, pair_ambiguous_missing_launch).empty(),
+          "a required native subgroup width does not supply the missing raw ballot launch");
     const auto pair_ambiguous_portable = compile_cselect_pair(
         pair_ambiguous_join_words, pair_ambiguous_portable_config);
     const auto pair_ambiguous_native = compile_cselect_pair(
@@ -8406,38 +8410,32 @@ int main() {
                !compile_cselect_pair(words, pair_ambiguous_native_config).empty();
     };
     std::vector<uint32_t> pair_ambiguous_low_overwrite = pair_ambiguous_join_words;
-    pair_ambiguous_low_overwrite.insert(
-        pair_ambiguous_low_overwrite.begin() + 15,
-        0xbe840380u);              // overwrite only s4 after the join
-    pair_ambiguous_low_overwrite[16] =
-        0x7e020205u;               // read untouched ambiguous s5
+    pair_ambiguous_low_overwrite.insert(pair_ambiguous_low_overwrite.begin() + 17,
+                                        0xbe840380u);   // overwrite only s4 after the join
+    pair_ambiguous_low_overwrite[18] = 0x7e020205u;   // read untouched ambiguous s5
     CHECK(portable_rejects_native_materializes(pair_ambiguous_low_overwrite),
           "portable ambiguity survives a low overwrite; native retains the ballot high word");
 
     std::vector<uint32_t> pair_ambiguous_high_overwrite = pair_ambiguous_join_words;
-    pair_ambiguous_high_overwrite.insert(
-        pair_ambiguous_high_overwrite.begin() + 15,
-        0xbe850380u);              // overwrite only s5 after the join
-    pair_ambiguous_high_overwrite[16] =
-        0x7e020204u;               // read untouched ambiguous s4
+    pair_ambiguous_high_overwrite.insert(pair_ambiguous_high_overwrite.begin() + 17,
+                                         0xbe850380u);   // overwrite only s5 after the join
+    pair_ambiguous_high_overwrite[18] = 0x7e020204u;   // read untouched ambiguous s4
     CHECK(portable_rejects_native_materializes(pair_ambiguous_high_overwrite),
           "portable ambiguity survives a high overwrite; native retains the ballot low word");
 
     std::vector<uint32_t> pair_ambiguous_addk = pair_ambiguous_join_words;
-    pair_ambiguous_addk[15] =
-        0xb7840001u;               // s_addk_i32 s4,1 implicitly reads/writes SDST
+    pair_ambiguous_addk[17] = 0xb7840001u;   // s_addk_i32 s4,1 implicitly reads/writes SDST
     CHECK(portable_rejects_native_materializes(pair_ambiguous_addk),
           "portable ambiguity rejects an implicit SOPK read while native has ballot words");
 
     std::vector<uint32_t> pair_ambiguous_cmpk = pair_ambiguous_join_words;
-    pair_ambiguous_cmpk[15] =
-        0xb2050000u;               // s_cmpk_lg_i32 s5,0 implicitly reads SDST
+    pair_ambiguous_cmpk[17] = 0xb2050000u;   // s_cmpk_lg_i32 s5,0 implicitly reads SDST
     CHECK(portable_rejects_native_materializes(pair_ambiguous_cmpk),
           "portable ambiguity rejects a SOPK compare while native has ballot words");
 
     std::vector<uint32_t> pair_ambiguous_bitset = pair_ambiguous_join_words;
-    pair_ambiguous_bitset[15] =
-        0xbe841d81u;               // s_bitset1_b32 s4,1 reads old SDST and an explicit bit index
+    pair_ambiguous_bitset[17] =
+        0xbe841d81u;   // s_bitset1_b32 s4,1 reads old SDST and an explicit bit index
     CHECK(portable_rejects_native_materializes(pair_ambiguous_bitset),
           "portable ambiguity rejects a SOP1 bitset while native has ballot words");
 
