@@ -531,33 +531,41 @@ dispatcher broadcasts do not pass through that lane-local lowering.
 
 The same 4,000-entry corpus compares 3,567 recorded-input replays and 433 stage probes:
 
-- Three compute entries become accepted, all with unloaded-only roots. Two use fresh predicates;
-  the third uses fresh predicates and loop-carried reads. Every emitted module passes `spirv-val`.
+- One compute entry becomes accepted, with unloaded-only roots at both fresh CMPX reads
+  (PCs 34 and 43). Its emitted module passes `spirv-val`.
 - No accepted output changes and no accepted program becomes refused. The comparison hashes
   1,538 existing outputs; supplemental exports through the identical public table-less compute
   entry point hash the other five, also unchanged. All ten supplemental modules validate.
-- Eight entries remain refused with a changed reason: seven stop earlier and one reaches a later
-  MIMG address refusal. Six name missing scalar publications; the others retain an unresolved
-  operand or address. One previously refused fragment replay becomes incomplete because
-  it needs a semantic choice absent from its old trace. No missing choice is guessed.
-- The remaining policy-1 cohort has 567 entries, including the named scalar-publication boundary.
-  Origin counts overlap when an entry has several roots; none has only unloaded roots and none is unclassified.
+- Ten entries remain refused with a changed reason: seven stop earlier and three reach later
+  Hard reads. These retain lost definitions, missing scalar publications, memory-result or
+  unresolved-operand obligations. One previously refused fragment replay becomes incomplete
+  because its old semantic-read trace cannot supply the new compilation sequence. No missing
+  choice is guessed.
+- The terminal policy-1 cohort has 570 entries. Origin groups overlap; none has only unloaded
+  roots and none is unclassified.
 
-| Origin | Remaining entries | Roots |
-| --- | ---: | ---: |
-| unloaded (mixed with Hard roots) | 32 | 1,284 |
-| launch-input | 473 | 478 |
-| unknown-launch | 71 | 573 |
-| lost-definition | 12 | 12 |
-| unmodelled-transfer | 5 | 5 |
-| unproved-memory-result | 14 | 311 |
-| unproved-strong-read | 1 | 1 |
-| unmodelled-scalar-publication | 6 | 6 |
-| spill / trace-budget / unreachable | 0 | 0 |
+| Origin | Terminal entries | Terminal roots | Entries including auxiliary causes | Roots including auxiliary causes |
+| --- | ---: | ---: | ---: | ---: |
+| unloaded (mixed with Hard roots) | 35 | 1,343 | 138 | 3,669 |
+| launch-input | 473 | 478 | 476 | 482 |
+| unknown-launch | 71 | 573 | 648 | 2,906 |
+| lost-definition | 12 | 12 | 31 | 34 |
+| unmodelled-transfer | 5 | 5 | 8 | 8 |
+| unproved-memory-result | 17 | 333 | 42 | 1,088 |
+| unproved-strong-read | 1 | 1 | 1 | 1 |
+| unmodelled-scalar-publication | 3 | 3 | 3 | 3 |
+| spill / trace-budget / unreachable | 0 | 0 | 0 | 0 |
 
-These counts use the recorded terminal identities. Some Wave64 dispatcher summaries omit a
-lowering's named cause even when its auxiliary diagnostic retains it (#5529). The table covers
-the 567 identified entries; it is not a complete inventory of every auxiliary policy refusal.
+Some Wave64 dispatcher summaries omit a lowering's named cause even when its auxiliary
+record retains it (#5529). Retaining the full `PROSPER_DBG=1` diagnostic stream from the same
+invocations identifies **957 refused entries with a named policy record**, including the 570
+terminal entries and 387 additional auxiliary entries (330 recorded-input replays, 57 stage
+probes). Auxiliary roots include failed alternative lowering paths; they are not all the final
+refusal's dependencies. The last two columns union each refused entry's terminal and auxiliary
+roots, without counting duplicate roots within an entry. Stage diagnostics reuse the corpus
+runner's representative for identical stage/code hashes. Independent token accounting agrees,
+and substituting an origin in a real diagnostic changes the aggregate. These wider counts are
+separate from the terminal-only census command above.
 
 The 27 dumped GTA/Kena programs retain the preceding measurement's nine accepted, fifteen refused
 and three missing-sidecar results. All nine accepted modules validate and retain their hashes.
@@ -574,8 +582,9 @@ The other refused game programs retain the earlier table's separate MIMG, VCC-ex
 reasons. This is an offline census, with no game run.
 
 The three MOUSE UI captures add a further replay limitation: `ps_403f306100` and
-`ps_4043ba9200` pass their unloaded-only predicate but need additional recorded semantic choices,
-so their old sidecars now report incomplete. `ps_4043ca3f00` still refuses with launch-input
+`ps_4043ba9200` encounter unloaded-only predicates on the strict attempt, but their old semantic
+read traces cannot replay the new strict-then-retry compilation sequence and now report incomplete.
+This does not establish that their retries reached the old predicate PCs. `ps_4043ca3f00` still refuses with launch-input
 `v0/v1` alongside unloaded roots. Fresh live captures and visible portrait verification remain
 necessary; these are not claimed as accepted modules.
 
