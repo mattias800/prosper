@@ -579,15 +579,17 @@ so their old sidecars now report incomplete. `ps_4043ca3f00` still refuses with 
 `v0/v1` alongside unloaded roots. Fresh live captures and visible portrait verification remain
 necessary; these are not claimed as accepted modules.
 
-Nine synthetic interpreter witnesses fail against the merged diagnostic-only compiler and pass
-with admission. They cover integer/float predicates, CMPX, saved SDWA predicates, narrowed writes,
-vector/scalar loop carries, and real scalar-buffer data beside an unloaded root. Three actual
-exact64 GPU dispatches cover both wave halves and CMPX's active-lane count. Eight existing
-scalar-selector/loop originals now execute their consistent arbitrary values; same-consumer twins
-with genuine missing spills remain refused. An agreeing READFIRST source retains its established
-proof. All 25 exported synthetic modules validate. The delayed vector-body original remains Hard at
-its legacy READFIRST publication; its genuine and complete-replacement controls retain their
-existing successful output.
+Thirteen synthetic interpreter witnesses fail against the merged diagnostic-only compiler and
+pass with admission. They cover integer/float predicates, CMPX, saved SDWA predicates, narrowed
+writes, vector/scalar loop carries, scalar and READLANE relays, implicit scalar compares, ordinary
+data reads beside an unloaded predicate, real scalar-buffer data, and a provided spill containing
+an unloaded value. Seven actual exact64 GPU dispatches exercise both wave halves, CMPX's active
+lane count, and the relay/data/spill paths. Five existing selector/loop fixtures also execute both
+scalar branch inputs; real missing spills remain refused. An agreeing READFIRST source retains its
+established proof. All exported synthetic modules validate. Three loop originals whose computed
+scalar values are discarded retain `lost-definition`; the delayed vector-body original remains
+Hard at its legacy READFIRST publication. Their genuine and complete-replacement controls retain
+the existing successful output.
 
 Mutation controls deny unloaded admission, admit Hard roots, lose scalar-load publication, keep
 a stale retry refusal, or disconnect the observer; each is detected. The actual #4943 missing-spill
@@ -600,6 +602,22 @@ summary. Window counts are successful retry compilations and static read sites, 
 executed lane reads. Failed retries publish their actual refusal and no admission count.
 
 #### Ruled out during admission qualification (2026-10-27)
+
+- **An unloaded predicate makes unrelated ordinary reads safe.** Synthetic retries still read an
+  unknown possible scratch-offset `s12`, or export/store an unsupplied fragment launch `v0`.
+  Bypassing the actual operand and direct-memory/export guards admits these real missing inputs.
+  Both instruction orders and an implicit SOPK operand are covered. The provided unloaded twins
+  retain their existing values; the unrelated Hard roots still veto admission.
+- **A reaching computed value can be replaced by its unloaded input's storage zero.** A conditional
+  `s40 = 7` is discarded at a join. Without retaining that lost definition, the retry traces the
+  other path to an unloaded word and admits zero on both paths. The interpreter observes 22 instead
+  of the required 11 on the written path. This remains `lost-definition`, independently of the
+  missing path's Arbitrary value. Refs [#4560](https://github.com/mattias800/prosper/issues/4560).
+- **Loop lane-bit checks cover ordinary carried spill reads.** A loop can store a previous scalar
+  and then READLANE an untracked slot, without ever using that scalar as a predicate. The ordinary
+  carried value hid the missing spill. Guarding the actual READLANE producer retains `spill` on
+  both branch inputs. A slot actually written from an unloaded word remains admitted and executes
+  in the interpreter and on the GPU.
 
 - **The final public reason identifies every forced-dispatcher cause.** The delayed vector-body
   fixture's default route reports `exec-loop-widens`; its forced Wave64 dispatcher separately
