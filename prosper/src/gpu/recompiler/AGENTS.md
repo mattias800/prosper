@@ -1,5 +1,9 @@
 # `recompiler` — RDNA2 machine code → SPIR-V
 
+`rdna2_cfg_readfirstlane` emits the existing common-phase gather and returns its builder IDs.
+The dispatcher retains scalar-state publication, destination lifetimes and the final barrier.
+Its borrowed column layout grants no source or launch authority.
+
 `rdna2_native_participation` retains genuine scalar branch conditions across instructions
 whose canonical effects preserve SCC. This does not supply memory results or authenticate an
 unknown condition; scalar writes still expire their destination facts independently.
