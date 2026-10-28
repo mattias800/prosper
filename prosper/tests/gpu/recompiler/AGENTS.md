@@ -1,5 +1,10 @@
 # `tests/gpu/recompiler` — translation tests and the legacy compute execution fixture
 
+`test_portable_wave32_readfirstlane` executes real scalar publications after an independently
+admitted unloaded predicate. Partial and multiple guest waves, empty EXEC and numeric VCC
+destinations run through the interpreter and ordinary Vulkan compute. Adjacent B32 lifetimes
+survive; overlapping B64 masks, unsupported mask projections and missing inputs stay refused.
+
 `test_native_scc_preservation` observes physical saved-mask words after an SCC branch with an
 intervening scalar load. Both branch outcomes execute in the interpreter and on a required
 Wave64 subgroup; a missing entry condition stays unproved. The no-load/no-branch controls

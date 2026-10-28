@@ -1,5 +1,6 @@
 // Owned logical-wave memory and event helpers, shared by the existing ALU/CFG emitters.
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 
 namespace prosper::gpu {
 bool emit_owned_raw_window(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, uint32_t n,
@@ -43,10 +44,13 @@ bool owned_or_portable_readfirstlane_enabled(const SpirvCompute& b) {
 }
 bool owned_or_portable_readfirstlane_candidate(const SpirvCompute& b, const Rdna2Inst& in) {
     const bool owned = b.guest_wave_event_domain == GuestWaveEventDomain::Owned64 &&
-                       b.has_workgroup_execution() && b.local_count == 64;
-    return (owned || (b.portable_readfirstlane_shader && b.is_compute)) && b.wave_size == 64 &&
-           !b.native_subgroup_size && b.local_count > 0 && in.fmt == Rdna2Format::VOP1 &&
-           in.opcode == 0x02 && in.src[0].kind == OperandKind::VGPR && in.dst.value >= 0 &&
+                       b.has_workgroup_execution() && b.local_count == 64 && b.wave_size == 64;
+    const bool portable = b.guest_wave_event_domain != GuestWaveEventDomain::Owned64 &&
+                          b.portable_readfirstlane_shader && b.is_compute &&
+                          (b.wave_size == 32 || b.wave_size == 64);
+    return (owned || portable) && !b.native_subgroup_size && b.local_count > 0 &&
+           in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02 &&
+           in.src[0].kind == OperandKind::VGPR && in.dst.value >= 0 &&
            in.dst.value <= (owned ? 105 : 107) && !in.has_sdwa && !in.has_dpp && !in.src_abs[0] &&
            !in.src_neg[0] && !in.clamp && !in.omod;
 }

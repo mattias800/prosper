@@ -4,6 +4,7 @@
 // rdna2_to_spirv.cpp. Shared state lives in gpu/recompiler/rdna2_to_spirv_internal.hpp.
 #include <atomic>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
 #include "gpu/recompiler/rdna2_cfg_use_proofs.hpp"
 #include "gpu/recompiler/ir/cfg/structured_loop_cursor.hpp"
 #include "gpu/recompiler/smem_x16_descriptor_proof.hpp"
@@ -3455,6 +3456,10 @@ bool emit_cfg_state_machine(
                 b.uconst(static_cast<uint32_t>(mask_ffbh->dst.value)));
         }
         if (readfirstlane) {
+            bool source_ok = true;
+            if (refuse_arbitrary_placeholder_operand(b, state, *readfirstlane,
+                                                     readfirstlane->src[0], &source_ok))
+                return false;
             const auto source = state.vreg.find(readfirstlane->src[0].value);
             if (source == state.vreg.end() ||
                 state.vgpr_lane_slots.contains(readfirstlane->src[0].value) ||
@@ -3471,12 +3476,15 @@ bool emit_cfg_state_machine(
             state.sreg_input.erase(readfirstlane->dst.value);
             state.sreg_srt.erase(readfirstlane->dst.value);
             for (int base : {readfirstlane->dst.value, readfirstlane->dst.value - 1}) {
+                if (base != readfirstlane->dst.value && state.sreg_bool_b32.contains(base))
+                    continue;
                 state.sreg_bool.erase(base);
                 state.sreg_bool_narrowed.erase(base);
                 state.sreg_bool_b32.erase(base);
                 state.sreg_wave64_mask_half.erase(base);
             }
-            if (readfirstlane->dst.value == 106 || readfirstlane->dst.value == 107)
+            if (readfirstlane->dst.value == 106 ||
+                (readfirstlane->dst.value == 107 && b.wave_size == 64))
                 state.vcc = 0;
         }
         if (readlane) {
@@ -4674,9 +4682,13 @@ bool emit_cfg_state_machine(
         }
         const auto clear_overlapping_masks = [&](const auto& vars) {
             for (const auto& [reg, var] : vars) {
-                const uint32_t overlaps = b.lor(
-                    b.ucmp(Op_IEqual, dst, b.uconst(static_cast<uint32_t>(reg))),
-                    b.ucmp(Op_IEqual, dst, b.uconst(static_cast<uint32_t>(reg + 1))));
+                // Wave32 MUST domains already expire overlapping B64 lifetimes. The adjacent
+                // B32 lifetime may remain live and must retain its independently stored bit.
+                const uint32_t overlaps =
+                    b.wave_size == 32
+                        ? b.ucmp(Op_IEqual, dst, b.uconst(static_cast<uint32_t>(reg)))
+                        : b.lor(b.ucmp(Op_IEqual, dst, b.uconst(static_cast<uint32_t>(reg))),
+                                b.ucmp(Op_IEqual, dst, b.uconst(static_cast<uint32_t>(reg + 1))));
                 b.store_function(var, b.bsel(b.land(pending, overlaps), no,
                     b.load_function(b.t_bool, var)));
             }

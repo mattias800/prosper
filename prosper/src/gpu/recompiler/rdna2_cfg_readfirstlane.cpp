@@ -31,7 +31,8 @@ CfgReadfirstlaneResult emit_cfg_readfirstlane_gather(SpirvCompute& b,
         b.emit_selmerge(assembled);
         b.emit_condbranch(is_leader, leader, assembled);
         b.emit_label(leader);
-        const uint32_t base = b.ibin(Op_ShiftLeftLogical, mbcnt_wave_index, b.uconst(6));
+        const uint32_t base = b.ibin(Op_ShiftLeftLogical, mbcnt_wave_index,
+                                     b.uconst(b.wave_size == 32 ? 5u : 6u));
         const auto lane_metadata = [&](uint32_t lane) {
             const uint32_t index = b.ibin(Op_IAdd, base, b.uconst(lane));
             if (padded_lanes == b.local_count)
@@ -48,14 +49,14 @@ CfgReadfirstlaneResult emit_cfg_readfirstlane_gather(SpirvCompute& b,
         uint32_t service_tag = tag;
         if (partial_wave) {
             service_tag = zero;
-            for (uint32_t lane = 0; lane < 64; ++lane) {
+            for (uint32_t lane = 0; lane < b.wave_size; ++lane) {
                 const uint32_t candidate = b.ibin(Op_ShiftRightLogical,
                     lane_metadata(lane), b.uconst(1));
                 service_tag = b.sel(b.ucmp(Op_IEqual, service_tag, zero), candidate, service_tag);
             }
         }
         uint32_t first = b.uconst(UINT32_MAX);
-        for (uint32_t lane = 0; lane < 64; ++lane) {
+        for (uint32_t lane = 0; lane < b.wave_size; ++lane) {
             const uint32_t metadata = lane_metadata(lane);
             const uint32_t include = b.land(
                 b.ucmp(Op_IEqual, b.ibin(Op_ShiftRightLogical, metadata, b.uconst(1)), service_tag),
