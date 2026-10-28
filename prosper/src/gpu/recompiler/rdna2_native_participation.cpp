@@ -383,7 +383,9 @@ Facts transfer(const Facts& before, const SpirvCompute& b, const Rdna2Inst& in) 
     }
     if (in.fmt == Rdna2Format::SOP1 || in.fmt == Rdna2Format::SOP2 || in.fmt == Rdna2Format::SOPK ||
         in.fmt == Rdna2Format::SMEM) {
-        f.scc = {};
+        // Preserve the current SCC only for an inventoried non-writer; unknown scalar effects
+        // still kill its proof. SMEM does not write SCC (ISA 70648 sections 3.8 and 7.2).
+        if (rdna2_writes_scc(in.fmt, in.opcode) != Rdna2Answer::No) f.scc = {};
         if (rdna2_instruction_may_change_exec(in)) f.exec = {};
         return f;
     }
