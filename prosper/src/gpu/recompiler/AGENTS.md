@@ -1,5 +1,9 @@
 # `recompiler` — RDNA2 machine code → SPIR-V
 
+`rdna2_native_participation` retains genuine scalar branch conditions across instructions
+whose canonical effects preserve SCC. This does not supply memory results or authenticate an
+unknown condition; scalar writes still expire their destination facts independently.
+
 Native compute SAVEEXEC destinations in VCC share producer-time physical-word retention with
 ordinary saved SGPR masks. The existing original-launch and participation proofs still own
 ballot authority; later scalar consumers retain the old EXEC words across one-word overwrites.

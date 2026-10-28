@@ -1,5 +1,10 @@
 # `tests/gpu/recompiler` — translation tests and the legacy compute execution fixture
 
+`test_native_scc_preservation` observes physical saved-mask words after an SCC branch with an
+intervening scalar load. Both branch outcomes execute in the interpreter and on a required
+Wave64 subgroup; a missing entry condition stays unproved. The no-load/no-branch controls
+separate condition preservation from memory-result ownership.
+
 `test_native_vcc_carry_replacement` observes both numeric VCC words after an implicit carry
 overwrites a saved EXEC mask or numeric literal. Straight-line and real dispatcher reloads distinguish emitted
 storage from MUST facts, with explicit replacements, mask readers and independent Wave32 high
