@@ -1,5 +1,9 @@
 # `recompiler` — RDNA2 machine code → SPIR-V
 
+`rdna2_scalar_vcc_retirement` retires mask views overwritten by scalar DATA writes.
+An independent Wave32 B32 neighbor survives; an overlapping pair or Wave64 view does not.
+Retaining a neighbor neither projects the new DATA nor supplies a missing input.
+
 `rdna2_cfg_readfirstlane` emits the existing common-phase gather and returns its builder IDs.
 The dispatcher retains scalar-state publication, destination lifetimes and the final barrier.
 Its borrowed column layout grants no source or launch authority.

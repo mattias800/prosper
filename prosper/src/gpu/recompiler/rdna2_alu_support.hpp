@@ -7,6 +7,7 @@
 #include "gpu/recompiler/rdna2_native_launch.hpp"
 #include "gpu/recompiler/rdna2_saved_mask_words.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
+#include "gpu/recompiler/rdna2_scalar_vcc_retirement.hpp"
 
 // Lifted out of rdna2_to_spirv.cpp's anonymous namespaces so the emit functions that
 // operate on them can live in their own translation units. These are INTERNAL to the
@@ -594,13 +595,17 @@ inline bool scalar_mask_write_is_vcc_only(const Rdna2Inst& in) {
 struct VccMaskViewDrop {
     SpirvCompute& b;
     RegState& rs;
+    int untouched_b32_word = -1;
     bool on = false;
     std::set<uint64_t> projection_roots;
     VccMaskViewDrop(SpirvCompute& builder, RegState& state) : b(builder), rs(state) {}
     VccMaskViewDrop(const VccMaskViewDrop&) = delete;
     VccMaskViewDrop& operator=(const VccMaskViewDrop&) = delete;
     ~VccMaskViewDrop() {
-        if (on) drop_vcc_mask_view(rs);
+        if (on) {
+            retire_scalar_vcc_mask_view(rs, untouched_b32_word);
+            return;   // numeric DATA did not publish a predicate, including a preserved neighbor
+        }
         if (projection_roots.empty()) return;
         // Plain scalar arithmetic retires VCC's Bool spelling. Its DATA result has not
         // observed any lane bits. Charge the entry guard's provisional projection only
@@ -655,6 +660,8 @@ inline bool refuse_mask_write(SpirvCompute& b, const RegState& rs, const Rdna2In
     if (projectable) return false;
     if (scalar_mask_write_is_vcc_only(in)) {
         drop.on = true;   // VCC as scalar scratch: data kept, no lane view
+        if (b.wave_size == 32 && scalar_write_width(in) == 1)
+            drop.untouched_b32_word = 213 - in.dst.value;
         return false;
     }
     b.stage_reject_pc = in.pc;

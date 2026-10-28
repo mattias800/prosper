@@ -6553,6 +6553,12 @@ endif()
         LIBRARIES prosper_core Vulkan::Vulkan
         LABELS gpu)
 
+      prosper_add_gtest(test_wave32_vcc_mask_lifetime
+        SOURCES tests/gpu/recompiler/test_wave32_vcc_mask_lifetime.cpp
+        INCLUDES tests tests/gpu/recompiler
+        LIBRARIES prosper_core Vulkan::Vulkan
+        LABELS gpu)
+
       prosper_add_gtest(test_native_scc_preservation
         SOURCES tests/gpu/recompiler/test_native_scc_preservation.cpp
         INCLUDES tests tests/gpu/recompiler
