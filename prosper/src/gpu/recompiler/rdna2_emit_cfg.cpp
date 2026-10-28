@@ -1406,11 +1406,10 @@ bool emit_cfg_state_machine(
                  portable_mask_common_pair_is_proven(b, in, pair_compare[1],
                                                      masks.contains(pair_compare[1])));
 
-            // Scalar-data presence and SCC validity share the same provenance contract. SOPK
-            // exposes its old SDST only as an implicit source; accepting ADDK, CMPK, or CMOVK after
-            // a dispatcher reload therefore requires that exact word to be a MUST scalar value.
-            // Check every dword of B64 inputs before the destination transfer ends the old lifetime.
-            auto source_is_scalar_range = [&](const Operand& source, uint32_t width) {
+            // Retain computed DATA independently of relay marks. SCC and mask proofs still
+            // require genuine sources; SOPK's implicit old SDST keeps its definite-word check.
+            auto source_is_scalar_range = [&](const Operand& source, uint32_t width,
+                                              bool value_only = false) {
                 if (source.kind == OperandKind::InlineInt ||
                     source.kind == OperandKind::InlineFloat ||
                     source.kind == OperandKind::Literal)
@@ -1426,15 +1425,20 @@ bool emit_cfg_state_machine(
                     (source.value == 126 || source.value == 127))
                     return width == 1 && b.is_compute && b.wave_size == 64 &&
                         b.native_subgroup_size == 64;
-                for (uint32_t word = 0; word < std::max(width, 1u); ++word)
-                    if (!definite_word(source.value + static_cast<int>(word))) return false;
+                for (uint32_t word = 0; word < std::max(width, 1u); ++word) {
+                    const int reg = source.value + static_cast<int>(word);
+                    if (value_only ? !scalar_words.contains(reg) : !definite_word(reg))
+                        return false;
+                }
                 return true;
             };
-            bool scalar_sources = true;   // not asked of a relative read: see the predicate
+            bool scalar_sources = true, scalar_values = true;
             for (uint32_t source = 0; source < in.n_src; ++source) {
                 const uint32_t width = scalar_alu_source_words(in, source);
-                if (width != UINT32_MAX && !s_movrels_b32_result_is_scalar_data(in))
+                if (width != UINT32_MAX && !s_movrels_b32_result_is_scalar_data(in)) {
                     scalar_sources &= source_is_scalar_range(in.src[source], width);
+                    scalar_values &= source_is_scalar_range(in.src[source], width, true);
+                }
             }
             bool implicit_scalar_source = true;
             if (implicit_scalar_words) {
@@ -1443,8 +1447,7 @@ bool emit_cfg_state_machine(
                     implicit_scalar_source &= definite_word(in.dst.value + static_cast<int>(word));
             }
             const bool scalar_alu_result = scalar_sources && implicit_scalar_source;
-            // Only intrinsic DATA has a numeric proof at a dispatcher reload. SGPR variable
-            // presence can be a descriptor/scalar placeholder, so raw SGPR WQM stays compact-only.
+            // WQM storage may be a placeholder, so only intrinsic DATA grants a numeric proof.
             const bool numeric_wqm = wqm_has_numeric_destination(in) &&
                 wqm_has_intrinsic_numeric_source(in);
             const bool vcc_pack_scalar_pair = b.is_compute && b.wave_size == 64 &&
@@ -1576,10 +1579,9 @@ bool emit_cfg_state_machine(
                             scalar_words.erase(base + static_cast<int>(word));
                 }
             } else if (valid_scc_read &&
-                       ((in.fmt != Rdna2Format::SOP1 &&
-                         in.fmt != Rdna2Format::SOP2 &&
-                         in.fmt != Rdna2Format::SOPK) || scalar_alu_result ||
-                        exact_mask_reduction)) {
+                       ((in.fmt != Rdna2Format::SOP1 && in.fmt != Rdna2Format::SOP2 &&
+                         in.fmt != Rdna2Format::SOPK) ||
+                        (scalar_values && implicit_scalar_source) || exact_mask_reduction)) {
                 for (const auto& [base, width] : scalar_writes)
                     for (uint32_t word = 0; word < width; ++word)
                         scalar_words.insert(base + static_cast<int>(word));
@@ -1595,11 +1597,8 @@ bool emit_cfg_state_machine(
             if (b32_vcc_scalar_write && !b32_vcc_scalar_result)
                 scalar_words.erase(in.dst.value);
 
-            // SCC is persisted through a dispatcher Function variable without a runtime validity
-            // tag. A scalar SOPC establishes a real Boolean, while the three exact whole-wave mask
-            // comparisons above establish one through their synchronized vote phase. Other scalar
-            // ALU writers need fully scalar sources or kill the fact. The resulting validity is a
-            // CFG MUST property, so a placeholder from any incoming edge still poisons the join.
+            // SCC needs genuine sources or an exact wave vote. Its persisted variable has no
+            // runtime validity tag, so a placeholder on any edge still poisons the CFG MUST join.
             if (in.fmt == Rdna2Format::SOPC) {
                 scalar_scc = scalar_sources;
             } else if (in.fmt == Rdna2Format::SOP2) {
@@ -2719,7 +2718,7 @@ bool emit_cfg_state_machine(
             }
             if (dispatch == UINT32_MAX)
                 for (int word : *entry_wave64_scalar_words)
-                    if (state.sreg.contains(word))
+                    if (state.sreg.contains(word) && !sreg_word_may_be_fabricated(state, word))
                         state.terminal_wave64_scalar_words.insert(word);
         } else if (filters_wave64_b64) {
             // An entry block the MUST walk never reached (only edges it does not model lead there:
