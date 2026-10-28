@@ -641,6 +641,7 @@ bool compute_extent_is_partial(const ComputeShaderConfig& config) {
 struct ComputeConstantFoldAttempt {
     bool changed = false;
     bool missing_mask_words = false;
+    bool missing_scalar_publication = false;
 };
 std::vector<uint32_t>
 recompile_compute_once(const uint32_t* code, size_t dwords, const ShaderResourceTable* rt,
@@ -648,7 +649,8 @@ recompile_compute_once(const uint32_t* code, size_t dwords, const ShaderResource
                        const PortableEntryExecRoot& entry, bool fold_constants = true,
                        ComputeConstantFoldAttempt* fold_attempt = nullptr,
                        std::vector<uint32_t>* store_loop_data_retry = nullptr,
-                       bool spilled_mask_bool_halves = false);
+                       bool spilled_mask_bool_halves = false,
+                       bool portable_wave32_readfirstlane = false);
 }   // namespace
 
 std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
@@ -667,6 +669,17 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     std::vector<uint32_t> store_loop_data_retry;
     std::vector<uint32_t> module = recompile_compute_once(
         code, dwords, rt, config, diagnostic, entry, true, &fold_attempt, &store_loop_data_retry);
+    if (module.empty() && fold_attempt.missing_scalar_publication &&
+        arbitrary_placeholder_retry_active() && config.wave_size == 32 &&
+        !config.native_subgroup_size) {
+        // Preserve every successful original route. A failed scalar publication can instead
+        // execute the real wave gather, through a fresh builder with all ordinary input guards.
+        RecompileDiagnosticAttempt broadcast_diagnostics;
+        module = recompile_compute_once(code, dwords, rt, config, diagnostic, entry, true, nullptr,
+                                        nullptr, false, true);
+        attempt_diagnostics.replace_with(broadcast_diagnostics);
+        return module;
+    }
     if (module.empty() && store_loop_data_retry.size() == dwords &&
         !store_loop_data_retry.empty() &&
         std::equal(store_loop_data_retry.begin(), store_loop_data_retry.end(), code) &&
@@ -763,8 +776,8 @@ recompile_compute_once(const uint32_t* code, size_t dwords, const ShaderResource
                        const ComputeShaderConfig& config, RecompileDiagnosticContext diagnostic,
                        const PortableEntryExecRoot& entry, bool fold_constants,
                        ComputeConstantFoldAttempt* fold_attempt,
-                       std::vector<uint32_t>* store_loop_data_retry,
-                       bool spilled_mask_bool_halves) {
+                       std::vector<uint32_t>* store_loop_data_retry, bool spilled_mask_bool_halves,
+                       bool portable_wave32_readfirstlane) {
     if (!config.float_transport.canonical()) return {};
     const bool has_null_guarded_raw_store = rt &&
         std::any_of(rt->resources.begin(), rt->resources.end(),
@@ -936,8 +949,10 @@ recompile_compute_once(const uint32_t* code, size_t dwords, const ShaderResource
         barrier_phases.found && !barrier_phases.guarded;
     b.native_subgroup_size = config.native_subgroup_size == wave_size &&
         local_count <= UINT32_MAX && local_count % wave_size == 0 ? wave_size : 0u;
-    const bool has_portable_readfirstlane = wave_size == 64 && !b.native_subgroup_size &&
-        !original_has_waterfall &&
+    const bool portable_readfirst_width =
+        wave_size == 64 || (wave_size == 32 && portable_wave32_readfirstlane);
+    const bool has_portable_readfirstlane =
+        portable_readfirst_width && !b.native_subgroup_size && !original_has_waterfall &&
         std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {
             return in.fmt == Rdna2Format::VOP1 && in.opcode == 0x02;
         });
@@ -953,8 +968,8 @@ recompile_compute_once(const uint32_t* code, size_t dwords, const ShaderResource
     // operations cannot be entered by only the real prefix of the final host subgroup.
     if (partial_barrier_phases || exact_partial_dispatcher)
         b.native_subgroup_size = 0;
-    b.portable_readfirstlane_shader = wave_size == 64 && !b.native_subgroup_size &&
-        !original_has_waterfall;
+    b.portable_readfirstlane_shader =
+        portable_readfirst_width && !b.native_subgroup_size && !original_has_waterfall;
     // PROSPER_DBG: report the inputs to that decision, not just its outcome (#2429).
     //
     // Every wave-width-dependent lowering in this file gates on `b.native_subgroup_size` -- the
@@ -1118,10 +1133,13 @@ recompile_compute_once(const uint32_t* code, size_t dwords, const ShaderResource
     const auto record_mask_word_failure = [&] {
         if (store_loop_data_retry && b.compute_store_loop_data_retry)
             *store_loop_data_retry = b.saved_mask_original_words;
-        if (fold_attempt)
+        if (fold_attempt) {
+            fold_attempt->missing_scalar_publication =
+                b.stage_reject_reason == "unmodelled-scalar-publication";
             fold_attempt->missing_mask_words =
                 b.stage_reject_reason == "saved-mask-physical-word-unavailable" ||
                 b.stage_reject_reason == "saved-mask-copy-words-unavailable";
+        }
     };
     if (config.force_exchange_dispatcher) {
         // ADR 0028 route 3 retry: every invocation of the workgroup runs the same persistent
