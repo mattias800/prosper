@@ -595,16 +595,15 @@ inline bool scalar_mask_write_is_vcc_only(const Rdna2Inst& in) {
 struct VccMaskViewDrop {
     SpirvCompute& b;
     RegState& rs;
-    const Rdna2Inst& instruction;
+    int untouched_b32_word = -1;
     bool on = false;
     std::set<uint64_t> projection_roots;
-    VccMaskViewDrop(SpirvCompute& builder, RegState& state, const Rdna2Inst& instruction)
-        : b(builder), rs(state), instruction(instruction) {}
+    VccMaskViewDrop(SpirvCompute& builder, RegState& state) : b(builder), rs(state) {}
     VccMaskViewDrop(const VccMaskViewDrop&) = delete;
     VccMaskViewDrop& operator=(const VccMaskViewDrop&) = delete;
     ~VccMaskViewDrop() {
         if (on) {
-            retire_scalar_vcc_mask_view(rs, instruction);
+            retire_scalar_vcc_mask_view(rs, untouched_b32_word);
             return;   // numeric DATA did not publish a predicate, including a preserved neighbor
         }
         if (projection_roots.empty()) return;
@@ -661,6 +660,8 @@ inline bool refuse_mask_write(SpirvCompute& b, const RegState& rs, const Rdna2In
     if (projectable) return false;
     if (scalar_mask_write_is_vcc_only(in)) {
         drop.on = true;   // VCC as scalar scratch: data kept, no lane view
+        if (b.wave_size == 32 && scalar_write_width(in) == 1)
+            drop.untouched_b32_word = 213 - in.dst.value;
         return false;
     }
     b.stage_reject_pc = in.pc;

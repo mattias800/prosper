@@ -3,6 +3,5 @@
 
 namespace prosper::gpu {
 struct RegState;
-struct Rdna2Inst;
-void retire_scalar_vcc_mask_view(RegState& state, const Rdna2Inst& instruction);
+void retire_scalar_vcc_mask_view(RegState& state, int untouched_word);
 }   // namespace prosper::gpu
