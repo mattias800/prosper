@@ -104,7 +104,7 @@ TEST(Wave32VccMaskLifetime, NumericScratchDoesNotRetainItsOwnMask) {
 
 TEST(Wave32VccMaskLifetime, PairOverwriteStillRetiresTheHighMask) {
     auto words = program(false);
-    words[8] = 0x92ea843cu;   // S_LSHL_B64 overwrites both VCC words
+    words[8] = 0x8fea843cu;   // S_LSHL_B64 overwrites both VCC words
     EXPECT_TRUE(compile(words).module.empty());
 }
 
