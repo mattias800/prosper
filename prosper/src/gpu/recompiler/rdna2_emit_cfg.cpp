@@ -1406,9 +1406,9 @@ bool emit_cfg_state_machine(
                  portable_mask_common_pair_is_proven(b, in, pair_compare[1],
                                                      masks.contains(pair_compare[1])));
 
-            // Scalar-data presence and SCC validity share the same provenance contract. SOPK
-            // exposes its old SDST only as an implicit source; accepting ADDK, CMPK, or CMOVK after
-            // a dispatcher reload therefore requires that exact word to be a MUST scalar value.
+            // Retain computed DATA even when its inputs carry relay marks. Those marks follow
+            // the result independently; erasing its numeric lifetime loses the computation at
+            // the next dispatcher reload. SOPK's implicit old SDST keeps its definite-word check.
             // Check every dword of B64 inputs before the destination transfer ends the old lifetime.
             auto source_is_scalar_range = [&](const Operand& source, uint32_t width) {
                 if (source.kind == OperandKind::InlineInt ||
@@ -1427,7 +1427,7 @@ bool emit_cfg_state_machine(
                     return width == 1 && b.is_compute && b.wave_size == 64 &&
                         b.native_subgroup_size == 64;
                 for (uint32_t word = 0; word < std::max(width, 1u); ++word)
-                    if (!definite_word(source.value + static_cast<int>(word))) return false;
+                    if (!scalar_words.contains(source.value + static_cast<int>(word))) return false;
                 return true;
             };
             bool scalar_sources = true;   // not asked of a relative read: see the predicate

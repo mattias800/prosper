@@ -27,19 +27,20 @@ std::vector<uint32_t> compile(const std::vector<uint32_t>& code) {
 void expect_seven(const std::vector<uint32_t>& code, const std::vector<float>& input) {
     const auto module = compile(code);
     ASSERT_FALSE(module.empty());
-    const auto output = prosper::test::run_compute(module, input, 64, 64);
+    const auto output = prosper::test::run_compute(module, input, 64, 64, {}, {}, nullptr, 64,
+                                                  nullptr, nullptr, nullptr, 64);
     ASSERT_EQ(output.size(), 64u) << "A Vulkan device was found; dispatch must execute";
     std::vector<uint32_t> bits(output.size());
     std::memcpy(bits.data(), output.data(), bits.size() * sizeof(uint32_t));
     EXPECT_EQ(bits, std::vector<uint32_t>(64, 7));
 }
 bool device_available() {
-    return prosper::test::default_compute_subgroup_properties().size != 0;
+    return prosper::test::default_compute_required_subgroup_supported(64, 64);
 }
 } // namespace
 
 TEST(DispatchScalarValue, APartialVectorSourceRetainsItsComputedScalarAcrossTheSplit) {
-    if (!device_available()) GTEST_SKIP() << "no Vulkan compute device";
+    if (!device_available()) GTEST_SKIP() << "native Wave64 compute unavailable";
     std::vector<float> input(64, 1.0f);
     expect_seven(program(), input);
     // Lane 0 remains enabled; inactive other lanes do not supply READLANE's chosen word.
@@ -48,12 +49,12 @@ TEST(DispatchScalarValue, APartialVectorSourceRetainsItsComputedScalarAcrossTheS
 }
 
 TEST(DispatchScalarValue, ACompleteSourceRetainsTheSameComputedValue) {
-    if (!device_available()) GTEST_SKIP() << "no Vulkan compute device";
+    if (!device_available()) GTEST_SKIP() << "native Wave64 compute unavailable";
     expect_seven(program(true), std::vector<float>(64, 1.0f));
 }
 
 TEST(DispatchScalarValue, AStraightScalarRelayRetainsTheSameValue) {
-    if (!device_available()) GTEST_SKIP() << "no Vulkan compute device";
+    if (!device_available()) GTEST_SKIP() << "native Wave64 compute unavailable";
     auto code = program();
     code[7] = 0xbf800000u; // replace the conditional split with NOP
     expect_seven(code, std::vector<float>(64, 1.0f));
@@ -64,6 +65,6 @@ TEST(DispatchScalarValue, RetainedDataDoesNotEraseItsMaskInputObligation) {
 }
 
 TEST(DispatchScalarValue, ACompleteSourceCanStillProduceAFreshPredicate) {
-    if (!device_available()) GTEST_SKIP() << "no Vulkan compute device";
+    if (!device_available()) GTEST_SKIP() << "native Wave64 compute unavailable";
     expect_seven(program(true, true), std::vector<float>(64, 1.0f));
 }
