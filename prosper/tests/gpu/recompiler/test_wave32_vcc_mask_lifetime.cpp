@@ -30,6 +30,7 @@ fixture::Words program(bool writes_high, uint32_t source = 60) {
     words.push_back((writes_high ? 0x8f6b8400u : 0x8f6a8400u) | source);
     // Scalar scratch is non-projectable; only the independent, existing B32 mask survives.
     if (writes_high) {
+        // Observe the mask directly; CNDMASK's separate VCC source-mark pair guard stays intact.
         const fixture::Words suffix{
             0xbefe036au, 0x7e020287u,   // observe retained VCC_LO through EXEC, output 7
             0xbefe03c1u,   // restore full EXEC before storing the preserved old values
