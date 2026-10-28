@@ -3,6 +3,8 @@
 Native compute SAVEEXEC destinations in VCC share producer-time physical-word retention with
 ordinary saved SGPR masks. The existing original-launch and participation proofs still own
 ballot authority; later scalar consumers retain the old EXEC words across one-word overwrites.
+Implicit VOP2 carry writes expire the prior VCC DATA lifetime in both emission and dispatcher
+MUST facts; opcode membership comes from the existing carry-family definitions.
 
 `rdna2_arbitrary_placeholder_relative` guards each potentially selected VGPR at the legacy
 MOVRELS bank reader during admission retries. The existing bounded-index query supplies no

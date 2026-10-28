@@ -8,6 +8,7 @@
 // emit_alu's. All three write VCC_LO's Wave32 B32 lifetime together with `rs.vcc` (#5348).
 #include "gpu/recompiler/ir/lower/carry_mask_write.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_mask_write.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
 namespace prosper::gpu::ir {
@@ -44,11 +45,20 @@ void write_vop2_carry_mask(SpirvCompute& b, RegState& rs, uint32_t carry) {
     const uint32_t carry_mask = exec_masked_carry(b, rs, carry);
     // In Wave32 the implicit VCC is VCC_LO, the same destination as the VOP3B form's
     // `sdst = vcc_lo`, so it gets the same word write. Setting `rs.vcc` alone left the VCC_LO B32
-    // lifetime holding the previous mask (#5348). Wave64 has no B32 lifetime and is unchanged.
+    // lifetime holding the previous mask (#5348). Wave64 replaces both retained DATA words.
     if (wave32_b32_masks(b))
         write_b32_carry_word(rs, 106, carry_mask);
-    else
+    else {
+        if (b.wave_size == 64) {
+            mask_write_clobbers_pair(rs, 106);
+            rs.sreg_bool.erase(106);
+            rs.sreg_bool_narrowed.erase(106);
+            rs.sreg_bool_b32.erase(106);
+            rs.unavailable_saved_mask_words.erase(106);
+            rs.unavailable_saved_mask_words.erase(107);
+        }
         rs.vcc = carry_mask;
+    }
 }
 
 void write_vop3b_carry_mask(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok,

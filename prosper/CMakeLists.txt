@@ -6547,6 +6547,12 @@ endif()
         LIBRARIES prosper_core Vulkan::Vulkan
         LABELS gpu)
 
+      prosper_add_gtest(test_native_vcc_carry_replacement
+        SOURCES tests/gpu/recompiler/test_native_vcc_carry_replacement.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan
+        LABELS gpu)
+
       prosper_add_gtest(test_native_saveexec_vcc_data
         SOURCES tests/gpu/recompiler/test_native_saveexec_vcc_data.cpp
         INCLUDES tests

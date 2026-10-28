@@ -1,4 +1,5 @@
 #include "gpu/recompiler/rdna2_saved_mask_words.hpp"
+#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_placeholder_origin_memory.hpp"
 #include "gpu/recompiler/rdna2_native_launch.hpp"

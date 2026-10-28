@@ -56,3 +56,7 @@ local declarations alive while later stages borrow their references and existing
 `image_resolution_routes.*` owns the existing unresolved-MIMG reports and diagnostic branch.
 It borrows the parent lookup helpers and resolution state; reporting keys, static deduplication,
 diagnostic selection and refusal order remain together, while descriptor lookup stays in `emit_alu`.
+
+`carry_mask_write` owns carry destinations' mask-domain state as well as their current predicate.
+Wave32 writes one word and preserves an independent VCC high word; Wave64 implicit writes retire
+both old numeric words before publishing the new VCC lifetime. Arithmetic stays in `ops/vector_carry`.

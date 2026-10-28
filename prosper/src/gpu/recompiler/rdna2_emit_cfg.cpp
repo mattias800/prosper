@@ -9,6 +9,7 @@
 #include "gpu/recompiler/smem_x16_descriptor_proof.hpp"
 #include "gpu/recompiler/fragment_packet_definedness.hpp"
 #include "gpu/recompiler/rdna2_packet_raw_masks.hpp"
+#include "gpu/recompiler/ir/ops/vector_carry.hpp"
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
@@ -1475,10 +1476,11 @@ bool emit_cfg_state_machine(
                 b.wave_size == 64 && source_is_mask(in.src[0]) &&
                 (b.is_fragment || (b.is_compute && b.native_subgroup_size == 64));
 
-            int mask_write = -1;
+            int mask_write =
+                in.fmt == Rdna2Format::VOP2 && ir::find_vector_carry(in.fmt, in.opcode) ? 106 : -1;
             if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode)) {
-                mask_write = in.dst.kind == OperandKind::SGPR && in.dst.value <= 105
-                    ? in.dst.value : 106;
+                mask_write =
+                    in.dst.kind == OperandKind::SGPR && in.dst.value <= 105 ? in.dst.value : 106;
             } else if (in.fmt == Rdna2Format::SOP1 && in.dst.value <= 107) {
                 if (packet_wqm)
                     mask_write = in.dst.value;
@@ -1534,15 +1536,16 @@ bool emit_cfg_state_machine(
             // guarantees the untouched high half cannot be observed before a complete replacement.
             // It is therefore safe to clear the pair-domain ambiguity for this path; a later join
             // with a mask path will recreate the ambiguity in the ordinary MUST merge below.
-            if (b.is_compute && b.vcc_b32_low_only_pcs.contains(in.pc) &&
-                b32_vcc_scalar_result)
+            if (b.is_compute && b.vcc_b32_low_only_pcs.contains(in.pc) && b32_vcc_scalar_result)
                 ambiguous.erase(106);
-            // An implicit VOPC destination is architectural VCC and is absent from the explicit
+            // Implicit VOPC and carry destinations are architectural VCC, absent from the explicit
             // scalar-writer inventory.
-            if (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
-                !(in.dst.kind == OperandKind::SGPR && in.dst.value <= 105)) {
+            if ((in.fmt == Rdna2Format::VOP2 && mask_write == 106) ||
+                (in.fmt == Rdna2Format::VOPC && !vopc_is_cmpx(in.opcode) &&
+                 !(in.dst.kind == OperandKind::SGPR && in.dst.value <= 105))) {
+                if (in.fmt == Rdna2Format::VOP2) scalar_writes.emplace_back(106, 2);
                 erase_overlapping(106, 2);
-                // VOPC writes a complete Wave64 mask even though it has no explicit scalar
+                // The writer replaces a complete Wave64 mask despite having no explicit scalar
                 // destination in the generic write inventory. End both physical words' old
                 // scalar lifetimes: retaining them can falsely classify a later one-word VCC_LO
                 // overwrite as a complete scalar pair after a dispatcher reload.
