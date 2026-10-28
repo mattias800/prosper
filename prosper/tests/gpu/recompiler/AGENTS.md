@@ -1,5 +1,10 @@
 # `tests/gpu/recompiler` — translation tests and the legacy compute execution fixture
 
+`test_ngg_scalar_vcc_barrier` keeps retained numeric DATA separate from the terminal facts
+that can reconstruct VCC after a barrier. One-arm spill negatives cover both physical words;
+fully supplied arms execute both branch outcomes in the interpreter and on a required Wave64
+subgroup. The test drives the real dispatcher phases with their explicit NGG workgroup context.
+
 `test_dispatch_scalar_value` executes scalar DATA across a forced dispatcher reload after
 a partial vector write and a fixed READLANE. Execution inputs enable the selected lane;
 complete-source and straight-line controls separate value loss from missing input. The paired

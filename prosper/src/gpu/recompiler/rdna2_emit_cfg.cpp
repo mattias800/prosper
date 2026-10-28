@@ -1597,9 +1597,8 @@ bool emit_cfg_state_machine(
             if (b32_vcc_scalar_write && !b32_vcc_scalar_result)
                 scalar_words.erase(in.dst.value);
 
-            // SCC's dispatcher variable carries no runtime validity tag. SOPC or an exact
-            // whole-wave vote establishes its Boolean; other scalar ALU writers need genuine
-            // sources. A placeholder on any incoming edge still poisons the CFG MUST join.
+            // SCC needs genuine sources or an exact wave vote. Its persisted variable has no
+            // runtime validity tag, so a placeholder on any edge still poisons the CFG MUST join.
             if (in.fmt == Rdna2Format::SOPC) {
                 scalar_scc = scalar_sources;
             } else if (in.fmt == Rdna2Format::SOP2) {
@@ -2719,7 +2718,7 @@ bool emit_cfg_state_machine(
             }
             if (dispatch == UINT32_MAX)
                 for (int word : *entry_wave64_scalar_words)
-                    if (state.sreg.contains(word))
+                    if (state.sreg.contains(word) && !sreg_word_may_be_fabricated(state, word))
                         state.terminal_wave64_scalar_words.insert(word);
         } else if (filters_wave64_b64) {
             // An entry block the MUST walk never reached (only edges it does not model lead there:
