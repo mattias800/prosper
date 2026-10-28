@@ -215,7 +215,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
         return true;
     PortableMaskHalfInstruction portable_halves(b, rs, in, ok);
     if (!ok || portable_halves.handled()) return true;
-    VccMaskViewDrop drop(b, rs);   // takes VCC's lane view away at exit when armed
+    VccMaskViewDrop drop(b, rs, in);   // retires overwritten mask views at exit when armed
     if (refuse_mask_write(b, rs, in, drop, ok) || emit_exec_cmov(b, rs, in, ok)) return true;
     switch (in.fmt) {
         case Rdna2Format::SOP1: {

@@ -1,5 +1,9 @@
 # `tests/gpu/recompiler` — translation tests and the legacy compute execution fixture
 
+`test_wave32_vcc_mask_lifetime` observes independent low/high masks after scalar scratch writes
+in the interpreter and on the GPU. Actual overwrites, pair overlap and Hard input mutations
+retain their separate contracts; untouched saved EXEC restores previously inactive lanes.
+
 `test_portable_wave32_readfirstlane` executes real scalar publications after an independently
 admitted unloaded predicate. Partial and multiple guest waves, empty EXEC and numeric VCC
 destinations run through the interpreter and ordinary Vulkan compute. Adjacent B32 lifetimes
