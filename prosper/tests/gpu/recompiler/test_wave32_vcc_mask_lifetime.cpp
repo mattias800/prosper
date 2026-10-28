@@ -2,8 +2,10 @@
 // Interpreter/GPU observations distinguish retained saved EXEC from stale overwritten predicates.
 #include "bpermute_spirv_oracle.hpp"
 #include "fixtures/arbitrary_placeholder.hpp"
+#include "fixtures/checked_compute_launch.hpp"
 #include "fixtures/compute_runner.h"
 #include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include <gtest/gtest.h>
 #include <atomic>
 #include <cstdint>
