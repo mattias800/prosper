@@ -28,7 +28,7 @@ void expect_seven(const std::vector<uint32_t>& code, const std::vector<float>& i
     const auto module = compile(code);
     ASSERT_FALSE(module.empty());
     const auto output = prosper::test::run_compute(module, input, 64, 64, {}, {}, nullptr, 64,
-                                                  nullptr, nullptr, nullptr, 64);
+                                                   nullptr, nullptr, nullptr, 64);
     ASSERT_EQ(output.size(), 64u) << "A Vulkan device was found; dispatch must execute";
     std::vector<uint32_t> bits(output.size());
     std::memcpy(bits.data(), output.data(), bits.size() * sizeof(uint32_t));
