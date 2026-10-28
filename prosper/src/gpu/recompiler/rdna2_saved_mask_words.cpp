@@ -1,4 +1,5 @@
 #include "gpu/recompiler/rdna2_saved_mask_words.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_placeholder_origin_memory.hpp"
 #include "gpu/recompiler/rdna2_native_launch.hpp"
 #include "gpu/recompiler/rdna2_partial_vcc_word.hpp"
@@ -11,6 +12,11 @@
 
 namespace prosper::gpu {
 namespace {
+bool physical_saved_mask_destination(const SpirvCompute& b, const Rdna2Inst& in, int root) {
+    return (root >= 0 && root <= 104) ||
+           (root == 106 && b.is_compute && !b.is_fragment && in.fmt == Rdna2Format::SOP1 &&
+            sop1_opcode_is_saveexec_b64(in.opcode));
+}
 bool stops_entry_participation(const Rdna2Inst& in) {
     // Keep this an allowlist for scalar control. Unknown escapes, calls, indirect PC writes,
     // kill/early-end, and every branch stop the proof, even when a structurizer linearizes them.
@@ -170,7 +176,8 @@ bool validate_saved_mask_copy_words(SpirvCompute& b, const RegState& rs, const R
 }
 
 bool saved_mask_write_retains_words(const SpirvCompute& b, const Rdna2Inst& in, int root) {
-    return root >= 0 && root <= 104 && saved_mask_producer_has_full_participation(b, in) &&
+    return physical_saved_mask_destination(b, in, root) &&
+           saved_mask_producer_has_full_participation(b, in) &&
            generation_needs_words(b, in, root) &&
            !(in.fmt == Rdna2Format::SOP1 && in.opcode == kSop1OpcodeMovB64 &&
              in.src[0].kind == OperandKind::SGPR);
@@ -424,9 +431,9 @@ void retain_saved_mask_words(SpirvCompute& b, RegState& rs, const Rdna2Inst& in)
         return;   // its pre-write source/proof lowering already decided whether DATA exists
     }
     for_each_scalar_write(in, [&](int root, uint32_t width) {
-        if (width != 2 || root < 0 || root > 104 || rs.sreg_bool_b32.contains(root) ||
-            !rs.sreg_bool.contains(root) || !scalar_write_is_b64_mask(in, root) ||
-            !generation_needs_words(b, in, root))
+        if (width != 2 || !physical_saved_mask_destination(b, in, root) ||
+            rs.sreg_bool_b32.contains(root) || !rs.sreg_bool.contains(root) ||
+            !scalar_write_is_b64_mask(in, root) || !generation_needs_words(b, in, root))
             return;
         if (definite_word(rs, root) && definite_word(rs, root + 1)) return;
         // A saved SGPR Bool may describe lanes which no longer execute this copy. Only its

@@ -1,5 +1,10 @@
 # `tests/gpu/recompiler` — translation tests and the legacy compute execution fixture
 
+`test_native_saveexec_vcc_data` observes the old EXEC high word after SAVEEXEC targets VCC
+and subsequent scalar writes replace only its low word. All ten B64 forms, narrowed and empty
+EXEC, genuine replacements and unsupported physical profiles retain separate controls; the
+interpreter and a required Wave64 pipeline check the numeric result.
+
 `test_ngg_scalar_vcc_barrier` keeps retained numeric DATA separate from the terminal facts
 that can reconstruct VCC after a barrier. One-arm spill negatives cover both physical words;
 fully supplied arms execute both branch outcomes in the interpreter and on a required Wave64
