@@ -128,6 +128,25 @@ struct LoopVccCarry {
         rs.vcc = !body_edge || rs.vcc == check_vcc ? check_vcc : 0u;
     }
 
+    // Publish the loop's VCC view separately from ordinary numeric register PHIs.
+    bool merge_exit(SpirvCompute& b, RegState& rs, uint32_t vcc_chk, uint32_t body_vcc,
+                    const DivLoop& L, uint32_t chk_end, uint32_t body_end) const {
+        if (!vcc_chk && !body_vcc) {
+            // Absence joins absence; the scalar halves have their own DATA PHIs.
+            rs.vcc = 0;
+            return true;
+        }
+        if (!merge_has_mask(b, vcc_chk, body_vcc, L.header_pc)) return false;
+        const uint32_t chk_value = vcc_chk;
+        const uint32_t body_value = merge_body_value(b, body_vcc);
+        const uint32_t merged =
+            (L.direct_exec_breaks || L.direct_wave_breaks) && chk_value != body_value
+                ? b.emit_phi_2way(b.t_bool, chk_value, chk_end, body_value, body_end)
+                : chk_value;
+        rs.vcc = merged;
+        return true;
+    }
+
     // Whether the merge can name VCC. With a placeholder back-edge, a direct-break edge reaches
     // the merge only when backedge_value proved VCC dead at the exit; merge_body_value supplies
     // that edge's input. Logs the reason when it cannot.

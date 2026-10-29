@@ -6520,13 +6520,14 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
             const LoopCheckMarks body_marks = loop_check_marks(body_exit);
             merge_ud_alias(rs, loop_entry_ud_alias);   // body-established aliases die here (#1773)
             for (auto& pr : phis) {
-                if (pr.dom == 3 &&
-                    !vcc_carry.merge_has_mask(b, vcc_chk, body_exit.vcc, L.header_pc))
-                    return false;
+                if (pr.dom == 3) {
+                    if (!vcc_carry.merge_exit(b, rs, vcc_chk, body_exit.vcc, L, chk_end, body_end))
+                        return false;
+                    continue;
+                }
                 uint32_t chk_value = pr.dom == 0 ? (condv.count(pr.reg) ? condv_val[pr.reg] : pr.phi)
                                    : pr.dom == 1 ? (conds.count(pr.reg) ? conds_val[pr.reg] : pr.phi)
                                    : pr.dom == 2 ? (scc_chk ? scc_chk : b.bfalse())
-                                   : pr.dom == 3 ? vcc_chk
                                    : pr.dom == 4 ? exec_chk
                                    : (bool_chk.count(pr.reg) ? bool_chk.at(pr.reg) : pr.phi);
                 uint32_t body_value =
@@ -6534,7 +6535,6 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                                                                      : b.uconst(0))
                     : pr.dom == 1 ? sreg_seed(b, body_exit, pr.reg)
                     : pr.dom == 2 ? (body_exit.scc ? body_exit.scc : b.bfalse())
-                    : pr.dom == 3 ? vcc_carry.merge_body_value(b, body_exit.vcc)
                     : pr.dom == 4
                         ? body_exit.exec
                         : (body_exit.sreg_bool.count(pr.reg) ? body_exit.sreg_bool.at(pr.reg)
@@ -6567,9 +6567,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                                                            body_marks.scc_blanket.end());
                         }
                     }
-                } else if (pr.dom == 3)
-                    rs.vcc = merged;
-                else if (pr.dom == 4) rs.exec = merged;
+                } else if (pr.dom == 4)
+                    rs.exec = merged;
                 else                  rs.sreg_bool[pr.reg] = merged;
             }
             LoopVccCarry::exit_without_phi(rs, phis, vcc_chk,

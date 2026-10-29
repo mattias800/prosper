@@ -4287,6 +4287,10 @@ if(TARGET prosper_core)
             tests/gpu/recompiler/test_uniform_counter_data_boundary.cpp
     INCLUDES tests tests/gpu/recompiler
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_loop_vcc_data_exit
+    SOURCES tests/gpu/recompiler/test_loop_vcc_data_exit.cpp
+    INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_saved_mask_phi
     SOURCES tests/gpu/recompiler/test_saved_mask_phi.cpp
     INCLUDES tests tests/gpu/recompiler
@@ -6572,6 +6576,11 @@ endif()
       prosper_add_gtest(test_native_scc_preservation
         SOURCES tests/gpu/recompiler/test_native_scc_preservation.cpp
         INCLUDES tests tests/gpu/recompiler
+        LIBRARIES prosper_core Vulkan::Vulkan
+        LABELS gpu)
+      prosper_add_gtest(test_loop_vcc_data_exit_gpu
+        SOURCES tests/gpu/execute/test_loop_vcc_data_exit_gpu.cpp
+        INCLUDES tests
         LIBRARIES prosper_core Vulkan::Vulkan
         LABELS gpu)
 

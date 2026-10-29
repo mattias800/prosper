@@ -1,5 +1,8 @@
 # Execution-layer tests
 
+`test_loop_vcc_data_exit_gpu` executes the shared structured-loop witness on a required native
+Wave64 subgroup, checking numeric VCC halves and both nested scalar branch outcomes.
+
 `test_arbitrary_placeholder_exec` runs the real exact64 production compute backend and checks
 both initialized low lanes and retained arbitrary high lanes. It keeps the actual device
 subgroup-contract gate and rejects CPU-fill substitution.

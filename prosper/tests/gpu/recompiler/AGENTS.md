@@ -1,5 +1,9 @@
 # `tests/gpu/recompiler` — translation tests and the legacy compute execution fixture
 
+`test_loop_vcc_data_exit` observes current scalar VCC halves after a structured loop retires
+its entry mask on both exits. Nested scalar branches and one/four iterations execute in the
+interpreter; the separate GPU arm lives under `execute/`. Hard root mutations remain refused.
+
 `test_wave32_vcc_mask_lifetime` observes independent low/high masks after scalar scratch writes
 in the interpreter and on the GPU. Actual overwrites, pair overlap and Hard input mutations
 retain their separate contracts; untouched saved EXEC restores previously inactive lanes.
