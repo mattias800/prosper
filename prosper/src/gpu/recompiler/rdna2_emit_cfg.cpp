@@ -6567,7 +6567,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                                                            body_marks.scc_blanket.end());
                         }
                     }
-                } else if (pr.dom == 4) rs.exec = merged;
+                } else if (pr.dom == 4)
+                    rs.exec = merged;
                 else                  rs.sreg_bool[pr.reg] = merged;
             }
             LoopVccCarry::exit_without_phi(rs, phis, vcc_chk,

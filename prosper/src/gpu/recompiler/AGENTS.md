@@ -1,5 +1,9 @@
 # `recompiler` — RDNA2 machine code → SPIR-V
 
+`rdna2_loop_vcc_carry` owns the VCC exit merge separately from numeric register PHIs. A mask
+retired on both incoming paths has no mask view at the merge; scalar words retain their own
+values and placeholder obligations. Mixed mask/DATA exits keep their existing refusal.
+
 `rdna2_scalar_vcc_retirement` retires mask views overwritten by scalar DATA writes.
 An independent Wave32 B32 neighbor survives; an overlapping pair or Wave64 view does not.
 Retaining a neighbor neither projects the new DATA nor supplies a missing input.

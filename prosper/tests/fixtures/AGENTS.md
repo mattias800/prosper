@@ -1,5 +1,9 @@
 # `prosper/tests/fixtures/` — shared harnesses and hand-built inputs
 
+`loop_vcc_data_exit.hpp` supplies a structured scalar loop shared by the interpreter and native
+Wave64 GPU witnesses. Both VCC halves are DATA at the exit; unknown-launch and missing-spill
+mutations retain independent fresh-predicate obligations.
+
 `arbitrary_placeholder.hpp` supplies synthetic integer programs and the explicit launch/output
 contract shared by the public-compiler interpreter witnesses and the exact64 GPU arm. READFIRST
 fixtures distinguish varying, agreeing and admission-independent scalar publications. Independent
