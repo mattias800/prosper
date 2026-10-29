@@ -3,7 +3,9 @@
 #include <cstdint>
 #include <span>
 
-namespace prosper::gpu { struct ShaderResource; }
+namespace prosper::gpu {
+struct ShaderResource;
+}
 namespace prosper::frontend {
 class OutputWriteContent {
 public:
@@ -13,6 +15,7 @@ public:
     OutputWriteContent(const OutputWriteContent&) = delete;
     OutputWriteContent& operator=(const OutputWriteContent&) = delete;
     static std::span<const uint8_t> for_write(uint64_t address);
+
 private:
     const OutputWriteContent* previous_;
     uint64_t advertised_, effective_;

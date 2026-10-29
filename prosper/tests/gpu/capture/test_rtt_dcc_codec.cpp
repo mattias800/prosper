@@ -16,7 +16,7 @@ GpuCaptureFile capture() {
     GpuCaptureRttSeed seed;
     seed.guest_addr = 0x10000;
     seed.width = seed.height = 64;
-    seed.rgba.assign(64 * 64 * 4, 0x81);
+    seed.rgba.assign(std::size_t{64} * 64 * 4, 0x81);
     seed.dcc_metadata = {0x30000, 4096, 4, true, 64, 64};
     c.rtt_seeds.push_back(seed);
     return c;
@@ -28,8 +28,8 @@ std::vector<uint8_t> encode(const GpuCaptureFile& c) {
     return bytes;
 }
 uint32_t word(const std::vector<uint8_t>& data, std::size_t at) {
-    return uint32_t(data[at]) | uint32_t(data[at + 1]) << 8 |
-           uint32_t(data[at + 2]) << 16 | uint32_t(data[at + 3]) << 24;
+    return uint32_t(data[at]) | uint32_t(data[at + 1]) << 8 | uint32_t(data[at + 2]) << 16 |
+           uint32_t(data[at + 3]) << 24;
 }
 } // namespace
 
@@ -101,8 +101,10 @@ TEST(RttDccCodec, TruncatedAndMismatchedCountTailsRefuse) {
     ASSERT_GT(original.size(), kTailBytes);
     for (bool truncated : {false, true}) {
         auto bytes = original;
-        if (truncated) bytes.pop_back();
-        else bytes[bytes.size() - kTailBytes] = 2;
+        if (truncated)
+            bytes.pop_back();
+        else
+            bytes[bytes.size() - kTailBytes] = 2;
         GpuCaptureFile read;
         std::string error;
         EXPECT_FALSE(deserialize_gpu_capture(bytes, read, error));

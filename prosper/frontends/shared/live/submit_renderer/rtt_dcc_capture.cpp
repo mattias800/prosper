@@ -4,8 +4,8 @@
 
 namespace prosper::frontend::submit_renderer {
 prosper::gpu::GpuCaptureRttDccMetadata capture_rtt_dcc_metadata(const RttSurf& s) {
-    return {s.dcc_metadata_addr, s.dcc_metadata_bytes, s.dcc_num_components,
-            s.dcc_alpha_is_on_msb, s.dcc_width, s.dcc_height};
+    return {s.dcc_metadata_addr,   s.dcc_metadata_bytes, s.dcc_num_components,
+            s.dcc_alpha_is_on_msb, s.dcc_width,          s.dcc_height};
 }
 void restore_rtt_dcc_metadata(RttSurf& s, const prosper::gpu::GpuCaptureRttDccMetadata& m,
                               bool same_target) {

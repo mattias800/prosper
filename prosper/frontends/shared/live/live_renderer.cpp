@@ -152,7 +152,7 @@ void queue_guest_gpu_write(uint64_t addr, uint64_t size, const char* origin) {
     constexpr size_t kMaxPendingRanges = 65536;
     if (pending.ranges.size() < kMaxPendingRanges) {
         auto facts = capture_dcc_write_facts(pending.dcc_planes, addr, size,
-                                            OutputWriteContent::for_write(addr));
+                                             OutputWriteContent::for_write(addr));
         pending.ranges.push_back(PendingGuestGpuWrite{addr, size, origin, std::move(facts)});
     } else {
         pending.overflowed = true;
@@ -886,7 +886,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 seed.guest_addr = addr; seed.width = it->second.w; seed.height = it->second.h;
                 seed.format = captured_format;
                 seed.rgba = *it->second.rgba;
-                seed.dcc_metadata = capture_rtt_dcc_metadata(it->second); return true;
+                seed.dcc_metadata = capture_rtt_dcc_metadata(it->second);
+                return true;
             });
         prosper::gpu::set_gpu_capture_rtt_seed_snapshot_reader(
             [invalidate_ds, materialize_current_rtt](
@@ -1522,7 +1523,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             }
             RttSurf& surface = g_rtt[seed.guest_addr];
             const bool same_target = !surface.volume_depth && surface.w == seed.width &&
-                surface.h == seed.height && surface.format == format;
+                                     surface.h == seed.height && surface.format == format;
             surface.guest_origins.observe(seed.guest_addr, 0u); // capture pixels do not certify a live guest layout
             surface.w = seed.width; surface.h = seed.height;
             surface.volume_depth = 0;

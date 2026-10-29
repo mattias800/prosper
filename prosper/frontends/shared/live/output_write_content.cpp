@@ -8,8 +8,8 @@ namespace prosper::frontend {
 namespace {
 thread_local const OutputWriteContent* current = nullptr;
 }
-OutputWriteContent::OutputWriteContent(uint64_t advertised, const void* destination,
-                                       uint64_t bytes, uint64_t readable_host_bytes)
+OutputWriteContent::OutputWriteContent(uint64_t advertised, const void* destination, uint64_t bytes,
+                                       uint64_t readable_host_bytes)
     : previous_(current), advertised_(advertised),
       effective_(reinterpret_cast<uintptr_t>(destination)) {
     const auto available = std::min(bytes, readable_host_bytes);
@@ -17,7 +17,9 @@ OutputWriteContent::OutputWriteContent(uint64_t advertised, const void* destinat
         bytes_ = {static_cast<const uint8_t*>(destination), static_cast<size_t>(available)};
     current = this;
 }
-OutputWriteContent::~OutputWriteContent() { current = previous_; }
+OutputWriteContent::~OutputWriteContent() {
+    current = previous_;
+}
 std::span<const uint8_t> OutputWriteContent::for_write(uint64_t address) {
     if (current && (address == current->advertised_ || address == current->effective_))
         return current->bytes_;

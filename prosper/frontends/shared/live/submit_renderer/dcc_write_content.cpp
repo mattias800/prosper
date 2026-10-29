@@ -6,20 +6,22 @@
 
 namespace prosper::frontend::submit_renderer {
 std::vector<DccWriteFact> capture_dcc_write_facts(std::span<const DccWritePlane> planes,
-    uint64_t address, uint64_t bytes, std::span<const uint8_t> content) {
+                                                  uint64_t address, uint64_t bytes,
+                                                  std::span<const uint8_t> content) {
     std::vector<DccWriteFact> facts;
     if (!address || !bytes) return facts;
     for (const auto& plane : planes) {
         if (!plane.address || !plane.bytes ||
             (address <= plane.address ? plane.address - address >= bytes
-                                      : address - plane.address >= plane.bytes)) continue;
+                                      : address - plane.address >= plane.bytes))
+            continue;
         DccWriteFact fact{plane, std::nullopt};
         if (address <= plane.address) {
             const auto offset = plane.address - address;
             if (offset < content.size() && plane.bytes <= content.size() - offset &&
                 offset <= bytes && plane.bytes <= bytes - offset) {
-                const auto data = content.subspan(static_cast<size_t>(offset),
-                                                   static_cast<size_t>(plane.bytes));
+                const auto data =
+                    content.subspan(static_cast<size_t>(offset), static_cast<size_t>(plane.bytes));
                 if (std::all_of(data.begin(), data.end(),
                                 [&](uint8_t byte) { return byte == data.front(); }))
                     fact.uniform_byte = data.front();

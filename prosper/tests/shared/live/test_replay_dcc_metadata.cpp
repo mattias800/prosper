@@ -93,8 +93,8 @@ DrawItem draw_to(uint64_t base, uint32_t slot) {
 
 using DccIdentity = std::tuple<uint64_t, uint64_t, uint32_t, bool, uint32_t, uint32_t>;
 DccIdentity identity(const frontend::RttSurf& s) {
-    return {s.dcc_metadata_addr, s.dcc_metadata_bytes, s.dcc_num_components,
-            s.dcc_alpha_is_on_msb, s.dcc_width, s.dcc_height};
+    return {s.dcc_metadata_addr,   s.dcc_metadata_bytes, s.dcc_num_components,
+            s.dcc_alpha_is_on_msb, s.dcc_width,          s.dcc_height};
 }
 class ReplayDccMetadata : public ::testing::TestWithParam<bool> {
 protected:
@@ -105,7 +105,8 @@ protected:
         unmap = prosper::Hle::lookup(prosper::nid_hash("sceKernelMunmap"));
         ASSERT_TRUE(map && unmap);
         ASSERT_EQ(map(reinterpret_cast<uint64_t>(&mapped), kMappedBytes, 3, 0,
-                      reinterpret_cast<uint64_t>("replay-dcc-metadata"), 0), 0u);
+                      reinterpret_cast<uint64_t>("replay-dcc-metadata"), 0),
+                  0u);
         target = mapped;
         ASSERT_NE(target, 0u);
         frontend::register_live_renderer("", false);
@@ -143,8 +144,12 @@ protected:
         declaration.prt->resources.push_back(sampled);
         (void)render_submit_items({declaration}, kWidth, kHeight);
         ASSERT_TRUE(observed_cache->contains(target));
-        expected = DccIdentity{sampled.metadata_addr, gpu_capture_dcc_metadata_footprint(sampled),
-                                   4, true, kWidth, kHeight};
+        expected = DccIdentity{sampled.metadata_addr,
+                               gpu_capture_dcc_metadata_footprint(sampled),
+                               4,
+                               true,
+                               kWidth,
+                               kHeight};
         ASSERT_EQ(identity(observed_cache->at(target)), expected);
         GpuCaptureFile capture;
         capture.metadata.width = kWidth;
@@ -212,7 +217,6 @@ protected:
         ASSERT_TRUE(frontend::execute_live_compute_items({item}));
         EXPECT_EQ(frontend::live_compute_cpu_fill_dispatches(), cpu_fills);
         EXPECT_GT(frontend::live_compute_queue_submit_attempts(), submits);
-
     }
     void expect_start(const std::array<uint8_t, 4>& expected_pixel) {
         auto draw = draw_to(target, 0);
@@ -262,7 +266,7 @@ TEST_P(ReplayDccMetadata, AnotherCompleteCodeProducesWhiteRatherThanAConstantBla
 }
 TEST_P(ReplayDccMetadata, EqualCompleteFillStillDefinesTheFollowingRenderStart) {
     ASSERT_NO_FATAL_FAILURE(prepare_replay_surface());
-    std::vector<uint8_t> metadata(4096, 0x40); // this dispatch leaves the bytes unchanged
+    std::vector<uint8_t> metadata(4096, 0x40);   // this dispatch leaves the bytes unchanged
     ASSERT_NO_FATAL_FAILURE(fill_metadata(metadata, 0x40404040));
     ASSERT_NO_FATAL_FAILURE(expect_start({0, 0, 0, 255}));
 }
@@ -327,10 +331,10 @@ TEST_P(ReplayDccMetadata, ChangedTargetCannotBorrowTheOldAssociationFromALegacyS
     ASSERT_TRUE(read_gpu_capture_rtt_seed(target, seed, error)) << error;
     seed.dcc_metadata = {};
     seed.width /= 2;
-    seed.rgba.resize(seed.width * seed.height * 4);
+    seed.rgba.resize(size_t{seed.width} * seed.height * 4);
     ASSERT_TRUE(restore_gpu_replay_rtt_seeds({seed}, error)) << error;
     EXPECT_EQ(identity(observed_cache->at(target)), DccIdentity{});
 }
 INSTANTIATE_TEST_SUITE_P(RegisteredReaders, ReplayDccMetadata, ::testing::Values(false, true),
                          [](const auto& info) { return info.param ? "All" : "Single"; });
-} // namespace
+}   // namespace

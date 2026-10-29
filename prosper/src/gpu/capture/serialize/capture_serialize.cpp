@@ -1475,7 +1475,8 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         }
     }
     if (gpu_capture_version_for(c) >= kVersionWithRttDccMetadata &&
-        !write_rtt_dcc_metadata(w, c.rtt_seeds, error)) return false;
+        !write_rtt_dcc_metadata(w, c.rtt_seeds, error))
+        return false;
     // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail
     // existed, so a capture sitting just under the maximum could serialize successfully into a file
     // that read_gpu_capture then rejects as oversized -- a write that reports success and produces

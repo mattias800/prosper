@@ -10,16 +10,16 @@ namespace {
 using namespace prosper::frontend;
 using namespace prosper::frontend::submit_renderer;
 constexpr std::array<DccWritePlane, 1> kPlane{{{0x1000, 0x2080, 16}}};
-}
+}   // namespace
 TEST(DccWriteContent, CompletePlaneInsideLargerWriteOwnsItsUniformByte) {
     std::array<uint8_t, 64> bytes{};
     bytes.fill(0x40);
     const auto facts = capture_dcc_write_facts(kPlane, 0x2070, bytes.size(), bytes);
     ASSERT_EQ(facts.size(), 1u);
     ASSERT_TRUE(facts[0].uniform_byte);
-    EXPECT_EQ(*facts[0].uniform_byte, 0x40);
+    EXPECT_EQ(facts[0].uniform_byte, 0x40);
     bytes.fill(0xc0); // the borrowed producer storage is no longer retained
-    EXPECT_EQ(*facts[0].uniform_byte, 0x40);
+    EXPECT_EQ(facts[0].uniform_byte, 0x40);
 }
 TEST(DccWriteContent, PartialUnavailableAndNonuniformWritesHaveNoUniformFact) {
     std::array<uint8_t, 16> bytes{};
@@ -27,7 +27,11 @@ TEST(DccWriteContent, PartialUnavailableAndNonuniformWritesHaveNoUniformFact) {
     for (uint32_t arm = 0; arm != 5; ++arm) {
         uint64_t address = 0x2080, count = bytes.size();
         std::span<const uint8_t> view = bytes;
-        if (arm == 0) { ++address; --count; view = view.first(count); }
+        if (arm == 0) {
+            ++address;
+            --count;
+            view = view.first(count);
+        }
         if (arm == 1) view = {};
         if (arm == 2) view = view.first(15);
         if (arm == 3) count = 1; // a longer borrowed view does not enlarge the announced write

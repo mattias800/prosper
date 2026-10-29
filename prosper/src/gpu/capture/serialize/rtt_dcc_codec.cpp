@@ -20,7 +20,7 @@ bool valid(const GpuCaptureRttDccMetadata& m, std::string& error) {
 }
 } // namespace
 bool write_rtt_dcc_metadata(Writer& w, const std::vector<GpuCaptureRttSeed>& seeds,
-                             std::string& error) {
+                            std::string& error) {
     w.u32(static_cast<uint32_t>(seeds.size()));
     for (const auto& seed : seeds) {
         const auto& m = seed.dcc_metadata;
@@ -34,8 +34,7 @@ bool write_rtt_dcc_metadata(Writer& w, const std::vector<GpuCaptureRttSeed>& see
     }
     return true;
 }
-bool read_rtt_dcc_metadata(Reader& r, std::vector<GpuCaptureRttSeed>& seeds,
-                            std::string& error) {
+bool read_rtt_dcc_metadata(Reader& r, std::vector<GpuCaptureRttSeed>& seeds, std::string& error) {
     uint32_t count = 0;
     if (!r.u32(count) || count != seeds.size()) {
         error = "invalid RTT DCC metadata count";
@@ -44,9 +43,9 @@ bool read_rtt_dcc_metadata(Reader& r, std::vector<GpuCaptureRttSeed>& seeds,
     for (auto& seed : seeds) {
         auto& m = seed.dcc_metadata;
         uint32_t alpha = 0;
-        if (!r.u64(m.metadata_addr) || !r.u64(m.metadata_bytes) ||
-            !r.u32(m.num_components) || !r.u32(alpha) || !r.u32(m.guest_width) ||
-            !r.u32(m.guest_height)) return false;
+        if (!r.u64(m.metadata_addr) || !r.u64(m.metadata_bytes) || !r.u32(m.num_components) ||
+            !r.u32(alpha) || !r.u32(m.guest_width) || !r.u32(m.guest_height))
+            return false;
         if (alpha > 1) {
             error = "invalid RTT DCC alpha convention";
             return false;

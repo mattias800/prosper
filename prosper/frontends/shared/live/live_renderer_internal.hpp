@@ -165,7 +165,7 @@ struct RttSurf {
     uint64_t dcc_metadata_addr = 0;
     uint64_t dcc_metadata_bytes = 0;
     bool dcc_metadata_dirty = false;
-    std::optional<uint8_t> dcc_uniform_write_byte; // derived from a complete owned-host write
+    std::optional<uint8_t> dcc_uniform_write_byte;   // derived from a complete owned-host write
     // How that descriptor reads the metadata's clear codes (gfx10_dcc_fast_clear_rgba8's inputs)
     // and the guest extent it described, kept so a pass that RENDERS to the cleared target can
     // decode the clear without a descriptor, and only for the surface the descriptor was of.

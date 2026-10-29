@@ -101,6 +101,12 @@ flip figure understates the difference.
 
 ## Ruled out
 
+- **"An unavailable DCC tail revokes a descriptor already learned for the same target."** A
+  pixel-only temporal reseed is not such a revocation. Clearing that association broke all
+  three existing guest-write-drain variants at their DCC→colour→DCC assertion during #4627
+  qualification. Keep the original assertions: preserve known metadata for the same dimensions
+  and backend format, while fresh or changed target identities cannot borrow it.
+
 - **"Recording only the retained DCC association repairs replay's rendered clear."** The #4627
   registered capture/restore regression first fails the missing association on main. After the
   v79 association roundtrip is repaired, an actual compute dispatch fills every metadata byte
@@ -140,10 +146,12 @@ flip figure understates the difference.
 
 ## Instrument notes specific to this title
 
-- **A replayed frame of this title does not show the fix for its black world.** The replay
-  process cannot read a metadata plane through a guest address, so it does not take the decal
-  buffer's clear and the replayed frame is the old picture, on any build ([#4627]). Check
-  `PROSPER_DCCLOG=1`: the live run prints the decode for `0x…5c10000`, the replay does not.
+- **Captures without retained DCC associations cannot reproduce the decal clear on a fresh
+  replay** ([#4627]). Through v78 the seeds omit that input, and replay cannot read metadata at
+  a guest address. The v79 tail retains known associations; complete hosted compute writes can
+  then supply their actual uniform plane content. Fresh captures are required to test that fix
+  on this title. The older frame remains at the pre-clear picture; no missing descriptor is
+  inferred from its pixels. `PROSPER_DCCLOG=1` identifies the decode and its rendered/sampled path.
 - **Until [#4619] was fixed, a replay of this title was faithful only up to the end of the
   lighting pass**, and nothing in its output said where the line was. `gpu_replay` discarded
   every retained depth image on every guest write, so the fog pass read zero depth and the

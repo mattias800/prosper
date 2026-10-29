@@ -13,12 +13,26 @@ void notify_output_write(uint64_t advertised, const void* destination, uint64_t 
     if (!advertised) return;
     const auto notify = [&](uint64_t address) {
         if (!address || !bytes) return;
-        if (preserving_bytes) prosper::gpu::notify_guest_gpu_write_preserving_bytes(address, bytes);
-        else prosper::gpu::notify_guest_gpu_write(address, bytes);
+        if (preserving_bytes)
+            prosper::gpu::notify_guest_gpu_write_preserving_bytes(address, bytes);
+        else
+            prosper::gpu::notify_guest_gpu_write(address, bytes);
     };
     notify(advertised);
     const uint64_t effective = reinterpret_cast<uintptr_t>(destination);
     if (effective != advertised) notify(effective);
 }
 
+void notify_output_write(const prosper::gpu::ShaderResource* resource, const void* destination,
+                         uint64_t bytes, bool preserving_bytes) {
+    notify_output_write(resource->gpu_addr, destination, bytes, preserving_bytes,
+                        hosted_output_bytes(resource, destination));
+}
+void notify_metadata_output_write(const prosper::gpu::ShaderResource* resource,
+                                  const void* destination, uint64_t bytes) {
+    notify_output_write(resource->metadata_addr, destination, bytes, false,
+                        destination == resource->dcc_metadata_host_data
+                            ? resource->dcc_metadata_host_data_size
+                            : 0);
+}
 } // namespace prosper::frontend

@@ -2050,8 +2050,8 @@ bool deserialize_gpu_capture(const std::vector<uint8_t>& bytes, GpuCaptureFile& 
                 }
         }
     }
-    if (version >= kVersionWithRttDccMetadata &&
-        !read_rtt_dcc_metadata(r, c.rtt_seeds, error)) return false;
+    if (version >= kVersionWithRttDccMetadata && !read_rtt_dcc_metadata(r, c.rtt_seeds, error))
+        return false;
     // DS seed identity is checked HERE, not in the record loop, because the slice arrives in the
     // tail above: a per-record check would compare incomplete identities and reject two faces of one
     // cube that differ only in slice -- which is exactly the capture this version exists to allow.
