@@ -45,7 +45,7 @@ inline std::vector<uint32_t> program(Options o) {
         0x4a020303u, // v1 += v3
         0x7e06026bu, // v3 = current numeric VCC_HI
         0x4a020303u, // v1 += v3
-        0x7d840703u, // a fresh predicate consumes that genuine high word
+        0x7d840687u, // VCC = (v3 == 7), checking which physical half was read
         0x02020296u, // v1 = VCC ? v1 : 22
         0xe0702000u,
         0x80020102u, // output[lane] = v1
