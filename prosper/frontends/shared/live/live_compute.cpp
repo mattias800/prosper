@@ -1,5 +1,6 @@
 #include "shared/live/live_compute.hpp"
 #include "shared/live/output_write_notify.hpp"
+#include "shared/live/output_write_content.hpp"
 #include "diagnostics/perf/perf_ledger.hpp"   // #3891: shader-compile alarm
 #include "diagnostics/perf/wave64_refusal.hpp"
 #include "shared/compute/storage_write_mask_spirv.hpp"
@@ -5047,7 +5048,8 @@ std::optional<bool> execute_cpu_broadcast_fill(const prosper::gpu::ComputeItem& 
     // suppress invalidation of renderer-owned depth written earlier in the same present.
     const char* previous_origin = guest_gpu_write_origin();
     set_guest_gpu_write_origin("compute-writeback(cpu-broadcast)");
-    notify_output_write(target->gpu_addr, destination, bytes);
+    notify_output_write(target->gpu_addr, destination, bytes, false,
+                        hosted_output_bytes(target, destination));
     set_guest_gpu_write_origin(previous_origin);
     if (!target->host_data && writer_provenance_enabled())
         record_guest_write(GuestWriterKind::ComputeBuffer, target->gpu_addr, bytes,
@@ -5612,11 +5614,13 @@ static void notify_unchanged_buffer_for(const KnownFillProof* known_fill, const 
     // A partial fill proves a clear only for its written prefix. Keep the ordinary
     // unchanged-output notification for the full binding without clearing tail aliases.
     if (clear && known_fill->written_bytes < buffer.resource->size)
-        notify_output_write(buffer.resource->gpu_addr, destination, buffer.resource->size, true);
+        notify_output_write(buffer.resource->gpu_addr, destination, buffer.resource->size, true,
+                            hosted_output_bytes(buffer.resource, destination));
     if (clear)
         prosper::gpu::set_guest_gpu_write_origin("compute-writeback(known-fill)");
     notify_output_write(buffer.resource->gpu_addr, destination,
-        clear ? known_fill->written_bytes : buffer.resource->size, true);
+        clear ? known_fill->written_bytes : buffer.resource->size, true,
+        hosted_output_bytes(buffer.resource, destination));
     prosper::gpu::set_guest_gpu_write_origin(previous);
 }
 
@@ -6000,7 +6004,8 @@ static void finish_dispatch_tail(DispatchTailState& state) {
                 if (buffer.resource->gpu_addr || buffer.resource->host_data) {
                     ComputeBufferCostScope cost(timing.enabled, timing.notify_ms);
                     set_guest_gpu_write_origin("compute-writeback(buffer-guest-bytes)");
-                    notify_output_write(buffer.resource->gpu_addr, destination, buffer.guest_bytes);
+                    notify_output_write(buffer.resource->gpu_addr, destination, buffer.guest_bytes, false,
+                                        hosted_output_bytes(buffer.resource, destination));
                     set_guest_gpu_write_origin(nullptr);
                 }
                 if (!buffer.resource->host_data && writer_provenance_enabled()) {
@@ -6118,7 +6123,8 @@ static void finish_dispatch_tail(DispatchTailState& state) {
                 ComputeBufferCostScope cost(timing.enabled, timing.notify_ms);
                 if (changed) {
                     set_guest_gpu_write_origin("compute-writeback(buffer-full)");
-                    notify_output_write(buffer.resource->gpu_addr, destination, buffer.resource->size);
+                    notify_output_write(buffer.resource->gpu_addr, destination, buffer.resource->size, false,
+                                        hosted_output_bytes(buffer.resource, destination));
                     set_guest_gpu_write_origin(nullptr);
                 } else {
                     notify_unchanged_buffer(buffer);
@@ -6197,7 +6203,8 @@ static void finish_dispatch_tail(DispatchTailState& state) {
                                  (unsigned long long)timing_program_hash, bi.binding,
                                  (unsigned long long)r->gpu_addr, bi.guest_bytes);
                 if (r->gpu_addr || r->host_data)
-                    notify_output_write(r->gpu_addr, destination, bi.guest_bytes, true);
+                    notify_output_write(r->gpu_addr, destination, bi.guest_bytes, true,
+                                        hosted_output_bytes(r, destination));
                 continue;
             }
             void* mapped = nullptr;
@@ -6274,7 +6281,8 @@ static void finish_dispatch_tail(DispatchTailState& state) {
                                  (unsigned long long)r->gpu_addr, bi.guest_bytes);
                 ctx.unmap_memory(staging_memory[i]);
                 if (r->gpu_addr || r->host_data)
-                    notify_output_write(r->gpu_addr, destination, bi.guest_bytes, true);
+                    notify_output_write(r->gpu_addr, destination, bi.guest_bytes, true,
+                                        hosted_output_bytes(r, destination));
                 continue;
             }
             // Notify page-based dirty trackers only when bytes will actually be written. Doing this
@@ -6472,7 +6480,8 @@ static void finish_dispatch_tail(DispatchTailState& state) {
             // emulator is invalidating its own caches. Everything reaching the DS invalidation path
             // used to report the default `gpu`, which cannot distinguish them.
             set_guest_gpu_write_origin("compute-writeback(image-guest-bytes)");
-            notify_output_write(r->gpu_addr, destination, bi.guest_bytes);
+            notify_output_write(r->gpu_addr, destination, bi.guest_bytes, false,
+                                hosted_output_bytes(r, destination));
             set_guest_gpu_write_origin(nullptr);
             if (!r->host_data && writer_provenance_enabled())
                 record_guest_write(GuestWriterKind::ComputeBuffer,
@@ -6494,7 +6503,9 @@ static void finish_dispatch_tail(DispatchTailState& state) {
                     // appearing as an anonymous `gpu` write; whether it SHOULD invalidate is a
                     // separate question that needs the operation's real HTILE semantics proven.
                     set_guest_gpu_write_origin("compute-writeback(metadata-reset)");
-                    notify_output_write(r->metadata_addr, bi.dcc_metadata, bi.dcc_metadata_bytes);
+                    notify_output_write(r->metadata_addr, bi.dcc_metadata, bi.dcc_metadata_bytes, false,
+                                        bi.dcc_metadata == r->dcc_metadata_host_data
+                                            ? r->dcc_metadata_host_data_size : 0);
                     set_guest_gpu_write_origin(nullptr);
                     if (!r->dcc_metadata_host_data && writer_provenance_enabled())
                         record_guest_write(GuestWriterKind::ComputeBuffer,

@@ -128,3 +128,10 @@ thread**, on that thread's first call. So:
   lambda that can outlive the call: the context struct dies with the callback frame.
 
 Where the next pieces go, and what remains in the callback, is tracked on #3892.
+
+`rtt_dcc_capture` copies descriptor associations into seed values and restores them at replay
+seed import. It retains origin history without claiming a readable live guest allocation.
+
+`dcc_write_content` snapshots uniform-byte facts for complete known metadata planes at the
+existing write-queue boundary. A missing, partial or nonuniform later write revokes the fact.
+The queue retains no borrowed pointer and does not copy or scan unrelated output payloads.

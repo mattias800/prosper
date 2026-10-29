@@ -525,3 +525,6 @@ values directly to a native profiler's operating-system TIDs.
 
 `output_write_notify` owns the common advertised/effective compute write notification; its
 existing journal and byte-preserving calls remain in their original order.
+
+`output_write_content` exposes a bounded hosted-byte view only during the existing synchronous
+write callback. Its one native TLS slot restores nested scopes and never owns a resource pointer.

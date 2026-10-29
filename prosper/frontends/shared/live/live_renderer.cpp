@@ -64,6 +64,8 @@
 #include "shared/live/submit_renderer/backend_timing.hpp" // record_backend_timing_stats, print_rtt_timing (#3892)
 #include "shared/live/submit_renderer/backend_draws.hpp"  // build_backend_draws, clear_for (#3892)
 #include "shared/live/submit_renderer/per_target_passes.hpp" // render_per_target_passes (#3892)
+#include "shared/live/submit_renderer/rtt_dcc_capture.hpp"
+#include "shared/live/output_write_content.hpp"
 #include "shared/live/submit_renderer/callback_prelude.hpp" // load_shader_overrides, materialize_dirty_dcc_clears (#3892)
 #include "shared/live/submit_renderer/callback_diagnostics.hpp" // the callback's own diagnostics (#3892)
 #include "shared/live/submit_renderer/single_framebuffer.hpp" // render_single_framebuffer (#3892)
@@ -148,10 +150,13 @@ void queue_guest_gpu_write(uint64_t addr, uint64_t size, const char* origin) {
     if (!origin) origin = "unknown";
     std::lock_guard<std::mutex> lock(pending.mutex);
     constexpr size_t kMaxPendingRanges = 65536;
-    if (pending.ranges.size() < kMaxPendingRanges)
-        pending.ranges.push_back(PendingGuestGpuWrite{addr, size, origin});
-    else
+    if (pending.ranges.size() < kMaxPendingRanges) {
+        auto facts = capture_dcc_write_facts(pending.dcc_planes, addr, size,
+                                            OutputWriteContent::for_write(addr));
+        pending.ranges.push_back(PendingGuestGpuWrite{addr, size, origin, std::move(facts)});
+    } else {
         pending.overflowed = true;
+    }
 }
 
 void register_cpu_rtt_dcc_metadata(
@@ -171,7 +176,12 @@ void register_cpu_rtt_dcc_metadata(
                 const uint64_t metadata_bytes =
                     prosper::gpu::gpu_capture_dcc_metadata_footprint(resource);
                 if (!metadata_bytes) continue;
+                const auto previous = capture_rtt_dcc_metadata(surface->second);
                 note_rtt_dcc_descriptor(surface->second, resource, metadata_bytes);
+                if (capture_rtt_dcc_metadata(surface->second) != previous) {
+                    surface->second.dcc_uniform_write_byte.reset();
+                    track_rtt_dcc_write_plane(surface->first, surface->second);
+                }
             }
         }
     }
@@ -875,7 +885,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 if (!materialize_current_rtt(addr, it->second, error)) return false;
                 seed.guest_addr = addr; seed.width = it->second.w; seed.height = it->second.h;
                 seed.format = captured_format;
-                seed.rgba = *it->second.rgba; return true;
+                seed.rgba = *it->second.rgba;
+                seed.dcc_metadata = capture_rtt_dcc_metadata(it->second); return true;
             });
         prosper::gpu::set_gpu_capture_rtt_seed_snapshot_reader(
             [invalidate_ds, materialize_current_rtt](
@@ -902,7 +913,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                     prosper::gpu::GpuCaptureRttSeed seed;
                     seed.guest_addr = addr; seed.width = surface.w; seed.height = surface.h;
                     seed.format = captured_format;
-                    seed.rgba = *surface.rgba; seeds.push_back(std::move(seed));
+                    seed.rgba = *surface.rgba;
+                    seed.dcc_metadata = capture_rtt_dcc_metadata(surface);
+                    seeds.push_back(std::move(seed));
                 }
                 return true;
             });
@@ -957,9 +970,15 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
         [](uint64_t addr, uint64_t metadata_addr, uint64_t metadata_bytes) {
             auto surface = g_rtt.find(addr);
             if (surface == g_rtt.end() || !metadata_addr || !metadata_bytes) return;
+            const bool changed = surface->second.dcc_metadata_addr != metadata_addr ||
+                                 surface->second.dcc_metadata_bytes != metadata_bytes;
             surface->second.dcc_metadata_addr = metadata_addr;
             surface->second.dcc_metadata_bytes = metadata_bytes;
             surface->second.dcc_guest_origins.observe(metadata_addr, metadata_bytes);
+            if (changed) {
+                surface->second.dcc_uniform_write_byte.reset();
+                track_rtt_dcc_write_plane(addr, surface->second);
+            }
         });
     prosper::gpu::set_live_target_query([invalidate_ds](uint64_t addr) {
         drain_guest_gpu_writes(g_rtt, invalidate_ds);
@@ -1513,6 +1532,9 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             surface.has_uniform_color = false;
             surface.gpu_valid = false;
             surface.dcc_metadata_dirty = false;
+            restore_rtt_dcc_metadata(surface, seed.dcc_metadata);
+            surface.dcc_uniform_write_byte.reset();
+            track_rtt_dcc_write_plane(seed.guest_addr, surface);
             prosper::test::invalidate_persistent_color_target(seed.guest_addr);
             return true;
         });

@@ -227,7 +227,9 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // v77 adds the vertex/NGG producing FLOAT_MODE and IEEE_MODE, with explicit unavailable state.
 // It is appended only when needed; captures without these compiler inputs retain their old bytes.
 // v78 appends independent producing FP16_OVFL facts for graphics; legacy captures stay unknown.
-constexpr uint32_t kVersion = 78;
+// v79 appends retained RTT DCC descriptor facts; older seeds keep the association unavailable.
+constexpr uint32_t kVersion = 79;
+constexpr uint32_t kVersionWithRttDccMetadata = 79;
 constexpr uint32_t kVersionWithFp16OverflowMode = 78;
 constexpr uint32_t kVersionWithGraphicsFloatMode = 77;
 constexpr uint32_t kVersionWithFrontFaceEncoding = 76;
@@ -248,6 +250,8 @@ inline bool gpu_capture_has_unavailable_source(const GpuCaptureFile& c) {
 }
 // The lowest version whose tails can hold everything this capture carries.
 inline uint32_t gpu_capture_version_for(const GpuCaptureFile& c) {
+    for (const auto& seed : c.rtt_seeds)
+        if (seed.dcc_metadata != GpuCaptureRttDccMetadata{}) return kVersionWithRttDccMetadata;
     for (const auto& compute : c.computes)
         if (compute.recompile_config.fp16_overflow != Fp16OverflowMode{})
             return kVersionWithFp16OverflowMode;

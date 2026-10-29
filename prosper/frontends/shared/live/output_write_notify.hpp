@@ -3,5 +3,5 @@
 #include <cstdint>
 namespace prosper::frontend {
 void notify_output_write(uint64_t advertised, const void* destination, uint64_t bytes,
-                         bool preserving_bytes = false);
+                         bool preserving_bytes = false, uint64_t readable_host_bytes = 0);
 } // namespace prosper::frontend

@@ -101,6 +101,12 @@ flip figure understates the difference.
 
 ## Ruled out
 
+- **"Recording only the retained DCC association repairs replay's rendered clear."** The #4627
+  registered capture/restore regression first fails the missing association on main. After the
+  v79 association roundtrip is repaired, an actual compute dispatch fills every metadata byte
+  with `0x40`, yet the subsequent render still starts red rather than black. The association
+  and ordered owned write content are separate required inputs; old seeds supply neither.
+
 - **"Something refused, dropped or skipped is what darkens the scene."** The run named three
   losses: fragment draws refused for a width-sensitive load, compute dispatches skipped for an
   unimplemented `ds_read_b32 gds`, and a truncated fragment program. [#4609] removed the first

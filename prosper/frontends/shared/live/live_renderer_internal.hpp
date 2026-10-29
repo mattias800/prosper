@@ -71,6 +71,8 @@
 #include "fixtures/retained_depth_array_gpu.h"   // GPU-resident retained depth-array snapshots
 #include "fixtures/retained_depth_cube_gpu.h"    // GPU-resident retained depth-cube snapshots
 
+#include "shared/live/submit_renderer/dcc_write_content.hpp"
+#include <optional>
 #include <atomic>
 #include <cerrno>
 #include <functional>
@@ -163,6 +165,7 @@ struct RttSurf {
     uint64_t dcc_metadata_addr = 0;
     uint64_t dcc_metadata_bytes = 0;
     bool dcc_metadata_dirty = false;
+    std::optional<uint8_t> dcc_uniform_write_byte; // derived from a complete owned-host write
     // How that descriptor reads the metadata's clear codes (gfx10_dcc_fast_clear_rgba8's inputs)
     // and the guest extent it described, kept so a pass that RENDERS to the cleared target can
     // decode the clear without a descriptor, and only for the surface the descriptor was of.
@@ -338,11 +341,13 @@ struct PendingGuestGpuWrite {
     uint64_t addr = 0;
     uint64_t size = 0;
     const char* origin = "unknown";   // string literal or static storage; never an owned buffer
+    std::vector<submit_renderer::DccWriteFact> dcc_facts;
 };
 
 struct PendingGuestGpuWrites {
     std::mutex mutex;
     std::vector<PendingGuestGpuWrite> ranges;
+    std::vector<submit_renderer::DccWritePlane> dcc_planes;
     bool overflowed = false;
 };
 
@@ -506,6 +511,7 @@ inline RttCache::iterator invalidate_cpu_rtt_entry(
             it->second.has_uniform_color = false;
             it->second.gpu_valid = false;
             it->second.dcc_metadata_dirty = true;
+            it->second.dcc_uniform_write_byte.reset();
             return ++it;
         }
         if (census) ++census->rtt_erases;
@@ -522,6 +528,7 @@ inline RttCache::iterator invalidate_cpu_rtt_entry(
         it->second.has_uniform_color = false;
         it->second.gpu_valid = false;
         it->second.dcc_metadata_dirty = true;
+        it->second.dcc_uniform_write_byte.reset();
         return ++it;
     } else {
         return ++it;
@@ -639,6 +646,8 @@ inline void drain_guest_gpu_writes(RttCache& cache, bool invalidate_ds) {
         ranges.swap(pending.ranges);
         overflowed = pending.overflowed;
         pending.overflowed = false;
+        if (!ranges.empty() || overflowed)
+            submit_renderer::refresh_dcc_write_planes(pending.dcc_planes, cache);
     }
     if (!ranges.empty() || overflowed)
         guest_gpu_write_drain_epoch().fetch_add(1, std::memory_order_relaxed);
@@ -676,6 +685,7 @@ inline void drain_guest_gpu_writes(RttCache& cache, bool invalidate_ds) {
             it->second.has_uniform_color = false;
             it->second.gpu_valid = false;
             it->second.dcc_metadata_dirty = true;
+            it->second.dcc_uniform_write_byte.reset();
             ++it;
         }
         if (census) census->report();
@@ -724,6 +734,7 @@ inline void drain_guest_gpu_writes(RttCache& cache, bool invalidate_ds) {
         if (census) census->color_overlaps += color_overlaps;
         invalidate_cpu_rtt_guest_write(cache, write.addr, write.size, census,
                                       prepared.empty() ? nullptr : &prepared);
+        submit_renderer::apply_dcc_write_facts(cache, write.dcc_facts);
         prosper::gpu::set_guest_gpu_write_origin(nullptr);
     }
     if (census) census->report();
