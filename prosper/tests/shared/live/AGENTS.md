@@ -71,5 +71,6 @@ are fixed before startup. These assertions do not imply physical comparison traf
 `test_replay_dcc_metadata` uses the registered capture readers and seed writer through a
 serialization roundtrip. A linker observer sees the real cache; changed old associations and
 unmapped guest memory prevent borrowing the previous live state. Its compute/blend arms verify full-plane black/white clears, unchanged writes and revocation
-by later partial or unobserved writes, without any guest mapping.
+by later partial or unobserved writes, without any guest mapping. Pixel-only temporal seeds keep
+already-learned descriptors for the same target; fresh or changed identities cannot borrow them.
 `test_dcc_write_content` adds bounded-scope, ownership, incomplete-view and per-plane controls.

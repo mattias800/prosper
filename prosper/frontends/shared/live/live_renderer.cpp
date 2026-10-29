@@ -1521,6 +1521,8 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
                 error = "invalid temporal RTT seed"; return false;
             }
             RttSurf& surface = g_rtt[seed.guest_addr];
+            const bool same_target = !surface.volume_depth && surface.w == seed.width &&
+                surface.h == seed.height && surface.format == format;
             surface.guest_origins.observe(seed.guest_addr, 0u); // capture pixels do not certify a live guest layout
             surface.w = seed.width; surface.h = seed.height;
             surface.volume_depth = 0;
@@ -1532,7 +1534,7 @@ void register_live_renderer(const std::string& frame_dir, bool dump_bmps_request
             surface.has_uniform_color = false;
             surface.gpu_valid = false;
             surface.dcc_metadata_dirty = false;
-            restore_rtt_dcc_metadata(surface, seed.dcc_metadata);
+            restore_rtt_dcc_metadata(surface, seed.dcc_metadata, same_target);
             surface.dcc_uniform_write_byte.reset();
             track_rtt_dcc_write_plane(seed.guest_addr, surface);
             prosper::test::invalidate_persistent_color_target(seed.guest_addr);

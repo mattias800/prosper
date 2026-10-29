@@ -140,6 +140,7 @@ void resolve_pass(ResolvePassContext& ctx) {
         resolved.dcc_alpha_is_on_msb = false;
         resolved.dcc_width = resolved.dcc_height = 0;
         resolved.dcc_metadata_dirty = false;
+        resolved.dcc_uniform_write_byte.reset();
         resolved.dcc_guest_origins = {};
         const uint32_t rw = resolved.w, rh = resolved.h;
         // The destination programming supplies its own complete physical layout. Source pixels

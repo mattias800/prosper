@@ -283,17 +283,17 @@ TEST_P(ReplayDccMetadata, LaterUnobservedWriteRevokesTheCompletePlaneFact) {
     notify_guest_gpu_write(std::get<0>(expected) + 16, 1);
     ASSERT_NO_FATAL_FAILURE(expect_start({255, 0, 0, 255}));
 }
-TEST_P(ReplayDccMetadata, LegacySeedClearsAnExistingAssociationRatherThanBorrowingIt) {
+TEST_P(ReplayDccMetadata, LegacySeedPreservesTheDescriptorAlreadyLearnedForTheSameTarget) {
     ASSERT_NO_FATAL_FAILURE(prepare_replay_surface());
     GpuCaptureRttSeed seed;
     std::string error;
     ASSERT_TRUE(read_gpu_capture_rtt_seed(target, seed, error)) << error;
     seed.dcc_metadata = {};
     ASSERT_TRUE(restore_gpu_replay_rtt_seeds({seed}, error)) << error;
-    EXPECT_EQ(identity(observed_cache->at(target)), DccIdentity{});
+    EXPECT_EQ(identity(observed_cache->at(target)), expected);
     std::vector<uint8_t> metadata(4096, 0xff);
     ASSERT_NO_FATAL_FAILURE(fill_metadata(metadata, 0x40404040));
-    ASSERT_NO_FATAL_FAILURE(expect_start({255, 0, 0, 255}));
+    ASSERT_NO_FATAL_FAILURE(expect_start({0, 0, 0, 255}));
 }
 TEST_P(ReplayDccMetadata, QueuedFactCannotNameAReplacedMetadataAssociation) {
     ASSERT_NO_FATAL_FAILURE(prepare_replay_surface());
@@ -305,6 +305,31 @@ TEST_P(ReplayDccMetadata, QueuedFactCannotNameAReplacedMetadataAssociation) {
     seed.dcc_metadata.metadata_addr += 0x1000;
     ASSERT_TRUE(restore_gpu_replay_rtt_seeds({seed}, error)) << error;
     ASSERT_NO_FATAL_FAILURE(expect_start({255, 0, 0, 255}));
+}
+TEST_P(ReplayDccMetadata, FreshLegacySeedCannotInventAnAssociation) {
+    ASSERT_NO_FATAL_FAILURE(prepare_replay_surface());
+    GpuCaptureRttSeed seed;
+    std::string error;
+    ASSERT_TRUE(read_gpu_capture_rtt_seed(target, seed, error)) << error;
+    seed.dcc_metadata = {};
+    observed_cache->erase(target);
+    prosper::test::invalidate_persistent_color_target(target);
+    ASSERT_TRUE(restore_gpu_replay_rtt_seeds({seed}, error)) << error;
+    EXPECT_EQ(identity(observed_cache->at(target)), DccIdentity{});
+    std::vector<uint8_t> metadata(4096, 0xff);
+    ASSERT_NO_FATAL_FAILURE(fill_metadata(metadata, 0x40404040));
+    ASSERT_NO_FATAL_FAILURE(expect_start({255, 0, 0, 255}));
+}
+TEST_P(ReplayDccMetadata, ChangedTargetCannotBorrowTheOldAssociationFromALegacySeed) {
+    ASSERT_NO_FATAL_FAILURE(prepare_replay_surface());
+    GpuCaptureRttSeed seed;
+    std::string error;
+    ASSERT_TRUE(read_gpu_capture_rtt_seed(target, seed, error)) << error;
+    seed.dcc_metadata = {};
+    seed.width /= 2;
+    seed.rgba.resize(seed.width * seed.height * 4);
+    ASSERT_TRUE(restore_gpu_replay_rtt_seeds({seed}, error)) << error;
+    EXPECT_EQ(identity(observed_cache->at(target)), DccIdentity{});
 }
 INSTANTIATE_TEST_SUITE_P(RegisteredReaders, ReplayDccMetadata, ::testing::Values(false, true),
                          [](const auto& info) { return info.param ? "All" : "Single"; });
