@@ -1,6 +1,7 @@
 // live_renderer.cpp — see live_renderer.hpp. Extracted from boot_trace's PROSPER_RENDER lambda
 // (behavior-preserving); Vulkan-backed, so this unit links Vulkan::Vulkan.
 #include "shared/live/live_renderer.hpp"
+#include "shared/live/submit_renderer/dcc_write_content.hpp"
 #include "diagnostics/readback_refusal.hpp"
 #include "diagnostics/env_cache.hpp"   // PROSPER_ENV_ON / _VALUE: cached reads on per-draw paths
 #include "diagnostics/env_numeric.hpp" // #3253: a typo must not select a different setting

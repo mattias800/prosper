@@ -11,6 +11,7 @@
 #endif
 
 #include "host/memory/guest_memory_copy.hpp"   // read_capture_guest_memory (#3734)
+#include "gpu/capture/rtt_dcc_metadata.hpp"
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/recompiler/compute_dispatch_launch.hpp"
 

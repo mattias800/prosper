@@ -171,7 +171,7 @@ inline BackendColorTargetStats backend_color_target_stats() {
 //
 // When `tex` is non-null, its RGBA8 texels are uploaded to a sampled VkImage and bound as a combined
 // image sampler at tex->binding — how a recompiled pixel shader's image_sample reaches a real texture.
-#include "fixtures/backend_draw.h"
+#include "fixtures/backend_draw.h"   // IWYU pragma: export
 
 struct BackendTextureUploadStats {
     size_t references = 0;

@@ -2,6 +2,10 @@
 // mapping. The next blended draw must read its start colour from the complete metadata write.
 // Partial, nonuniform and unknown later writes must not reuse an earlier uniform-clear fact.
 #include "fixtures/spirv_triangle.h"
+#include "fixtures/render_runner.h"
+#include "shared/live/live_renderer_internal.hpp"
+#include "hle/dispatch/nid.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/execute/gpu_execute.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"

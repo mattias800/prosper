@@ -1,4 +1,5 @@
 #include "shared/live/output_write_notify.hpp"
+#include <cstdint>
 #include "gpu/execute/gpu_execute.hpp"
 #include "shared/live/output_write_content.hpp"
 

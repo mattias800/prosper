@@ -1,5 +1,10 @@
 // Scan only known metadata planes intersected by this write, under the existing queue lock.
 #include "shared/live/submit_renderer/dcc_write_content.hpp"
+#include <cstdint>
+#include <cstddef>
+#include <span>
+#include <optional>
+#include <vector>
 #include "shared/live/live_renderer_internal.hpp"
 #include <algorithm>
 #include <mutex>

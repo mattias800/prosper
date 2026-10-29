@@ -1,6 +1,7 @@
 // load_shader_overrides, materialize_dirty_dcc_clears -- see callback_prelude.hpp. Moved verbatim out of
 // live_renderer.cpp (#3892).
 #include "shared/live/submit_renderer/callback_prelude.hpp"
+#include <optional>
 #include "shared/live/submit_renderer/guest_reads.hpp"
 #include "shared/live/submit_renderer/mrt_slots.hpp"   // color_binding
 #include "gpu/state/render_state.hpp"   // kColorTargetCount

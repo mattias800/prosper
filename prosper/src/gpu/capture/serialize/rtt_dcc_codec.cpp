@@ -1,5 +1,8 @@
 // The v79 tail retains a descriptor association, never a host pointer or an inferred clear.
 #include "gpu/capture/serialize/rtt_dcc_codec.hpp"
+#include "gpu/capture/gpu_capture.hpp"
+#include "gpu/capture/rtt_dcc_metadata.hpp"
+#include "gpu/capture/gpu_capture_internal.hpp"
 #include "gpu/capture/serialize/capture_codecs.hpp"
 #include <cstdint>
 #include <string>

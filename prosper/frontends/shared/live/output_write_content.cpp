@@ -1,5 +1,7 @@
 // No pointer escapes the synchronous observer; that observer retains only owned content facts.
 #include "shared/live/output_write_content.hpp"
+#include <cstdint>
+#include <span>
 #include "gpu/resources/shader_resources.hpp"
 #include <algorithm>
 #include <cstddef>

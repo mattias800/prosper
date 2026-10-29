@@ -1,5 +1,6 @@
 // Only complete, uniform producer bytes can stand in for an unreadable metadata plane.
 #include "shared/live/output_write_content.hpp"
+#include <span>
 #include "shared/live/submit_renderer/dcc_write_content.hpp"
 #include <gtest/gtest.h>
 #include <array>

@@ -1,5 +1,6 @@
 // Capture and restore values, without retaining a cache entry or claiming live guest layout.
 #include "shared/live/submit_renderer/rtt_dcc_capture.hpp"
+#include "gpu/capture/rtt_dcc_metadata.hpp"
 #include "shared/live/live_renderer_internal.hpp"
 
 namespace prosper::frontend::submit_renderer {
