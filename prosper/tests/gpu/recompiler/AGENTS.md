@@ -1,5 +1,8 @@
 # `tests/gpu/recompiler` — translation tests and the legacy compute execution fixture
 
+`test_cfg_reject_reason` retains a Wave64 dispatcher's actual fresh-mask cause and launch root
+in its terminal record. The ordinary Wave32 path and supplied sources are independent controls.
+
 `test_loop_vcc_data_exit` observes current scalar VCC halves after a structured loop retires
 its entry mask on both exits. Nested scalar branches and one/four iterations execute in the
 interpreter; the separate GPU arm lives under `execute/`. Hard root mutations remain refused.

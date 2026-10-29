@@ -2856,6 +2856,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_saved_exec_data.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_cfg_reject_reason
+    SOURCES tests/gpu/recompiler/test_cfg_reject_reason.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_compute_loop_data_route
     SOURCES tests/gpu/recompiler/test_compute_loop_data_route.cpp
     INCLUDES tests tests/gpu/recompiler

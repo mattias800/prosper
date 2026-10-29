@@ -3279,16 +3279,15 @@ bool emit_cfg_state_machine(
                         // lowering ran and could not resolve an operand or a resource-table
                         // descriptor. Without it a census cannot tell "implement this" from
                         // "this instruction is fine, its descriptor is not".
-                    const bool stage_unsupported = b.wave_size == 32 &&
-                                                   b.stage_reject_pc == in.pc &&
-                                                   !b.stage_reject_reason.empty();
+                    const bool named_refusal =
+                        b.stage_reject_pc == in.pc && !b.stage_reject_reason.empty();
                     log_recompile_diagnostic(b.diagnostic, "cfg-recompile-reject", "terminal",
-                                             "mode=%s%s%s pc=%u words=%s len=%u fmt=%d op=0x%x",
+                                             "mode=%s pc=%u words=%s len=%u fmt=%d op=0x%x%s%s",
                                              handled ? "unresolved-operand" : "unknown-encoding",
-                                             stage_unsupported ? " reason=" : "",
-                                             stage_unsupported ? b.stage_reject_reason.c_str() : "",
                                              in.pc, reject_words_text(in).c_str(), in.len_dwords,
-                                             static_cast<int>(in.fmt), in.opcode);
+                                             static_cast<int>(in.fmt), in.opcode,
+                                             named_refusal ? " reason=" : "",
+                                             named_refusal ? b.stage_reject_reason.c_str() : "");
                     return false;
                 }
                 // Ordinary scalar B64 logicals already produced an exact nonzero SCC id above.
