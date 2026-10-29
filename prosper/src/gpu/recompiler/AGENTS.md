@@ -37,6 +37,8 @@ envelope. Bounded compile-case records retain that identity; complete terminal d
 the roots. Neither changes compiler inputs or admission.
 
 `rdna2_placeholder_origins` identifies typed roots of fabricated words.
+CFG terminal records retain the emitter's current-PC cause at either wave width, so the existing
+origin formatter can expose those roots. Reporting a root grants no admission or register value.
 The launch snapshot distinguishes absent inputs from words hardware never loads; the backward
 CFG slice follows joins and loops to those roots and keeps spill slots separate. Its query and
 formatter supply attempt-local refusal details. Each queried placeholder word retains its own
