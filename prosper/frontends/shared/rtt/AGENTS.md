@@ -5,6 +5,10 @@ renderer/consumer shape compatibility, CPU/GPU representation authority, and nat
 pixel filling and nearest-neighbor scaling. Snapshot materialization may retain immutable CPU
 owners, but these helpers do not acquire Vulkan resources or establish completion or freshness.
 
+`retained_color_clear.hpp` selects matching 2D clear values and immutable CPU seed owners. Call
+after resource preparation drains guest writes; the returned ownership preserves lifetime, not
+freshness. Clear pointers refer to the caller's per-slot storage, never to retained cache nodes.
+
 Live publication, invalidation, image imports, leases and synchronization belong in `shared/live`
 and its renderer/backend integration. A matching extent or byte layout alone does not authorize
 borrowing a live image. Generic format decoding belongs in `shared/texture`. CPU byte-oracle and

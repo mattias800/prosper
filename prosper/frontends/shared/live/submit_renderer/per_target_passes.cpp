@@ -5,6 +5,7 @@
 #include "shared/live/submit_renderer/pass_diagnostics.hpp" // the pass-loop diagnostics (#3892)
 #include "shared/live/submit_renderer/mrt_slots.hpp"        // color_binding, active_format, active_color(_count) (#3892)
 #include "shared/rtt/volume_producer_shape.hpp"   // each volume slot's guest claim (#4643)
+#include "shared/rtt/retained_color_clear.hpp"
 
 namespace prosper::frontend::submit_renderer {
 
@@ -494,9 +495,6 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
                 }
             }
         }
-        const uint8_t* seed = nullptr;
-        const float* retained_uniform_clear = nullptr;
-        bool gpu_seed_available = false;
         const bool seed_rtt0 = seed_target(base);
         const VkFormat pass_format = format0;
         const auto& primary_volume_view = pass.front()->color_targets[0];
@@ -559,43 +557,6 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
         const VkFormat pass_format1 = use_color1 ? format1 : VK_FORMAT_UNDEFINED;
         const size_t pass_bytes = static_cast<size_t>(gw) * gh *
             prosper::test::backend_color_bytes_per_pixel(pass_format);
-        if (seed_rtt0 && base) { auto sit = g_rtt.find(base);
-            gpu_seed_available = live_gpu_targets && sit != g_rtt.end() &&
-                sit->second.gpu_valid && sit->second.w == gw && sit->second.h == gh &&
-                sit->second.format == pass_format &&
-                sit->second.volume_depth == producer_volume_depth &&
-                prosper::test::find_persistent_color_target(
-                    base, gw, gh, pass_format, true,
-                    producer_volume_depth) != nullptr;
-            if (!gpu_seed_available && sit != g_rtt.end() &&
-                !producer_volume_depth && !sit->second.volume_depth &&
-                sit->second.w == gw && sit->second.h == gh &&
-                sit->second.format == pass_format && sit->second.rgba &&
-                sit->second.rgba->size() == pass_bytes)
-                seed = sit->second.rgba->data();
-            if (!gpu_seed_available && !seed && sit != g_rtt.end() &&
-                !producer_volume_depth && !sit->second.volume_depth &&
-                sit->second.w == gw && sit->second.h == gh &&
-                sit->second.format == pass_format &&
-                sit->second.has_uniform_color)
-                retained_uniform_clear = sit->second.uniform_color.data();
-            // Gated seed-decision diagnostic: a pass that should LOAD prior target
-            // content but silently falls back to its clear color erases everything the
-            // earlier pass produced (an opaque-black clear wipes a transparent UI RT —
-            // #320's dialogue overlay). Make the decision and its reason visible.
-            if (rtt_log && !seed && !gpu_seed_available) {
-                if (sit == g_rtt.end())
-                    fprintf(stderr, "[rtt] seed miss target=0x%llx reason=no-entry\n",
-                            (unsigned long long)base);
-                else
-                    fprintf(stderr,
-                            "[rtt] seed miss target=0x%llx reason=mismatch "
-                            "entry=%ux%u fmt=%d rgba=%zu want=%ux%u fmt=%d bytes=%zu\n",
-                            (unsigned long long)base, sit->second.w, sit->second.h,
-                            (int)sit->second.format,
-                            sit->second.rgba ? sit->second.rgba->size() : (size_t)0,
-                            gw, gh, (int)pass_format, pass_bytes);
-            } }
         // A later pass in THIS batch that reads the target's CPU bytes cannot be served
         // lazily: the producing commands are still unsubmitted when it binds, so a
         // mid-batch readback would return stale pixels. Only the direct GPU bind (2D
@@ -821,31 +782,7 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
                 .cpu_needed_same_batch = cpu_needed_same_batch};
             note_readback_why(note_readback_why_ctx);
         }
-        const uint8_t* seed1 = nullptr;
-        const float* retained_uniform_clear1 = nullptr;
-        bool gpu_seed1_available = false;
         const bool seed_rtt1 = seed_target(base1);
-        // A volume slot is never CPU-seeded: it LOADs its retained slices (#4643).
-        if (seed_rtt1 && use_color1 && !slot_volumes[1].depth) {
-            auto sit = g_rtt.find(base1);
-            gpu_seed1_available = live_gpu_targets && sit != g_rtt.end() &&
-                sit->second.gpu_valid &&
-                sit->second.w == gw && sit->second.h == gh &&
-                sit->second.format == pass_format1 &&
-                prosper::test::find_persistent_color_target(
-                    base1, gw, gh, pass_format1) != nullptr;
-            if (!gpu_seed1_available && sit != g_rtt.end() &&
-                sit->second.w == gw && sit->second.h == gh &&
-                sit->second.format == pass_format1 && sit->second.rgba &&
-                sit->second.rgba->size() == static_cast<size_t>(gw) * gh *
-                    prosper::test::backend_color_bytes_per_pixel(pass_format1))
-                seed1 = sit->second.rgba->data();
-            if (!gpu_seed1_available && !seed1 && sit != g_rtt.end() &&
-                sit->second.w == gw && sit->second.h == gh &&
-                sit->second.format == pass_format1 &&
-                sit->second.has_uniform_color)
-                retained_uniform_clear1 = sit->second.uniform_color.data();
-        }
         if (base1 && !use_color1 && rtt_log) {
             const auto* first = render_pass.empty() ? nullptr : render_pass.front();
             fprintf(stderr,
@@ -922,18 +859,77 @@ void render_per_target_passes(PerTargetPassContext& ctx) {
             backend_target.load_existing_slots[slot] = seed_target(pass_bases[slot]);
             backend_target.readback_slots[slot] =
                 pass_bases[slot] != 0 && !defer_readback_slots[slot] && !slot_volumes[slot].depth;
-            // A target left as one uniform colour (a DCC fast clear nothing has drawn over
-            // yet) has no image to load: the slot starts from that colour, as slots 0 and 1
-            // do through `retained_uniform_clear` (#4624). The backend uses it only when it
-            // loads nothing into the slot.
-            if (!backend_target.load_existing_slots[slot]) continue;
-            if (const auto sit = g_rtt.find(pass_bases[slot]);
-                sit != g_rtt.end() && sit->second.has_uniform_color && sit->second.w == gw &&
-                sit->second.h == gh && sit->second.format == pass_formats[slot])
-                backend_target.uniform_clear_slots[slot] = sit->second.uniform_color.data();
         }
         auto backend_draws = build_bds(
             render_pass, batch_backend_submits ? &backend_submission : nullptr);
+        // Resource preparation can drain guest writes and erase g_rtt entries. Re-query after
+        // it, then own each selected colour until render_draws_rgba has consumed the arguments.
+        std::array<std::array<float, 4>, prosper::gpu::kColorTargetCount> uniform_clear_storage{};
+        std::shared_ptr<const std::vector<uint8_t>> seed_owner, seed1_owner;
+        const uint8_t* seed = nullptr;
+        const float* retained_uniform_clear = nullptr;
+        bool gpu_seed_available = false;
+        const uint8_t* seed1 = nullptr;
+        const float* retained_uniform_clear1 = nullptr;
+        bool gpu_seed1_available = false;
+        if (seed_rtt0 && base) {
+            auto sit = g_rtt.find(base);
+            gpu_seed_available =
+                live_gpu_targets && sit != g_rtt.end() && sit->second.gpu_valid &&
+                sit->second.w == gw && sit->second.h == gh && sit->second.format == pass_format &&
+                sit->second.volume_depth == producer_volume_depth &&
+                prosper::test::find_persistent_color_target(base, gw, gh, pass_format, true,
+                                                            producer_volume_depth) != nullptr;
+            const auto* surface = sit == g_rtt.end() ? nullptr : &sit->second;
+            seed_owner = prosper::frontend::retained_color_slot_seed(
+                surface, !gpu_seed_available, gw, gh, pass_format, producer_volume_depth,
+                pass_bytes);
+            seed = seed_owner ? seed_owner->data() : nullptr;
+            retained_uniform_clear = prosper::frontend::retained_color_slot_clear(
+                surface, !gpu_seed_available && !seed, gw, gh, pass_format, producer_volume_depth,
+                uniform_clear_storage[0]);
+            // Gated seed-decision diagnostic: a pass that should LOAD prior target
+            // content but silently falls back to its clear color erases everything the
+            // earlier pass produced (an opaque-black clear wipes a transparent UI RT —
+            // #320's dialogue overlay). Make the decision and its reason visible.
+            if (rtt_log && !seed && !gpu_seed_available) {
+                if (sit == g_rtt.end())
+                    fprintf(stderr, "[rtt] seed miss target=0x%llx reason=no-entry\n",
+                            (unsigned long long)base);
+                else
+                    fprintf(stderr,
+                            "[rtt] seed miss target=0x%llx reason=mismatch "
+                            "entry=%ux%u fmt=%d rgba=%zu want=%ux%u fmt=%d bytes=%zu\n",
+                            (unsigned long long)base, sit->second.w, sit->second.h,
+                            (int)sit->second.format,
+                            sit->second.rgba ? sit->second.rgba->size() : (size_t)0, gw, gh,
+                            (int)pass_format, pass_bytes);
+            }
+        }
+        // A volume slot is never CPU-seeded: it LOADs its retained slices (#4643).
+        if (seed_rtt1 && use_color1 && !slot_volumes[1].depth) {
+            auto sit = g_rtt.find(base1);
+            gpu_seed1_available =
+                live_gpu_targets && sit != g_rtt.end() && sit->second.gpu_valid &&
+                sit->second.w == gw && sit->second.h == gh && sit->second.format == pass_format1 &&
+                prosper::test::find_persistent_color_target(base1, gw, gh, pass_format1) != nullptr;
+            const auto* surface = sit == g_rtt.end() ? nullptr : &sit->second;
+            seed1_owner = prosper::frontend::retained_color_slot_seed(
+                surface, !gpu_seed1_available, gw, gh, pass_format1, slot_volumes[1].depth,
+                static_cast<size_t>(gw) * gh *
+                    prosper::test::backend_color_bytes_per_pixel(pass_format1));
+            seed1 = seed1_owner ? seed1_owner->data() : nullptr;
+            retained_uniform_clear1 = prosper::frontend::retained_color_slot_clear(
+                surface, !gpu_seed1_available && !seed1, gw, gh, pass_format1,
+                slot_volumes[1].depth, uniform_clear_storage[1]);
+        }
+        for (uint32_t slot = 2; slot < mrt_count; ++slot) {
+            const auto sit = g_rtt.find(pass_bases[slot]);
+            backend_target.uniform_clear_slots[slot] = prosper::frontend::retained_color_slot_clear(
+                sit == g_rtt.end() ? nullptr : &sit->second,
+                backend_target.load_existing_slots[slot], gw, gh, pass_formats[slot],
+                slot_volumes[slot].depth, uniform_clear_storage[slot]);
+        }
         const auto build_done = timing_enabled || perf_build_clock
             ? RenderClock::now() : RenderClock::time_point{};
         if (perf_build_clock) {

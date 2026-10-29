@@ -2280,6 +2280,11 @@ if(TARGET prosper_core)
     SOURCES frontends/shared/tests/test_mrt_binding.cpp
     INCLUDES frontends src)
 
+  # Retained clear ownership/admission and backend clear priority, without a device (#4624).
+  prosper_add_gtest(test_color_slot_clear
+    SOURCES tests/render/test_color_slot_clear.cpp
+    INCLUDES tests frontends)
+
   prosper_add_gtest(test_rtt_injection
     SOURCES frontends/shared/tests/test_rtt_injection.cpp
     INCLUDES frontends)
@@ -6343,12 +6348,6 @@ endif()
         SOURCES tests/render/test_ds_guest_plane_bytes.cpp
         INCLUDES tests frontends
         LIBRARIES prosper_core Vulkan::Vulkan)
-
-      # What a colour slot above 1 starts from when nothing is loaded into it (#4624).
-      prosper_add_gtest(test_color_slot_clear
-        SOURCES tests/render/test_color_slot_clear.cpp
-        INCLUDES tests
-        LIBRARIES prosper_core)
 
       # A replay process, which has no guest mapping table, compares guest addresses (#4619).
       prosper_add_gtest(test_ds_replay_alias
