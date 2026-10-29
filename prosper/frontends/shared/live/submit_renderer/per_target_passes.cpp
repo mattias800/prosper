@@ -6,6 +6,9 @@
 #include "shared/live/submit_renderer/mrt_slots.hpp"        // color_binding, active_format, active_color(_count) (#3892)
 #include "shared/rtt/volume_producer_shape.hpp"   // each volume slot's guest claim (#4643)
 #include "shared/rtt/retained_color_clear.hpp"
+#include <array>
+#include <memory>
+#include <vector>
 
 namespace prosper::frontend::submit_renderer {
 

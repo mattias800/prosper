@@ -6,6 +6,10 @@ GPU commands; distinguish those state assertions from rendered pixel or synchron
 Pure frontend policy tests belong in `frontends/shared/tests`. `tests/fixtures/render_runner.h`
 is also the shipping graphics backend, and its synchronization rules apply here.
 
+`test_dcc_clear_render_target` also drains real queued colour-plane writes into its retained
+cache and observes clear-value/CPU-owner lifetimes and subsequent selection refusal. These are
+CPU cache/ownership checks; they submit no Vulkan work and claim no live resource-build interleaving.
+
 `test_raster_quad_collection` uses owned AGC registration and the real realization/registered
 renderer route. Its CPU arm checks producing SOURCE/raw lifetime without creating a device; its
 GPU arm observes only private pre-depth/pre-guest-PS raster-input records, including helper versus
