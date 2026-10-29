@@ -35,7 +35,7 @@ const float* retained_color_slot_clear(const Surface* surface, bool load_existin
 template <typename Surface, typename Format>
 std::shared_ptr<const std::vector<uint8_t>>
 retained_color_slot_seed(const Surface* surface, bool load_existing, uint32_t width,
-                         uint32_t height, Format format, uint32_t volume_depth, size_t bytes) {
+                         uint32_t height, Format format, uint32_t volume_depth, std::size_t bytes) {
     if (!retained_color_slot_matches(surface, load_existing, width, height, format, volume_depth) ||
         !surface->rgba || surface->rgba->size() != bytes)
         return {};

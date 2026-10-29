@@ -57,6 +57,7 @@ TEST(ColorSlotClear, ARetainedUniformColourComesBeforeThePassesOwnClear) {
 }
 
 namespace {
+constexpr std::size_t kSeedBytes = std::size_t{64} * 32 * 4;
 struct RetainedSurface {
     uint32_t w = 64, h = 32, format = 7, volume_depth = 0;
     bool has_uniform_color = true;
@@ -127,41 +128,41 @@ TEST(ColorSlotClear, EverySlotsSelectedClearHasIndependentStorage) {
 
 TEST(ColorSlotClear, CpuSeedRetainsTheImmutablePixelOwnerAfterCacheErasure) {
     std::unordered_map<uint64_t, RetainedSurface> cache{{1, RetainedSurface{}}};
-    cache.at(1).rgba = std::make_shared<const std::vector<uint8_t>>(64 * 32 * 4, 0x5a);
+    cache.at(1).rgba = std::make_shared<const std::vector<uint8_t>>(kSeedBytes, 0x5a);
     const std::weak_ptr<const std::vector<uint8_t>> observed = cache.at(1).rgba;
     auto seed =
-        prosper::frontend::retained_color_slot_seed(&cache.at(1), true, 64, 32, 7u, 0, 64 * 32 * 4);
+        prosper::frontend::retained_color_slot_seed(&cache.at(1), true, 64, 32, 7u, 0, kSeedBytes);
     ASSERT_NE(seed, nullptr);
     cache.clear(); // mutation: borrowing the cache's pointer loses this last real owner
     ASSERT_FALSE(observed.expired());
-    EXPECT_EQ(*seed, std::vector<uint8_t>(64 * 32 * 4, 0x5a));
+    EXPECT_EQ(*seed, std::vector<uint8_t>(kSeedBytes, 0x5a));
     seed.reset();
     EXPECT_TRUE(observed.expired());
 }
 
 TEST(ColorSlotClear, CpuSeedRequiresTheExactCurrentTwoDimensionalSurface) {
     RetainedSurface surface;
-    surface.rgba = std::make_shared<const std::vector<uint8_t>>(64 * 32 * 4, 0x5a);
-    const auto select = [&](bool load, uint32_t volume, size_t bytes) {
+    surface.rgba = std::make_shared<const std::vector<uint8_t>>(kSeedBytes, 0x5a);
+    const auto select = [&](bool load, uint32_t volume, std::size_t bytes) {
         return prosper::frontend::retained_color_slot_seed(&surface, load, 64, 32, 7u, volume,
                                                            bytes);
     };
-    ASSERT_NE(select(true, 0, 64 * 32 * 4), nullptr);
-    EXPECT_EQ(select(false, 0, 64 * 32 * 4), nullptr);
-    EXPECT_EQ(select(true, 2, 64 * 32 * 4), nullptr);
-    EXPECT_EQ(select(true, 0, 64 * 32 * 4 - 1), nullptr);
+    ASSERT_NE(select(true, 0, kSeedBytes), nullptr);
+    EXPECT_EQ(select(false, 0, kSeedBytes), nullptr);
+    EXPECT_EQ(select(true, 2, kSeedBytes), nullptr);
+    EXPECT_EQ(select(true, 0, kSeedBytes - 1), nullptr);
     surface.volume_depth = 2;
-    EXPECT_EQ(select(true, 0, 64 * 32 * 4), nullptr);
+    EXPECT_EQ(select(true, 0, kSeedBytes), nullptr);
     surface.volume_depth = 0;
     ++surface.w;
-    EXPECT_EQ(select(true, 0, 64 * 32 * 4), nullptr);
+    EXPECT_EQ(select(true, 0, kSeedBytes), nullptr);
     --surface.w;
     ++surface.h;
-    EXPECT_EQ(select(true, 0, 64 * 32 * 4), nullptr);
+    EXPECT_EQ(select(true, 0, kSeedBytes), nullptr);
     --surface.h;
     ++surface.format;
-    EXPECT_EQ(select(true, 0, 64 * 32 * 4), nullptr);
+    EXPECT_EQ(select(true, 0, kSeedBytes), nullptr);
     --surface.format;
     surface.rgba.reset();
-    EXPECT_EQ(select(true, 0, 64 * 32 * 4), nullptr);
+    EXPECT_EQ(select(true, 0, kSeedBytes), nullptr);
 }
