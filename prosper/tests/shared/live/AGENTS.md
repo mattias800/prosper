@@ -10,6 +10,10 @@ is also the shipping graphics backend, and its synchronization rules apply here.
 cache and observes clear-value/CPU-owner lifetimes and subsequent selection refusal. These are
 CPU cache/ownership checks; they submit no Vulkan work and claim no live resource-build interleaving.
 
+`test_retained_preparation_order` uses Linux linker wrapping to inject a real queued write inside
+the registered renderer's resource-build boundary. It observes the real drain and rendered pixels
+for CPU seeds in slots 0/1 and uniform clears in slots 0/1/2; no shipping test hook is added.
+
 `test_raster_quad_collection` uses owned AGC registration and the real realization/registered
 renderer route. Its CPU arm checks producing SOURCE/raw lifetime without creating a device; its
 GPU arm observes only private pre-depth/pre-guest-PS raster-input records, including helper versus
@@ -45,6 +49,10 @@ samples, while pre-promotion comparisons provide a positive population control. 
 are fixed before startup. These assertions do not imply physical comparison traffic or GPU timing.
 
 ## Ruled out
+
+- Owning retained inputs alone does not prove selection follows resource preparation. The #5537
+  renderer witness moves the unchanged selection before the real build/drain and fails all five
+  CPU-seed/clear pixel cases; restoring the order passes all five.
 
 - Complementing the expected PS float with `1 - value` leaves `0.5` unchanged. The #3987
   raw-wide negative observer produced 47 pixel failures and one passing fresh-mask arm, despite
