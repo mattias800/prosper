@@ -18,14 +18,18 @@
 // descriptor; that line is covered by the title, not by this file.
 #include "gpu/state/render_state.hpp"
 #include "hle/dispatch/dispatch.hpp"
+#include "shared/live/live_renderer_internal.hpp"
 #include "shared/live/submit_renderer/callback_prelude.hpp"
 #include "shared/rtt/mrt_binding.hpp"
+#include "shared/rtt/retained_color_clear.hpp"
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <gtest/gtest.h>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <vector>
 
@@ -130,6 +134,54 @@ TEST_F(DccClearRenderTarget, APassThatRendersToAClearedTargetStartsFromItsClearC
     EXPECT_TRUE(surface().has_uniform_color);
     EXPECT_EQ(surface().uniform_color, (std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f}));
     EXPECT_FALSE(surface().dcc_metadata_dirty);
+}
+
+TEST_F(DccClearRenderTarget, AQueuedColorWriteErasesTheEntryWithoutDanglingCopiedClearValues) {
+    fast_clear(kClear0001);
+    ASSERT_EQ(span(draw_to(kTarget, 0xf)), 1u);
+    const auto expected = surface().uniform_color;
+    std::array<float, 4> storage{};
+    const float* clear = prosper::frontend::retained_color_slot_clear(
+        &surface(), true, kWidth, kHeight, surface().format, 0, storage);
+    ASSERT_EQ(clear, storage.data());   // borrowing mutation fails before any freed-memory read
+    {
+        auto& pending = prosper::frontend::pending_guest_gpu_writes();
+        std::lock_guard<std::mutex> lock(pending.mutex);
+        pending.ranges.push_back({kTarget, 4, "gpu"});
+    }
+    prosper::frontend::drain_guest_gpu_writes(cache_, false);
+    ASSERT_TRUE(cache_.empty());
+    EXPECT_EQ(storage, expected);
+    EXPECT_EQ(prosper::frontend::retained_color_slot_clear(static_cast<const RttSurf*>(nullptr),
+                                                           true, kWidth, kHeight,
+                                                           VK_FORMAT_R8G8B8A8_UNORM, 0, storage),
+              nullptr);   // the next selection cannot reuse that now-invalidated clear
+}
+
+TEST_F(DccClearRenderTarget, AQueuedColorWriteErasesTheEntryButKeepsAnOwnedCpuSeedAlive) {
+    constexpr std::size_t bytes = static_cast<std::size_t>(kWidth) * kHeight * 4;
+    auto& target = cache_.at(kTarget);
+    target.rgba = std::make_shared<const std::vector<uint8_t>>(bytes, 0x5a);
+    target.gpu_valid = false;
+    const std::weak_ptr<const std::vector<uint8_t>> observed = target.rgba;
+    auto seed = prosper::frontend::retained_color_slot_seed(&target, true, kWidth, kHeight,
+                                                            target.format, 0, bytes);
+    ASSERT_NE(seed, nullptr);
+    {
+        auto& pending = prosper::frontend::pending_guest_gpu_writes();
+        std::lock_guard<std::mutex> lock(pending.mutex);
+        pending.ranges.push_back({kTarget, 4, "gpu"});
+    }
+    prosper::frontend::drain_guest_gpu_writes(cache_, false);
+    ASSERT_TRUE(cache_.empty());
+    ASSERT_FALSE(observed.expired());   // non-owning mutation fails before the dereference
+    EXPECT_EQ(*seed, std::vector<uint8_t>(bytes, 0x5a));
+    EXPECT_EQ(prosper::frontend::retained_color_slot_seed(static_cast<const RttSurf*>(nullptr),
+                                                          true, kWidth, kHeight,
+                                                          VK_FORMAT_R8G8B8A8_UNORM, 0, bytes),
+              nullptr);
+    seed.reset();
+    EXPECT_TRUE(observed.expired());
 }
 
 TEST_F(DccClearRenderTarget, TheColourIsTheOneTheCodeNames) {

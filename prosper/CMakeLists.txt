@@ -2280,6 +2280,11 @@ if(TARGET prosper_core)
     SOURCES frontends/shared/tests/test_mrt_binding.cpp
     INCLUDES frontends src)
 
+  # Retained clear ownership/admission and backend clear priority, without a device (#4624).
+  prosper_add_gtest(test_color_slot_clear
+    SOURCES tests/render/test_color_slot_clear.cpp
+    INCLUDES tests frontends)
+
   prosper_add_gtest(test_rtt_injection
     SOURCES frontends/shared/tests/test_rtt_injection.cpp
     INCLUDES frontends)
@@ -6154,6 +6159,17 @@ endif()
         SOURCES tests/shared/live/test_dcc_clear_render_target.cpp
         INCLUDES tests frontends
         LIBRARIES prosper_live_renderer)
+      if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        # Intercept resource preparation in the real renderer without a shipping test hook.
+        prosper_add_gtest(test_retained_preparation_order
+          SOURCES tests/shared/live/test_retained_preparation_order.cpp
+          INCLUDES tests frontends
+          LIBRARIES prosper_live_renderer
+          LABELS gpu
+          PROPERTIES ENVIRONMENT "PROSPER_RTT=1;PROSPER_RTT_PERTARGET=1")
+        target_link_options(test_retained_preparation_order PRIVATE
+          "-Wl,--wrap=_ZN7prosper8frontend15submit_renderer19build_backend_drawsERNS1_18BackendDrawContextERKSt6vectorIPKNS_3gpu8DrawItemESaIS8_EEPNS_4test22BackendSubmissionBatchE")
+      endif()
       add_test(NAME game_compute_rtt_destination_mirror COMMAND test_game_compute_rtt_mirror)
       add_test(NAME game_compute_rtt_destination_mirror_no_direct_retile
                COMMAND test_game_compute_rtt_mirror)
@@ -6343,12 +6359,6 @@ endif()
         SOURCES tests/render/test_ds_guest_plane_bytes.cpp
         INCLUDES tests frontends
         LIBRARIES prosper_core Vulkan::Vulkan)
-
-      # What a colour slot above 1 starts from when nothing is loaded into it (#4624).
-      prosper_add_gtest(test_color_slot_clear
-        SOURCES tests/render/test_color_slot_clear.cpp
-        INCLUDES tests
-        LIBRARIES prosper_core)
 
       # A replay process, which has no guest mapping table, compares guest addresses (#4619).
       prosper_add_gtest(test_ds_replay_alias

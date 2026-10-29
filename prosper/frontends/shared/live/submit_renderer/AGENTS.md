@@ -57,6 +57,8 @@ reference binding sites.
   into the submit's `RenderTiming`) and the `PROSPER_RTT_TIMING` record formatters.
 - `per_target_passes.{hpp,cpp}` — `render_per_target_passes`: the `PROSPER_RTT` per-target pass
   loop (pass grouping, MRT, RTT publication, and choosing the present candidate among its passes).
+  Retained clear and CPU seed selection follows resource preparation and its guest-write drain.
+  Each pass owns copied clear values and immutable CPU pixel owners through rendering/diagnostics.
   It owns the callback's submission batch; when the executor marks the span
   `defer_batch_completion` (#3948 stage 2, a span followed by a dispatch) the batch is submitted
   without a wait and retired later by the executor, not at the end of the call.
