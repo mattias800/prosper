@@ -2,6 +2,7 @@
 #pragma once
 
 #include "gpu/execute/gpu_execute.hpp"
+#include "gpu/capture/rtt_dcc_metadata.hpp"
 
 #include <array>
 #include <cstddef>
@@ -367,6 +368,7 @@ struct GpuCaptureRttSeed {
     uint32_t height = 0;
     GpuCaptureColorFormat format = GpuCaptureColorFormat::Rgba8Unorm;
     std::vector<uint8_t> rgba;
+    GpuCaptureRttDccMetadata dcc_metadata;
 };
 
 enum class GpuCaptureDsFormat : uint32_t {

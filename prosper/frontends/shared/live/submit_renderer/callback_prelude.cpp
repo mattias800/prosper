@@ -1,6 +1,7 @@
 // load_shader_overrides, materialize_dirty_dcc_clears -- see callback_prelude.hpp. Moved verbatim out of
 // live_renderer.cpp (#3892).
 #include "shared/live/submit_renderer/callback_prelude.hpp"
+#include <optional>
 #include "shared/live/submit_renderer/guest_reads.hpp"
 #include "shared/live/submit_renderer/mrt_slots.hpp"   // color_binding
 #include "gpu/state/render_state.hpp"   // kColorTargetCount
@@ -182,9 +183,15 @@ void materialize_dirty_dcc_clears(DccClearContext& ctx) {
                                  uint64_t host_data_bytes, uint32_t num_components,
                                  bool alpha_is_on_msb, bool rendered) {
         if (!metadata_bytes || metadata_bytes > SIZE_MAX) return;
-        std::vector<uint8_t> metadata(static_cast<size_t>(metadata_bytes));
+        // A complete uniform plane is represented exactly by its repeated byte. The decoder
+        // needs only that byte; the producer proof already checked the entire plane.
+        const auto owned_byte = rendered ? found->second.dcc_uniform_write_byte : std::nullopt;
+        std::vector<uint8_t> metadata(owned_byte ? 1 : static_cast<size_t>(metadata_bytes));
         size_t copied = 0;
-        if (host_data) {
+        if (owned_byte) {
+            metadata[0] = *owned_byte;
+            copied = 1;
+        } else if (host_data) {
             copied = static_cast<size_t>(std::min<uint64_t>(metadata.size(), host_data_bytes));
             std::memcpy(metadata.data(), host_data, copied);
         } else {

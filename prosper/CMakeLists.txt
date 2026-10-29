@@ -1091,6 +1091,9 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/execute/test_compute_dispatch_launch.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_rtt_dcc_codec
+    SOURCES tests/gpu/capture/test_rtt_dcc_codec.cpp
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_compute_dispatch_launch_codec
     SOURCES tests/gpu/capture/test_compute_dispatch_launch_codec.cpp
     INCLUDES tests
@@ -5444,10 +5447,14 @@ endif()
                                                frontends/shared/live/submit_renderer/resolve_pass.cpp
                                                frontends/shared/live/submit_renderer/pass_diagnostics.cpp
                                                frontends/shared/live/submit_renderer/callback_prelude.cpp
+                                               frontends/shared/live/submit_renderer/rtt_dcc_capture.cpp
+                                               frontends/shared/live/submit_renderer/dcc_write_content.cpp
+                                               frontends/shared/live/output_write_content.cpp
                                                frontends/shared/live/submit_renderer/callback_diagnostics.cpp
                                                frontends/shared/live/submit_renderer/single_framebuffer.cpp
                                                frontends/shared/live/submit_renderer/final_span_present.cpp
                                                frontends/shared/live/live_compute.cpp
+                                               frontends/shared/live/output_write_notify.cpp
                                                frontends/shared/live/live_target_r11g11b10.cpp
                                                frontends/shared/live/pipeline_observe_hook.cpp
                                                frontends/shared/present/present_blit.cpp
@@ -5860,10 +5867,14 @@ endif()
                                                frontends/shared/live/submit_renderer/resolve_pass.cpp
                                                frontends/shared/live/submit_renderer/pass_diagnostics.cpp
                                                frontends/shared/live/submit_renderer/callback_prelude.cpp
+                                               frontends/shared/live/submit_renderer/rtt_dcc_capture.cpp
+                                               frontends/shared/live/submit_renderer/dcc_write_content.cpp
+                                               frontends/shared/live/output_write_content.cpp
                                                frontends/shared/live/submit_renderer/callback_diagnostics.cpp
                                                frontends/shared/live/submit_renderer/single_framebuffer.cpp
                                                frontends/shared/live/submit_renderer/final_span_present.cpp
                                                frontends/shared/live/live_compute.cpp
+                                               frontends/shared/live/output_write_notify.cpp
                                                frontends/shared/live/live_target_r11g11b10.cpp
                                                frontends/shared/live/pipeline_observe_hook.cpp
                                                frontends/shared/present/present_blit.cpp
@@ -6168,6 +6179,15 @@ endif()
         INCLUDES tests frontends
         LIBRARIES prosper_live_renderer)
       if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        prosper_add_gtest(test_replay_dcc_metadata
+          SOURCES tests/shared/live/test_replay_dcc_metadata.cpp
+                    tests/shared/live/test_dcc_write_content.cpp
+          INCLUDES tests frontends
+          LIBRARIES prosper_live_renderer
+          LABELS gpu
+          PROPERTIES ENVIRONMENT "PROSPER_RTT=1;PROSPER_RTT_PERTARGET=1;PROSPER_GPU_REPLAY_RTT_SEEDS=1")
+        target_link_options(test_replay_dcc_metadata PRIVATE
+          "-Wl,--wrap=_ZN7prosper8frontend15submit_renderer19build_backend_drawsERNS1_18BackendDrawContextERKSt6vectorIPKNS_3gpu8DrawItemESaIS8_EEPNS_4test22BackendSubmissionBatchE")
         # Intercept resource preparation in the real renderer without a shipping test hook.
         prosper_add_gtest(test_retained_preparation_order
           SOURCES tests/shared/live/test_retained_preparation_order.cpp

@@ -30,3 +30,6 @@ mis-parses every prior capture without erroring.
 The size limits (`kMax*`, also in `gpu_capture_internal.hpp`) are the bound on untrusted input:
 these files parse bytes that came off disk, and every count read from a header is checked against
 one before it is used to size an allocation.
+
+`rtt_dcc_codec` owns the v79 RTT-association tail, including count/field validation. Older
+records leave the association unavailable; the original seed payload layout stays intact.

@@ -57,3 +57,6 @@ existing destination and clean only this writer's private temporary. Concurrent 
 one another with complete valid files; they must never share a truncatable temporary or delete the
 previous destination to recover from a failed rename. The collector retains payload ownership until
 the asynchronous writer completes, including failure and shutdown.
+
+`rtt_dcc_metadata` is the retained descriptor association carried alongside RTT seed pixels. It
+contains guest ranges and interpretation facts only; no host pointer or clear value is inferred.

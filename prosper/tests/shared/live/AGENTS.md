@@ -67,3 +67,10 @@ are fixed before startup. These assertions do not imply physical comparison traf
   failed shader realization as a refusal control.
 - An EXEC-writing CMPX does not isolate a VS VCC lifetime refusal. Use the decoded non-EXEC
   VCC compare with a known VGPR setup in the focused graphics backing test.
+
+`test_replay_dcc_metadata` uses the registered capture readers and seed writer through a
+serialization roundtrip. A linker observer sees the real cache; changed old associations and
+unmapped guest memory prevent borrowing the previous live state. Its compute/blend arms verify full-plane black/white clears, unchanged writes and revocation
+by later partial or unobserved writes, without any guest mapping. Pixel-only temporal seeds keep
+already-learned descriptors for the same target; fresh or changed identities cannot borrow them.
+`test_dcc_write_content` adds bounded-scope, ownership, incomplete-view and per-plane controls.
