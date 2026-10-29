@@ -5448,6 +5448,7 @@ endif()
                                                frontends/shared/live/submit_renderer/single_framebuffer.cpp
                                                frontends/shared/live/submit_renderer/final_span_present.cpp
                                                frontends/shared/live/live_compute.cpp
+                                               frontends/shared/live/output_write_notify.cpp
                                                frontends/shared/live/live_target_r11g11b10.cpp
                                                frontends/shared/live/pipeline_observe_hook.cpp
                                                frontends/shared/present/present_blit.cpp
@@ -5864,6 +5865,7 @@ endif()
                                                frontends/shared/live/submit_renderer/single_framebuffer.cpp
                                                frontends/shared/live/submit_renderer/final_span_present.cpp
                                                frontends/shared/live/live_compute.cpp
+                                               frontends/shared/live/output_write_notify.cpp
                                                frontends/shared/live/live_target_r11g11b10.cpp
                                                frontends/shared/live/pipeline_observe_hook.cpp
                                                frontends/shared/present/present_blit.cpp

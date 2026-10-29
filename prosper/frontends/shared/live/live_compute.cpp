@@ -1,4 +1,5 @@
 #include "shared/live/live_compute.hpp"
+#include "shared/live/output_write_notify.hpp"
 #include "diagnostics/perf/perf_ledger.hpp"   // #3891: shader-compile alarm
 #include "diagnostics/perf/wave64_refusal.hpp"
 #include "shared/compute/storage_write_mask_spirv.hpp"
@@ -3694,23 +3695,6 @@ struct BorrowedComputeImageLease {
         if (context) context->release_cached_image(key);
     }
 };
-
-// Hosted/replay resources can write a different live allocation than their advertised range.
-// Both identities matter to renderer aliases and to the ordered journal, including cached views
-// absent from this dispatch. Do not duplicate the normal guest-backed notification.
-void notify_output_write(uint64_t advertised, const void* destination, uint64_t bytes,
-                         bool preserving_bytes = false) {
-    // Zero-address backing is GPU-internal state (for example GDS), not a guest output.
-    if (!advertised) return;
-    const auto notify = [&](uint64_t address) {
-        if (!address || !bytes) return;
-        if (preserving_bytes) prosper::gpu::notify_guest_gpu_write_preserving_bytes(address, bytes);
-        else prosper::gpu::notify_guest_gpu_write(address, bytes);
-    };
-    notify(advertised);
-    const uint64_t effective = reinterpret_cast<uintptr_t>(destination);
-    if (effective != advertised) notify(effective);
-}
 
 // Image conversion writes straight into the host-visible Vulkan staging allocation. Keep the map
 // scoped so every validation/error exit unmaps it before cleanup releases the pooled memory.
