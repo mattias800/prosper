@@ -5,6 +5,8 @@ LOW-only replacement. Complete and actual partial groups run in the interpreter;
 launch words and a missing spill cannot supply entry-mask authority. Scalar multiplication
 separately observes the new words through a mask read. `test_native_entry_exec_proof` checks
 all CFG predecessors and backedges, physical aliases and original builder/program/launch binding.
+READFIRST arithmetic must not launder a missing broadcast into mask authority; its complete
+overwrite executes independently. A partial profile without forced zero start stays refused.
 
 `test_native_pixel_parameter` checks the original-program interpolation-only entry service,
 actual native Input output and the reused scalar lifetime. Unknown/wrong prefixes, numerical

@@ -8,7 +8,10 @@ supply their recorded entry bits; current participation never substitutes for th
 Existing full-participation emission keeps priority. Unknown profiles, changed code/context
 and missing roots retain their separate boundaries. A native VCC mask read can project two
 already genuine current scalar words after a numerical overwrite retired its previous predicate;
-missing or fabricated words cannot borrow that projection.
+missing or fabricated words cannot borrow that projection. Each current word also needs one
+original reaching expression from scalar inputs, pure ALU, an entry-only scalar load or the
+authenticated entry mask. Vector publications, value cycles and multiple definitions remain
+unproved; complete overwrites retire their old ancestry. Partial launches force a zero origin.
 
 `pixel_parameter_launch` carries the producing PS RSRC2 word with independent knownness.
 `rdna2_native_parameter_base` admits an interpolation-only entry service during guarded retries

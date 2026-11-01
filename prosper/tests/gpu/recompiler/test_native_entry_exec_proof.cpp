@@ -6,6 +6,7 @@
 #include "gpu/recompiler/rdna2_native_entry_exec_words.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <stdexcept>
 #include <cstdint>
 #include <vector>
@@ -128,34 +129,52 @@ TEST(NativeEntryExecProof, OriginalSubregionsKeepTheirExistingAuthority) {
 }
 
 TEST(NativeEntryExecProof, CurrentVccDataNeedsBothGenuinePhysicalWords) {
-    Frame f;
+    Frame f(fixture::program(true));
+    const auto reader = *std::find_if(f.ins.begin(), f.ins.end(), [](const auto& in) {
+        return in.fmt == Rdna2Format::VOP3 && in.opcode == 0x101;
+    });
     RegState rs;
     rs.vector_wave_size = 64;
     rs.sreg[106] = f.b.uconst(13);
     rs.sreg[107] = f.b.uconst(0x00ffffffu);
-    ASSERT_NE(native_compute_vcc_data_mask(f.b, rs), 0u);
+    ASSERT_NE(native_compute_vcc_data_mask(f.b, rs, reader), 0u);
     for (const int word : {106, 107}) {
         RegState missing = rs;
         missing.sreg.erase(word);
-        EXPECT_EQ(native_compute_vcc_data_mask(f.b, missing), 0u);
+        EXPECT_EQ(native_compute_vcc_data_mask(f.b, missing, reader), 0u);
         RegState gap = rs;
         gap.unavailable_saved_mask_words.insert(word);
-        EXPECT_EQ(native_compute_vcc_data_mask(f.b, gap), 0u);
+        EXPECT_EQ(native_compute_vcc_data_mask(f.b, gap, reader), 0u);
         RegState fabricated = rs;
         fabricated.sreg_merge_placeholder.insert(word);
-        EXPECT_EQ(native_compute_vcc_data_mask(f.b, fabricated), 0u);
+        EXPECT_EQ(native_compute_vcc_data_mask(f.b, fabricated, reader), 0u);
         fabricated.sreg_loop_blanket[word] = {1};
-        EXPECT_EQ(native_compute_vcc_data_mask(f.b, fabricated), 0u);
+        EXPECT_EQ(native_compute_vcc_data_mask(f.b, fabricated, reader), 0u);
         RegState local = rs;
         local.lane_local_scalars.insert(local.sreg.at(word));
-        EXPECT_EQ(native_compute_vcc_data_mask(f.b, local), 0u);
+        EXPECT_EQ(native_compute_vcc_data_mask(f.b, local, reader), 0u);
     }
     const auto launch = f.b.guest_compute_launch;
     f.b.guest_compute_launch.launch.known = 0;
-    EXPECT_EQ(native_compute_vcc_data_mask(f.b, rs), 0u);
+    EXPECT_EQ(native_compute_vcc_data_mask(f.b, rs, reader), 0u);
     f.b.guest_compute_launch = launch;
     f.b.is_fragment = true;
-    EXPECT_EQ(native_compute_vcc_data_mask(f.b, rs), 0u);
+    EXPECT_EQ(native_compute_vcc_data_mask(f.b, rs, reader), 0u);
+    Frame generic(fixture::readfirst_program(true));
+    const auto generic_reader =
+        *std::find_if(generic.ins.begin(), generic.ins.end(), [](const auto& in) {
+            return in.fmt == Rdna2Format::VOP3 && in.opcode == 0x101;
+        });
+    RegState current;
+    current.sreg[106] = generic.b.uconst(1);
+    current.sreg[107] = generic.b.uconst(0);
+    ASSERT_NE(native_compute_vcc_data_mask(generic.b, current, generic_reader), 0u);
+    auto changed = generic.ins;
+    changed[0].src[0].value = 1;
+    constrain_native_entry_exec_words_region(generic.b, changed);
+    EXPECT_EQ(native_compute_vcc_data_mask(generic.b, current, generic_reader), 0u);
+    constrain_native_entry_exec_words_region(generic.b, generic.ins);
+    EXPECT_EQ(native_compute_vcc_data_mask(generic.b, current, generic_reader), 0u);
 }
 
 TEST(NativeEntryExecProof, TheOriginalClosedInstructionInventoryOwnsThePlan) {

@@ -9,9 +9,10 @@ namespace prosper::gpu::test_fixture {
 // Project-owned launch contract (#5541), not a recovered packet: 4,152 workers at
 // LocalSize 64 leave 56 workers in the last of 65 groups. Thread-dimension dispatch
 // and NUM_THREAD_PARTIAL authenticate that extent without pretending every wave is full.
+// FORCE_START_AT_000 authenticates the zero origin; COMPUTE_START_* is not retained.
 inline constexpr ComputeDispatchLaunchState kGta5Pc232OwnedLaunch{
     .known = ComputeDispatchLaunchState::kAll,
-    .initiator = 0x23,
+    .initiator = 0x27,
     .num_thread = {64u | (56u << 16), 1u | (1u << 16), 1u | (1u << 16)},
     .dimensions = {4152, 1, 1},
 };

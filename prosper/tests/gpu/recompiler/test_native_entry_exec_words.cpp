@@ -74,3 +74,38 @@ TEST(NativeEntryExecWords, AScalarMultiplyRetiresOnlyTheOldPredicateNotTheCurren
         }
     }
 }
+
+TEST(NativeEntryExecWords, MissingForceStartCannotAuthenticateThePartialEntryMask) {
+    auto c = fixture::config(true);
+    c.dispatch_launch.initiator &= ~uint64_t{4};
+    EXPECT_TRUE(fixture::compile(fixture::program(), c).module.empty());
+}
+
+TEST(NativeEntryExecWords, ArithmeticCannotLaunderAnUnprovedReadfirstPublication) {
+    const auto c = fixture::config(false);
+    const auto result = fixture::compile(fixture::readfirst_program(false), c);
+    EXPECT_TRUE(result.module.empty()) << "a real broadcast is required";
+    if (result.module.empty()) return;
+    bpermute_oracle::Interpreter vm(result.module);
+    vm.native_subgroup_width = 64;
+    vm.supplied_push_constants = c.user_sgprs;
+    const auto actual = vm.run_buffers(64, {{3, fixture::Words(64, fixture::untouched)}}, 3);
+    ASSERT_TRUE(vm.error.empty()) << vm.error;
+    fixture::Words expected(64, 0);
+    expected[0] = 1; // hardware READFIRST selects local lane zero, so every lane sees scalar 1
+    EXPECT_EQ(actual, expected);
+}
+
+TEST(NativeEntryExecWords, ACompleteCurrentOverwriteRetiresTheUnprovedArithmeticRelay) {
+    const auto c = fixture::config(false);
+    const auto result = fixture::compile(fixture::readfirst_program(true), c);
+    ASSERT_FALSE(result.module.empty()) << result.reason;
+    bpermute_oracle::Interpreter vm(result.module);
+    vm.native_subgroup_width = 64;
+    vm.supplied_push_constants = c.user_sgprs;
+    const auto actual = vm.run_buffers(64, {{3, fixture::Words(64, fixture::untouched)}}, 3);
+    ASSERT_TRUE(vm.error.empty()) << vm.error;
+    fixture::Words expected(64, 0);
+    expected[0] = 1;
+    EXPECT_EQ(actual, expected);
+}

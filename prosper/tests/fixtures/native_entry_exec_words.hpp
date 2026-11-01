@@ -26,6 +26,13 @@ inline Words program(bool data_mask = false) {
             0xbeea038du, 0x7e04026au, 0x7e06026bu, 0xbefe0402u, 0x8f0d870cu, 0x34020081u,
             0x4a02020du, 0xe0702000u, 0x80020201u, 0xe0702004u, 0x80020301u, 0xbf810000u};
 }
+inline Words readfirst_program(bool overwrite) {
+    if (overwrite)
+        return {0x7e1c0500u, 0x806a810eu, 0xbeeb0380u, 0xbeea0381u, 0xd5010002u,
+                0x01a90280u, 0xe0702000u, 0x80020200u, 0xbf810000u};
+    return {0x7e1c0500u, 0x806a810eu, 0xbeeb0380u, 0xd5010002u,
+            0x01a90280u, 0xe0702000u, 0x80020200u, 0xbf810000u};
+}
 inline gpu::ComputeShaderConfig config(bool partial) {
     gpu::ComputeShaderConfig c;
     c.local_x = c.wave_size = c.native_subgroup_size = 64;

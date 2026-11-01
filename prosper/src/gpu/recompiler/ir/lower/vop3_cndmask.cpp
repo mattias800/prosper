@@ -38,7 +38,7 @@ std::optional<bool> Vop3MaskLowering::route_cndmask() {
                            b.uconst(0));
         }
     }
-    if (!m && s2.value == 106) m = native_compute_vcc_data_mask(b, rs);
+    if (!m && s2.value == 106) m = native_compute_vcc_data_mask(b, rs, in);
     // fv (not val): cndmask is float-modifier-capable and compilers emit it with -v/|v|
     // sources (sign-select idioms). Raw val() silently dropped neg/abs — the shader
     // recompiled "successfully" and computed the un-negated value. fv == val when no

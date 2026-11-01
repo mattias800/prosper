@@ -16,6 +16,6 @@ void initialize_native_entry_exec_words(SpirvCompute&, const ComputeDispatchLaun
                                         const std::vector<Rdna2Inst>&, const uint32_t*, size_t);
 void constrain_native_entry_exec_words_region(SpirvCompute&, const std::vector<Rdna2Inst>&);
 bool native_entry_exec_word_proven(const SpirvCompute&, const Rdna2Inst&);
-uint32_t native_compute_vcc_data_mask(SpirvCompute&, const RegState&);
+uint32_t native_compute_vcc_data_mask(SpirvCompute&, const RegState&, const Rdna2Inst&);
 std::optional<std::array<uint32_t, 2>> native_entry_exec_words(SpirvCompute&, const Rdna2Inst&);
 } // namespace prosper::gpu

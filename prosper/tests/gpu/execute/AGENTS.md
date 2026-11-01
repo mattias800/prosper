@@ -40,3 +40,6 @@ DS fields as reads; each lane owns a distinct LDS cell.
 `test_native_fp_mask_participation` observes saved physical mask words after a real native
 loop controlled by finite, NaN and mixed floating predicates. The scalar branch is wave-wide;
 missing spill and high-word inputs remain refusals. The integer control retains its old route.
+
+The native entry-word fixture also observes a complete numerical overwrite after a dead
+READFIRST arithmetic relay; the old publication supplies no later mask bit.

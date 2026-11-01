@@ -1,6 +1,9 @@
 #include "gpu/recompiler/rdna2_native_entry_exec_words.hpp"
 #include "gpu/recompiler/compute_dispatch_launch.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/rdna2_legacy_vcc_writes.hpp"
+#include "gpu/recompiler/ir/ops/scalar_alu.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
 #include "gpu/recompiler/rdna2_native_launch.hpp"
@@ -26,7 +29,9 @@ struct NativeEntryExecWordPlan {
     std::vector<Rdna2Inst> original;
     std::vector<uint32_t> words;
     std::set<uint32_t> producers;
+    std::vector<std::vector<size_t>> predecessors;
     uint32_t partial = 0, last_group = 0;
+    bool revoked = false;
 };
 namespace {
 using Identities = std::bitset<127>;
@@ -47,7 +52,7 @@ std::optional<uint32_t> entry_partial(const ComputeDispatchLaunchProfile& profil
     const auto& raw = profile.launch;
     const uint32_t remainder = profile.threads[0] % 64;
     if (!profile.exact_thread_extent || raw.known != ComputeDispatchLaunchState::kAll ||
-        raw.initiator != 0x23u || raw.dimensions != profile.threads || !remainder ||
+        raw.initiator != 0x27u || raw.dimensions != profile.threads || !remainder ||
         raw.num_thread != std::array<uint32_t, 3>{64u | (remainder << 16), 0x10001u, 0x10001u})
         return {};
     return remainder;
@@ -167,6 +172,127 @@ std::set<uint32_t> entry_producers(const SpirvCompute& b, const std::vector<Rdna
     }
     return result;
 }
+// This proof grants no value or definedness. Each observed word needs one invariant reaching
+// expression. Multiple definitions, value cycles, vector publications and late memory loads are
+// unproved; a complete current overwrite may retire all of them without changing older routes.
+class UniformWords {
+    const NativeEntryExecWordPlan& plan;
+    size_t budget = 8192;
+    using Key = std::pair<size_t, int>;
+    std::map<Key, bool> memo;
+    std::set<Key> visiting;
+    bool writes(const Rdna2Inst& in, int word) const {
+        if (word == 128) return rdna2_writes_scc(in.fmt, in.opcode) != Rdna2Answer::No;
+        bool found = (word == 106 || word == 107) && legacy_valu_writes_vcc(in);
+        for_each_scalar_write(in, [&](int base, uint32_t width) {
+            found |= word >= base && int64_t(word) < int64_t(base) + width;
+        });
+        return found;
+    }
+    std::optional<size_t> definition(size_t before, int word) {
+        const size_t entry = plan.original.size();
+        std::set<size_t> definitions, seen;
+        auto pending = plan.predecessors[before];
+        if (!before) definitions.insert(entry);
+        while (!pending.empty()) {
+            if (!budget) return {};
+            --budget;
+            const size_t at = pending.back();
+            pending.pop_back();
+            if (!seen.insert(at).second) continue;
+            if (writes(plan.original[at], word)) {
+                definitions.insert(at);
+            } else if (!at) {
+                definitions.insert(entry);
+            } else {
+                const auto& incoming = plan.predecessors[at];
+                pending.insert(pending.end(), incoming.begin(), incoming.end());
+            }
+            if (definitions.size() > 1) return {};
+        }
+        if (definitions.empty()) return {};
+        return *definitions.begin();
+    }
+    bool prefix_load(size_t at) const {
+        const auto& in = plan.original[at];
+        if (in.fmt != Rdna2Format::SMEM || in.opcode != 0) return false;
+        for (const auto& candidate : plan.original) {
+            if (candidate.pc < in.pc &&
+                (rdna2_may_write_guest_memory(candidate) ||
+                 (candidate.fmt == Rdna2Format::SOPP && candidate.opcode == 0xa)))
+                return false;
+            const bool branch =
+                candidate.fmt == Rdna2Format::SOPP &&
+                (candidate.opcode == 2 || (candidate.opcode >= 4 && candidate.opcode <= 9));
+            if (!branch) continue;
+            const int64_t target = int64_t(candidate.pc) + candidate.len_dwords + candidate.simm16;
+            if (candidate.pc < in.pc || target <= in.pc) return false;
+        }
+        return true;
+    }
+    bool source(size_t at, const Operand& operand, uint32_t width) {
+        if (operand.kind == OperandKind::InlineInt || operand.kind == OperandKind::InlineFloat ||
+            operand.kind == OperandKind::Literal)
+            return true;
+        if (operand.kind != OperandKind::SGPR && operand.kind != OperandKind::Special) return false;
+        if (operand.value == 125) return true;
+        if (operand.value == 253) return word(at, 128);
+        if (!width || width > 2 || operand.value < 0 || operand.value + int(width) > 126)
+            return false;
+        for (uint32_t part = 0; part < width; ++part)
+            if (!word(at, operand.value + int(part))) return false;
+        return true;
+    }
+    bool expression(size_t at, int destination) {
+        const auto& in = plan.original[at];
+        if ((destination == 106 || destination == 107) && plan.producers.contains(in.pc))
+            return true; // the separately authenticated original entry word, not current EXEC
+        const bool load = prefix_load(at);
+        const bool move = in.fmt == Rdna2Format::SOP1 &&
+                          (in.opcode == kSop1OpcodeMovB32 || in.opcode == kSop1OpcodeMovB64);
+        if (!load && !move && !ir::find_scalar_op(in.fmt, in.opcode)) return false;
+        for (uint32_t k = 0; k < in.n_src; ++k) {
+            // S_LOAD_DWORD has a real two-word scalar address and a one-word offset. ALU
+            // widths deliberately do not describe memory operands; no new memory facts are used.
+            const uint32_t width = load ? (k == 0 ? 2u : 1u) : scalar_alu_source_words(in, k);
+            if (!source(at, in.src[k], width)) return false;
+        }
+        if ((rdna2_instruction_effects(in).implicit_reads & kRdna2ImplicitScc) && !word(at, 128))
+            return false;
+        const auto old = scalar_implicit_destination_read_width(in);
+        for (uint32_t part = 0; part < old; ++part)
+            if (!word(at, in.dst.value + int(part))) return false;
+        return true;
+    }
+
+public:
+    explicit UniformWords(const NativeEntryExecWordPlan& original) : plan(original) {}
+    bool word(size_t before, int physical) {
+        const Key key{before, physical};
+        if (const auto found = memo.find(key); found != memo.end()) return found->second;
+        if (!visiting.insert(key).second) return false;
+        const auto producer = definition(before, physical);
+        const bool result =
+            producer &&
+            (*producer == plan.original.size() ? physical != 128 : expression(*producer, physical));
+        visiting.erase(key);
+        memo.emplace(key, result);
+        return result;
+    }
+};
+bool uniform_vcc_pair(const SpirvCompute& b, const Rdna2Inst& in) {
+    const auto& plan = b.native_entry_exec_word_plan;
+    if (!plan || plan->revoked || b.saved_mask_original_fragment_entry || plan->owner != &b ||
+        plan->launch != b.guest_compute_launch || plan->words != b.saved_mask_original_words)
+        return false;
+    const auto found =
+        std::lower_bound(plan->original.begin(), plan->original.end(), in.pc,
+                         [](const auto& candidate, uint32_t pc) { return candidate.pc < pc; });
+    if (found == plan->original.end() || in != *found) return false;
+    const auto before = size_t(found - plan->original.begin());
+    UniformWords proof(*plan);
+    return proof.word(before, 106) && proof.word(before, 107);
+}
 bool original_region(const NativeEntryExecWordPlan& plan, const std::vector<Rdna2Inst>& region) {
     if (!std::is_sorted(region.begin(), region.end(),
                         [](const auto& a, const auto& c) { return a.pc < c.pc; }))
@@ -181,7 +307,7 @@ bool original_region(const NativeEntryExecWordPlan& plan, const std::vector<Rdna
     }
     return true;
 }
-} // namespace
+}   // namespace
 bool native_entry_exec_word_move(const SpirvCompute& b, const Rdna2Inst& in) {
     return native_context(b) && !in.synthetic_terminator && in.fmt == Rdna2Format::SOP1 &&
            in.opcode == kSop1OpcodeMovB64 && in.dst.value == 106 &&
@@ -198,14 +324,18 @@ void initialize_native_entry_exec_words(SpirvCompute& b, const ComputeDispatchLa
     std::vector<Rdna2Inst> original;
     rdna2_walk(code, dwords, original);
     if (selected != original) return;
+    std::vector<std::vector<size_t>> successors;
+    if (!closed_program(original, successors)) return;
     auto producers = entry_producers(b, original);
-    if (producers.empty()) return;
     auto plan = std::make_shared<NativeEntryExecWordPlan>();
     plan->owner = &b;
     plan->launch = launch;
     plan->original = std::move(original);
     plan->words.assign(code, code + dwords);
     plan->producers = std::move(producers);
+    plan->predecessors.resize(plan->original.size());
+    for (size_t from = 0; from < successors.size(); ++from)
+        for (size_t to : successors[from]) plan->predecessors[to].push_back(from);
     plan->partial = *partial;
     plan->last_group = launch.threads[0] / 64;
     b.native_entry_exec_word_plan = std::move(plan);
@@ -214,6 +344,7 @@ void constrain_native_entry_exec_words_region(SpirvCompute& b, const std::vector
     if (b.native_entry_exec_word_plan && !original_region(*b.native_entry_exec_word_plan, ins)) {
         auto revoked = std::make_shared<NativeEntryExecWordPlan>(*b.native_entry_exec_word_plan);
         revoked->producers.clear();
+        revoked->revoked = true;
         b.native_entry_exec_word_plan = std::move(revoked);
     }
 }
@@ -232,9 +363,9 @@ bool native_entry_exec_word_proven(const SpirvCompute& b, const Rdna2Inst& in) {
                          [](const auto& candidate, uint32_t pc) { return candidate.pc < pc; });
     return original != plan->original.end() && in == *original;
 }
-uint32_t native_compute_vcc_data_mask(SpirvCompute& b, const RegState& rs) {
+uint32_t native_compute_vcc_data_mask(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in) {
     uint32_t low = 0, high = 0;
-    if (!native_context(b) || !entry_partial(b.guest_compute_launch) ||
+    if (!native_context(b) || !entry_partial(b.guest_compute_launch) || !uniform_vcc_pair(b, in) ||
         b.guest_compute_launch.local != b.guest_local_size ||
         b.guest_compute_launch != b.saved_mask_original_compute_launch ||
         !native_logical_data_word(rs, 106, low) || !native_logical_data_word(rs, 107, high) ||
