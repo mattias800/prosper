@@ -335,7 +335,8 @@ void seed_vector_word_definedness(RegState& rs, const std::vector<Rdna2Inst>& in
                    in.n_src >= 3 && in.src[2].kind == OperandKind::Special &&
                    in.src[2].value == 253;
         });
-    const bool track_scc = scc_offset || arbitrary_placeholder_retry_active();
+    const bool track_scc = scc_offset || arbitrary_placeholder_retry_active() ||
+                           scalar_dependency_repair_active();
     if (track_scc) rs.track_scc_definition = true;
     if (wave_size == 32 || track_scc) {
         // These producing entries supply no architectural SCC input; bfalse is storage only.

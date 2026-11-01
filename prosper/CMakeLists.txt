@@ -4039,6 +4039,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_compute_quad_or.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_scalar_dependency_retry
+    SOURCES tests/gpu/recompiler/test_scalar_dependency_retry.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   if(Vulkan_FOUND)
     prosper_add_gtest(test_native_pixel_parameter_gpu
       SOURCES tests/gpu/execute/test_native_pixel_parameter_gpu.cpp

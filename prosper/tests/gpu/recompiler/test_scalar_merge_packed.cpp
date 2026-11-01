@@ -3,6 +3,7 @@
 #include "fixtures/checked_compute_launch.hpp"
 #include "fixtures/compute_runner.h"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
+#include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
@@ -67,6 +68,14 @@ struct Emitter {
         return b.finish();
     }
 };
+Words compile(bool native, bool read_old_mask = false) {
+    return recompile_with_arbitrary_placeholders(
+        {RecompileDiagnosticStage::Compute, 0x5521cc8000ull}, [&] {
+            Emitter e(native);
+            if (!e.emit(program(read_old_mask))) return Words{};
+            return e.finish();
+        });
+}
 Words expected() {
     Words result;
     for (uint32_t lane = 0; lane < 64; ++lane) {
@@ -78,15 +87,13 @@ Words expected() {
 void gpu(bool native) {
     for (uint32_t branch : {0u, 1u}) {
         SCOPED_TRACE(branch);
-        Emitter e(native);
-        ASSERT_TRUE(e.emit(program()))
-            << e.b.stage_reject_reason
-            << last_terminal_reject_reason(e.b.diagnostic.program_address);
+        const auto module = compile(native);
+        ASSERT_FALSE(module.empty()) << last_terminal_reject_reason(0x5521cc8000ull);
         Words push(21);
         push[20] = branch;
         const auto output = prosper::test::run_compute(
-            e.finish(), std::vector<float>(64, std::bit_cast<float>(branch)), 64, 128, {}, {},
-            nullptr, 64, nullptr, nullptr, nullptr, native ? 64 : 0, nullptr, push);
+            module, std::vector<float>(64, std::bit_cast<float>(branch)), 64, 128, {}, {}, nullptr,
+            64, nullptr, nullptr, nullptr, native ? 64 : 0, nullptr, push);
         Words actual;
         for (float value : output) actual.push_back(std::bit_cast<uint32_t>(value));
         EXPECT_EQ(actual, expected());
@@ -99,11 +106,9 @@ TEST(ScalarMergePacked, CompleteReplacementExecutesBothArmsInTheInterpreter) {
         for (uint32_t branch : {0u, 1u}) {
             SCOPED_TRACE(native);
             SCOPED_TRACE(branch);
-            Emitter e(native);
-            ASSERT_TRUE(e.emit(program()))
-                << e.b.stage_reject_reason
-                << last_terminal_reject_reason(e.b.diagnostic.program_address);
-            bpermute_oracle::Interpreter vm(e.finish());
+            const auto module = compile(native);
+            ASSERT_FALSE(module.empty()) << last_terminal_reject_reason(0x5521cc8000ull);
+            bpermute_oracle::Interpreter vm(module);
             vm.native_subgroup_width = 64;
             vm.half_rte_preserve_denorm = true;
             vm.supplied_push_constants = Words(21);
@@ -117,9 +122,10 @@ TEST(ScalarMergePacked, CompleteReplacementExecutesBothArmsInTheInterpreter) {
 
 TEST(ScalarMergePacked, PackedReadBeforeReplacementKeepsTheMissingMaskLive) {
     for (bool native : {false, true}) {
-        Emitter e(native);
-        EXPECT_FALSE(e.emit(program(true)));
-        EXPECT_EQ(e.b.stage_reject_reason, "structured-saved-mask-domain-missing-edge");
+        EXPECT_TRUE(compile(native, true).empty());
+        EXPECT_NE(last_terminal_reject_reason(0x5521cc8000ull)
+                      .find("structured-saved-mask-domain-missing-edge"),
+                  std::string::npos);
     }
 }
 

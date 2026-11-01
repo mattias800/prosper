@@ -17,6 +17,7 @@ namespace prosper::gpu {
 namespace {
 struct Attempt {
     bool allow = false, eligible = false;
+    bool repair = false, repair_eligible = false;
 };
 thread_local Attempt* current = nullptr;
 struct Scope {
@@ -40,17 +41,29 @@ bool arbitrary_placeholder_retry_active() {
     return current && current->allow;
 }
 
+bool scalar_dependency_repair_active() {
+    return current && current->repair;
+}
+
+bool allow_packed_scalar_merge() {
+    if (!current || current->repair || current->allow) return true;
+    current->repair_eligible = true;
+    return false;
+}
+
 void request_scalar_condition_root_retry(const SpirvCompute& b, const RegState& rs,
                                          const Rdna2Inst& in) {
-    if (!current || current->allow || b.is_fragment_packet() || !(b.is_compute || b.is_fragment) ||
-        b.wave_size != 64 || rs.track_scc_definition || !scalar_instruction_writes_scc(in))
+    if (!current || current->allow || current->repair || b.is_fragment_packet() ||
+        !(b.is_compute || b.is_fragment) || b.wave_size != 64 || rs.track_scc_definition ||
+        !scalar_instruction_writes_scc(in))
         return;
     const auto source = scalar_source_marks(rs, in);
     // This requests another compilation, never a value or validity fact. The original legacy
-    // transfer loses these soft roots; the retry already tracks SCC and checks every Hard input.
+    // transfer loses these soft roots; re-emission uses existing SCC dependency tracking.
+    // It grants no arbitrary admission and retains the emitter's ordinary Hard-root checks.
     // A successful original module returns before the request can change its selected output.
     if (source.placeholder && !source.hard && !source.blanket_roots.empty())
-        current->eligible = true;
+        current->repair_eligible = true;
 }
 
 std::vector<uint32_t>
@@ -61,18 +74,29 @@ recompile_with_arbitrary_placeholders(const RecompileDiagnosticContext& diagnost
     Scope scope;
     RecompileDiagnosticAttempt original;
     auto module = compile();
-    if (!module.empty() || !scope.state.eligible) {
+    if (!module.empty() || (!scope.state.eligible && !scope.state.repair_eligible)) {
         original.commit();
         return module;
+    }
+    original.discard();
+    if (scope.state.repair_eligible) {
+        scope.state.repair = true;
+        RecompileDiagnosticAttempt repaired;
+        module = compile();
+        if (!module.empty() || !scope.state.eligible) {
+            repaired.commit();
+            return module;
+        }
+        repaired.discard();
     }
     scope.state.allow = true;
     RecompileDiagnosticAttempt retry;
     module = compile();
     if (module.empty()) {
-        original.replace_with(retry);
+        retry.commit();
         return module;
     }
-    original.replace_with(retry);
+    retry.commit();
     const auto reads = arbitrary_placeholder_reads(module);
     observe_arbitrary_placeholder_admission(diagnostic.program_address, reads.fresh_mask,
                                             reads.loop_carry);

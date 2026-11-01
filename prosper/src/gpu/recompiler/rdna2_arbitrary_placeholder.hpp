@@ -21,6 +21,8 @@ void append_unproved_loop_reads(PlaceholderRoots&, const SpirvCompute&, uint32_t
                                 const std::vector<int>& words);
 bool arbitrary_placeholder_attempt_active();
 bool arbitrary_placeholder_retry_active();
+bool scalar_dependency_repair_active();
+bool allow_packed_scalar_merge();
 // Request a guarded re-emission when legacy SCC transfer would drop soft loop obligations.
 void request_scalar_condition_root_retry(const SpirvCompute&, const RegState&, const Rdna2Inst&);
 bool refuse_arbitrary_scalar_publication(SpirvCompute&, const RegState&, const Rdna2Inst&);

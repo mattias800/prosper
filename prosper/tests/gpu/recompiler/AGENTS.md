@@ -494,3 +494,7 @@ read marker.
 `test_scalar_merge_packed` executes both arms of a mixed-domain join whose old mask dies after
 packed arithmetic. Actual packed scalar reads still keep that generation live; unused neighbors
 and unrelated words do not. Unknown packed effects retain their refusal.
+
+`test_scalar_dependency_retry` separates dependency repair from Arbitrary admission. Successful
+original bytes return first, repair alone grants no admission, and only the selected attempt
+publishes diagnostics. Named Hard origins retain their veto in every attempt.

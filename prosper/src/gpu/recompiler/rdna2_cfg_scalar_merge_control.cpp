@@ -4,6 +4,7 @@
 #include "gpu/recompiler/rdna2_cfg_scalar_merge_routes.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
+#include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
 #include <optional>
 
 namespace prosper::gpu::detail {
@@ -37,6 +38,7 @@ std::optional<bool> CfgScalarMergeRoutes::step() {
             // An unrelated packed instruction cannot keep an old scalar generation live.
             if (!rdna2_instruction_effects(in).describes_sources())
                 return block(in, "unmodelled-vop3p");
+            if (!allow_packed_scalar_merge()) return false;
             return alu();
         case Rdna2Format::SOP1:
         case Rdna2Format::SOP2:

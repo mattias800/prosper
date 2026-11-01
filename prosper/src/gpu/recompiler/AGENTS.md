@@ -86,11 +86,11 @@ limit relative banks; without a bound it visits the complete bank rather than on
 legacy loop liveness scan and diagnostic roots; it consumes no new effects-table fields.
 
 `rdna2_arbitrary_placeholder` implements the owner-approved ADR 0038 admission boundary.
-Legacy Wave64 SCC writers can request a guarded re-emission when they would drop existing
-soft loop roots. Successful original modules still return first; the retry uses existing SCC
-tracking and checks every Hard input. Repairing those dependencies invents no arbitrary read.
-The original compiler routes run first; only a refused program with an unloaded-only read or
-dropped soft SCC dependency retries.
+Legacy Wave64 SCC writers and packed scalar liveness can request dependency re-emission after
+the original routes refuse. Successful original modules return first, preserving route choice
+and bytes. The repair uses existing SCC tracking and canonical packed source widths; it grants
+no Arbitrary admission and retains the emitter's ordinary Hard-root checks. An unloaded read
+still requires a separate admission retry, with the complete ordinary-input guards below.
 Every admitted read must still have a nonempty, entirely unloaded typed root set. No value,
 domain, physical mask word or runtime validity fact is supplied. Owned packets retain their
 separate genuine-input contract. Inert module metadata identifies read sites in the selected
@@ -101,7 +101,7 @@ on retries, including straight-line operations before or after an admitted read.
 agreeing-source and fragment waterfall proofs remain; real dispatcher broadcasts bypass this
 legacy site. A missing scalar publication stays Hard independently of the predicate's roots.
 `rdna2_arbitrary_placeholder_inputs` checks actual ordinary operand reads and direct exports
-on retries, including direct memory readers and READLANE spill sources. Missing launch/spill inputs stay Hard even when unrelated to the admitted predicate.
+on admission retries, including direct memory readers and READLANE spill sources. Missing launch/spill inputs stay Hard even when unrelated to the admitted predicate.
 A zero fallback for a reaching computed definition names `lost-definition`; an unloaded input
 does not authorize discarding that computation. Existing loop assumptions retain their own
 back-edge check; no new value or validity fact is supplied.
