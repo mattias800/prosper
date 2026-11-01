@@ -3,6 +3,7 @@
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_placeholder_origin_memory.hpp"
 #include "gpu/recompiler/rdna2_native_launch.hpp"
+#include "gpu/recompiler/rdna2_native_entry_exec_words.hpp"
 #include "gpu/recompiler/rdna2_partial_vcc_word.hpp"
 
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
@@ -191,7 +192,8 @@ bool saved_mask_mov_defines_words(const SpirvCompute& b, const Rdna2Inst& in, bo
             (b.is_compute && b.wave_size == 64 && b.native_subgroup_size == 64 && source_is_mask &&
              in.src[0].kind != OperandKind::SGPR &&
              (saved_mask_producer_has_full_participation(b, in) ||
-              native_uniform_exec_mov_has_full_participation(b, in))));
+              native_uniform_exec_mov_has_full_participation(b, in) ||
+              native_entry_exec_word_proven(b, in))));
 }
 
 bool saved_mask_logical_defines_words(const SpirvCompute& b, const Rdna2Inst& in,
@@ -251,6 +253,7 @@ void load_missing_saved_mask_words(RegState& rs, const std::set<int>& roots,
 void initialize_saved_mask_word_proof(SpirvCompute& b, const std::vector<Rdna2Inst>& ins,
                                       const uint32_t* code, size_t dwords, uint32_t initial_active,
                                       const RegState* initial) {
+    constrain_native_entry_exec_words_region(b, ins);
     initialize_partial_vcc_word_proof(b, ins, code, dwords,
                                       initial_active || (initial && initial->exec_narrowed));
     if (b.saved_mask_word_analysis_done) {

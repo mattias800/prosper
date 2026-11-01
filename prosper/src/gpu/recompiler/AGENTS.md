@@ -1,5 +1,15 @@
 # `recompiler` — RDNA2 machine code → SPIR-V
 
+`rdna2_native_entry_exec_words` retains numerical entry EXEC words for original native
+Wave64 VCC copies whose source is that same entry mask on every CFG predecessor. It binds the
+raw launch, original program and builder, follows aliases through the closed original CFG,
+and reuses existing backward DATA demand. Complete groups and a closed 1D partial launch
+supply their recorded entry bits; current participation never substitutes for those bits.
+Existing full-participation emission keeps priority. Unknown profiles, changed code/context
+and missing roots retain their separate boundaries. A native VCC mask read can project two
+already genuine current scalar words after a numerical overwrite retired its previous predicate;
+missing or fabricated words cannot borrow that projection.
+
 `pixel_parameter_launch` carries the producing PS RSRC2 word with independent knownness.
 `rdna2_native_parameter_base` admits an interpolation-only entry service during guarded retries
 on native fragments, preserving successful original modules byte-for-byte:

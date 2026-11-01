@@ -1,4 +1,5 @@
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
+#include "gpu/recompiler/rdna2_native_entry_exec_words.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_native_launch.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
@@ -534,7 +535,9 @@ LogicalDataDemand analyze_logical_data_demand(const SpirvCompute& b,
             mask_source(masks_before[i], in.src[0], in) &&
             mask_source(masks_before[i], in.src[1], in))
             result.fragment_survivors.insert(in.pc);
-        if (is_native_b64_logical(b, original[i]) && (after[i] & kills[i]).any()) {
+        if ((is_native_b64_logical(b, original[i]) ||
+             native_entry_exec_word_move(b, original[i])) &&
+            (after[i] & kills[i]).any()) {
             result.logical_data.insert(original[i].pc);
             if ((spill_free_after[i] & kills[i]).any())
                 result.logical_data_beyond_mask_spills.insert(original[i].pc);

@@ -1,5 +1,11 @@
 # `tests/gpu/recompiler` — translation tests and the legacy compute execution fixture
 
+`test_native_entry_exec_words` observes both numeric VCC halves after a loop, CMPX and
+LOW-only replacement. Complete and actual partial groups run in the interpreter; missing
+launch words and a missing spill cannot supply entry-mask authority. Scalar multiplication
+separately observes the new words through a mask read. `test_native_entry_exec_proof` checks
+all CFG predecessors and backedges, physical aliases and original builder/program/launch binding.
+
 `test_native_pixel_parameter` checks the original-program interpolation-only entry service,
 actual native Input output and the reused scalar lifetime. Unknown/wrong prefixes, numerical
 observers, conditional overwrites, reentry and foreign contexts retain their own boundaries.

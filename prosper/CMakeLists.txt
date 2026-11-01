@@ -2784,6 +2784,14 @@ if(TARGET prosper_core)
             tests/gpu/capture/test_front_face_compile_inputs.cpp
     INCLUDES src tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_native_entry_exec_proof
+    SOURCES tests/gpu/recompiler/test_native_entry_exec_proof.cpp
+    INCLUDES src tests
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_native_entry_exec_words
+    SOURCES tests/gpu/recompiler/test_native_entry_exec_words.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_native_pixel_parameter
     SOURCES tests/gpu/recompiler/test_native_pixel_parameter.cpp
             tests/gpu/capture/test_pixel_parameter_inputs.cpp
@@ -4035,6 +4043,11 @@ if(TARGET prosper_core)
     prosper_add_gtest(test_native_pixel_parameter_gpu
       SOURCES tests/gpu/execute/test_native_pixel_parameter_gpu.cpp
       INCLUDES tests frontends
+      LIBRARIES prosper_core Vulkan::Vulkan
+      LABELS gpu PROPERTIES TIMEOUT 60)
+    prosper_add_gtest(test_native_entry_exec_words_gpu
+      SOURCES tests/gpu/execute/test_native_entry_exec_words_gpu.cpp
+      INCLUDES tests
       LIBRARIES prosper_core Vulkan::Vulkan
       LABELS gpu PROPERTIES TIMEOUT 60)
     prosper_add_gtest(test_native_fp_mask_participation

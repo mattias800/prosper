@@ -1,5 +1,9 @@
 # Execution-layer tests
 
+`test_native_entry_exec_words_gpu` executes complete groups and the final 56-worker
+group on a required native Wave64 device, checking retained HIGH, the new LOW, old inactive
+register values and absent-worker output sentinels.
+
 `test_pixel_parameter_producer` drives the actual draw producer/cache with known, absent and
 changed PS user prefixes. `test_native_pixel_parameter_gpu` observes real native interpolation
 and the reused SGPR lifetime in the colour attachment, with two distinct parameter values.

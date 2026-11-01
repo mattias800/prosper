@@ -3,6 +3,7 @@
 // unchanged.
 #include "gpu/recompiler/ir/lower/vop3_mask_lowering_internal.hpp"
 #include "gpu/recompiler/ir/ops/vector_cndmask.hpp"
+#include "gpu/recompiler/rdna2_native_entry_exec_words.hpp"
 
 namespace prosper::gpu::ir {
 
@@ -37,6 +38,7 @@ std::optional<bool> Vop3MaskLowering::route_cndmask() {
                            b.uconst(0));
         }
     }
+    if (!m && s2.value == 106) m = native_compute_vcc_data_mask(b, rs);
     // fv (not val): cndmask is float-modifier-capable and compilers emit it with -v/|v|
     // sources (sign-select idioms). Raw val() silently dropped neg/abs — the shader
     // recompiled "successfully" and computed the un-negated value. fv == val when no

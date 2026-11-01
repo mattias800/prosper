@@ -1,5 +1,9 @@
 # `prosper/tests/fixtures/` — shared harnesses and hand-built inputs
 
+`native_entry_exec_words` owns a counted-loop entry-mask witness, complete/partial raw
+launches and word-level output expectations. Inactive guest lanes preserve distinct old
+register data; absent workers retain the output sentinel.
+
 `native_pixel_parameter` owns the LLVM-assembled entry/interpolation/reused-SGPR program.
 `native_fragment_spirv_oracle` executes unmodified native fragment modules through the integer
 VM with explicit location/builtin words and defined outputs. Its fixed READLANE witness declares
