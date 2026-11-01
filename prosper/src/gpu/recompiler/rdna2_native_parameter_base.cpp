@@ -37,6 +37,23 @@ bool overlaps(int base, uint32_t width, int word) {
     return width && base <= word && word - base < static_cast<int>(width);
 }
 
+uint32_t scalar_source_width(const Rdna2Inst& in, uint32_t source) {
+    // ALU widths exclude memory operands. Use the legacy SMEM facts and the decoded
+    // address/descriptor spans also charged by the existing descriptor-lifetime proof.
+    // The wider MIMG/FLAT spans are conservative; no ADR 0038 step 8a facts are consumed.
+    switch (in.fmt) {
+        case Rdna2Format::SMEM: return rdna2_instruction_effects(in).ssrc_dwords[source];
+        case Rdna2Format::MUBUF:
+        case Rdna2Format::MTBUF: return source == 1 ? 4u : source == 2 ? 1u : 0u;
+        case Rdna2Format::MIMG: return source == 1 ? 8u : source == 2 ? 4u : 0u;
+        case Rdna2Format::FLAT: return source == 1 ? 2u : 0u;
+        default: {
+            const auto width = scalar_alu_source_words(in, source);
+            return width == UINT32_MAX ? 0u : width;
+        }
+    }
+}
+
 bool reads_word(const Rdna2Inst& in, int word) {
     // ISA 70648 section 12.2: a non-null SDST supplies part of the wait threshold.
     // These SOPK forms have no explicit source operand in the decoded array.
@@ -47,7 +64,7 @@ bool reads_word(const Rdna2Inst& in, int word) {
     for (uint32_t k = 0; k < in.n_src; ++k) {
         const auto source = in.src[k];
         if ((source.kind == OperandKind::SGPR || source.kind == OperandKind::Special) &&
-            overlaps(source.value, scalar_alu_source_words(in, k), word))
+            overlaps(source.value, scalar_source_width(in, k), word))
             return true;
     }
     return false;

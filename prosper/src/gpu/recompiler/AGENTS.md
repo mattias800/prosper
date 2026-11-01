@@ -11,6 +11,7 @@ authority. The partial scalar inventory names loaded prefix words without declar
 unloaded; ADR 0038's real-input boundary remains separate.
 SMEM store/atomic payloads stay outside the closed service; SOPK wait thresholds also charge
 their encoded scalar source, independently of the explicit source array.
+Memory addresses and descriptor spans use legacy memory widths, separately from ALU widths.
 
 `rdna2_loop_vcc_carry` owns the VCC exit merge separately from numeric register PHIs. A mask
 retired on both incoming paths has no mask view at the merge; scalar words retain their own

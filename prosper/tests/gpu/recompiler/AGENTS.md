@@ -4,6 +4,8 @@
 actual native Input output and the reused scalar lifetime. Unknown/wrong prefixes, numerical
 observers, conditional overwrites, reentry and foreign contexts retain their own boundaries.
 Encoded SMEM store/atomic payloads and SOPK wait thresholds cannot bypass those boundaries.
+Memory-address and descriptor fixtures include the last scalar word of each span and matched
+after-overwrite controls; an M0 scalar offset remains a numerical observer.
 
 `test_cfg_reject_reason` retains a Wave64 dispatcher's actual fresh-mask cause and launch root
 in its terminal record. The ordinary Wave32 path and supplied sources are independent controls.
@@ -332,6 +334,10 @@ The no-descriptor-patch high-word arm also exercises the outer lifetime shortcut
 arm reaches derived provenance. The one-arm compare targets the MUST mask meet at a forward join.
 
 ## Ruled out
+
+- ALU source widths do not inventory memory addresses. They return zero for SMEM/buffer/image/
+  flat formats; a bound load can also bypass ordinary SBASE operand lowering. The interpolation
+  entry proof must charge legacy memory address/descriptor spans before retiring an entry word.
 
 - A launch-provided VGPR can retain genuine inactive words after a partial overwrite. A cohort
   regression must first create an unavailable old generation, then overwrite only the intended

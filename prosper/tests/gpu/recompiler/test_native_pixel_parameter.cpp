@@ -184,6 +184,53 @@ TEST(NativePixelParameter, EncodedWaitCounterSourcesCannotBorrowTheEntryWord) {
     }
 }
 
+TEST(NativePixelParameter, MemoryAddressesAndDescriptorsConsumeTheWholeScalarSpan) {
+    // LLVM gfx1013 loads: plain/buffer SBASE, scalar offset, V#/T#/sampler and global/
+    // scratch addresses. Include the last pair/quad/oct word; the base alone is insufficient.
+    struct Read {
+        uint32_t count;
+        Rdna2Format format;
+        std::array<uint32_t, 2> words;
+    };
+    for (const Read read : {
+             Read{30, Rdna2Format::SMEM, {0xf400010fu, 0xfa000000u}},
+             Read{31, Rdna2Format::SMEM, {0xf400010fu, 0xfa000000u}},
+             Read{30, Rdna2Format::SMEM, {0xf400010eu, 0x3c000000u}},
+             Read{30, Rdna2Format::SMEM, {0xf420010eu, 0xfa000000u}},
+             Read{31, Rdna2Format::SMEM, {0xf420010eu, 0xfa000000u}},
+             Read{30, Rdna2Format::MUBUF, {0xe0300000u, 0x80070200u}},
+             Read{30, Rdna2Format::MUBUF, {0xe0300000u, 0x1e000200u}},
+             Read{30, Rdna2Format::MTBUF, {0xe8b00000u, 0x80070200u}},
+             Read{30, Rdna2Format::MIMG, {0xf0000100u, 0x00060200u}},
+             Read{31, Rdna2Format::MIMG, {0xf0000100u, 0x00060200u}},
+             Read{30, Rdna2Format::MIMG, {0xf0800100u, 0x00e00200u}},
+             Read{29, Rdna2Format::FLAT, {0xdc308000u, 0x021c0000u}},
+             Read{30, Rdna2Format::FLAT, {0xdc304000u, 0x021e0000u}},
+         }) {
+        SCOPED_TRACE(read.count);
+        SCOPED_TRACE(static_cast<unsigned>(read.format));
+        auto code = fixture::program(read.count);
+        code.insert(code.begin() + 1, read.words.begin(), read.words.end());
+        ASSERT_EQ(decode(code)[1].fmt, read.format);
+        EXPECT_FALSE(plan(code, read.count)) << "the entry word is an actual numeric input";
+        code = fixture::program(read.count);
+        code.insert(code.begin() + 2, read.words.begin(), read.words.end());
+        EXPECT_TRUE(plan(code, read.count)) << "the complete overwrite ends the entry lifetime";
+    }
+}
+
+TEST(NativePixelParameter, AScalarMemoryOffsetCannotObserveNumericM0) {
+    // LLVM gfx1013: s_load_dword s4, s[0:1], m0; M0 is a numerical offset here.
+    const std::array<uint32_t, 2> load{0xf4000100u, 0xf8000000u};
+    for (const size_t position : {1u, 2u}) {
+        auto code = fixture::program();
+        code.insert(code.begin() + position, load.begin(), load.end());
+        const auto instructions = decode(code);
+        ASSERT_EQ(instructions[position].src[1].value, 124);
+        EXPECT_FALSE(plan(code));
+    }
+}
+
 TEST(NativePixelParameter, EntryReentryAndUninventoriedControlNeverAcquireAuthority) {
     auto code = fixture::program();
     code.insert(code.end() - 1, 0xbf82fff2u);   // branch back to the entry M0 load
