@@ -4026,6 +4026,11 @@ if(TARGET prosper_core)
     INCLUDES tests
     LIBRARIES prosper_core)
   if(Vulkan_FOUND)
+    prosper_add_gtest(test_native_fp_mask_participation
+      SOURCES tests/gpu/execute/test_native_fp_mask_participation.cpp
+      INCLUDES tests tests/gpu/recompiler
+      LIBRARIES prosper_core Vulkan::Vulkan
+      LABELS gpu PROPERTIES TIMEOUT 60)
       prosper_add_gtest(test_allocated_movrels_gpu
         SOURCES tests/gpu/execute/test_allocated_movrels_gpu.cpp
         INCLUDES tests

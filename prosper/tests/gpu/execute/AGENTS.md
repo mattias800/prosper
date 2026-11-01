@@ -28,3 +28,7 @@ Both targets link the implementations from `prosper_core`.
 required native Wave64 subgroup, using real runtime push constants and both cohort halves.
 Its LDS boundary arm checks a final-bank address and two-word data without charging reserved
 DS fields as reads; each lane owns a distinct LDS cell.
+
+`test_native_fp_mask_participation` observes saved physical mask words after a real native
+loop controlled by finite, NaN and mixed floating predicates. The scalar branch is wave-wide;
+missing spill and high-word inputs remain refusals. The integer control retains its old route.

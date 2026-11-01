@@ -20,6 +20,9 @@ overlapping pair. Owned64 retains its independent width and launch contract.
 `rdna2_native_participation` retains genuine scalar branch conditions across instructions
 whose canonical effects preserve SCC. This does not supply memory results or authenticate an
 unknown condition; scalar writes still expire their destination facts independently.
+Known vector-compare definitions also supply genuine Boolean results from complete genuine
+operands. This is independent of integer-only constant truth evaluation; floating bits are never
+compared as integers. Missing source words and physical producer scope retain their own guards.
 
 Native compute SAVEEXEC destinations in VCC share producer-time physical-word retention with
 ordinary saved SGPR masks. The existing original-launch and participation proofs still own
