@@ -536,3 +536,6 @@ back edge cannot authorize an unbounded or writing address. The legacy lane-loca
 publication also remains Hard as `unmodelled-scalar-publication`: a real whole-wave value
 is required, and no broadcast is invented by the origin inventory.
 Those dependencies report `unproved-strong-read` and stay Hard.
+
+`rdna2_cfg_descriptor_sregs` inventories direct entry descriptors separately from scalar SSA
+storage. The dispatcher retains its existing per-path retirement; this helper grants no input.

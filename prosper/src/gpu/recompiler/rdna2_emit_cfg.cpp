@@ -1,3 +1,4 @@
+#include "gpu/recompiler/rdna2_cfg_descriptor_sregs.hpp"
 #include "gpu/recompiler/ir/cfg/exec_relation_consumer.hpp"
 #include "gpu/recompiler/ir/cfg/structured_if_cursor.hpp"
 // rdna2_emit_cfg.cpp — the divergent-control-flow state machine and emit_body, split out of
@@ -770,21 +771,7 @@ bool emit_cfg_state_machine(
         prosper::gpu::for_each_possible_vector_write(in, max_observable_vgpr, callback);
     };
 
-    // Direct user-data descriptors are deliberately absent from the initial scalar SSA map: their
-    // identity lives in the resource table, and presence in sreg means shader code overwrote them.
-    // The dispatcher persists every referenced SGPR in a Function variable, so recover that
-    // distinction per block until the first static write; otherwise a direct V# such as UE4's s[8:11]
-    // looks rewritten merely because the dispatcher loaded its zero-initialized backing variable.
-    std::set<int> direct_descriptor_sregs;
-    if (rt) {
-        for (const auto& resource : rt->resources) {
-            if (resource.srt_offset != 0xFFFFFFFFu || resource.sgpr_base == 0xFFFFFFFFu) continue;
-            const uint32_t words = (resource.cls == ResourceClass::Texture ||
-                                    resource.cls == ResourceClass::StorageImage) ? 8u : 4u;
-            for (uint32_t word = 0; word < words; ++word)
-                direct_descriptor_sregs.insert(static_cast<int>(resource.sgpr_base + word));
-        }
-    }
+    const auto direct_descriptor_sregs = cfg_direct_descriptor_sregs(rt);
 
     // The dispatcher reloads scalar values from Function variables, so map membership cannot say
     // whether shader code has overwritten an entry-time descriptor. Compute a forward MAY-write set
