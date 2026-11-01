@@ -14,8 +14,10 @@ using Words = std::vector<uint32_t>;
 inline uint32_t rsrc2(uint32_t count) {
     return ((count & 31u) << 1) | ((count >> 5) << 27);
 }
-inline gpu::PixelSystemInputMapping mapping(uint32_t count = 30) {
-    gpu::PixelSystemInputMapping result{1u << 8, 1u << 8};
+inline gpu::PixelSystemInputMapping mapping(uint32_t count = 30, bool smooth = false) {
+    // P1/P2 consume the real perspective-center I/J pair in v0/v1. Flat P0 needs only POS_X.
+    const uint32_t fields = (1u << 8) | (smooth ? 1u << 1 : 0u);
+    gpu::PixelSystemInputMapping result{fields, fields};
     result.parameter_launch = {true, rsrc2(count)};
     return result;
 }

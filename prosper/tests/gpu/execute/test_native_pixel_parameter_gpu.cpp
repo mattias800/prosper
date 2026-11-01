@@ -26,8 +26,8 @@ TEST(NativePixelParameterGpu, NativeInterpolationAndTheReusedScalarReachTheAttac
     namespace fixture = prosper::test::native_pixel_parameter;
     for (const bool wave32 : {false, true})
         for (const bool smooth : {false, true}) {
-            const auto result =
-                fixture::compile(fixture::program(30, smooth), fixture::mapping(), wave32);
+            const auto result = fixture::compile(fixture::program(30, smooth),
+                                                 fixture::mapping(30, smooth), wave32);
             ASSERT_FALSE(result.module.empty()) << result.reason;
             for (const float red : {0.125f, 0.625f}) {
                 const auto pixels =

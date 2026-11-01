@@ -67,7 +67,7 @@ TEST(NativePixelParameter, ActualFragmentInputAndReusedScalarLifetimeExecute) {
 TEST(NativePixelParameter, SmoothP1P2ReadsTheSameRealNativeInput) {
     for (const bool wave32 : {false, true}) {
         const auto result =
-            fixture::compile(fixture::program(30, true), fixture::mapping(), wave32);
+            fixture::compile(fixture::program(30, true), fixture::mapping(30, true), wave32);
         ASSERT_FALSE(result.module.empty()) << result.reason;
         EXPECT_GT(arbitrary_placeholder_reads(result.module).total(), 0u);
         for (const uint32_t red : {0x3e000000u, 0x3f200000u}) {
