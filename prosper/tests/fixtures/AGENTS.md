@@ -7,6 +7,10 @@ a complete active native subgroup with uniform fixture inputs; other collectives
 divergent subgroups and missing resources fail. It supplies no quad/raster packing authority.
 The device witness uses real rasterized inputs.
 
+`gta5_compute_cfg_fixture` keeps the complete frozen pc232 program and its separate, explicitly
+owned 4,152-worker partial-launch contract. The launch words are authored fixture inputs; they
+are not represented as recovered game packets or full-wave authority.
+
 `allocated_movrels` owns explicit private-bank integer programs shared by interpreter and device
 tests, including DS boundary operands and preserved relative-write padding across CFG reloads.
 
