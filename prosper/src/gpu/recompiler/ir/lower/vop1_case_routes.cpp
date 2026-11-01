@@ -17,6 +17,9 @@
 
 namespace prosper::gpu::ir {
 bool Vop1CaseRoutes::lower() {
+    if (b.compute_allocated_vgprs && in.opcode == kVop1OpcodeMovreldB32 &&
+        in.dst.value >= static_cast<int>(b.compute_allocated_vgprs))
+        return true; // A proved out-of-bank destination consumes no data operand.
     uint32_t a = in.opcode == 0x43 && b.compute_allocated_vgprs ? b.uconst(0) : val(in.src[0]);
     uint32_t old_d = vreg_old(b, rs, in.dst.value);
     uint32_t dpp_active = 0;

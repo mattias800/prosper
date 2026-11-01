@@ -3,8 +3,10 @@
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
+#include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_relative_index_values.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include "gpu/recompiler/rdna2_vector_old_word.hpp"
 #include <cstdint>
 #include <optional>
 #include <set>
@@ -13,8 +15,7 @@
 
 namespace prosper::gpu {
 int allocated_vgpr_max(const std::vector<Rdna2Inst>& instructions, uint32_t allocation) {
-    return std::max(shader_max_vgpr(instructions),
-                    allocation ? static_cast<int>(allocation - 1) : -1);
+    return allocation ? static_cast<int>(allocation - 1) : shader_max_vgpr(instructions);
 }
 
 void add_allocated_vgprs(std::set<int>& registers, uint32_t allocation) {
@@ -31,10 +32,46 @@ void add_allocated_relative_write(const Rdna2Inst& in, uint32_t allocation, std:
 
 bool allocated_vgpr_inventory_fits(const std::vector<Rdna2Inst>& instructions,
                                    uint32_t allocation) {
-    return !allocation || shader_max_vgpr(instructions) < static_cast<int>(allocation);
+    if (!allocation) return true;
+    const auto fits = [allocation](int first, uint32_t count) {
+        return !count || (first >= 0 && uint64_t(first) + count <= allocation);
+    };
+    for (const auto& in : instructions) {
+        if (in.is_end) break;
+        const bool relative_write =
+            in.fmt == Rdna2Format::VOP1 && in.opcode == kVop1OpcodeMovreldB32;
+        // VDST/SRC0 are unsigned selector bases, not ordinary physical operands. An
+        // out-of-bank destination is a NOP; an out-of-bank source selects current VGPR0.
+        if (relative_write && in.dst.value >= static_cast<int>(allocation)) continue;
+        const bool relative_read = in.fmt == Rdna2Format::VOP1 && in.opcode == 0x43;
+        if (!relative_write && !fits(in.dst.value, rdna2_vgpr_destination_span(in))) return false;
+        for (uint32_t source = 0; source < in.n_src; ++source) {
+            if (in.src[source].kind != OperandKind::VGPR || (relative_read && source == 0))
+                continue;
+            uint32_t span = vector_provenance_source_span(in, source);
+            // Known VALU entries explicitly distinguish unused encoded fields from reads.
+            if (rdna2_instruction_effects(in).describes_sources())
+                span = rdna2_valu_vgpr_source_span(in, source);
+            if (in.fmt == Rdna2Format::MIMG && source == 0) {
+                const uint32_t addresses = rdna2_mimg_read_address_count(in);
+                // An unmodelled image-address shape cannot authenticate a complete bank.
+                if (!addresses) return false;
+                for (uint32_t i = 0; i < addresses; ++i)
+                    if (!fits(rdna2_mimg_address_vgpr(in, i), 1)) return false;
+            } else if (!fits(in.src[source].value, span))
+                return false;
+        }
+    }
+    return true;
 }
 
 bool allocated_relative_write_needs_dispatcher(const std::vector<Rdna2Inst>& instructions) {
+    // Real guest barriers must first pass through the ordinary phase planner. Its zero-length
+    // emitter markers are already synchronized and may enter a per-phase dispatcher.
+    if (std::any_of(instructions.begin(), instructions.end(), [](const auto& in) {
+            return in.fmt == Rdna2Format::SOPP && in.opcode == 0x0a && in.len_dwords;
+        }))
+        return false;
     return std::any_of(instructions.begin(), instructions.end(), [](const auto& in) {
         return in.fmt == Rdna2Format::VOP1 && in.opcode == kVop1OpcodeMovreldB32;
     });
@@ -68,7 +105,7 @@ std::optional<std::set<int>> relative_vgpr_sources(const SpirvCompute& b, const 
                 return std::nullopt;
         }
     } else if (limit) {
-        result.insert(0); // Every index beyond the allocation selects this genuine source.
+        result.insert(0);   // Every index beyond the allocation selects this genuine source.
         for (uint32_t r = static_cast<uint32_t>(in.src[0].value); r < limit; ++r)
             result.insert(static_cast<int>(r));
     } else
@@ -107,4 +144,4 @@ bool lower_allocated_movrels(SpirvCompute& b, RegState& rs, const Rdna2Inst& in,
                                    selected, fallback);
     return true;
 }
-} // namespace prosper::gpu
+}   // namespace prosper::gpu

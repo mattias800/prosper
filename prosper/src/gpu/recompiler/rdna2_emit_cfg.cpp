@@ -5153,7 +5153,8 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         // Retain normal body proofs above; the dispatcher carries the full declared bank.
         if (!allow_cfg_dispatcher) return false;
         return emit_cfg_state_machine(b, rs, ins, safe, rt, allow_exec_update, allow_smem, exp_fn,
-                                      code, dwords, initial_dispatch_active);
+                                      code, dwords, initial_dispatch_active,
+                                      force_lds_fminmax_dispatcher);
     }
     if (b.is_compute && std::any_of(ins.begin(), ins.end(), compute_dpp_quad_or)) {
         if (!allow_cfg_dispatcher || std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {

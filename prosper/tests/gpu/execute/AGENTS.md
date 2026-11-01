@@ -26,3 +26,5 @@ Both targets link the implementations from `prosper_core`.
 
 `test_allocated_movrels_gpu` checks the declared bank and current-VGPR0 OOB source on a
 required native Wave64 subgroup, using real runtime push constants and both cohort halves.
+Its LDS boundary arm checks a final-bank address and two-word data without charging reserved
+DS fields as reads; each lane owns a distinct LDS cell.

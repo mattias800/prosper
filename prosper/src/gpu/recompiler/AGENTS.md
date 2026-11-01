@@ -34,6 +34,8 @@ out-of-range source reads current VGPR0. Allocation and bounded-index queries su
 value; each candidate retains its own provenance. Without either bound, selection stays Hard.
 Synthetic callers may declare an allocation matching RSRC1; legacy/live callers remain unknown
 until their complete producing allocation, including absence of shared VGPRs, is authenticated.
+Allocation admission counts semantic operands; conservative DS storage padding cannot reject
+a valid bank. Real guest barriers retain phase planning before a relative-write dispatcher.
 
 `rdna2_diagnostic_identity` keeps the primary refusal identity separate from the printed root
 envelope. Bounded compile-case records retain that identity; complete terminal diagnostics retain

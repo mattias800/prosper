@@ -24,7 +24,8 @@ void relative_words(const SpirvCompute& b, const RegState& rs, const Rdna2Inst& 
     if ((relative != Rdna2M0Relative::Source && relative != Rdna2M0Relative::Both) || !in.n_src ||
         in.src[0].kind != OperandKind::VGPR)
         return;
-    if (b.compute_allocated_vgprs && in.fmt == Rdna2Format::VOP1 && in.opcode == 0x43) {
+    if (b.compute_allocated_vgprs && in.fmt == Rdna2Format::VOP1 && in.opcode == 0x43 &&
+        !sreg_word_may_be_fabricated(rs, 124)) {
         const auto sources = relative_vgpr_sources(b, rs, in);
         if (sources && !observations.unbounded_relative.contains(in.pc)) {
             observations.relative_words[in.pc].insert(sources->begin(), sources->end());

@@ -3,6 +3,7 @@
 #include "fixtures/arbitrary_placeholder.hpp"
 #include "fixtures/checked_compute_launch.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/resources/shader_resources.hpp"
 #include <cstdint>
 #include <vector>
 namespace prosper::test::allocated_movrels {
@@ -89,6 +90,37 @@ inline std::vector<uint32_t> terminating_arms(uint32_t else_register,
                                 0x80020109u,
                                 0xbf810000u};
     if (specialization_prefix) words.insert(words.begin(), {0xbf068080u, 0xbf840001u, 0xbf800000u});
+    return words;
+}
+inline gpu::ShaderResourceTable ds_table(bool wide) {
+    auto resources = arbitrary_placeholder::table();
+    resources.resources[0].stride = wide ? 8 : 4;
+    resources.resources[0].size = 64 * resources.resources[0].stride;
+    return resources;
+}
+inline std::vector<uint32_t> ds_boundary(bool wide, bool outside_source = false,
+                                         bool outside_destination = false) {
+    const uint32_t address = wide ? 5u : 23u;
+    const uint32_t data = wide ? (outside_source ? 23u : 22u) : 1u;
+    std::vector<uint32_t> words{0x34000083u | (address << 17u),   // private LDS cell: lane * 8
+                                0x7e000287u | (data << 17u)};
+    if (data + 1 < 24) words.push_back(0x7e00028du | ((data + 1) << 17u));
+    words.insert(words.end(), {0xd9340000u, address | (data << 8u),   // ds_write_b64
+                               wide ? 0xd9d80000u : 0xd8d80000u,
+                               ((outside_destination ? 23u : 1u) << 24u) | address,
+                               wide ? 0xe0742000u : 0xe0702000u, 0x80020100u, 0xbf810000u});
+    return words;
+}
+inline std::vector<uint32_t> outside_relative(bool write, bool retry, uint32_t base = 255) {
+    std::vector<uint32_t> words{0x7e120300u, 0x7e020287u, 0x7e0a0287u};   // index v9, v1=v5=7
+    if (write)
+        words.insert(words.end(), {0xd7610005u, 0x00010000u});   // lost v5 is not read by a NOP
+    else
+        words.push_back(0x7e00028du);   // current VGPR0 = 13
+    words.push_back(0xbefc0380u);
+    words.push_back(write ? (0x7e008505u | (base << 17u)) : (0x7e028700u | base));
+    if (retry) words.insert(words.end(), {0x7e28023cu, 0x7d842914u});
+    words.insert(words.end(), {0xe0702000u, 0x80020109u, 0xbf810000u});
     return words;
 }
 }   // namespace prosper::test::allocated_movrels

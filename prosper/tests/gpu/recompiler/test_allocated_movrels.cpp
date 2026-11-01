@@ -4,9 +4,15 @@
 #include "fixtures/allocated_movrels.hpp"
 #include "fixtures/arbitrary_placeholder.hpp"
 #include "gpu/recompiler/rdna2_relative_vgpr_source.hpp"
+#include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include "gpu/recompiler/rdna2_placeholder_origins.hpp"
 #include <gtest/gtest.h>
 #include <cstdint>
+#include <cstddef>
+#include <memory>
+#include <set>
 #include <vector>
 namespace {
 using namespace prosper::gpu;
@@ -141,4 +147,95 @@ TEST(AllocatedMovrels, AllocationBoundsArmsExposedByConstantBranchSpecialization
         ASSERT_TRUE(vm.error.empty()) << vm.error;
         EXPECT_EQ(output, std::vector<uint32_t>(64, condition == 0 ? 7u : 13u));
     }
+}
+TEST(AllocatedMovrels, AllocationCountsActualDsWordsRatherThanStoragePadding) {
+    auto c = fixture::config(0);
+    c.lds_bytes = 512;
+    for (bool wide : {false, true}) {
+        const auto resources = fixture::ds_table(wide);
+        const auto words = fixture::ds_boundary(wide);
+        const auto module = recompile_compute(words.data(), words.size(), &resources, c);
+        ASSERT_FALSE(module.empty()) << wide;
+        bpermute_oracle::Interpreter vm(module);
+        vm.native_subgroup_width = 64;
+        vm.supplied_push_constants = c.user_sgprs;
+        std::vector<uint32_t> expected(std::size_t{64} * (wide ? 2u : 1u), 7u);
+        if (wide)
+            for (std::size_t i = 1; i < expected.size(); i += 2) expected[i] = 13;
+        const auto output = vm.run(64, std::vector<uint32_t>(expected.size(), 0xdeadbeefu));
+        ASSERT_TRUE(vm.error.empty()) << vm.error;
+        EXPECT_EQ(output, expected);
+    }
+    const auto resources = fixture::ds_table(true);
+    for (bool source : {false, true}) {
+        const auto outside = fixture::ds_boundary(true, source, !source);
+        EXPECT_TRUE(recompile_compute(outside.data(), outside.size(), &resources, c).empty());
+    }
+}
+TEST(AllocatedMovrels, RelativeBaseIsAnIndexAndAnOutOfBankDestinationIsANop) {
+    auto c = fixture::config(0);
+    c.user_sgprs[0] = 13;
+    const auto resources = prosper::test::arbitrary_placeholder::table();
+    for (bool write : {false, true}) {
+        for (bool retry : {false, true}) {
+            const auto words = fixture::outside_relative(write, retry);
+            const auto module = recompile_compute(words.data(), words.size(), &resources, c);
+            ASSERT_FALSE(module.empty()) << write << ',' << retry;
+            bpermute_oracle::Interpreter vm(module);
+            vm.native_subgroup_width = 64;
+            vm.supplied_push_constants = c.user_sgprs;
+            const auto output = vm.run(64, std::vector<uint32_t>(64, 0xdeadbeefu));
+            ASSERT_TRUE(vm.error.empty()) << vm.error;
+            EXPECT_EQ(output, std::vector<uint32_t>(64, write ? 7u : 13u));
+            if (write) {
+                const auto real_write = fixture::outside_relative(true, retry, 1);
+                EXPECT_TRUE(
+                    recompile_compute(real_write.data(), real_write.size(), &resources, c).empty());
+            }
+        }
+    }
+}
+
+TEST(AllocatedMovrels, GuestBarriersRetainTheExistingPhaseBoundary) {
+    auto words = fixture::program(false, true);
+    words.insert(words.begin() + 19, 0xbf8a0000u); // after the indexed write, before its reload
+    std::vector<Rdna2Inst> instructions;
+    ASSERT_EQ(rdna2_walk(words.data(), words.size(), instructions), words.size());
+    EXPECT_FALSE(allocated_relative_write_needs_dispatcher(instructions));
+    for (auto& in : instructions)
+        if (in.fmt == Rdna2Format::SOPP && in.opcode == 0x0a) in.len_dwords = 0;
+    EXPECT_TRUE(allocated_relative_write_needs_dispatcher(instructions))
+        << "emitter-only phase markers remain eligible";
+    const auto resources = prosper::test::arbitrary_placeholder::table();
+    const auto c = fixture::config(20);
+    const auto module = recompile_compute(words.data(), words.size(), &resources, c);
+    ASSERT_FALSE(module.empty());
+    bpermute_oracle::Interpreter vm(module);
+    vm.native_subgroup_width = 64;
+    vm.supplied_push_constants = c.user_sgprs;
+    const auto output = vm.run(64, std::vector<uint32_t>(64, 0xdeadbeefu));
+    ASSERT_TRUE(vm.error.empty()) << vm.error;
+    EXPECT_EQ(output, std::vector<uint32_t>(64, 105u));
+}
+
+TEST(AllocatedMovrels, APlaceholderIndexCannotNarrowDiagnosticRoots) {
+    auto p = std::make_shared<PlaceholderOriginProgram>();
+    const std::vector<uint32_t> words{0x7e0c8704u, 0xbf810000u};
+    ASSERT_EQ(rdna2_walk(words.data(), words.size(), p->instructions), words.size());
+    SpirvCompute b;
+    b.begin(16, nullptr, 64, 1, 1, 64, 0);
+    b.compute_allocated_vgprs = 24;
+    RegState rs;
+    rs.exec = b.btrue();
+    rs.placeholder_origin_program = p;
+    rs.sreg[124] = b.uconst(0);
+    rs.sreg_merge_placeholder.insert(124);
+    note_placeholder_resources(b, rs, p->instructions.front());
+    EXPECT_TRUE(p->observations->unbounded_relative.contains(0));
+    EXPECT_FALSE(p->observations->relative_words.contains(0));
+    p->observations = std::make_shared<PlaceholderOriginObservations>();
+    rs.sreg_merge_placeholder.clear();
+    note_placeholder_resources(b, rs, p->instructions.front());
+    EXPECT_EQ(p->observations->relative_words.at(0), std::set<int>{4});
+    EXPECT_TRUE(p->observations->unbounded_relative.empty());
 }

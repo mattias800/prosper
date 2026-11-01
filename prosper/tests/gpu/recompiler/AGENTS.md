@@ -460,3 +460,6 @@ from source definedness.
 Strict spill-storage controls have no independent arbitrary predicate, including destination
 aliases and the current-VGPR0 fallback. Terminating-arm controls validate the post-END else
 inventory after specialization and execute both in-range alternatives.
+DS boundary cases distinguish actual address/data widths from dispatcher padding, with wide
+out-of-bank twins. Selector bases, guest-barrier phase routing and marked M0 observations keep
+their independent bounds and root contracts.

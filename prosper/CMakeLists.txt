@@ -4026,6 +4026,11 @@ if(TARGET prosper_core)
     INCLUDES tests
     LIBRARIES prosper_core)
   if(Vulkan_FOUND)
+      prosper_add_gtest(test_allocated_movrels_gpu
+        SOURCES tests/gpu/execute/test_allocated_movrels_gpu.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan
+        LABELS gpu)
     prosper_add_gtest(test_compute_f32_mad_rounding
       SOURCES tests/gpu/execute/test_compute_f32_mad_rounding.cpp
       INCLUDES tests
@@ -6622,11 +6627,6 @@ endif()
         LIBRARIES prosper_core Vulkan::Vulkan
         LABELS gpu)
 
-      prosper_add_gtest(test_allocated_movrels_gpu
-        SOURCES tests/gpu/execute/test_allocated_movrels_gpu.cpp
-        INCLUDES tests
-        LIBRARIES prosper_core Vulkan::Vulkan
-        LABELS gpu)
       prosper_add_gtest(test_native_saveexec_vcc_data
         SOURCES tests/gpu/recompiler/test_native_saveexec_vcc_data.cpp
         INCLUDES tests
