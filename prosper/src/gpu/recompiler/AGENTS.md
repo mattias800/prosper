@@ -86,10 +86,11 @@ limit relative banks; without a bound it visits the complete bank rather than on
 legacy loop liveness scan and diagnostic roots; it consumes no new effects-table fields.
 
 `rdna2_arbitrary_placeholder` implements the owner-approved ADR 0038 admission boundary.
-Legacy Wave64 SCC writers and packed scalar liveness can request dependency re-emission after
+Legacy Wave64 SCC writers and packed/lane-read scalar liveness can request dependency re-emission after
 the original routes refuse. Successful original modules return first, preserving route choice
 and bytes. The repair uses existing SCC tracking and canonical packed source widths; it grants
-no Arbitrary admission and retains the emitter's ordinary Hard-root checks. An unloaded read
+no Arbitrary admission and enables the same ordinary input, spill, old-word and publication
+guards as admission re-emission. An unloaded read
 still requires a separate admission retry, with the complete ordinary-input guards below.
 Every admitted read must still have a nonempty, entirely unloaded typed root set. No value,
 domain, physical mask word or runtime validity fact is supplied. Owned packets retain their

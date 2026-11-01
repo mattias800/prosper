@@ -1,6 +1,7 @@
 // Original scalar CFG case groups; native path exits are retained.
 #include <cstdint>
 #include "gpu/recompiler/rdna2_cfg_scalar_merge_routes.hpp"
+#include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
@@ -85,9 +86,14 @@ std::optional<bool> CfgScalarMergeRoutes::alu() {
                 // must observe the old pair before replacing it. EXEC/M0 (124/126/127) still cannot
                 // be proven dead (implicit reads everywhere), and cmpx writes EXEC rather than its
                 // decoded SGPR destination.
+                // READLANE/READFIRSTLANE encode their scalar destination in the primary field
+                // which the decoder also uses for VGPR destinations. Use its canonical effect.
                 const uint32_t dst_width = scalar_write_width(in);
-                if (dst_width && in.dst.kind == OperandKind::SGPR && R <= 107 &&
-                    R >= in.dst.value && R < in.dst.value + static_cast<int>(dst_width) &&
+                if (dst_width &&
+                    (in.dst.kind == OperandKind::SGPR ||
+                     (rdna2_lane_read_writes_sgpr(in) && allow_scalar_merge_dependency_repair())) &&
+                    R <= 107 && R >= in.dst.value &&
+                    R < in.dst.value + static_cast<int>(dst_width) &&
                     !(in.fmt == Rdna2Format::VOPC && vopc_is_cmpx(in.opcode)))
                     continue;
                 break;

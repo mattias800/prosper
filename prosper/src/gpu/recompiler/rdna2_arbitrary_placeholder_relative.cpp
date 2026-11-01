@@ -26,7 +26,7 @@ bool reject_index(SpirvCompute& b, const Rdna2Inst& in, bool& ok) {
 
 bool refuse_arbitrary_placeholder_relative_source(SpirvCompute& b, const RegState& rs,
                                                   const Rdna2Inst& in, bool& ok) {
-    if (!arbitrary_placeholder_retry_active() || b.is_fragment_packet()) return false;
+    if (!placeholder_recompile_guards_active() || b.is_fragment_packet()) return false;
     if (refuse_arbitrary_placeholder_operand(b, rs, in, {OperandKind::Special, 124}, &ok))
         return true;
     const auto m0 = rs.sreg.find(124);

@@ -90,7 +90,7 @@ void retain_dropped_definition(PlaceholderRoots& roots, const detail::Placeholde
 
 bool refuse_arbitrary_placeholder_operand(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in,
                                           const Operand& operand, bool* ok) {
-    if (!arbitrary_placeholder_retry_active() || b.is_fragment_packet()) return false;
+    if (!placeholder_recompile_guards_active() || b.is_fragment_packet()) return false;
     PlaceholderWord word;
     bool missing = false;
     if (!hard_operand(rs, operand, word, missing)) return false;
@@ -111,7 +111,7 @@ bool refuse_arbitrary_placeholder_operand(SpirvCompute& b, const RegState& rs, c
 
 bool refuse_arbitrary_placeholder_lane_read(SpirvCompute& b, const RegState& rs,
                                             const Rdna2Inst& in, bool& ok) {
-    if (!arbitrary_placeholder_retry_active() || b.is_fragment_packet() ||
+    if (!placeholder_recompile_guards_active() || b.is_fragment_packet() ||
         !vector_lane_read_marks(rs, in).hard)
         return false;
     const auto* program = rs.placeholder_origin_program ? rs.placeholder_origin_program.get()
@@ -135,7 +135,7 @@ bool refuse_arbitrary_placeholder_lane_read(SpirvCompute& b, const RegState& rs,
 
 bool refuse_arbitrary_placeholder_export(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in,
                                          bool& ok) {
-    if (!arbitrary_placeholder_retry_active() || in.fmt != Rdna2Format::EXP) return false;
+    if (!placeholder_recompile_guards_active() || in.fmt != Rdna2Format::EXP) return false;
     // Exports read the register map directly instead of going through operand_bits.
     for (uint32_t k = 0; k < in.n_src; ++k) {
         const uint32_t components = in.exp_compr ? (3u << (2u * k)) : (1u << k);
@@ -147,7 +147,7 @@ bool refuse_arbitrary_placeholder_export(SpirvCompute& b, const RegState& rs, co
 }
 bool refuse_arbitrary_placeholder_old_destination(SpirvCompute& b, const RegState& rs,
                                                   const Rdna2Inst& in, bool& ok) {
-    if (!arbitrary_placeholder_retry_active() || b.is_fragment_packet() ||
+    if (!placeholder_recompile_guards_active() || b.is_fragment_packet() ||
         vector_write_leaves_old_word(in, rs.vector_native_interpolation) ||
         !vector_write_depends_on_old_word(in, !rs.exec_narrowed) ||
         rdna2_instruction_effects(in).lane_flow == Rdna2LaneFlow::WriteLane)

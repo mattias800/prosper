@@ -45,7 +45,11 @@ bool scalar_dependency_repair_active() {
     return current && current->repair;
 }
 
-bool allow_packed_scalar_merge() {
+bool placeholder_recompile_guards_active() {
+    return current && (current->allow || current->repair);
+}
+
+bool allow_scalar_merge_dependency_repair() {
     if (!current || current->repair || current->allow) return true;
     current->repair_eligible = true;
     return false;

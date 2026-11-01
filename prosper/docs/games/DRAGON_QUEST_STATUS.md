@@ -836,6 +836,25 @@ by that setting. No new runtime result or rung change is claimed here.
   Early activation and a minimize/restore did not release it; forced termination produced no
   exit alarm summary. It is a void run. The subsequent native Wayland runs above reached actual
   guest UI, so use a working window backend before drawing a renderer conclusion.
+
+- **#5521: the entry `s30` is not an observed USER_DATA_30 value.** The captured PS
+  RSRC2 is `0x3c`, declaring 30 user SGPRs; only physical USER_DATA_0 through 29 are observed.
+  AMD RDNA2 section 3.12.2 places the automatic primitive-mask/LDS-offset word immediately
+  after that prefix. Thus the PC1 M0 writer needs the hardware-loaded system `s30`; copying an
+  absent USER_DATA_30 or inventing zero would not supply it. Dependency repair retains this
+  separate input refusal until the entry service is modelled.
+
+
+- **#5521: the second shader's `s6` mask is not live through PC 2041.** The old
+  scalar-only destination scan missed `V_READLANE_B32 s6, ...` at PC 1959 because its primary
+  decoded destination is labelled VGPR. The canonical scalar-write inventory names that one-word
+  overwrite; every path from merge 1945 to the later read crosses it. No physical mask-word
+  projection or saved-generation correlation is needed. A READLANE selector that reads the old
+  scalar, a missing spill source and a still-live high word remain separate obligations.
+- **#5521: an empty-alpha window capture is not a black guest frame.** Several desktop PNGs
+  had zero RGB and empty or edge-only alpha; those captures are void visual evidence. Only a
+  positively observed menu/title and a capture with composited content can establish the scene.
+
 - **The PC1228/1239 s6 join proves the old pair is read later.** Falsified on main after #5542:
   its scalar liveness walk follows a back edge to VOP3P 0x20 at PC1086 and stops because that
   format is absent from the dispatcher. The instruction reads v11, v11 and literal zero.

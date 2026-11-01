@@ -11,7 +11,7 @@ namespace prosper::gpu {
 bool refuse_arbitrary_scalar_publication(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in) {
     // Only the legacy lane-local lowering calls this. Dispatcher/owned broadcast services
     // bypass it. Preserve strict successful modules and the existing agreeing-source proof.
-    if (!arbitrary_placeholder_retry_active() || scalar_scope_first_lane_agrees(b, rs, in) ||
+    if (!placeholder_recompile_guards_active() || scalar_scope_first_lane_agrees(b, rs, in) ||
         scalar_scope_local_index_waterfall(b, in))
         return false;
     const auto* program = rs.placeholder_origin_program ? rs.placeholder_origin_program.get()

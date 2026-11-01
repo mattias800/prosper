@@ -4059,6 +4059,11 @@ if(TARGET prosper_core)
       INCLUDES tests tests/gpu/recompiler
       LIBRARIES prosper_core Vulkan::Vulkan
       LABELS gpu PROPERTIES TIMEOUT 60)
+    prosper_add_gtest(test_scalar_merge_lane_reads
+      SOURCES tests/gpu/execute/test_scalar_merge_lane_reads.cpp
+      INCLUDES tests tests/gpu/recompiler
+      LIBRARIES prosper_core Vulkan::Vulkan
+      LABELS gpu)
     prosper_add_gtest(test_scalar_merge_packed
       SOURCES tests/gpu/execute/test_scalar_merge_packed.cpp
       INCLUDES tests tests/gpu/recompiler

@@ -437,6 +437,13 @@ must now carry a `Flat` decoration it did not have before. #3051
 
 ## Ruled out
 
+- **#5521: dependency repair needs the ordinary retry input guards too.** A real
+  WRITELANE on only one incoming edge exposed a missing-spill acceptance when the repaired
+  deadness scan retired an old scalar mask. The retained mutation must refuse; dependency
+  re-emission now checks ordinary inputs, spill slots, old destinations and scalar publication
+  independently of permission to admit unloaded placeholders.
+
+
 Cross-title falsifications where the **recompiler was blamed and exonerated**. One line per dead
 hypothesis, the evidence that killed it, and where that evidence lives. Do not re-derive these
 without contradictory new evidence.

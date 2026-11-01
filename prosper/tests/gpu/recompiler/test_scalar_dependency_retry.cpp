@@ -21,7 +21,8 @@ TEST(ScalarDependencyRetry, OriginalSuccessKeepsItsBytesAndDoesNotRetry) {
     const Words original{1, 2, 3};
     const auto result = recompile_with_arbitrary_placeholders({}, [&] {
         ++attempts;
-        EXPECT_FALSE(allow_packed_scalar_merge());
+        EXPECT_FALSE(placeholder_recompile_guards_active());
+        EXPECT_FALSE(allow_scalar_merge_dependency_repair());
         return Words(original);
     });
     EXPECT_EQ(result, original);
@@ -33,11 +34,12 @@ TEST(ScalarDependencyRetry, RepairDoesNotGrantArbitraryAdmission) {
     const Words repaired{4, 5, 6};
     const auto result = recompile_with_arbitrary_placeholders({}, [&] {
         if (++attempts == 1) {
-            EXPECT_FALSE(allow_packed_scalar_merge());
+            EXPECT_FALSE(allow_scalar_merge_dependency_repair());
             return Words{};
         }
         EXPECT_TRUE(scalar_dependency_repair_active());
-        EXPECT_TRUE(allow_packed_scalar_merge());
+        EXPECT_TRUE(placeholder_recompile_guards_active());
+        EXPECT_TRUE(allow_scalar_merge_dependency_repair());
         EXPECT_FALSE(arbitrary_placeholder_retry_active());
         SpirvCompute b;
         EXPECT_FALSE(admit_arbitrary_placeholder_read(b, 7, ArbitraryPlaceholderRead::FreshMask,
@@ -53,7 +55,7 @@ TEST(ScalarDependencyRetry, AnUnloadedReadStillNeedsTheSeparateAdmissionAttempt)
     unsigned attempts = 0;
     const auto result = recompile_with_arbitrary_placeholders({}, [&] {
         ++attempts;
-        const bool packed = allow_packed_scalar_merge();
+        const bool packed = allow_scalar_merge_dependency_repair();
         SpirvCompute b;
         const bool admitted = admit_arbitrary_placeholder_read(
             b, 7, ArbitraryPlaceholderRead::FreshMask, roots(PlaceholderOrigin::Unloaded));
@@ -75,7 +77,7 @@ TEST(ScalarDependencyRetry, AHardRootKeepsOnlyTheFinalRefusal) {
         TerminalRejectCapture capture;
         const auto result = recompile_with_arbitrary_placeholders(context, [&] {
             const bool first = ++attempts == 1;
-            const bool packed = allow_packed_scalar_merge();
+            const bool packed = allow_scalar_merge_dependency_repair();
             EXPECT_EQ(packed, !first);
             SpirvCompute b;
             EXPECT_FALSE(admit_arbitrary_placeholder_read(b, 7, ArbitraryPlaceholderRead::FreshMask,
@@ -100,7 +102,7 @@ TEST(ScalarDependencyRetry, ANamelessFailedRepairKeepsTheOriginalCause) {
     unsigned attempts = 0;
     const auto result = recompile_with_arbitrary_placeholders(context, [&] {
         const bool first = ++attempts == 1;
-        EXPECT_EQ(allow_packed_scalar_merge(), !first);
+        EXPECT_EQ(allow_scalar_merge_dependency_repair(), !first);
         log_recompile_diagnostic(context, "recompile-reject",
                                  first ? "route-decline" : "consequent",
                                  first ? "original missing input" : "body failed");
@@ -123,7 +125,7 @@ TEST(ScalarDependencyRetry, ANamelessThirdAttemptKeepsTheLastMeaningfulCause) {
         unsigned attempts = 0;
         const auto result = recompile_with_arbitrary_placeholders(context, [&] {
             ++attempts;
-            const bool packed = allow_packed_scalar_merge();
+            const bool packed = allow_scalar_merge_dependency_repair();
             EXPECT_EQ(packed, attempts != 1);
             SpirvCompute b;
             if (attempts == 1)

@@ -55,3 +55,7 @@ read marker.
 `test_scalar_merge_packed` executes both arms of a mixed-domain join whose old mask dies after
 packed arithmetic. Actual packed scalar reads still keep that generation live; unused neighbors
 and unrelated words do not. Unknown packed effects retain their refusal.
+
+`test_scalar_merge_lane_reads` executes real WRITELANE/READLANE replacements across mixed
+scalar joins. Old selectors, missing spill slots and a live high word retain their obligations;
+ordinary VGPR writes never retire a scalar generation. Interpreter and device arms agree.
