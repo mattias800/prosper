@@ -152,6 +152,38 @@ TEST(NativePixelParameter, M0WritesLdsAndRelativeUsesAreOutsideTheClosedService)
     EXPECT_FALSE(native_parameter_base_plan(fixture::mapping().parameter_launch, redirect));
 }
 
+TEST(NativePixelParameter, EncodedScalarMemoryPayloadReadsStayOutsideTheService) {
+    // LLVM gfx1013: s_store_dword / s_atomic_add s30, s[0:1], 0. SDATA is encoded
+    // in the destination field, but consumes the real entry word before its overwrite.
+    for (const std::array<uint32_t, 2> payload : {
+             std::array<uint32_t, 2>{0xf4400780u, 0xfa000000u},
+             std::array<uint32_t, 2>{0xf6080780u, 0xfa000000u},
+         }) {
+        auto code = fixture::program();
+        code.insert(code.begin() + 1, payload.begin(), payload.end());
+        const auto instructions = decode(code);
+        ASSERT_EQ(instructions[1].fmt, Rdna2Format::SMEM);
+        ASSERT_EQ(instructions[1].dst.value, 30);
+        EXPECT_FALSE(plan(code));
+    }
+}
+
+TEST(NativePixelParameter, EncodedWaitCounterSourcesCannotBorrowTheEntryWord) {
+    // LLVM gfx1013: s_waitcnt_{vscnt,vmcnt,expcnt,lgkmcnt} s30, 0. These source
+    // fields are outside the explicit source array; do not certify their numeric use.
+    for (const uint32_t wait : {0xbb9e0000u, 0xbc1e0000u, 0xbc9e0000u, 0xbd1e0000u}) {
+        auto code = fixture::program();
+        code.insert(code.begin() + 1, wait);
+        const auto instructions = decode(code);
+        ASSERT_EQ(instructions[1].fmt, Rdna2Format::SOPK);
+        ASSERT_EQ(instructions[1].dst.value, 30);
+        EXPECT_FALSE(plan(code));
+        code = fixture::program();
+        code.insert(code.begin() + 2, wait);   // the complete overwrite supplies this threshold
+        EXPECT_TRUE(plan(code));
+    }
+}
+
 TEST(NativePixelParameter, EntryReentryAndUninventoriedControlNeverAcquireAuthority) {
     auto code = fixture::program();
     code.insert(code.end() - 1, 0xbf82fff2u);   // branch back to the entry M0 load

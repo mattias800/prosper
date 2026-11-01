@@ -3,6 +3,7 @@
 `test_native_pixel_parameter` checks the original-program interpolation-only entry service,
 actual native Input output and the reused scalar lifetime. Unknown/wrong prefixes, numerical
 observers, conditional overwrites, reentry and foreign contexts retain their own boundaries.
+Encoded SMEM store/atomic payloads and SOPK wait thresholds cannot bypass those boundaries.
 
 `test_cfg_reject_reason` retains a Wave64 dispatcher's actual fresh-mask cause and launch root
 in its terminal record. The ordinary Wave32 path and supplied sources are independent controls.

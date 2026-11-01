@@ -38,6 +38,11 @@ bool overlaps(int base, uint32_t width, int word) {
 }
 
 bool reads_word(const Rdna2Inst& in, int word) {
+    // ISA 70648 section 12.2: a non-null SDST supplies part of the wait threshold.
+    // These SOPK forms have no explicit source operand in the decoded array.
+    if (in.fmt == Rdna2Format::SOPK && in.opcode >= kSopkOpcodeWaitcntVscnt &&
+        in.opcode <= kSopkOpcodeWaitcntLgkmcnt && in.dst.value == word)
+        return true;
     if (overlaps(in.dst.value, scalar_implicit_destination_read_width(in), word)) return true;
     for (uint32_t k = 0; k < in.n_src; ++k) {
         const auto source = in.src[k];
@@ -100,6 +105,11 @@ bool unsupported_m0_use(const Rdna2Inst& in) {
     // untracking M0 must not turn its unknown numerical base into a default ADDTID base.
     if (in.fmt == Rdna2Format::DS || in.mubuf_lds || in.flat_lds) return true;
     const auto& effects = rdna2_instruction_effects(in);
+    // Store/atomic SDATA is also a source encoded in dst, outside the explicit source array.
+    // Keep these payloads outside this closed service; consume only legacy effects here.
+    if (in.fmt == Rdna2Format::SMEM &&
+        (effects.smem == Rdna2ScalarMemory::Store || effects.smem == Rdna2ScalarMemory::Atomic))
+        return true;
     if (effects.implicit_reads & kRdna2ImplicitM0) return true;
     // LDS_DIRECT is a dynamic operand spelling, rather than an unconditional VALU effect.
     // Unmodeled Special selectors cannot inherit interpolation-only M0 authority either.

@@ -9,6 +9,8 @@ overwrite before control diverges. Numeric M0, LDS/GDS, relative uses, changed o
 unknown layouts remain outside this service. It publishes no SGPR/M0 bits and grants no mask
 authority. The partial scalar inventory names loaded prefix words without declaring other words
 unloaded; ADR 0038's real-input boundary remains separate.
+SMEM store/atomic payloads stay outside the closed service; SOPK wait thresholds also charge
+their encoded scalar source, independently of the explicit source array.
 
 `rdna2_loop_vcc_carry` owns the VCC exit merge separately from numeric register PHIs. A mask
 retired on both incoming paths has no mask view at the merge; scalar words retain their own
