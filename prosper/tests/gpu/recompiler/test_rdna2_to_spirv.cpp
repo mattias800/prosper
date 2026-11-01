@@ -1454,6 +1454,12 @@ int main() {
     // the pc15 compare is formed from words hardware never loaded (#5039).
     ComputeShaderConfig vcc_low_dispatch_cfg17d = native_cfg17d;
     vcc_low_dispatch_cfg17d.user_sgprs.assign(15, 0u);
+    // Project-owned launch: the highest explicit VGPR is v20. The smallest Wave64
+    // RSRC1 allocation covers 24 words (four per encoded block), with no shared VGPRs.
+    // User SGPR values remain runtime data and establish no relative-index bound (#5541).
+    vcc_low_dispatch_cfg17d.allocated_vgprs = 24;
+    vcc_low_dispatch_cfg17d.compute_pgm_rsrc1 =
+        (vcc_low_dispatch_cfg17d.compute_pgm_rsrc1 & ~63u) | 5u;
     CHECK(!recompile_compute(code17d1_vcc_low_dispatch,
                              std::size(code17d1_vcc_low_dispatch), nullptr,
                              vcc_low_dispatch_cfg17d).empty(),

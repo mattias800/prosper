@@ -2,6 +2,7 @@
 #include "gpu/recompiler/ir/lower/vop1_case_routes.hpp"
 #include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
+#include "gpu/recompiler/rdna2_relative_vgpr_source.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/ir/lower/vop1_integer_lowering.hpp"
@@ -16,7 +17,10 @@
 
 namespace prosper::gpu::ir {
 bool Vop1CaseRoutes::lower() {
-    uint32_t a = val(in.src[0]);
+    if (b.compute_allocated_vgprs && in.opcode == kVop1OpcodeMovreldB32 &&
+        in.dst.value >= static_cast<int>(b.compute_allocated_vgprs))
+        return true; // A proved out-of-bank destination consumes no data operand.
+    uint32_t a = in.opcode == 0x43 && b.compute_allocated_vgprs ? b.uconst(0) : val(in.src[0]);
     uint32_t old_d = vreg_old(b, rs, in.dst.value);
     uint32_t dpp_active = 0;
     if (auto routed = ir::lower_vop1_dpp_source(b, rs, in, ok, a, dpp_active)) return *routed;
@@ -129,6 +133,7 @@ std::optional<bool> Vop1CaseRoutes::residual_routes(uint32_t& d, const bool& int
 
         case 0x43: {   // v_movrels_b32: dst = VGPR[src0# + M0] (relative-indexed VGPR read)
             if (refuse_arbitrary_placeholder_relative_source(b, rs, in, ok)) return true;
+            if (lower_allocated_movrels(b, rs, in, d, ok)) break;
             // M0 is written by plain scalar ALU (s_mov/s_or m0, … decode dst as SGPR 124), so
             // its per-invocation value lives in rs.sreg[124]. The source register NUMBER is
             // src0# + M0 — a runtime value — so lower to a bounded select chain over every

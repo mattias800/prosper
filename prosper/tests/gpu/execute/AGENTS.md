@@ -23,3 +23,8 @@ input. Diagnostic selectors are code-generation inputs too, even when normal lau
 `test_index_size_detect` covers the `draw_index_width` fingerprints. `test_ngg_indexed_realize`
 covers the shared `draw_index_source` rule and indexed NGG fetch through the executor umbrella.
 Both targets link the implementations from `prosper_core`.
+
+`test_allocated_movrels_gpu` checks the declared bank and current-VGPR0 OOB source on a
+required native Wave64 subgroup, using real runtime push constants and both cohort halves.
+Its LDS boundary arm checks a final-bank address and two-word data without charging reserved
+DS fields as reads; each lane owns a distinct LDS cell.

@@ -1,5 +1,8 @@
 # `prosper/tests/fixtures/` — shared harnesses and hand-built inputs
 
+`allocated_movrels` owns explicit private-bank integer programs shared by interpreter and device
+tests, including DS boundary operands and preserved relative-write padding across CFG reloads.
+
 `loop_vcc_data_exit.hpp` supplies a structured scalar loop shared by the interpreter and native
 Wave64 GPU witnesses. Both VCC halves are DATA at the exit; unknown-launch and missing-spill
 mutations retain independent fresh-predicate obligations.
@@ -242,3 +245,6 @@ recovery control without disabling range sharing.
 The range counters distinguish actual union copies from distinct resolved descriptor slices;
 skipped draws can leave planned bytes unused, so bound bytes minus upload bytes remains signed.
 Planning and shared write-proof time are nested in resource setup, outside per-binding copy time.
+
+`allocated_movrels` declares a synthetic private VGPR allocation, runtime index, bank words and
+expected OOB observations shared by compiler and GPU execution tests. It grants no launch value.

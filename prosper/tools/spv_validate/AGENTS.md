@@ -6,3 +6,6 @@ inventory also rejects a producing entry point without a validated module.
 `arbitrary_placeholder_witness` exercises the delegating admission entry directly using the
 shared synthetic register fixture. It requires actual chosen-module admission metadata; an
 ordinary strict success cannot stand in for this path. No Vulkan device or game is needed.
+
+The allocated MOVRELS witnesses validate both Wave32 and Wave64 declared-bank/OOB modules
+through the existing `recompile_compute` selector. Unknown allocations stay outside this route.

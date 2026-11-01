@@ -21,6 +21,7 @@
 // is a hard failure rather than a pass.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "arbitrary_placeholder_witness.hpp"
+#include "fixtures/allocated_movrels.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/ngg_subgroup_shell.hpp"
 #include "gpu/recompiler/ngg_raster_commit.hpp"
@@ -2513,6 +2514,14 @@ int main(int argc, char** argv) {
                             0xF800180Fu,0x05020302u,0xBF810000u};
       dump(dir, "fragment_nested_exec_loops", recompile_fragment(c, sizeof(c)/4, nullptr)); }
 
+    dump(dir, "allocated_movrels_wave64", prosper::test::allocated_movrels::compile(23),
+         "recompile_compute");
+    dump(dir, "allocated_movrels_wave32", prosper::test::allocated_movrels::compile(23, 32),
+         "recompile_compute");
+    dump(dir, "allocated_movrels_padding_wave64",
+         prosper::test::allocated_movrels::compile(20, 64, false, true), "recompile_compute");
+    dump(dir, "allocated_movrels_padding_wave32",
+         prosper::test::allocated_movrels::compile(20, 32, false, true), "recompile_compute");
     // --- Emitters that are NOT the RDNA2 recompiler ---
     dump(dir, "arbitrary_placeholder_admission",
          prosper::spv_validation::arbitrary_placeholder_witness(),

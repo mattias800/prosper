@@ -2,7 +2,7 @@
 #include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_placeholder_origins.hpp"
-#include "gpu/recompiler/rdna2_relative_index_values.hpp"
+#include "gpu/recompiler/rdna2_relative_vgpr_source.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <cstdint>
 #include <memory>
@@ -31,15 +31,11 @@ bool refuse_arbitrary_placeholder_relative_source(SpirvCompute& b, const RegStat
         return true;
     const auto m0 = rs.sreg.find(124);
     if (m0 == rs.sreg.end()) return reject_index(b, in, ok);
-    // This existing integer query bounds values only. Every selected source independently
-    // retains its actual value/provenance check; the union of other alternatives supplies none.
-    const auto offsets = relative_index_values(b, rs, m0->second, rs.exec);
-    if (!offsets || offsets->empty()) return reject_index(b, in, ok);
-    for (uint32_t offset : *offsets) {
-        const uint64_t reg = static_cast<uint64_t>(in.src[0].value) + offset;
-        if (reg > 255) return reject_index(b, in, ok);
-        if (refuse_arbitrary_placeholder_operand(b, rs, in,
-                                                 {OperandKind::VGPR, static_cast<int>(reg)}, &ok))
+    // Allocation bounds selection only; each possible source keeps its independent roots.
+    const auto sources = relative_vgpr_sources(b, rs, in);
+    if (!sources || sources->empty()) return reject_index(b, in, ok);
+    for (int reg : *sources) {
+        if (refuse_arbitrary_placeholder_operand(b, rs, in, {OperandKind::VGPR, reg}, &ok))
             return true;
     }
     return false;

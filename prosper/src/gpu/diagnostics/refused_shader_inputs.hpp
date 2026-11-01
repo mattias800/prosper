@@ -26,6 +26,9 @@
 // Compute schema 8 additionally retains a supplied producing RTE32 capability verdict. Earlier
 // schemas leave it unspecified; replay then uses its own executing-device verdict.
 //
+// Compute schema 9 retains an explicit complete private VGPR allocation; older schemas keep
+// it unknown. It independently records whether an RTE32 verdict was supplied.
+//
 // A diagnostic: written only beside a newly dumped refused program, never read by the live path.
 // Guest buffer bytes stay local, beside the dump; they are never part of the repository.
 #pragma once
@@ -44,7 +47,7 @@ namespace prosper::gpu {
 // Guest buffer bytes kept per sidecar. Above it the table is still recorded in full, but buffer
 // contents become opaque and a replay that needs them reports INCOMPLETE.
 inline constexpr uint64_t kRefusedShaderInputsMaxPayloadBytes = 256ull * 1024ull;
-inline constexpr uint32_t kRefusedShaderInputsSchema = 8;
+inline constexpr uint32_t kRefusedShaderInputsSchema = 9;
 
 struct RefusedGraphicsInputs;
 struct RefusedShaderInputs {

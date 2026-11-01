@@ -28,9 +28,14 @@ Implicit VOP2 carry writes expire the prior VCC DATA lifetime in both emission a
 MUST facts; opcode membership comes from the existing carry-family definitions.
 
 `rdna2_arbitrary_placeholder_relative` guards each potentially selected VGPR at the legacy
-MOVRELS bank reader during admission retries. The existing bounded-index query supplies no
-register values: every candidate retains its own provenance check, and an unbounded or
-out-of-range index keeps an explicit unmodelled-transfer refusal.
+MOVRELS bank reader during admission retries. `rdna2_relative_vgpr_source` shares selection with
+the origin observer and implements the explicit complete-private-allocation contract: an
+out-of-range source reads current VGPR0. Allocation and bounded-index queries supply no register
+value; each candidate retains its own provenance. Without either bound, selection stays Hard.
+Synthetic callers may declare an allocation matching RSRC1; legacy/live callers remain unknown
+until their complete producing allocation, including absence of shared VGPRs, is authenticated.
+Allocation admission counts semantic operands; conservative DS storage padding cannot reject
+a valid bank. Real guest barriers retain phase planning before a relative-write dispatcher.
 
 `rdna2_diagnostic_identity` keeps the primary refusal identity separate from the printed root
 envelope. Bounded compile-case records retain that identity; complete terminal diagnostics retain
@@ -536,3 +541,6 @@ back edge cannot authorize an unbounded or writing address. The legacy lane-loca
 publication also remains Hard as `unmodelled-scalar-publication`: a real whole-wave value
 is required, and no broadcast is invented by the origin inventory.
 Those dependencies report `unproved-strong-read` and stay Hard.
+
+`rdna2_cfg_descriptor_sregs` inventories direct entry descriptors separately from scalar SSA
+storage. The dispatcher retains its existing per-path retirement; this helper grants no input.

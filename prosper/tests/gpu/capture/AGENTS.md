@@ -6,3 +6,6 @@ rendering or raw recompilation. CLI cases launch the actual replay tool with bou
 
 `test_rtt_dcc_codec` checks the append-only association layout, legacy prefixes, absent facts
 and malformed records. These are format/metadata assertions, with no rendering authority.
+
+`test_compute_vgpr_allocation` checks complete private-allocation cache identity, diagnostic
+sidecars and v80 frame inputs, including legacy unknownness and malformed tails.

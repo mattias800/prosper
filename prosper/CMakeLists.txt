@@ -1091,6 +1091,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/execute/test_compute_dispatch_launch.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_compute_vgpr_allocation
+    SOURCES tests/gpu/capture/test_compute_vgpr_allocation.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_rtt_dcc_codec
     SOURCES tests/gpu/capture/test_rtt_dcc_codec.cpp
     LIBRARIES prosper_core)
@@ -4022,6 +4026,11 @@ if(TARGET prosper_core)
     INCLUDES tests
     LIBRARIES prosper_core)
   if(Vulkan_FOUND)
+      prosper_add_gtest(test_allocated_movrels_gpu
+        SOURCES tests/gpu/execute/test_allocated_movrels_gpu.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan
+        LABELS gpu)
     prosper_add_gtest(test_compute_f32_mad_rounding
       SOURCES tests/gpu/execute/test_compute_f32_mad_rounding.cpp
       INCLUDES tests
@@ -4308,6 +4317,10 @@ if(TARGET prosper_core)
     LIBRARIES prosper_core)
   prosper_add_gtest(test_local_index_waterfall
     SOURCES tests/gpu/recompiler/test_local_index_waterfall.cpp
+    INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
+  prosper_add_gtest(test_allocated_movrels
+    SOURCES tests/gpu/recompiler/test_allocated_movrels.cpp
     INCLUDES tests tests/gpu/recompiler
     LIBRARIES prosper_core)
   prosper_add_gtest(test_relative_bank_source

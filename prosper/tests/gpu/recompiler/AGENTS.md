@@ -453,3 +453,13 @@ Hard-input controls use a launch word that is genuinely unknown (the possible sc
 SGPR), or an untracked spill. A never-loaded ordinary SGPR is Arbitrary under ADR 0038 and
 cannot stand in for a missing meaningful input. Keep the original consumer/branch positions
 when correcting such a fixture.
+
+`test_allocated_movrels` executes runtime private-bank selection and the current-VGPR0 OOB
+rule in both wave widths. Missing allocation and lost-candidate controls keep ownership separate
+from source definedness.
+Strict spill-storage controls have no independent arbitrary predicate, including destination
+aliases and the current-VGPR0 fallback. Terminating-arm controls validate the post-END else
+inventory after specialization and execute both in-range alternatives.
+DS boundary cases distinguish actual address/data widths from dispatcher padding, with wide
+out-of-bank twins. Selector bases, guest-barrier phase routing and marked M0 observations keep
+their independent bounds and root contracts.

@@ -33,3 +33,6 @@ one before it is used to size an allocation.
 
 `rtt_dcc_codec` owns the v79 RTT-association tail, including count/field validation. Older
 records leave the association unavailable; the original seed payload layout stays intact.
+
+`compute_vgpr_codec` owns the v80 complete private-allocation tail for successful and failed
+compute inputs. Old records retain unknown allocation even when their raw RSRC1 word is present.

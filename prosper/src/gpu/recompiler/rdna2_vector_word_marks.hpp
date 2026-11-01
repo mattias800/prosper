@@ -87,7 +87,8 @@ void record_exec_mask_subset(RegState& rs, uint32_t result, uint32_t left, uint3
 // unknown launch profile, every absent word stays a hard placeholder.
 void seed_vector_word_definedness(RegState& rs, const std::vector<Rdna2Inst>& instructions,
                                   bool native_interpolation = false, uint32_t wave_size = 64,
-                                  const std::vector<LaunchVgpr>* launch = nullptr);
+                                  const std::vector<LaunchVgpr>* launch = nullptr,
+                                  uint32_t allocated_vgprs = 0);
 ScalarSourceMarks vector_source_marks(const RegState& rs, const Rdna2Inst& in);
 // A graphics ds_write_addtid_b32 spill (rdna2_emit_alu.cpp's per-lane spill model): the slot keyed
 // by (M0 value, offset) takes the spilled word, and lds_addtid_marks takes its marks -- the word's

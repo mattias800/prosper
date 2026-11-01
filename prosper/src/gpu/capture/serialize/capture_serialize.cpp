@@ -6,6 +6,7 @@
 
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/capture/serialize/rtt_dcc_codec.hpp"
+#include "gpu/capture/serialize/compute_vgpr_codec.hpp"
 #include "gpu/capture/capture_source_gate.hpp"   // #3807 v74 placeholder marks
 
 #include <mutex>
@@ -1476,6 +1477,9 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
     }
     if (gpu_capture_version_for(c) >= kVersionWithRttDccMetadata &&
         !write_rtt_dcc_metadata(w, c.rtt_seeds, error))
+        return false;
+    if (gpu_capture_version_for(c) >= kVersionWithComputeVgprAllocation &&
+        !write_compute_vgpr_allocations(w, c, error))
         return false;
     // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail
     // existed, so a capture sitting just under the maximum could serialize successfully into a file

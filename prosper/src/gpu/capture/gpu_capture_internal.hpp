@@ -229,7 +229,9 @@ constexpr char kMagic[8] = {'P','R','G','P','C','A','P','\0'};
 // It is appended only when needed; captures without these compiler inputs retain their old bytes.
 // v78 appends independent producing FP16_OVFL facts for graphics; legacy captures stay unknown.
 // v79 appends retained RTT DCC descriptor facts; older seeds keep the association unavailable.
-constexpr uint32_t kVersion = 79;
+// v80 appends explicit complete private VGPR allocations; earlier records remain unknown.
+constexpr uint32_t kVersion = 80;
+constexpr uint32_t kVersionWithComputeVgprAllocation = 80;
 constexpr uint32_t kVersionWithRttDccMetadata = 79;
 constexpr uint32_t kVersionWithFp16OverflowMode = 78;
 constexpr uint32_t kVersionWithGraphicsFloatMode = 77;
@@ -251,6 +253,11 @@ inline bool gpu_capture_has_unavailable_source(const GpuCaptureFile& c) {
 }
 // The lowest version whose tails can hold everything this capture carries.
 inline uint32_t gpu_capture_version_for(const GpuCaptureFile& c) {
+    for (const auto& compute : c.computes)
+        if (compute.recompile_config.allocated_vgprs) return kVersionWithComputeVgprAllocation;
+    for (const auto& diagnostic : c.failure_diagnostics)
+        for (const auto& stage : diagnostic.stages)
+            if (stage.recompile_config.allocated_vgprs) return kVersionWithComputeVgprAllocation;
     for (const auto& seed : c.rtt_seeds)
         if (seed.dcc_metadata != GpuCaptureRttDccMetadata{}) return kVersionWithRttDccMetadata;
     for (const auto& compute : c.computes)
