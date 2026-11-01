@@ -1,16 +1,23 @@
 #include "gpu/recompiler/rdna2_native_entry_exec_words.hpp"
 #include "gpu/recompiler/compute_dispatch_launch.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
 #include "gpu/recompiler/rdna2_native_launch.hpp"
 #include "gpu/recompiler/rdna2_saved_mask_words.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <algorithm>
+#include <array>
 #include <bitset>
+#include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
+#include <utility>
+#include <vector>
 
 namespace prosper::gpu {
 struct NativeEntryExecWordPlan {
@@ -135,11 +142,17 @@ std::set<uint32_t> entry_producers(const SpirvCompute& b, const std::vector<Rdna
         const size_t i = work.front();
         work.pop_front();
         queued[i] = false;
-        const auto after = transfer(*incoming[i], ins[i]);
+        const auto& state = incoming[i];
+        if (!state) return {};
+        const auto after = transfer(*state, ins[i]);
         for (size_t next : successors[i]) {
-            const auto value = incoming[next] ? *incoming[next] & after : after;
-            if (incoming[next] && *incoming[next] == value) continue;
-            incoming[next] = value;
+            auto& slot = incoming[next];
+            auto value = after;
+            if (slot) {
+                value = *slot & after;
+                if (*slot == value) continue;
+            }
+            slot = value;
             if (!queued[next]) {
                 work.push_back(next);
                 queued[next] = true;
@@ -147,9 +160,11 @@ std::set<uint32_t> entry_producers(const SpirvCompute& b, const std::vector<Rdna
         }
     }
     std::set<uint32_t> result;
-    for (size_t i = 0; i < ins.size(); ++i)
-        if (incoming[i] && incoming[i]->test(126) && native_entry_exec_word_move(b, ins[i]))
+    for (size_t i = 0; i < ins.size(); ++i) {
+        const auto& state = incoming[i];
+        if (state && state->test(126) && native_entry_exec_word_move(b, ins[i]))
             result.insert(ins[i].pc);
+    }
     return result;
 }
 bool original_region(const NativeEntryExecWordPlan& plan, const std::vector<Rdna2Inst>& region) {

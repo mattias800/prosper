@@ -6,6 +6,7 @@
 #include "gpu/resources/shader_resources.hpp"
 #include <atomic>
 #include <cstdint>
+#include <cstddef>
 #include <string>
 #include <utility>
 #include <vector>
@@ -42,7 +43,8 @@ inline gpu::ComputeShaderConfig config(bool partial) {
     return c;
 }
 inline Words output(bool partial) {
-    return Words((partial ? 4160 : 128) * 2, untouched);
+    const size_t workers = partial ? 4160 : 128;
+    return Words(workers * 2, untouched);
 }
 inline gpu::ShaderResourceTable table(bool partial) {
     gpu::ShaderResource r;

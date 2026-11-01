@@ -7,6 +7,10 @@
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <gtest/gtest.h>
 #include <stdexcept>
+#include <cstdint>
+#include <vector>
+#include <utility>
+#include "gpu/recompiler/compute_dispatch_launch.hpp"
 
 namespace {
 using namespace prosper::gpu;

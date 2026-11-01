@@ -3,6 +3,7 @@
 #include "fixtures/arbitrary_placeholder.hpp"
 #include "bpermute_spirv_oracle.hpp"
 #include <gtest/gtest.h>
+#include <cstdint>
 
 namespace {
 namespace fixture = prosper::test::native_entry_exec_words;

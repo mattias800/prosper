@@ -2,6 +2,7 @@
 #include "fixtures/native_entry_exec_words.hpp"
 #include "fixtures/compute_runner.h"
 #include <gtest/gtest.h>
+#include <cstdint>
 
 namespace {
 void device(bool partial, bool data_mask = false) {
