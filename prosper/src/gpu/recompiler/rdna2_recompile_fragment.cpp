@@ -388,7 +388,7 @@ std::vector<uint32_t> recompile_fragment_impl(
     // Preserve every successful original module, including its instruction/id ordering. The
     // guarded retry is where the missing real entry service must replace the legacy fallback.
     const auto parameter_base =
-        system_inputs && arbitrary_placeholder_retry_active()
+        system_inputs && placeholder_recompile_guards_active()
             ? native_parameter_base_plan(system_inputs->parameter_launch, ins)
             : nullptr;
     // Unsupported scalar writes can replace launch MODE authority. Inspect the original stream

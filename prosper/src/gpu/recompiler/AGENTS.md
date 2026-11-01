@@ -16,7 +16,8 @@ backedge roots. Partial launches force a zero origin.
 
 `pixel_parameter_launch` carries the producing PS RSRC2 word with independent knownness.
 `rdna2_native_parameter_base` admits an interpolation-only entry service during guarded retries
-on native fragments, preserving successful original modules byte-for-byte:
+on native fragments, including guarded dependency repair, preserving successful original modules
+byte-for-byte:
 the first automatic scalar word follows the recorded user prefix, one unconditional entry move
 loads M0, and only native VINTRP consumes it. Later scalar reads require a complete unconditional
 overwrite before control diverges. Numeric M0, LDS/GDS, relative uses, changed original code and

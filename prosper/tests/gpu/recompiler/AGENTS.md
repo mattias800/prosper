@@ -492,3 +492,7 @@ publishes diagnostics. Named Hard origins retain their veto in every attempt.
 Failed dependency repairs retain the original sequence's selected cause; failed admission
 attempts reporting only consequences retain the last meaningful cause. Successful retries
 discard earlier refusal records.
+
+`test_scalar_dependency_parameter` executes the same native PS input service inside the separate
+dependency-repair attempt. Repair supplies no arbitrary admission; unknown or numerically observed
+automatic inputs retain their own refusal.
