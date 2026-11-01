@@ -22,6 +22,7 @@
 #include "gpu/recompiler/fragment_float_mode.hpp"
 #include "gpu/recompiler/fp16_overflow_mode.hpp"
 #include "gpu/recompiler/fragment_float_flags.hpp"
+#include "gpu/recompiler/pixel_parameter_launch.hpp"
 #include "gpu/recompiler/graphics_float_mode.hpp"
 #include "gpu/recompiler/fragment_export_formats.hpp"
 #include "gpu/recompiler/fragment_arithmetic_observation.hpp"
@@ -556,6 +557,7 @@ struct PixelSystemInputMapping {
     uint32_t ena = 0;
     uint32_t addr = 0;
     FragmentFrontFaceEncoding front_face_encoding = FragmentFrontFaceEncoding::Unavailable;
+    PixelParameterLaunch parameter_launch{};
 
     void retain_front_face_encoding(bool available, uint32_t baryc_cntl) {
         front_face_encoding =
@@ -565,7 +567,8 @@ struct PixelSystemInputMapping {
                 : FragmentFrontFaceEncoding::Unavailable;
     }
     bool canonical() const {
-        return static_cast<uint8_t>(front_face_encoding) <=
+        return parameter_launch.canonical() &&
+               static_cast<uint8_t>(front_face_encoding) <=
                    static_cast<uint8_t>(FragmentFrontFaceEncoding::AllBits) &&
                (front_face_encoding == FragmentFrontFaceEncoding::Unavailable ||
                 (ena & addr & (1u << 12)));

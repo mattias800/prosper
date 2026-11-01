@@ -65,7 +65,8 @@ void seed_placeholder_origins(RegState&, const std::vector<Rdna2Inst>&,
                               const std::vector<LaunchVgpr>*, bool native_interpolation);
 void configure_compute_placeholder_origins(RegState&, const ComputeShaderConfig&);
 void configure_pixel_placeholder_origins(RegState&, const std::vector<LaunchVgpr>&,
-                                         bool profile_known);
+                                         bool profile_known,
+                                         const PixelParameterLaunch* parameter_launch = nullptr);
 void note_placeholder_resources(const SpirvCompute&, const RegState&, const Rdna2Inst&);
 void note_placeholder_native_input(const SpirvCompute&, const RegState&, const Rdna2Inst&);
 void note_placeholder_image_addresses(const RegState&, const Rdna2Inst&);

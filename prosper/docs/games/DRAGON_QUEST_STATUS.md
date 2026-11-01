@@ -814,6 +814,28 @@ route, settings and observed checkpoint; a run with opt-in `PROSPER_NULL_PAGE=1`
 by that setting. No new runtime result or rung change is claimed here.
 
 ## Ruled out — eliminated, do not re-run these
+- **"A straight-line unloaded-vector comparison alone exercises the new PS entry service."**
+  The first synthetic interpolation fixture passed the legacy strict route without a guarded
+  retry, including with unknown parameter layout. It was not a red-without-fix witness. The
+  replacement fixed READLANE relay enters the existing unloaded-only retry, observes real
+  native Input colours and the reused scalar lifetime, and refuses the real entry input on
+  literal main. Separate unknown/wrong-prefix and numerical-use controls constrain the service.
+- **"The November title defect is only the SCC/liveness refusal."** On 2026-11-01 the
+  dependency-repair candidate `cf1d00f6` reached the title and Adventure Log in a normal visible
+  Wayland/immediate run, then returned with ordinary Circle input and exited normally:
+  4,751 presentations over 155.46 s, seven route entries loaded/eight reloaded, 13,413 fragment
+  drops and 8,942 compute skips in 30 completed alarm windows. Sky, sea and glints remained
+  absent. Current main `2e5b4d078` also showed the missing title content and exited normally
+  (5,178 presentations, 158.06 s, 14,838 drops/9,892 skips in 31 windows). These unequal
+  correctness runs establish no performance result. Fresh PS launch records identify another
+  real input: USER_SGPR=30 puts the automatic primitive-mask/parameter-offset word at s30,
+  before `M0 = s30`; physical USER_DATA_30 was absent. That service is tracked in #5543 and
+  must not become an arbitrary zero. #5544 remains draft pending complete replay qualification.
+- **"An empty X11 capture is a guest black frame."** The preceding owned candidate5 stopped
+  inside SDL's X11 window-show MapNotify wait, before GPU present/window-up initialization.
+  Early activation and a minimize/restore did not release it; forced termination produced no
+  exit alarm summary. It is a void run. The subsequent native Wayland runs above reached actual
+  guest UI, so use a working window backend before drawing a renderer conclusion.
 - **"After the first Cross press the game drops to ~5 fps because the GPU (or the compute path) is the
   bottleneck."** **Falsified 2026-10-07**, Windows, RTX 4070 SUPER, 3840x2160, `--present-mode immediate`,
   direct frontend. In the slow state an F8 capture accounts for only ~20% of wall time in renderer plus

@@ -611,96 +611,87 @@ struct Interpreter {
       m.valid[p.offset + i] = v.defined;
     }
   }
-  explicit Interpreter(const std::vector<uint32_t> &module) {
-    try {
-      if (module.size() < 5 || module[0] != 0x07230203u || module[3] > 200000)
-        fail("invalid module header");
-      bool function = false;
-      for (size_t pc = 5; pc < module.size();) {
-        const uint32_t count = module[pc] >> 16, op = module[pc] & 0xffff;
-        if (!count || count > module.size() - pc)
-          fail("invalid instruction length");
-        Inst i{op, {module.begin() + pc + 1, module.begin() + pc + count}};
-        pc += count;
-        const auto &a = i.a;
-        if (op == 11) {
-          const std::vector<uint32_t> expected{0x4c534c47u, 0x6474732eu, 0x3035342eu, 0};
-          if (glsl || a.size() != 5 || std::vector<uint32_t>(a.begin() + 1, a.end()) != expected)
-            fail("unsupported extension import");
-          glsl = a[0];
-        }
-        if (op == 15 && a.size() >= 2 && a[0] == 5)
-          main = a[1];
-        if (op == 16 && a.size() >= 2 && a[1] == 17) {
-            if (a.size() != 5 ||
-                !local_sizes.emplace(a[0], std::vector<uint32_t>{a.begin() + 2, a.end()}).second)
-                fail("invalid or duplicate LocalSize");
-        }
-        if (op == 331 && a.size() >= 2 && a[1] == 38) specialized_local_sizes.insert(a[0]);
-        // OpExecutionMode DenormPreserve (4459) 64: binary64 subnormals reach the relations.
-        if (op == 16 && a.size() == 3 && a[1] == 4459 && a[2] == 64) denorm_preserve64 = true;
-        if (op >= 19 && op <= 33 && !a.empty())
-          types[a[0]] = {op, {a.begin() + 1, a.end()}};
-        if (op == 71 && a.size() >= 2) {
-          if (!decorations
-                   .emplace(std::make_pair(a[0], a[1]),
-                            std::vector<uint32_t>{a.begin() + 2, a.end()})
-                   .second)
-            fail("duplicate decoration outside oracle profile");
-          if (a.size() == 3 && a[1] == 11)
-            builtins[a[0]] = a[2];
-          if (a.size() == 3 && a[1] == 33)
-            bindings[a[0]] = a[2];
-        }
-        if (op == 72 && a.size() >= 3) {
-          if (!member_decorations
-                   .emplace(std::array<uint32_t, 3>{a[0], a[1], a[2]},
-                            std::vector<uint32_t>{a.begin() + 3, a.end()})
-                   .second)
-            fail("duplicate member decoration outside oracle profile");
-        }
-        if (op == 41 || op == 42 || op == 43 || op == 44) {
-          if (a.size() < 2)
-            fail("malformed constant");
-          std::vector<uint32_t> v;
-          if (op == 41 || op == 42)
-            v.push_back(op == 41);
-          else if (op == 43)
-            v = {a.begin() + 2, a.end()};
-          else
-            for (size_t j = 2; j < a.size(); ++j) {
-              auto c = constants.find(a[j]);
-              if (c == constants.end())
-                fail("unknown composite constant");
-              v.insert(v.end(), c->second.words.begin(), c->second.words.end());
-            }
-          if (size(a[0]) != v.size())
-            fail("constant type mismatch");
-          constants[a[1]] = {a[0], std::move(v)};
-        }
-        if (op == 54) {
-          if (a.size() != 4 || a[1] != main)
-            fail("unsupported function");
-          function = true;
-        } else if (op == 56)
-          function = false;
-        else if (function) {
-          if (op == 248) {
-            if (a.size() != 1)
-              fail("invalid label");
-            labels[a[0]] = ins.size();
-            if (!entry)
-              entry = ins.size() + 1;
+  // Native fragment adapters opt into model 4 and supply their own per-invocation I/O.
+  // Default compute fixtures keep model 5; neither path rewrites module instructions.
+  explicit Interpreter(const std::vector<uint32_t>& module, uint32_t execution_model = 5) {
+      try {
+          if (execution_model != 4 && execution_model != 5) fail("unsupported execution model");
+          if (module.size() < 5 || module[0] != 0x07230203u || module[3] > 200000)
+              fail("invalid module header");
+          bool function = false;
+          for (size_t pc = 5; pc < module.size();) {
+              const uint32_t count = module[pc] >> 16, op = module[pc] & 0xffff;
+              if (!count || count > module.size() - pc) fail("invalid instruction length");
+              Inst i{op, {module.begin() + pc + 1, module.begin() + pc + count}};
+              pc += count;
+              const auto& a = i.a;
+              if (op == 11) {
+                  const std::vector<uint32_t> expected{0x4c534c47u, 0x6474732eu, 0x3035342eu, 0};
+                  if (glsl || a.size() != 5 ||
+                      std::vector<uint32_t>(a.begin() + 1, a.end()) != expected)
+                      fail("unsupported extension import");
+                  glsl = a[0];
+              }
+              if (op == 15 && a.size() >= 2 && a[0] == execution_model) main = a[1];
+              if (op == 16 && a.size() >= 2 && a[1] == 17) {
+                  if (a.size() != 5 ||
+                      !local_sizes.emplace(a[0], std::vector<uint32_t>{a.begin() + 2, a.end()})
+                           .second)
+                      fail("invalid or duplicate LocalSize");
+              }
+              if (op == 331 && a.size() >= 2 && a[1] == 38) specialized_local_sizes.insert(a[0]);
+              // OpExecutionMode DenormPreserve (4459) 64: binary64 subnormals reach the relations.
+              if (op == 16 && a.size() == 3 && a[1] == 4459 && a[2] == 64) denorm_preserve64 = true;
+              if (op >= 19 && op <= 33 && !a.empty()) types[a[0]] = {op, {a.begin() + 1, a.end()}};
+              if (op == 71 && a.size() >= 2) {
+                  if (!decorations
+                           .emplace(std::make_pair(a[0], a[1]),
+                                    std::vector<uint32_t>{a.begin() + 2, a.end()})
+                           .second)
+                      fail("duplicate decoration outside oracle profile");
+                  if (a.size() == 3 && a[1] == 11) builtins[a[0]] = a[2];
+                  if (a.size() == 3 && a[1] == 33) bindings[a[0]] = a[2];
+              }
+              if (op == 72 && a.size() >= 3) {
+                  if (!member_decorations
+                           .emplace(std::array<uint32_t, 3>{a[0], a[1], a[2]},
+                                    std::vector<uint32_t>{a.begin() + 3, a.end()})
+                           .second)
+                      fail("duplicate member decoration outside oracle profile");
+              }
+              if (op == 41 || op == 42 || op == 43 || op == 44) {
+                  if (a.size() < 2) fail("malformed constant");
+                  std::vector<uint32_t> v;
+                  if (op == 41 || op == 42)
+                      v.push_back(op == 41);
+                  else if (op == 43)
+                      v = {a.begin() + 2, a.end()};
+                  else
+                      for (size_t j = 2; j < a.size(); ++j) {
+                          auto c = constants.find(a[j]);
+                          if (c == constants.end()) fail("unknown composite constant");
+                          v.insert(v.end(), c->second.words.begin(), c->second.words.end());
+                      }
+                  if (size(a[0]) != v.size()) fail("constant type mismatch");
+                  constants[a[1]] = {a[0], std::move(v)};
+              }
+              if (op == 54) {
+                  if (a.size() != 4 || a[1] != main) fail("unsupported function");
+                  function = true;
+              } else if (op == 56)
+                  function = false;
+              else if (function) {
+                  if (op == 248) {
+                      if (a.size() != 1) fail("invalid label");
+                      labels[a[0]] = ins.size();
+                      if (!entry) entry = ins.size() + 1;
+                  }
+                  ins.push_back(std::move(i));
+              } else if (op == 59)
+                  globals.push_back(std::move(i));
           }
-          ins.push_back(std::move(i));
-        } else if (op == 59)
-          globals.push_back(std::move(i));
-      }
-      if (!main || !entry || ins.empty())
-        fail("missing main");
-    } catch (const std::exception &e) {
-      error = e.what();
-    }
+          if (!main || !entry || ins.empty()) fail("missing main");
+      } catch (const std::exception& e) { error = e.what(); }
   }
   void jump(Lane &l, uint32_t label) {
     auto it = labels.find(label);

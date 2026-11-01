@@ -46,6 +46,8 @@ struct FragmentCompileCase {
     bool has_resources = false, has_pixel_inputs = false, has_system_inputs = false;
     PixelInputMapping pixel_inputs{};
     PixelSystemInputMapping system_inputs{};
+    // Schema 9 appends system_inputs.parameter_launch. Older records keep it unavailable;
+    // diagnostic physical-register observations never become a past compiler argument.
     FragmentInterpolationLayout interpolation{};
     bool wave32 = false;
     FragmentFloatMode float_mode{}; // actual producing key authority; unavailable is never inferred

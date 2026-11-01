@@ -7,6 +7,7 @@
 #include "gpu/capture/gpu_capture.hpp"
 #include "gpu/capture/serialize/rtt_dcc_codec.hpp"
 #include "gpu/capture/serialize/compute_vgpr_codec.hpp"
+#include "gpu/capture/serialize/pixel_parameter_codec.hpp"
 #include "gpu/capture/capture_source_gate.hpp"   // #3807 v74 placeholder marks
 
 #include <mutex>
@@ -617,7 +618,8 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
     for (const auto& draw : c.draws) {
         if ((draw.has_pixel_inputs && !draw.pixel_inputs.valid_mask) ||
             (draw.pixel_inputs.passthrough_mask & ~draw.pixel_inputs.valid_mask) ||
-            (draw.has_system_inputs && !draw.system_inputs.ena && !draw.system_inputs.addr)) {
+            (draw.has_system_inputs && !draw.system_inputs.ena && !draw.system_inputs.addr &&
+             !draw.system_inputs.parameter_launch.available)) {
             error = "invalid realized-draw pixel-stage ABI";
             return false;
         }
@@ -1129,7 +1131,8 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
             (available && (diagnostic.kind != SubmitOperationKind::Draw ||
                            !diagnostic.vertex_retry_config_available ||
                            (diagnostic.has_system_inputs !=
-                            (diagnostic.system_inputs.ena || diagnostic.system_inputs.addr))))) {
+                            (diagnostic.system_inputs.ena || diagnostic.system_inputs.addr ||
+                             diagnostic.system_inputs.parameter_launch.available))))) {
             error = "invalid failed-draw fragment retry config";
             return false;
         }
@@ -1480,6 +1483,9 @@ bool serialize_gpu_capture(const GpuCaptureFile& c, std::vector<uint8_t>& bytes,
         return false;
     if (gpu_capture_version_for(c) >= kVersionWithComputeVgprAllocation &&
         !write_compute_vgpr_allocations(w, c, error))
+        return false;
+    if (gpu_capture_version_for(c) >= kVersionWithPixelParameterLaunch &&
+        !write_pixel_parameter_launches(w, c, error))
         return false;
     // Re-check the ceiling AFTER the final tail. The bound above was enforced before this tail
     // existed, so a capture sitting just under the maximum could serialize successfully into a file

@@ -1,5 +1,18 @@
 # `recompiler` — RDNA2 machine code → SPIR-V
 
+`pixel_parameter_launch` carries the producing PS RSRC2 word with independent knownness.
+`rdna2_native_parameter_base` admits an interpolation-only entry service during guarded retries
+on native fragments, preserving successful original modules byte-for-byte:
+the first automatic scalar word follows the recorded user prefix, one unconditional entry move
+loads M0, and only native VINTRP consumes it. Later scalar reads require a complete unconditional
+overwrite before control diverges. Numeric M0, LDS/GDS, relative uses, changed original code and
+unknown layouts remain outside this service. It publishes no SGPR/M0 bits and grants no mask
+authority. The partial scalar inventory names loaded prefix words without declaring other words
+unloaded; ADR 0038's real-input boundary remains separate.
+SMEM store/atomic payloads stay outside the closed service; SOPK wait thresholds also charge
+their encoded scalar source, independently of the explicit source array.
+Memory addresses and descriptor spans use legacy memory widths, separately from ALU widths.
+
 `rdna2_loop_vcc_carry` owns the VCC exit merge separately from numeric register PHIs. A mask
 retired on both incoming paths has no mask view at the merge; scalar words retain their own
 values and placeholder obligations. Mixed mask/DATA exits keep their existing refusal.

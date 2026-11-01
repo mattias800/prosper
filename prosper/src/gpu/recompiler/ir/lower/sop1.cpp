@@ -1,9 +1,11 @@
 // sop1.cpp — SOP1 lowering: the route chain, then the plain scalar-data tail.
 #include "gpu/recompiler/ir/lower/scalar_lowering_internal.hpp"
+#include "gpu/recompiler/rdna2_native_parameter_base.hpp"
 
 namespace prosper::gpu::ir {
 
 bool lower_sop1(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool allow_wave) {
+    if (emit_native_parameter_base_load(b, rs, in)) return true;
     return Sop1Lowering({b, rs, in, ok, allow_wave}).lower();
 }
 

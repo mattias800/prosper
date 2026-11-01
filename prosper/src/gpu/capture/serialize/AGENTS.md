@@ -36,3 +36,7 @@ records leave the association unavailable; the original seed payload layout stay
 
 `compute_vgpr_codec` owns the v80 complete private-allocation tail for successful and failed
 compute inputs. Old records retain unknown allocation even when their raw RSRC1 word is present.
+
+`pixel_parameter_codec` owns the v81 PS parameter-launch tail for draws and failed draws.
+PRFC schema 9 carries the same explicit compile input. Unknown profiles preserve the older
+wire version; old records never infer parameter authority from raw register observations.

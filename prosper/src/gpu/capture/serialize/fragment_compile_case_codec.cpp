@@ -209,7 +209,9 @@ uint64_t compile_case_resource_metadata_identity(const ShaderResourceTable* tabl
 std::vector<uint8_t> encode_fragment_compile_case(const FragmentCompileCase& c) {
     validate_fragment_compile_case(c);
     Writer w; const uint8_t magic[8] = {'P','R','F','C','A','S','E',0};
-    const uint32_t schema = c.float_flags.fp16_overflow == Fp16OverflowMode{} ? 7u : 8u;
+    const uint32_t schema = c.system_inputs.parameter_launch != PixelParameterLaunch{} ? 9u
+                            : c.float_flags.fp16_overflow == Fp16OverflowMode{}        ? 7u
+                                                                                       : 8u;
     w(magic, schema);
     capsule(w, c);
     // Schema 1's field walk remains an unchanged prefix. Retain each marker verbatim: it is a
@@ -232,6 +234,8 @@ std::vector<uint8_t> encode_fragment_compile_case(const FragmentCompileCase& c) 
     w(c.system_inputs.front_face_encoding);
     // Schema 8 independently retains producing half-overflow authority. All old prefixes stay exact.
     if (schema >= 8) w(c.float_flags.fp16_overflow.available, c.float_flags.fp16_overflow.saturate);
+    if (schema >= 9)
+        w(c.system_inputs.parameter_launch.available, c.system_inputs.parameter_launch.value);
     w.value(checksum(w.bytes)); return std::move(w.bytes);
 }
 FragmentCompileCase decode_fragment_compile_case(std::span<const uint8_t> bytes) {
@@ -241,7 +245,7 @@ FragmentCompileCase decode_fragment_compile_case(std::span<const uint8_t> bytes)
     Reader r{bytes.first(bytes.size() - 8)}; uint8_t magic[8]{}; uint32_t schema{}; r(magic, schema);
     const uint8_t wanted[8] = {'P','R','F','C','A','S','E',0};
     check(std::equal(std::begin(magic), std::end(magic), std::begin(wanted)) &&
-              (schema >= 1 && schema <= 8),
+              (schema >= 1 && schema <= 9),
           "compile-case schema");
     FragmentCompileCase c; capsule(r, c);
     if (schema >= 2) {
@@ -264,6 +268,8 @@ FragmentCompileCase decode_fragment_compile_case(std::span<const uint8_t> bytes)
           c.export_formats.sint_outputs);
     if (schema >= 7) r(c.system_inputs.front_face_encoding);
     if (schema >= 8) r(c.float_flags.fp16_overflow.available, c.float_flags.fp16_overflow.saturate);
+    if (schema >= 9)
+        r(c.system_inputs.parameter_launch.available, c.system_inputs.parameter_launch.value);
     check(r.position == r.bytes.size(), "compile-case trailing data");
     for (size_t k = 0; k < c.blobs.size(); ++k) if (c.blobs[k].alias_of != UINT32_MAX) {
         check(c.blobs[k].alias_of < k, "compile-case alias index");

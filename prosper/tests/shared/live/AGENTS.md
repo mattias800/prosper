@@ -50,6 +50,12 @@ are fixed before startup. These assertions do not imply physical comparison traf
 
 ## Ruled out
 
+- Slicing a current v81 capture at the old v71 tail size does not reconstruct v69. The native
+  parameter-launch tail forces intervening versioned tails too. Keep the actual current-version
+  input roundtrip, then explicitly project that newer authority to unknown before serializing
+  the historical v71 fixture. Its v69 truncation/malformed-field and pre-v69 absence assertions
+  still apply to real historical bytes.
+
 - Owning retained inputs alone does not prove selection follows resource preparation. The #5537
   renderer witness moves the unchanged selection before the real build/drain and fails all five
   CPU-seed/clear pixel cases; restoring the order passes all five.

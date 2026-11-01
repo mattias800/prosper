@@ -39,11 +39,17 @@ void configure_compute_placeholder_origins(RegState& rs, const ComputeShaderConf
 }
 
 void configure_pixel_placeholder_origins(RegState& rs, const std::vector<LaunchVgpr>& inventory,
-                                         bool known) {
+                                         bool known, const PixelParameterLaunch* parameter_launch) {
     if (!rs.placeholder_origin_program) return;
     auto p = std::make_shared<PlaceholderOriginProgram>(*rs.placeholder_origin_program);
     p->vectors = inventory;
     p->vector_profile_known = known && launch_profile_complete(inventory);
+    if (parameter_launch) {
+        if (const auto word = pixel_parameter_sgpr(*parameter_launch))
+            for (uint32_t reg = 0; reg <= *word; ++reg) p->loaded_scalars.insert(reg);
+        // This names the known user/first-system prefix, not numerical values or a complete
+        // inventory of the optional system words. Other absent scalars remain unknown-launch.
+    }
     rs.placeholder_origin_program = std::move(p);
 }
 
