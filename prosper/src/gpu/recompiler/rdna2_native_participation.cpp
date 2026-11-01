@@ -2,6 +2,7 @@
 #include "gpu/recompiler/rdna2_native_launch.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
+#include "gpu/recompiler/ir/ops/vector_compare.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
@@ -207,13 +208,16 @@ bool integer_compare(uint32_t opcode) {
 }
 Mask compare(const Facts& f, const SpirvCompute& b, const Rdna2Inst& in) {
     const uint32_t opcode = vopc_is_cmpx(in.opcode) ? in.opcode - 0x10u : in.opcode;
-    if (!integer_compare(opcode) || in.has_dpp || in.has_modifier || in.sdwa_src0_sel != 6 ||
-        in.sdwa_src1_sel != 6 || in.src_abs[0] || in.src_abs[1] || in.src_neg[0] || in.src_neg[1])
+    if (!ir::find_vector_compare(opcode) || in.has_dpp || in.has_modifier ||
+        in.sdwa_src0_sel != 6 || in.sdwa_src1_sel != 6 || in.src_abs[0] || in.src_abs[1] ||
+        in.src_neg[0] || in.src_neg[1])
         return {};
     const uint64_t active = f.exec.constant.value_or(full);
     const bool genuine = f.exec.genuine && (vector_sources(f, in) & active) == active;
     Mask result{genuine, std::nullopt};
-    if (!genuine || !f.exec.constant) return result;
+    // Every lowered comparison defines a genuine predicate from genuine operands, including
+    // NaNs. Only the following integer truth evaluator is limited to the 32-bit compare set.
+    if (!genuine || !f.exec.constant || !integer_compare(opcode)) return result;
     uint64_t bits = 0;
     for (uint32_t lane = 0; lane < 64; ++lane) {
         if (!(active & (uint64_t{1} << lane))) continue;
