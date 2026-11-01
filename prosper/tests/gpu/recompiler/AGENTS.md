@@ -459,4 +459,4 @@ rule in both wave widths. Missing allocation and lost-candidate controls keep ow
 from source definedness.
 Strict spill-storage controls have no independent arbitrary predicate, including destination
 aliases and the current-VGPR0 fallback. Terminating-arm controls validate the post-END else
-inventory and execute both in-range alternatives.
+inventory after specialization and execute both in-range alternatives.

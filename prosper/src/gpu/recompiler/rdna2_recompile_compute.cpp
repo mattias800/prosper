@@ -661,10 +661,7 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
     if (!compute_vgpr_allocation_is_canonical(config.allocated_vgprs, config.compute_pgm_rsrc1,
                                               config.wave_size))
         return {};
-    if (config.allocated_vgprs &&
-        (dwords > UINT32_MAX ||
-         !allocated_vgpr_program_fits(code, static_cast<uint32_t>(dwords), config.allocated_vgprs)))
-        return {};
+    if (config.allocated_vgprs && dwords > UINT32_MAX) return {};
     if (!arbitrary_placeholder_attempt_active())
         return recompile_with_arbitrary_placeholders(
             diagnostic, [&] { return recompile_compute(code, dwords, rt, config, diagnostic); });
@@ -866,6 +863,7 @@ recompile_compute_once(const uint32_t* code, size_t dwords, const ShaderResource
     // See recompile_valu: compute has no branch-external EXP state, so the common host-shell merge is
     // only a place to finish the invocation after either guest arm has terminated.
     (void)extend_terminating_if_else(code, dwords, ins);
+    if (!allocated_vgpr_inventory_fits(ins, config.allocated_vgprs)) return {};
     LdsFminmaxSynchronization lds_fminmax_synchronization;
     if (!prepare_lds_fminmax_synchronization(
             ins, diagnostic, local_count <= wave_size, &lds_fminmax_synchronization))

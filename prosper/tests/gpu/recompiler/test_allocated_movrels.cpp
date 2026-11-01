@@ -125,3 +125,20 @@ TEST(AllocatedMovrels, AllocationAlsoBoundsTheSecondTerminatingArm) {
         EXPECT_EQ(output, std::vector<uint32_t>(64, condition == 0 ? 7u : 13u));
     }
 }
+TEST(AllocatedMovrels, AllocationBoundsArmsExposedByConstantBranchSpecialization) {
+    const auto resources = prosper::test::arbitrary_placeholder::table();
+    for (uint32_t condition : {0u, 1u}) {
+        const auto c = fixture::config(condition);
+        const auto outside = fixture::terminating_arms(24, true);
+        EXPECT_TRUE(recompile_compute(outside.data(), outside.size(), &resources, c).empty());
+        const auto inside = fixture::terminating_arms(23, true);
+        const auto module = recompile_compute(inside.data(), inside.size(), &resources, c);
+        ASSERT_FALSE(module.empty());
+        bpermute_oracle::Interpreter vm(module);
+        vm.native_subgroup_width = 64;
+        vm.supplied_push_constants = c.user_sgprs;
+        const auto output = vm.run(64, std::vector<uint32_t>(64, 0xdeadbeefu));
+        ASSERT_TRUE(vm.error.empty()) << vm.error;
+        EXPECT_EQ(output, std::vector<uint32_t>(64, condition == 0 ? 7u : 13u));
+    }
+}

@@ -74,18 +74,21 @@ inline std::vector<uint32_t> strict_spill_source(bool fallback, bool alias, bool
                                0x80020009u | (destination << 8u), 0xbf810000u});
     return words;   // No unrelated arbitrary predicate: the original strict attempt must reject.
 }
-inline std::vector<uint32_t> terminating_arms(uint32_t else_register) {
-    return {0x7e120300u,
-            0xbf068004u,
-            0xbf840004u,
-            0x7e020287u,
-            0xe0702000u,
-            0x80020109u,
-            0xbf810000u,
-            0x7e00028du | (else_register << 17u),
-            0x7e020300u | else_register,
-            0xe0702000u,
-            0x80020109u,
-            0xbf810000u};
+inline std::vector<uint32_t> terminating_arms(uint32_t else_register,
+                                              bool specialization_prefix = false) {
+    std::vector<uint32_t> words{0x7e120300u,
+                                0xbf068004u,
+                                0xbf840004u,
+                                0x7e020287u,
+                                0xe0702000u,
+                                0x80020109u,
+                                0xbf810000u,
+                                0x7e00028du | (else_register << 17u),
+                                0x7e020300u | else_register,
+                                0xe0702000u,
+                                0x80020109u,
+                                0xbf810000u};
+    if (specialization_prefix) words.insert(words.begin(), {0xbf068080u, 0xbf840001u, 0xbf800000u});
+    return words;
 }
 }   // namespace prosper::test::allocated_movrels

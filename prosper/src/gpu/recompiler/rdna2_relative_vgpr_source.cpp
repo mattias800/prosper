@@ -4,7 +4,6 @@
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
 #include "gpu/recompiler/rdna2_relative_index_values.hpp"
-#include "gpu/recompiler/rdna2_recompile_shared.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <cstdint>
 #include <optional>
@@ -30,11 +29,9 @@ void add_allocated_relative_write(const Rdna2Inst& in, uint32_t allocation, std:
     }
 }
 
-bool allocated_vgpr_program_fits(const uint32_t* code, uint32_t words, uint32_t allocation) {
-    std::vector<Rdna2Inst> instructions;
-    rdna2_walk(code, words, instructions);
-    (void)extend_terminating_if_else(code, words, instructions);
-    return shader_max_vgpr(instructions) < static_cast<int>(allocation);
+bool allocated_vgpr_inventory_fits(const std::vector<Rdna2Inst>& instructions,
+                                   uint32_t allocation) {
+    return !allocation || shader_max_vgpr(instructions) < static_cast<int>(allocation);
 }
 
 bool allocated_relative_write_needs_dispatcher(const std::vector<Rdna2Inst>& instructions) {
