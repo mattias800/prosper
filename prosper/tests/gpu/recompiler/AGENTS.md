@@ -486,15 +486,6 @@ their independent bounds and root contracts.
 The native VCC expression proof also follows backedges into PC0; supplied entry words do not
 hide later vector publications. Complete per-iteration overwrites retain their execution control.
 
-`test_wave64_scc_loop_obligations` executes compare/arithmetic conditions relayed through
-CSELECT into fresh masks, in the interpreter and both GPU profiles. Missing-spill counter and
-bound twins retain the guarded retry boundary; a dependency repair alone emits no arbitrary
-read marker.
-
-`test_scalar_merge_packed` executes both arms of a mixed-domain join whose old mask dies after
-packed arithmetic. Actual packed scalar reads still keep that generation live; unused neighbors
-and unrelated words do not. Unknown packed effects retain their refusal.
-
 `test_scalar_dependency_retry` separates dependency repair from Arbitrary admission. Successful
 original bytes return first, repair alone grants no admission, and only the selected attempt
 publishes diagnostics. Named Hard origins retain their veto in every attempt.
