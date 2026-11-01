@@ -140,7 +140,16 @@ TEST(NativeEntryExecProof, CurrentVccDataNeedsBothGenuinePhysicalWords) {
         RegState fabricated = rs;
         fabricated.sreg_merge_placeholder.insert(word);
         EXPECT_EQ(native_compute_vcc_data_mask(f.b, fabricated), 0u);
+        fabricated.sreg_loop_blanket[word] = {1};
+        EXPECT_EQ(native_compute_vcc_data_mask(f.b, fabricated), 0u);
+        RegState local = rs;
+        local.lane_local_scalars.insert(local.sreg.at(word));
+        EXPECT_EQ(native_compute_vcc_data_mask(f.b, local), 0u);
     }
+    const auto launch = f.b.guest_compute_launch;
+    f.b.guest_compute_launch.launch.known = 0;
+    EXPECT_EQ(native_compute_vcc_data_mask(f.b, rs), 0u);
+    f.b.guest_compute_launch = launch;
     f.b.is_fragment = true;
     EXPECT_EQ(native_compute_vcc_data_mask(f.b, rs), 0u);
 }

@@ -1,7 +1,6 @@
 #include "gpu/recompiler/rdna2_native_entry_exec_words.hpp"
 #include "gpu/recompiler/compute_dispatch_launch.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
-#include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
 #include "gpu/recompiler/rdna2_native_launch.hpp"
 #include "gpu/recompiler/rdna2_saved_mask_words.hpp"
@@ -220,8 +219,12 @@ bool native_entry_exec_word_proven(const SpirvCompute& b, const Rdna2Inst& in) {
 }
 uint32_t native_compute_vcc_data_mask(SpirvCompute& b, const RegState& rs) {
     uint32_t low = 0, high = 0;
-    if (!native_context(b) || !native_logical_data_word(rs, 106, low) ||
-        !native_logical_data_word(rs, 107, high) || !scalar_words_projectable(b, rs, 106, 2))
+    if (!native_context(b) || !entry_partial(b.guest_compute_launch) ||
+        b.guest_compute_launch.local != b.guest_local_size ||
+        b.guest_compute_launch != b.saved_mask_original_compute_launch ||
+        !native_logical_data_word(rs, 106, low) || !native_logical_data_word(rs, 107, high) ||
+        sreg_word_may_be_fabricated(rs, 106) || sreg_word_may_be_fabricated(rs, 107) ||
+        rs.lane_local_scalars.contains(low) || rs.lane_local_scalars.contains(high))
         return 0;
     // The physical pair is already genuine DATA. Observe its guest lane bit; no ballot or
     // previously retired predicate can supply a missing half or replace these current words.
