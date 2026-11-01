@@ -385,8 +385,12 @@ std::vector<uint32_t> recompile_fragment_impl(
         return {};
     std::vector<Rdna2Inst> ins;
     const size_t program_dwords = rdna2_walk(code, dwords, ins);
+    // Preserve every successful original module, including its instruction/id ordering. The
+    // guarded retry is where the missing real entry service must replace the legacy fallback.
     const auto parameter_base =
-        system_inputs ? native_parameter_base_plan(system_inputs->parameter_launch, ins) : nullptr;
+        system_inputs && arbitrary_placeholder_retry_active()
+            ? native_parameter_base_plan(system_inputs->parameter_launch, ins)
+            : nullptr;
     // Unsupported scalar writes can replace launch MODE authority. Inspect the original stream
     // before specialization or dead EXEC can hide them. Future MODE support needs ordered state.
     for (const auto& in : ins) {

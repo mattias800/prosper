@@ -79,6 +79,23 @@ TEST(NativePixelParameter, SmoothP1P2ReadsTheSameRealNativeInput) {
     }
 }
 
+TEST(NativePixelParameter, ASuccessfulOriginalRouteKeepsItsExactModuleBytes) {
+    auto code = fixture::program();
+    code[6] = 0x7d840f07u; // replace the scalar-relay comparison with v7 == v7
+    code.erase(code.begin() + 4, code.begin() + 6);   // remove READLANE, retaining the legacy route
+    auto unknown = fixture::mapping();
+    unknown.parameter_launch = {};
+    for (const bool wave32 : {false, true}) {
+        const auto original = fixture::compile(code, unknown, wave32);
+        const auto known = fixture::compile(code, fixture::mapping(), wave32);
+        ASSERT_FALSE(original.module.empty()) << original.reason;
+        ASSERT_FALSE(known.module.empty()) << known.reason;
+        EXPECT_EQ(arbitrary_placeholder_reads(original.module).total(), 0u);
+        EXPECT_EQ(arbitrary_placeholder_reads(known.module).total(), 0u);
+        EXPECT_EQ(known.module, original.module);
+    }
+}
+
 TEST(NativePixelParameter, UnknownAndWrongPrefixesCannotBorrowTheService) {
     const auto code = fixture::program();
     auto inputs = fixture::mapping();
@@ -93,12 +110,12 @@ TEST(NativePixelParameter, UnknownAndWrongPrefixesCannotBorrowTheService) {
 
 TEST(NativePixelParameter, OrdinaryUserDataAndNumericM0ObserversRemainHard) {
     auto code = fixture::program();
-    code[3] = 0x7e0e021du; // v7 = s29, an actual missing user-SGPR input
+    code[3] = 0x7e0e021du;   // v7 = s29, an actual missing user-SGPR input
     const auto user = fixture::compile(code, fixture::mapping());
     EXPECT_TRUE(user.module.empty());
     EXPECT_NE(user.reason.find("origin=launch-input word=s29"), std::string::npos);
     code = fixture::program();
-    code[9] = 0x7e12027cu; // v9 = M0, a numerical observer
+    code[9] = 0x7e12027cu;   // v9 = M0, a numerical observer
     EXPECT_FALSE(plan(code));
     const auto numeric = fixture::compile(code, fixture::mapping());
     EXPECT_TRUE(numeric.module.empty());
@@ -108,14 +125,14 @@ TEST(NativePixelParameter, EntryLifetimeRequiresAnUnconditionalCompleteOverwrite
     auto code = fixture::program();
     ASSERT_TRUE(plan(code));
     code[1] =
-        0xbf800000u; // remove the overwrite; later numerical source is still the entry input
+        0xbf800000u;   // remove the overwrite; later numerical source is still the entry input
     EXPECT_FALSE(plan(code));
     EXPECT_TRUE(fixture::compile(code, fixture::mapping()).module.empty());
     code = fixture::program();
-    code[1] = 0xbe9e05f0u; // s_cmov_b32 s30,0.5: SCC may preserve the original word
+    code[1] = 0xbe9e05f0u;   // s_cmov_b32 s30,0.5: SCC may preserve the original word
     EXPECT_FALSE(plan(code));
     code = fixture::program();
-    code.insert(code.begin(), 0xbe9e0380u); // an earlier scalar write destroys entry identity
+    code.insert(code.begin(), 0xbe9e0380u);   // an earlier scalar write destroys entry identity
     EXPECT_FALSE(plan(code));
 }
 
@@ -137,13 +154,13 @@ TEST(NativePixelParameter, M0WritesLdsAndRelativeUsesAreOutsideTheClosedService)
 
 TEST(NativePixelParameter, EntryReentryAndUninventoriedControlNeverAcquireAuthority) {
     auto code = fixture::program();
-    code.insert(code.end() - 1, 0xbf82fff2u); // branch back to the entry M0 load
+    code.insert(code.end() - 1, 0xbf82fff2u);   // branch back to the entry M0 load
     EXPECT_FALSE(plan(code));
     code = fixture::program();
-    code.insert(code.end() - 1, 0xbf820010u); // branch outside the original decoded prefix
+    code.insert(code.end() - 1, 0xbf820010u);   // branch outside the original decoded prefix
     EXPECT_FALSE(plan(code));
     code = fixture::program();
-    code.insert(code.begin(), 0xbf820000u); // even a fallthrough branch ends entry dominance
+    code.insert(code.begin(), 0xbf820000u);   // even a fallthrough branch ends entry dominance
     EXPECT_FALSE(plan(code));
 }
 
