@@ -64,11 +64,11 @@ TEST(ScalarDependencyRetry, AnUnloadedReadStillNeedsTheSeparateAdmissionAttempt)
         module.insert(module.end(), b.debug.begin(), b.debug.end());
         return module;
     });
-    EXPECT_EQ(attempts, 3u);
+    EXPECT_EQ(attempts, 4u);
     EXPECT_EQ(arbitrary_placeholder_reads(result).fresh_mask, 1u);
 }
 
-TEST(ScalarDependencyRetry, AHardRootKeepsOnlyTheFinalRefusal) {
+TEST(ScalarDependencyRetry, AFailedRepairKeepsTheEstablishedHardRefusal) {
     constexpr uint64_t address = 0x5521cc9000ull;
     const RecompileDiagnosticContext context{RecompileDiagnosticStage::Compute, address};
     for (const auto kind : {PlaceholderOrigin::LaunchInput, PlaceholderOrigin::Spill,
@@ -90,8 +90,8 @@ TEST(ScalarDependencyRetry, AHardRootKeepsOnlyTheFinalRefusal) {
         EXPECT_EQ(attempts, 2u);
         const auto records = capture.take();
         ASSERT_EQ(records.size(), 1u);
-        EXPECT_NE(records.front().second.find("actual Hard root"), std::string::npos);
-        EXPECT_EQ(records.front().second.find("original route"), std::string::npos);
+        EXPECT_EQ(records.front().second.find("actual Hard root"), std::string::npos);
+        EXPECT_NE(records.front().second.find("original route"), std::string::npos);
     }
 }
 
@@ -117,32 +117,52 @@ TEST(ScalarDependencyRetry, ANamelessFailedRepairKeepsTheOriginalCause) {
               std::string::npos);
 }
 
-TEST(ScalarDependencyRetry, ANamelessThirdAttemptKeepsTheLastMeaningfulCause) {
+TEST(ScalarDependencyRetry, ANamelessRepairKeepsTheEstablishedAdmissionCause) {
     constexpr uint64_t address = 0x5521cc9200ull;
     const RecompileDiagnosticContext context{RecompileDiagnosticStage::Compute, address};
-    for (bool meaningful_repair : {false, true}) {
+    for (bool meaningful_admission : {false, true}) {
         TerminalRejectCapture capture;
         unsigned attempts = 0;
         const auto result = recompile_with_arbitrary_placeholders(context, [&] {
             ++attempts;
             const bool packed = allow_scalar_merge_dependency_repair();
-            EXPECT_EQ(packed, attempts != 1);
+            EXPECT_EQ(packed, attempts >= 3);
             SpirvCompute b;
             if (attempts == 1)
                 EXPECT_FALSE(admit_arbitrary_placeholder_read(
                     b, 7, ArbitraryPlaceholderRead::FreshMask, roots(PlaceholderOrigin::Unloaded)));
-            const bool cause = attempts == 1 || (attempts == 2 && meaningful_repair);
+            const bool cause = attempts == 1 || (attempts == 2 && meaningful_admission);
             log_recompile_diagnostic(context, "recompile-reject",
                                      cause ? "route-decline" : "consequent",
-                                     attempts == 1 ? "original cause" : "repair cause");
+                                     attempts == 1 ? "original cause" : "admission cause");
             return Words{};
         });
         EXPECT_TRUE(result.empty());
         EXPECT_EQ(attempts, 3u);
         const auto records = capture.take();
         ASSERT_EQ(records.size(), 1u);
-        EXPECT_NE(
-            records.front().second.find(meaningful_repair ? "repair cause" : "original cause"),
-            std::string::npos);
+        EXPECT_NE(records.front().second.find(meaningful_admission ? "admission cause"
+                                                                   : "original cause"),
+                  std::string::npos);
     }
+}
+
+TEST(ScalarDependencyRetry, OriginalAdmissionSuccessKeepsItsBytesAndDoesNotRepair) {
+    unsigned attempts = 0;
+    Words expected;
+    const auto result = recompile_with_arbitrary_placeholders({}, [&] {
+        ++attempts;
+        EXPECT_FALSE(scalar_dependency_repair_active());
+        EXPECT_FALSE(allow_scalar_merge_dependency_repair());
+        SpirvCompute b;
+        if (!admit_arbitrary_placeholder_read(b, 7, ArbitraryPlaceholderRead::FreshMask,
+                                              roots(PlaceholderOrigin::Unloaded)))
+            return Words{};
+        expected = {0x07230203u, 0x00010300u, 0, 1, 0};
+        expected.insert(expected.end(), b.debug.begin(), b.debug.end());
+        return Words(expected);
+    });
+    EXPECT_EQ(attempts, 2u);
+    EXPECT_EQ(result, expected);
+    EXPECT_EQ(arbitrary_placeholder_reads(result).fresh_mask, 1u);
 }

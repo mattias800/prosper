@@ -87,8 +87,8 @@ legacy loop liveness scan and diagnostic roots; it consumes no new effects-table
 
 `rdna2_arbitrary_placeholder` implements the owner-approved ADR 0038 admission boundary.
 Legacy Wave64 SCC writers and packed/lane-read scalar liveness can request dependency re-emission after
-the original routes refuse. Successful original modules return first, preserving route choice
-and bytes. The repair uses existing SCC tracking and canonical packed source widths; it grants
+the complete original strict/admission sequence refuses. Successful original modules return
+first, preserving route choice and bytes. Failed repairs retain that sequence's selected cause. The repair uses existing SCC tracking and canonical packed source widths; it grants
 no Arbitrary admission and enables the same ordinary input, spill, old-word and publication
 guards as admission re-emission. An unloaded read
 still requires a separate admission retry, with the complete ordinary-input guards below.

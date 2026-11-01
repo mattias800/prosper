@@ -50,7 +50,7 @@ bool placeholder_recompile_guards_active() {
 }
 
 bool allow_scalar_merge_dependency_repair() {
-    if (!current || current->repair || current->allow) return true;
+    if (!current || current->repair) return true;
     current->repair_eligible = true;
     return false;
 }
@@ -82,32 +82,49 @@ recompile_with_arbitrary_placeholders(const RecompileDiagnosticContext& diagnost
         original.commit();
         return module;
     }
-    if (scope.state.repair_eligible) {
-        scope.state.repair = true;
-        RecompileDiagnosticAttempt repaired;
+    // Preserve the complete existing strict/admission sequence, including its selected failure.
+    // An unsuccessful dependency repair must not replace that route's established cause.
+    if (scope.state.eligible) {
+        scope.state.allow = true;
+        RecompileDiagnosticAttempt retry;
         module = compile();
         if (!module.empty()) {
-            original.replace_with(repaired);
+            original.replace_with(retry);
+            const auto reads = arbitrary_placeholder_reads(module);
+            observe_arbitrary_placeholder_admission(diagnostic.program_address, reads.fresh_mask,
+                                                    reads.loop_carry);
             return module;
         }
-        original.select_failure(repaired);
-        if (!scope.state.eligible) {
-            original.commit();
-            return module;
-        }
-    }
-    scope.state.allow = true;
-    RecompileDiagnosticAttempt retry;
-    module = compile();
-    if (module.empty()) {
         original.select_failure(retry);
+        scope.state.allow = false;
+    }
+    if (!scope.state.repair_eligible) {
         original.commit();
         return module;
     }
-    original.replace_with(retry);
-    const auto reads = arbitrary_placeholder_reads(module);
-    observe_arbitrary_placeholder_admission(diagnostic.program_address, reads.fresh_mask,
-                                            reads.loop_carry);
+    scope.state.repair = true;
+    scope.state.eligible = false;   // only unloaded reads reached during repair request its retry
+    RecompileDiagnosticAttempt repaired;
+    module = compile();
+    if (!module.empty()) {
+        original.replace_with(repaired);
+        return module;
+    }
+    repaired.discard();
+    if (scope.state.eligible) {
+        scope.state.allow = true;
+        RecompileDiagnosticAttempt retry;
+        module = compile();
+        if (!module.empty()) {
+            original.replace_with(retry);
+            const auto reads = arbitrary_placeholder_reads(module);
+            observe_arbitrary_placeholder_admission(diagnostic.program_address, reads.fresh_mask,
+                                                    reads.loop_carry);
+            return module;
+        }
+        retry.discard();
+    }
+    original.commit();
     return module;
 }
 
@@ -126,4 +143,4 @@ bool admit_arbitrary_placeholder_read(SpirvCompute& b, uint32_t pc, ArbitraryPla
     SpirvCompute::putv(b.debug, Op_ModuleProcessed, words);
     return true;
 }
-} // namespace prosper::gpu
+}   // namespace prosper::gpu
