@@ -42,9 +42,8 @@ bool arbitrary_placeholder_retry_active() {
 
 void request_scalar_condition_root_retry(const SpirvCompute& b, const RegState& rs,
                                          const Rdna2Inst& in) {
-    if (!current || current->allow || b.is_fragment_packet() ||
-        !(b.is_compute || b.is_fragment) || b.wave_size != 64 || rs.track_scc_definition ||
-        !scalar_instruction_writes_scc(in))
+    if (!current || current->allow || b.is_fragment_packet() || !(b.is_compute || b.is_fragment) ||
+        b.wave_size != 64 || rs.track_scc_definition || !scalar_instruction_writes_scc(in))
         return;
     const auto source = scalar_source_marks(rs, in);
     // This requests another compilation, never a value or validity fact. The original legacy
@@ -75,9 +74,8 @@ recompile_with_arbitrary_placeholders(const RecompileDiagnosticContext& diagnost
     }
     original.replace_with(retry);
     const auto reads = arbitrary_placeholder_reads(module);
-    if (reads.total())
-        observe_arbitrary_placeholder_admission(diagnostic.program_address, reads.fresh_mask,
-                                                reads.loop_carry);
+    observe_arbitrary_placeholder_admission(diagnostic.program_address, reads.fresh_mask,
+                                            reads.loop_carry);
     return module;
 }
 

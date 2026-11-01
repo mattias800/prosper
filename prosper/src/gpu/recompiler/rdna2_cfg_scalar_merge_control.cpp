@@ -3,6 +3,7 @@
 #include <cstdint>
 #include "gpu/recompiler/rdna2_cfg_scalar_merge_routes.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include <optional>
 
 namespace prosper::gpu::detail {
@@ -31,6 +32,12 @@ std::optional<bool> CfgScalarMergeRoutes::step() {
         case Rdna2Format::SOPK: return sopk();
         case Rdna2Format::SOPP: return sopp();
         case Rdna2Format::SMEM: return smem();
+        case Rdna2Format::VOP3P:
+            // Packed ALU reads the explicit source words described by the shared effects table.
+            // An unrelated packed instruction cannot keep an old scalar generation live.
+            if (!rdna2_instruction_effects(in).describes_sources())
+                return block(in, "unmodelled-vop3p");
+            return alu();
         case Rdna2Format::SOP1:
         case Rdna2Format::SOP2:
         case Rdna2Format::SOPC:

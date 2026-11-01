@@ -836,6 +836,12 @@ by that setting. No new runtime result or rung change is claimed here.
   Early activation and a minimize/restore did not release it; forced termination produced no
   exit alarm summary. It is a void run. The subsequent native Wayland runs above reached actual
   guest UI, so use a working window backend before drawing a renderer conclusion.
+- **The PC1228/1239 s6 join proves the old pair is read later.** Falsified on main after #5542:
+  its scalar liveness walk follows a back edge to VOP3P 0x20 at PC1086 and stops because that
+  format is absent from the dispatcher. The instruction reads v11, v11 and literal zero.
+  Scanning through it proves both old words dead; interpreter and device witnesses execute a
+  complete replacement past packed arithmetic, while actual packed scalar reads still refuse
+  a missing incoming value (#5521). This does not authorize zero-filled predecessor masks.
 - **"After the first Cross press the game drops to ~5 fps because the GPU (or the compute path) is the
   bottleneck."** **Falsified 2026-10-07**, Windows, RTX 4070 SUPER, 3840x2160, `--present-mode immediate`,
   direct frontend. In the slow state an F8 capture accounts for only ~20% of wall time in renderer plus

@@ -89,7 +89,8 @@ legacy loop liveness scan and diagnostic roots; it consumes no new effects-table
 Legacy Wave64 SCC writers can request a guarded re-emission when they would drop existing
 soft loop roots. Successful original modules still return first; the retry uses existing SCC
 tracking and checks every Hard input. Repairing those dependencies invents no arbitrary read.
-The original compiler routes run first; only a refused program with an unloaded-only read retries.
+The original compiler routes run first; only a refused program with an unloaded-only read or
+dropped soft SCC dependency retries.
 Every admitted read must still have a nonempty, entirely unloaded typed root set. No value,
 domain, physical mask word or runtime validity fact is supplied. Owned packets retain their
 separate genuine-input contract. Inert module metadata identifies read sites in the selected
@@ -191,6 +192,8 @@ roots and MEMORY; no EXEC ancestry or global scalar authority is added.
   fails when a decodable opcode has no entry. Other questions and formats are still answered by
   older helpers.
 - `rdna2_cfg_scalar_merge` — scalar CFG merge-deadness, physical mask-write widths and VCC liveness scans.
+  Known packed ALU shares the canonical scalar-source widths; an unrelated packed operation
+  cannot keep a replaced scalar generation live. Unknown packed effects remain blockers.
   The control, ALU and memory sources retain the existing instruction proofs; the private routes
   header holds borrowed worklist variables. The CFG umbrella exports the public proof API.
 - `rdna2_to_spirv` (+ `_internal`, `emit_alu`, `emit_cfg`, `alu_support`, `cfg_support`) — the

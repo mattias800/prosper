@@ -42,6 +42,7 @@ std::optional<bool> CfgScalarMergeRoutes::alu() {
             case Rdna2Format::VOP1:
             case Rdna2Format::VOP2:
             case Rdna2Format::VOP3:
+            case Rdna2Format::VOP3P:
             case Rdna2Format::VOPC:
             case Rdna2Format::
                 DS:   // DS operands are VGPR/M0 only; it cannot read an ordinary SGPR/VCC
