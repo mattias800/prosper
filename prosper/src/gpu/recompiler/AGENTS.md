@@ -86,6 +86,9 @@ limit relative banks; without a bound it visits the complete bank rather than on
 legacy loop liveness scan and diagnostic roots; it consumes no new effects-table fields.
 
 `rdna2_arbitrary_placeholder` implements the owner-approved ADR 0038 admission boundary.
+Legacy Wave64 SCC writers can request a guarded re-emission when they would drop existing
+soft loop roots. Successful original modules still return first; the retry uses existing SCC
+tracking and checks every Hard input. Repairing those dependencies invents no arbitrary read.
 The original compiler routes run first; only a refused program with an unloaded-only read retries.
 Every admitted read must still have a nonempty, entirely unloaded typed root set. No value,
 domain, physical mask word or runtime validity fact is supplied. Owned packets retain their

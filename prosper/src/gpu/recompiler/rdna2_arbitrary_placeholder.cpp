@@ -4,6 +4,9 @@
 #include <functional>
 #include <string>
 #include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
+#include "gpu/recompiler/rdna2_cfg_scalar_sources.hpp"
+#include "gpu/recompiler/rdna2_scalar_condition_marks.hpp"
+#include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include "gpu/recompiler/rdna2_diagnostic_attempt.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_arbitrary_placeholder_observation.hpp"
@@ -37,6 +40,20 @@ bool arbitrary_placeholder_retry_active() {
     return current && current->allow;
 }
 
+void request_scalar_condition_root_retry(const SpirvCompute& b, const RegState& rs,
+                                         const Rdna2Inst& in) {
+    if (!current || current->allow || b.is_fragment_packet() ||
+        !(b.is_compute || b.is_fragment) || b.wave_size != 64 || rs.track_scc_definition ||
+        !scalar_instruction_writes_scc(in))
+        return;
+    const auto source = scalar_source_marks(rs, in);
+    // This requests another compilation, never a value or validity fact. The original legacy
+    // transfer loses these soft roots; the retry already tracks SCC and checks every Hard input.
+    // A successful original module returns before the request can change its selected output.
+    if (source.placeholder && !source.hard && !source.blanket_roots.empty())
+        current->eligible = true;
+}
+
 std::vector<uint32_t>
 recompile_with_arbitrary_placeholders(const RecompileDiagnosticContext& diagnostic,
                                       const std::function<std::vector<uint32_t>()>& compile) {
@@ -58,8 +75,9 @@ recompile_with_arbitrary_placeholders(const RecompileDiagnosticContext& diagnost
     }
     original.replace_with(retry);
     const auto reads = arbitrary_placeholder_reads(module);
-    observe_arbitrary_placeholder_admission(diagnostic.program_address, reads.fresh_mask,
-                                            reads.loop_carry);
+    if (reads.total())
+        observe_arbitrary_placeholder_admission(diagnostic.program_address, reads.fresh_mask,
+                                                reads.loop_carry);
     return module;
 }
 

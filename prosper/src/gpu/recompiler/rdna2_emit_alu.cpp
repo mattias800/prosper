@@ -199,6 +199,7 @@ static bool instruction_reads_scc_as_scalar_data(const Rdna2Inst& in) {
 bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool allow_exec_update,
               const std::unordered_set<uint32_t>* safe_execz, bool allow_smem,
               const ShaderResourceTable* rt, bool allow_wave) {
+    request_scalar_condition_root_retry(b, rs, in);
     const ir::cfg::ExecCensusObservation exec_census(b, rs, in);   // step 7a shadow; observes only
     rs.native_interpolation_publication = {};
     if (b.is_fragment && instruction_reads_scc_as_scalar_data(in))

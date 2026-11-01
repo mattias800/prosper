@@ -485,3 +485,8 @@ their independent bounds and root contracts.
 
 The native VCC expression proof also follows backedges into PC0; supplied entry words do not
 hide later vector publications. Complete per-iteration overwrites retain their execution control.
+
+`test_wave64_scc_loop_obligations` executes compare/arithmetic conditions relayed through
+CSELECT into fresh masks, in the interpreter and both GPU profiles. Missing-spill counter and
+bound twins retain the guarded retry boundary; a dependency repair alone emits no arbitrary
+read marker.

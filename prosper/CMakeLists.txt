@@ -4055,6 +4055,11 @@ if(TARGET prosper_core)
       INCLUDES tests tests/gpu/recompiler
       LIBRARIES prosper_core Vulkan::Vulkan
       LABELS gpu PROPERTIES TIMEOUT 60)
+    prosper_add_gtest(test_wave64_scc_loop_obligations
+      SOURCES tests/gpu/recompiler/test_wave64_scc_loop_obligations.cpp
+      INCLUDES tests tests/gpu/recompiler
+      LIBRARIES prosper_core Vulkan::Vulkan
+      LABELS gpu)
       prosper_add_gtest(test_allocated_movrels_gpu
         SOURCES tests/gpu/execute/test_allocated_movrels_gpu.cpp
         INCLUDES tests
