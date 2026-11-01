@@ -19,5 +19,6 @@ bool compute_vgpr_allocation_is_canonical(uint32_t words, uint32_t rsrc1, uint32
 std::optional<std::set<int>> relative_vgpr_sources(const SpirvCompute&, const RegState&,
                                                    const Rdna2Inst&);
 // Returns false when the caller has no allocation; the legacy lowering owns that case.
-bool lower_allocated_movrels(SpirvCompute&, RegState&, const Rdna2Inst&, uint32_t& result);
+bool lower_allocated_movrels(SpirvCompute&, RegState&, const Rdna2Inst&, uint32_t& result,
+                             bool& ok);
 } // namespace prosper::gpu

@@ -87,3 +87,41 @@ TEST(AllocatedMovrels, AnExplicitWordBeyondTheDeclaredAllocationStaysUnsupported
     const auto resources = prosper::test::arbitrary_placeholder::table();
     EXPECT_TRUE(recompile_compute(words.data(), words.size(), &resources, c).empty());
 }
+TEST(AllocatedMovrels, StrictReadsCannotLoseSpillStorageOrTheCurrentZeroFallback) {
+    const auto resources = prosper::test::arbitrary_placeholder::table();
+    auto c = fixture::config(0);
+    c.user_sgprs[0] = 13;
+    for (bool fallback : {false, true}) {
+        for (bool alias : {false, true}) {
+            const auto lost = fixture::strict_spill_source(fallback, alias, true);
+            EXPECT_TRUE(recompile_compute(lost.data(), lost.size(), &resources, c).empty())
+                << fallback << ',' << alias;
+            const auto provided = fixture::strict_spill_source(fallback, alias, false);
+            const auto module = recompile_compute(provided.data(), provided.size(), &resources, c);
+            ASSERT_FALSE(module.empty());
+            bpermute_oracle::Interpreter vm(module);
+            vm.native_subgroup_width = 64;
+            vm.supplied_push_constants = c.user_sgprs;
+            const auto output = vm.run(64, std::vector<uint32_t>(64, 0xdeadbeefu));
+            ASSERT_TRUE(vm.error.empty()) << vm.error;
+            EXPECT_EQ(output, std::vector<uint32_t>(64, 7u));
+        }
+    }
+}
+TEST(AllocatedMovrels, AllocationAlsoBoundsTheSecondTerminatingArm) {
+    const auto resources = prosper::test::arbitrary_placeholder::table();
+    for (uint32_t condition : {0u, 1u}) {
+        const auto c = fixture::config(condition);
+        const auto outside = fixture::terminating_arms(24);
+        EXPECT_TRUE(recompile_compute(outside.data(), outside.size(), &resources, c).empty());
+        const auto inside = fixture::terminating_arms(23);
+        const auto module = recompile_compute(inside.data(), inside.size(), &resources, c);
+        ASSERT_FALSE(module.empty());
+        bpermute_oracle::Interpreter vm(module);
+        vm.native_subgroup_width = 64;
+        vm.supplied_push_constants = c.user_sgprs;
+        const auto output = vm.run(64, std::vector<uint32_t>(64, 0xdeadbeefu));
+        ASSERT_TRUE(vm.error.empty()) << vm.error;
+        EXPECT_EQ(output, std::vector<uint32_t>(64, condition == 0 ? 7u : 13u));
+    }
+}

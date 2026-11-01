@@ -1,8 +1,10 @@
 // AMD ISA 70648 section 3.6.1: an out-of-range vector source reads current VGPR0.
 #include "gpu/recompiler/rdna2_relative_vgpr_source.hpp"
+#include "gpu/recompiler/rdna2_alu_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_cfg_registers.hpp"
 #include "gpu/recompiler/rdna2_relative_index_values.hpp"
+#include "gpu/recompiler/rdna2_recompile_shared.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <cstdint>
 #include <optional>
@@ -31,6 +33,7 @@ void add_allocated_relative_write(const Rdna2Inst& in, uint32_t allocation, std:
 bool allocated_vgpr_program_fits(const uint32_t* code, uint32_t words, uint32_t allocation) {
     std::vector<Rdna2Inst> instructions;
     rdna2_walk(code, words, instructions);
+    (void)extend_terminating_if_else(code, words, instructions);
     return shader_max_vgpr(instructions) < static_cast<int>(allocation);
 }
 
@@ -76,11 +79,23 @@ std::optional<std::set<int>> relative_vgpr_sources(const SpirvCompute& b, const 
     return result;
 }
 
-bool lower_allocated_movrels(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, uint32_t& result) {
+bool lower_allocated_movrels(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, uint32_t& result,
+                             bool& ok) {
     const uint32_t limit = b.compute_allocated_vgprs;
     if (!limit) return false;
     const auto m0 = rs.sreg.find(124);
     if (m0 == rs.sreg.end()) return false;
+    const auto sources = relative_vgpr_sources(b, rs, in);
+    if (!sources) {
+        ok = false;
+        return true;
+    }
+    // Strict attempts retain the ordinary reader's storage-domain checks too. WRITELANE
+    // erases per-lane DATA even when old source marks still describe the earlier clean value.
+    for (int reg : *sources) {
+        (void)operand_bits(b, rs, in, {OperandKind::VGPR, reg}, &ok);
+        if (!ok) return true;
+    }
     const auto zero = rs.vreg.find(0);
     const uint32_t fallback = zero != rs.vreg.end() && zero->second ? zero->second : b.uconst(0);
     uint32_t selected = b.uconst(0);

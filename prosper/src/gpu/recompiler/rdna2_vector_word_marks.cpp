@@ -541,7 +541,11 @@ ScalarSourceMarks vector_relative_source_marks(const SpirvCompute& b, const RegS
         const auto sources = relative_vgpr_sources(b, rs, in);
         if (!sources) return missing;
         ScalarSourceMarks marks;
-        for (int reg : *sources) union_marks(marks, vector_word(rs, reg), &rs, true);
+        for (int reg : *sources) {
+            if (rs.vgpr_lane_slots.contains(reg) || rs.vgpr_lane_mask_slots.contains(reg))
+                return missing;
+            union_marks(marks, vector_word(rs, reg), &rs, true);
+        }
         marks.memory = marks.memory || rs.sreg_memory_pattern.contains(124);
         return marks;
     }

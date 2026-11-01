@@ -61,4 +61,31 @@ inline std::vector<uint32_t> expected(uint32_t offset, uint32_t wave, bool overw
     }
     return out;
 }
+inline std::vector<uint32_t> strict_spill_source(bool fallback, bool alias, bool spill) {
+    const uint32_t source = fallback ? 0u : 6u;
+    const uint32_t destination = alias ? source : 1u;
+    std::vector<uint32_t> words{0x7e120300u, 0x7e000287u | (source << 17u)};
+    if (spill) words.insert(words.end(), {0xd7610000u | source, 0x00010000u});
+    if (fallback)
+        words.insert(words.end(), {0xbefc03ffu, UINT32_MAX});
+    else
+        words.push_back(0xbefc0380u);
+    words.insert(words.end(), {0x7e008706u | (destination << 17u), 0xe0702000u,
+                               0x80020009u | (destination << 8u), 0xbf810000u});
+    return words;   // No unrelated arbitrary predicate: the original strict attempt must reject.
+}
+inline std::vector<uint32_t> terminating_arms(uint32_t else_register) {
+    return {0x7e120300u,
+            0xbf068004u,
+            0xbf840004u,
+            0x7e020287u,
+            0xe0702000u,
+            0x80020109u,
+            0xbf810000u,
+            0x7e00028du | (else_register << 17u),
+            0x7e020300u | else_register,
+            0xe0702000u,
+            0x80020109u,
+            0xbf810000u};
+}
 }   // namespace prosper::test::allocated_movrels
