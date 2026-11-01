@@ -312,8 +312,9 @@ static void capture_entry_controls(const DrawItem& draw, Owners& owner) {
     GpuReplayFrame replay;
     const bool restored = roundtrip && materialize_gpu_replay(decoded,replay,error) && replay.items.size() == 1;
     check(restored && replay.items[0].ps_entry == draw.ps_entry &&
-        replay.items[0].ps_raster_launch == draw.ps_raster_launch,
-        "actual capture codec and materializer retain observed raw entry/launch facts");
+              replay.items[0].ps_raster_launch == draw.ps_raster_launch &&
+              replay.items[0].system_inputs.parameter_launch == draw.system_inputs.parameter_launch,
+          "actual capture codec and materializer retain observed raw entry/launch facts");
     if (!restored) return;
     auto invalid = captured;
     invalid.draws[0].ps_entry.user_data[1] = 42;
@@ -327,7 +328,15 @@ static void capture_entry_controls(const DrawItem& draw, Owners& owner) {
     invalid = captured; invalid.draws[0].fs_raw_shader_index = UINT32_MAX;
     check(!serialize_gpu_capture(invalid,refused_bytes,error),
         "producing association requires retained raw words, not merely SOURCE or an entry marker");
-    auto entry_bytes = bytes;
+    // This arm reconstructs a historical wire prefix. The automatic native parameter service
+    // was not representable there; keep the actual current-version roundtrip above separate.
+    auto historical = captured;
+    for (auto& item : historical.draws) item.system_inputs.parameter_launch = {};
+    std::vector<uint8_t> entry_bytes;
+    const bool historical_ok = serialize_gpu_capture(historical, entry_bytes, error);
+    check(historical_ok && entry_bytes.size() > 12 && entry_bytes[8] == 71,
+          "legacy projection selects the actual v71 prefix without native parameter authority");
+    if (!historical_ok || entry_bytes.size() <= 12 || entry_bytes[8] != 71) return;
     entry_bytes.resize(entry_bytes.size() - (4u + 25u * captured.draws.size()) - 5u);
     // Strip new launch controls and the one absent v70 wave record before testing v69 entry bytes.
     entry_bytes[8] = 69;
@@ -365,7 +374,8 @@ static void capture_entry_controls(const DrawItem& draw, Owners& owner) {
                           materialize_gpu_replay(decoded, replay, error) &&
                           replay.items.size() == 1;
       check(old_ok && !decoded.draws[0].ps_entry_source_available &&
-                !replay.items[0].ps_entry.observed,
+                !replay.items[0].ps_entry.observed &&
+                replay.items[0].system_inputs.parameter_launch == PixelParameterLaunch{},
             "actual pre-v69 capture remains readable with explicit unavailable entry/source facts");
       if (!old_ok) return;
       restored_backend = captured_backend_contract(replay.items[0], decoded.draws[0], decoded);
