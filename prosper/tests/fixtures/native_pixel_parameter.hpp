@@ -38,14 +38,14 @@ struct Compilation {
     Words module;
     std::string reason;
 };
-inline Compilation compile(const Words& code, const gpu::PixelSystemInputMapping& inputs,
-                           bool wave32 = false) {
+inline Compilation
+compile(const Words& code, const gpu::PixelSystemInputMapping& inputs, bool wave32 = false,
+        gpu::FloatTransportConfig transport = {gpu::FloatTransportProfile::ExplicitNonFinite32}) {
     static std::atomic<uint64_t> next{0x5543000000ull};
     const auto address = next.fetch_add(0x100);
-    auto module =
-        gpu::recompile_fragment(code.data(), code.size(), nullptr, &inputs, UINT32_MAX, nullptr,
-                                wave32, {gpu::RecompileDiagnosticStage::Fragment, address}, {},
-                                nullptr, {gpu::FloatTransportProfile::ExplicitNonFinite32});
+    auto module = gpu::recompile_fragment(
+        code.data(), code.size(), nullptr, &inputs, UINT32_MAX, nullptr, wave32,
+        {gpu::RecompileDiagnosticStage::Fragment, address}, {}, nullptr, transport);
     return {std::move(module), gpu::last_terminal_reject_reason(address)};
 }
 } // namespace prosper::test::native_pixel_parameter
