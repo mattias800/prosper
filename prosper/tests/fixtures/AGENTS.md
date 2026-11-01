@@ -1,5 +1,12 @@
 # `prosper/tests/fixtures/` — shared harnesses and hand-built inputs
 
+`native_pixel_parameter` owns the LLVM-assembled entry/interpolation/reused-SGPR program.
+`native_fragment_spirv_oracle` executes unmodified native fragment modules through the integer
+VM with explicit location/builtin words and defined outputs. Its fixed READLANE witness declares
+a complete active native subgroup with uniform fixture inputs; other collectives, partial or
+divergent subgroups and missing resources fail. It supplies no quad/raster packing authority.
+The device witness uses real rasterized inputs.
+
 `allocated_movrels` owns explicit private-bank integer programs shared by interpreter and device
 tests, including DS boundary operands and preserved relative-write padding across CFG reloads.
 

@@ -53,6 +53,7 @@
 namespace prosper::gpu {
 
 class SavedMaskCopyFrame;
+struct NativeParameterBasePlan;
 
 inline const char* recompile_diagnostic_stage_name(RecompileDiagnosticStage stage) {
     switch (stage) {

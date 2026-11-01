@@ -33,6 +33,7 @@ if(TARGET Vulkan::Vulkan)
     test_fragment_loop_mask_exec
     test_fragment_loop_vcc_scratch
     test_fragment_numeric_mbcnt
+    test_native_pixel_parameter_gpu
     test_fragment_partial_wave_exec
     test_fragment_proven_votes
     test_fragment_scalar_bank

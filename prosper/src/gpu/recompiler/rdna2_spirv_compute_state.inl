@@ -6,6 +6,7 @@
 // Class-scope fragment: preserve the mechanically moved member bytes.
 // clang-format off
     std::shared_ptr<const PortableMaskHalfProgram> portable_mask_half_program;
+    std::shared_ptr<const NativeParameterBasePlan> native_parameter_base;
     // Producing exact-extent configuration may pad a workgroup with absent guest invocations.
     // A common symbolic-half read cannot derive their scalar bits from physical workers.
     bool portable_mask_common_partial_entry = false;

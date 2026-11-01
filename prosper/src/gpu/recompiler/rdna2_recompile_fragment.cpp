@@ -9,6 +9,7 @@
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_launch_vgprs.hpp"
+#include "gpu/recompiler/rdna2_native_parameter_base.hpp"
 #include "gpu/recompiler/rdna2_fragment_terminal_tail.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
 #include "gpu/recompiler/gta5/rdna2_gta5_cf9200_contract.hpp"
@@ -379,10 +380,13 @@ std::vector<uint32_t> recompile_fragment_impl(
     FragmentArithmeticObservation* arithmetic_observation, FloatTransportConfig float_transport,
     FragmentFloatFlags float_flags, FragmentExportFormats export_formats) {
     if ((wave_size != 32 && wave_size != 64) || !float_mode.canonical() ||
-        !float_transport.canonical() || !float_flags.canonical() || !export_formats.canonical())
+        !float_transport.canonical() || !float_flags.canonical() || !export_formats.canonical() ||
+        (system_inputs && !system_inputs->parameter_launch.canonical()))
         return {};
     std::vector<Rdna2Inst> ins;
     const size_t program_dwords = rdna2_walk(code, dwords, ins);
+    const auto parameter_base =
+        system_inputs ? native_parameter_base_plan(system_inputs->parameter_launch, ins) : nullptr;
     // Unsupported scalar writes can replace launch MODE authority. Inspect the original stream
     // before specialization or dead EXEC can hide them. Future MODE support needs ordered state.
     for (const auto& in : ins) {
@@ -465,6 +469,10 @@ std::vector<uint32_t> recompile_fragment_impl(
     const uint32_t effective_wave_size = effective_fragment_wave_size(
         wave_size, program_dwords, shader_program_hash(code, program_dwords));
     SpirvCompute b;
+    // Specialization may have rewritten the instruction inventory. Such a stream retains its
+    // ordinary lowering; it cannot inherit the original program's parameter service.
+    if (parameter_base && native_parameter_base_region(*parameter_base, ins))
+        b.native_parameter_base = parameter_base;
     if (pcrel_dispatch_target == UINT32_MAX) {
         const auto tails = rdna2_fragment_terminal_tail(code, dwords, ins);
         if (!tails.instructions.empty()) {
@@ -673,8 +681,9 @@ std::vector<uint32_t> recompile_fragment_impl(
     seed_vector_word_definedness(
         rs, ins, /*native_interpolation=*/true, b.wave_size,
         system_inputs && pixel_launch_profile_known(*system_inputs) ? &launch_inventory : nullptr);
-    configure_pixel_placeholder_origins(
-        rs, launch_inventory, system_inputs && pixel_launch_profile_known(*system_inputs));
+    configure_pixel_placeholder_origins(rs, launch_inventory,
+                                        system_inputs && pixel_launch_profile_known(*system_inputs),
+                                        system_inputs ? &system_inputs->parameter_launch : nullptr);
     b.placeholder_origin_program = rs.placeholder_origin_program;
     SavedMaskCopyFragmentDispatchScope copy_dispatch_scope(b, rs, ins, code, dwords,
                                                            pcrel_dispatch_target);

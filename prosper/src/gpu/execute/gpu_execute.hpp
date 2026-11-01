@@ -2454,10 +2454,15 @@ realize_draw_item(const GpuState& ds, const GpuState::Draw* draw, uint32_t vcoun
     }
     const PixelInputMapping* pixel_input_ptr = pixel_inputs.valid_mask ? &pixel_inputs : nullptr;
     PixelSystemInputMapping system_inputs{rs.ps_input_ena, rs.ps_input_addr};
+    const auto parameter_launch = ds.sh.find(prosper::agc::Pm4::SPI_SHADER_PGM_RSRC2_PS);
+    if (rs.ps_addr && parameter_launch != ds.sh.end())
+        system_inputs.parameter_launch = {true, parameter_launch->second};
     system_inputs.retain_front_face_encoding(rs.ps_raster_launch.baryc_cntl_available,
                                              rs.ps_raster_launch.baryc_cntl);
     const PixelSystemInputMapping* system_input_ptr =
-        (system_inputs.ena || system_inputs.addr) ? &system_inputs : nullptr;
+        (system_inputs.ena || system_inputs.addr || system_inputs.parameter_launch.available)
+            ? &system_inputs
+            : nullptr;
     const FragmentInterpolationLayout interpolation =
         fragment_analysis ? fragment_interpolation_layout_cached(fragment_analysis,
                                                                  system_input_ptr, pixel_input_ptr)

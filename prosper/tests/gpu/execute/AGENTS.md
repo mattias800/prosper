@@ -1,5 +1,9 @@
 # Execution-layer tests
 
+`test_pixel_parameter_producer` drives the actual draw producer/cache with known, absent and
+changed PS user prefixes. `test_native_pixel_parameter_gpu` observes real native interpolation
+and the reused SGPR lifetime in the colour attachment, with two distinct parameter values.
+
 `test_loop_vcc_data_exit_gpu` executes the shared structured-loop witness on a required native
 Wave64 subgroup, checking numeric VCC halves and both nested scalar branch outcomes.
 

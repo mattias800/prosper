@@ -33,6 +33,7 @@
 #include "gpu/recompiler/rdna2_spill_slot_domain.hpp"
 #include "gpu/recompiler/rdna2_spilled_mask_halves.hpp"
 #include "gpu/recompiler/rdna2_native_logical_words.hpp"
+#include "gpu/recompiler/rdna2_native_parameter_base.hpp"
 #include "gpu/recompiler/rdna2_wave32_dispatch_words.hpp"
 #include "gpu/recompiler/rdna2_saved_mask_words.hpp"
 #include "gpu/recompiler/rdna2_copy_continuation.hpp"
@@ -5108,6 +5109,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
                uint32_t initial_dispatch_active,
                bool force_barrier_phases,
                bool force_lds_fminmax_dispatcher) {
+    if (!native_parameter_base_region(b, ins)) return false;
     // code/dwords: raw stream for forward-if target checks; inherited_dead_masks keeps
     // whole-shader liveness valid when a barrier-separated body is compiled in phases.
     ir::cfg::ExecRelationScope exec_relations(b);
