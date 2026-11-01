@@ -155,7 +155,9 @@ bool refuse_arbitrary_placeholder_old_destination(SpirvCompute& b, const RegStat
     // The existing predicate names actual old-word reads, including inactive lanes, partial
     // words and accumulators. Lane-slot writers preserve their slot map, not ordinary SSA.
     bool refused = false;
-    for_each_possible_vector_write(in, 255, [&](int reg) {
+    const int maximum =
+        b.compute_allocated_vgprs ? static_cast<int>(b.compute_allocated_vgprs - 1) : 255;
+    for_each_possible_vector_write(in, maximum, [&](int reg) {
         if (!refused)
             refused =
                 refuse_arbitrary_placeholder_operand(b, rs, in, {OperandKind::VGPR, reg}, &ok);

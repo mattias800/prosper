@@ -1,4 +1,5 @@
 #include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
+#include "gpu/recompiler/rdna2_relative_vgpr_source.hpp"
 #include "gpu/recompiler/rdna2_placeholder_origins.hpp"
 // rdna2_to_spirv.cpp — see rdna2_to_spirv.hpp. Internal SpirvCompute builder + the VALU translator.
 #include <atomic>
@@ -657,6 +658,13 @@ std::vector<uint32_t> recompile_compute(const uint32_t* code, size_t dwords,
                                         const ShaderResourceTable* rt,
                                         const ComputeShaderConfig& config,
                                         RecompileDiagnosticContext diagnostic) {
+    if (!compute_vgpr_allocation_is_canonical(config.allocated_vgprs, config.compute_pgm_rsrc1,
+                                              config.wave_size))
+        return {};
+    if (config.allocated_vgprs &&
+        (dwords > UINT32_MAX ||
+         !allocated_vgpr_program_fits(code, static_cast<uint32_t>(dwords), config.allocated_vgprs)))
+        return {};
     if (!arbitrary_placeholder_attempt_active())
         return recompile_with_arbitrary_placeholders(
             diagnostic, [&] { return recompile_compute(code, dwords, rt, config, diagnostic); });
@@ -1051,6 +1059,7 @@ recompile_compute_once(const uint32_t* code, size_t dwords, const ShaderResource
     b.storage_buffer_int64_atomics = config.storage_buffer_int64_atomics;
     b.packed_r11_storage = config.packed_r11_storage;
     b.compute_pgm_rsrc1 = config.compute_pgm_rsrc1;
+    b.compute_allocated_vgprs = config.allocated_vgprs;
     b.compute_fp16_overflow = config.fp16_overflow;
     b.begin(1, rt, local_x, local_y, local_z, wave_size,
             static_cast<uint32_t>(config.user_sgprs.size()));
@@ -1124,7 +1133,9 @@ recompile_compute_once(const uint32_t* code, size_t dwords, const ShaderResource
     // per-invocation scalar inputs and therefore cannot inherit this launch contract.
     b.native_logical_uniform_launch = true;
     b.guest_compute_launch = compute_dispatch_launch_profile(config);
-    seed_vector_word_definedness(rs, ins, false, b.wave_size, &launch_inventory);
+    if (config.allocated_vgprs) rs.max_vgpr = static_cast<int>(config.allocated_vgprs - 1);
+    seed_vector_word_definedness(rs, ins, false, b.wave_size, &launch_inventory,
+                                 config.allocated_vgprs);
     configure_compute_placeholder_origins(rs, config);
     b.placeholder_origin_program = rs.placeholder_origin_program;
 

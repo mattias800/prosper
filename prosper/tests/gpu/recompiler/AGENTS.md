@@ -453,3 +453,7 @@ Hard-input controls use a launch word that is genuinely unknown (the possible sc
 SGPR), or an untracked spill. A never-loaded ordinary SGPR is Arbitrary under ADR 0038 and
 cannot stand in for a missing meaningful input. Keep the original consumer/branch positions
 when correcting such a fixture.
+
+`test_allocated_movrels` executes runtime private-bank selection and the current-VGPR0 OOB
+rule in both wave widths. Missing allocation and lost-candidate controls keep ownership separate
+from source definedness.

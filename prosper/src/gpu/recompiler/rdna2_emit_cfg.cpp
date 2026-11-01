@@ -1,4 +1,5 @@
 #include "gpu/recompiler/rdna2_cfg_descriptor_sregs.hpp"
+#include "gpu/recompiler/rdna2_relative_vgpr_source.hpp"
 #include "gpu/recompiler/ir/cfg/exec_relation_consumer.hpp"
 #include "gpu/recompiler/ir/cfg/structured_if_cursor.hpp"
 // rdna2_emit_cfg.cpp — the divergent-control-flow state machine and emit_body, split out of
@@ -734,6 +735,7 @@ bool emit_cfg_state_machine(
               in.src[0].value >= 106 && in.src[0].value < 124)))
             sregs.insert(in.src[0].value + 1);
     }
+    add_allocated_vgprs(vregs, b.compute_allocated_vgprs);
     for (const auto& kv : initial.vreg) vregs.insert(kv.first);
     for (const auto& kv : initial.sreg) sregs.insert(kv.first);
 
@@ -766,7 +768,7 @@ bool emit_cfg_state_machine(
     // select any observable VGPR at or above VDST, exactly the range emit_alu updates. Analyses that
     // protect v_writelane spill lifetimes must invalidate that full range as well, or a dynamic
     // ordinary write can leave a stale mask-half proof attached to an erased slot.
-    const int max_observable_vgpr = shader_max_vgpr(ins);
+    const int max_observable_vgpr = allocated_vgpr_max(ins, b.compute_allocated_vgprs);
     auto for_each_possible_vector_write = [&](const Rdna2Inst& in, const auto& callback) {
         prosper::gpu::for_each_possible_vector_write(in, max_observable_vgpr, callback);
     };
@@ -793,6 +795,8 @@ bool emit_cfg_state_machine(
         bool reads_dynamic_vector_range = false;
         for (const auto& in : ins) {
             if (in.pc < lo || in.pc >= hi) continue;
+            add_allocated_relative_write(in, b.compute_allocated_vgprs, vector_writes[block],
+                                         vector_reads[block]);
             for (uint32_t source = 0; source < in.n_src; ++source) {
                 const uint32_t words = rdna2_vgpr_source_span(in, source);
                 if (words) {
@@ -5110,7 +5114,7 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
     prepare_ngg_row_source_proof(b, rs, ins);
     SavedMaskCopyBodyScope copy_scope(b, rs, ins, code, dwords, initial_dispatch_active);
     PortableMaskHalfBodyScope half_scope(b, rs, ins);
-    rs.max_vgpr = std::max(rs.max_vgpr, shader_max_vgpr(ins));
+    rs.max_vgpr = std::max(rs.max_vgpr, allocated_vgpr_max(ins, b.compute_allocated_vgprs));
     if (!b.cselect_b64_low_only_analysis_done) {
         b.cselect_b64_low_only_pcs = proven_cselect_b64_low_only_pcs(ins);
         b.cselect_b64_low_only_analysis_done = true;
@@ -5142,6 +5146,14 @@ bool emit_body(SpirvCompute& b, RegState& rs, const std::vector<Rdna2Inst>& ins,
         rs.mubuf_pcrel_tables = std::move(tables.mubuf);
         rs.smem_pcrel_tables = std::move(tables.smem);
         rs.mtbuf_pcrel_tables = std::move(tables.mtbuf);
+    }
+    if (b.is_compute && b.compute_allocated_vgprs &&
+        allocated_relative_write_needs_dispatcher(ins)) {
+        // Relative reads observe padding words outside the static structured-join inventory.
+        // Retain normal body proofs above; the dispatcher carries the full declared bank.
+        if (!allow_cfg_dispatcher) return false;
+        return emit_cfg_state_machine(b, rs, ins, safe, rt, allow_exec_update, allow_smem, exp_fn,
+                                      code, dwords, initial_dispatch_active);
     }
     if (b.is_compute && std::any_of(ins.begin(), ins.end(), compute_dpp_quad_or)) {
         if (!allow_cfg_dispatcher || std::any_of(ins.begin(), ins.end(), [](const Rdna2Inst& in) {

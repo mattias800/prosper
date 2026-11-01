@@ -1,3 +1,4 @@
+#include "gpu/recompiler/rdna2_relative_vgpr_source.hpp"
 #include "gpu/recompiler/compiler_choices.hpp"
 #include "gpu/diagnostics/refused_shader_inputs.hpp"
 #include "gpu/diagnostics/refused_graphics_inputs.hpp"
@@ -217,6 +218,10 @@ uint64_t refused_compute_inputs_identity(const ShaderResourceTable* table,
         encoded.num<uint32_t>(8);
         encoded.num<uint8_t>(*rte32 == 1);
     }
+    if (c.allocated_vgprs) {
+        encoded.num<uint32_t>(9);
+        encoded.num<uint32_t>(c.allocated_vgprs);
+    }
     uint64_t hash = encoded.hash;
     mix(hash, compile_case_resource_metadata_identity(table));
     return hash;
@@ -233,7 +238,11 @@ std::vector<uint8_t> encode(const std::string& stage, uint64_t address,
     require(config.fp16_overflow.canonical(), "refused-shader inputs FP16 overflow");
     const auto rte32 = config.choices.get(CompilerChoice::Float32Rte);
     require(!rte32 || *rte32 == 0 || *rte32 == 1, "refused-shader inputs RTE32 verdict");
-    const uint32_t schema = rte32                            ? kRefusedShaderInputsSchema
+    require(compute_vgpr_allocation_is_canonical(config.allocated_vgprs, config.compute_pgm_rsrc1,
+                                                 config.wave_size),
+            "refused-shader inputs VGPR allocation");
+    const uint32_t schema = config.allocated_vgprs           ? kRefusedShaderInputsSchema
+                            : rte32                          ? 8
                             : config.fp16_overflow.available ? 7
                                                              : 4;
     Out o;
@@ -251,7 +260,9 @@ std::vector<uint8_t> encode(const std::string& stage, uint64_t address,
         o.num<uint8_t>(config.fp16_overflow.available);
         o.num<uint8_t>(config.fp16_overflow.saturate);
     }
+    if (schema >= 9) o.num<uint8_t>(rte32.has_value());
     if (rte32) o.num<uint8_t>(*rte32);
+    if (schema >= 9) o.num<uint32_t>(config.allocated_vgprs);
     o.num<uint64_t>(fnv(o.bytes.data(), o.bytes.size()));
     return std::move(o.bytes);
 }
@@ -269,7 +280,8 @@ RefusedShaderInputs decode_refused_shader_inputs(const std::vector<uint8_t>& byt
     const uint32_t schema = in.num<uint32_t>();
     if (schema == 2 || schema == 3 || schema == 5 || schema == kRefusedGraphicsInputsSchema)
         return decode_refused_graphics_inputs(bytes);
-    require(schema == 1 || schema == 4 || schema == 7 || schema == kRefusedShaderInputsSchema,
+    require(schema == 1 || schema == 4 || schema == 7 || schema == 8 ||
+                schema == kRefusedShaderInputsSchema,
             "refused-shader inputs schema");
     RefusedShaderInputs inputs;
     inputs.stage = in.text();
@@ -285,7 +297,15 @@ RefusedShaderInputs decode_refused_shader_inputs(const std::vector<uint8_t>& byt
         inputs.compute.fp16_overflow = {in.flag(), in.flag()};
         require(inputs.compute.fp16_overflow.canonical(), "refused-shader inputs FP16 overflow");
     }
-    if (schema >= 8) inputs.compute.choices.set(CompilerChoice::Float32Rte, in.flag());
+    if (schema == 8 || (schema >= 9 && in.flag()))
+        inputs.compute.choices.set(CompilerChoice::Float32Rte, in.flag());
+    if (schema >= 9) {
+        inputs.compute.allocated_vgprs = in.num<uint32_t>();
+        require(compute_vgpr_allocation_is_canonical(inputs.compute.allocated_vgprs,
+                                                     inputs.compute.compute_pgm_rsrc1,
+                                                     inputs.compute.wave_size),
+                "refused-shader inputs VGPR allocation");
+    }
     require(in.at == in.end, "refused-shader inputs trailing data");
     if (!carrier.empty()) {
         FragmentCompileCase c = decode_fragment_compile_case(carrier);

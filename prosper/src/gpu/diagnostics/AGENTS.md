@@ -175,3 +175,6 @@ per-run handle. It lives in this folder because its audience is the same (somebo
 and it obeys the same two cautions: it resolves its entry point once, no-ops when the extension is
 absent, and never propagates a failure, because a run that died for want of a debug name would be a
 worse instrument than no names at all.
+
+Refused compute inputs schema 9 retains an explicit private VGPR allocation separately from raw
+RSRC1. Schema 8 and older remain unknown; neither serialization nor identity grants an allocation.

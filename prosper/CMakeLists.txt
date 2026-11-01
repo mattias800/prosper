@@ -1091,6 +1091,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/execute/test_compute_dispatch_launch.cpp
     INCLUDES tests
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_compute_vgpr_allocation
+    SOURCES tests/gpu/capture/test_compute_vgpr_allocation.cpp
+    INCLUDES tests
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_rtt_dcc_codec
     SOURCES tests/gpu/capture/test_rtt_dcc_codec.cpp
     LIBRARIES prosper_core)
@@ -4310,6 +4314,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_local_index_waterfall.cpp
     INCLUDES tests tests/gpu/recompiler
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_allocated_movrels
+    SOURCES tests/gpu/recompiler/test_allocated_movrels.cpp
+    INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_relative_bank_source
     SOURCES tests/gpu/recompiler/test_relative_bank_source.cpp
       tests/gpu/recompiler/test_deferred_m0_retirement.cpp
@@ -6614,6 +6622,11 @@ endif()
         LIBRARIES prosper_core Vulkan::Vulkan
         LABELS gpu)
 
+      prosper_add_gtest(test_allocated_movrels_gpu
+        SOURCES tests/gpu/execute/test_allocated_movrels_gpu.cpp
+        INCLUDES tests
+        LIBRARIES prosper_core Vulkan::Vulkan
+        LABELS gpu)
       prosper_add_gtest(test_native_saveexec_vcc_data
         SOURCES tests/gpu/recompiler/test_native_saveexec_vcc_data.cpp
         INCLUDES tests

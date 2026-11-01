@@ -834,6 +834,11 @@ struct ComputeShaderConfig {
     // the no-flush default; legacy captures explicitly load UINT32_MAX and remain fail-visible for
     // instructions whose semantics need state that the old artifact did not record.
     uint32_t compute_pgm_rsrc1 = kDefaultComputePgmRsrc1;
+    // Explicit complete private VGPR allocation, with no shared VGPRs; zero means unknown.
+    // Must agree with RSRC1.VGPRS and wave size. A raw/default RSRC1 alone grants no bound.
+    // Synthetic launches own this contract; legacy/live callers leave it unavailable until
+    // their complete producing allocation (including absence of shared VGPRs) is authenticated.
+    uint32_t allocated_vgprs = 0;
     uint32_t tidig_comp_cnt = 0;
     bool tgid_x_en = false, tgid_y_en = false, tgid_z_en = false;
     bool tg_size_en = false;

@@ -242,3 +242,6 @@ recovery control without disabling range sharing.
 The range counters distinguish actual union copies from distinct resolved descriptor slices;
 skipped draws can leave planned bytes unused, so bound bytes minus upload bytes remains signed.
 Planning and shared write-proof time are nested in resource setup, outside per-binding copy time.
+
+`allocated_movrels` declares a synthetic private VGPR allocation, runtime index, bank words and
+expected OOB observations shared by compiler and GPU execution tests. It grants no launch value.

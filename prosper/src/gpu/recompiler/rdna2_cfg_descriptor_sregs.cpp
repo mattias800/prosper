@@ -15,7 +15,9 @@ std::set<int> cfg_direct_descriptor_sregs(const ShaderResourceTable* rt) {
         for (const auto& resource : rt->resources) {
             if (resource.srt_offset != 0xFFFFFFFFu || resource.sgpr_base == 0xFFFFFFFFu) continue;
             const uint32_t words = (resource.cls == ResourceClass::Texture ||
-                                    resource.cls == ResourceClass::StorageImage) ? 8u : 4u;
+                                    resource.cls == ResourceClass::StorageImage)
+                                       ? 8u
+                                       : 4u;
             for (uint32_t word = 0; word < words; ++word)
                 direct_descriptor_sregs.insert(static_cast<int>(resource.sgpr_base + word));
         }
@@ -23,4 +25,4 @@ std::set<int> cfg_direct_descriptor_sregs(const ShaderResourceTable* rt) {
 
     return direct_descriptor_sregs;
 }
-} // namespace prosper::gpu
+}   // namespace prosper::gpu

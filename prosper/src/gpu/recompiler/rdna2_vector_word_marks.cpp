@@ -1,3 +1,4 @@
+#include "gpu/recompiler/rdna2_relative_vgpr_source.hpp"
 #include "gpu/recompiler/rdna2_placeholder_origins.hpp"
 #include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
 #include "gpu/recompiler/rdna2_vector_word_marks.hpp"
@@ -320,11 +321,12 @@ void record_exec_mask_subset(RegState& rs, uint32_t result, uint32_t left, uint3
 
 void seed_vector_word_definedness(RegState& rs, const std::vector<Rdna2Inst>& instructions,
                                   bool native_interpolation, uint32_t wave_size,
-                                  const std::vector<LaunchVgpr>* launch) {
+                                  const std::vector<LaunchVgpr>* launch, uint32_t allocated_vgprs) {
     // CONFIDENCE: HIGH -- operand_bits/vreg_old supply zero for absent ordinary VGPRs. That
     // placeholder is not a guest value. Seed before PHIs or dispatcher storage can hide absence;
     // later complete writers retire the mark, while preserved old bits/lanes retain it.
-    const int highest = shader_max_vgpr(instructions);
+    const int highest = std::max(shader_max_vgpr(instructions),
+                                 allocated_vgprs ? static_cast<int>(allocated_vgprs - 1) : -1);
     rs.vector_wave_size = wave_size;
     seed_placeholder_origins(rs, instructions, launch, native_interpolation);
     const bool scc_offset =
@@ -535,6 +537,14 @@ ScalarSourceMarks vector_relative_source_marks(const SpirvCompute& b, const RegS
     ScalarSourceMarks missing;
     missing.placeholder = missing.hard = true;
     const auto m0 = rs.sreg.find(124);
+    if (b.compute_allocated_vgprs && m0 != rs.sreg.end() && !sreg_word_may_be_fabricated(rs, 124)) {
+        const auto sources = relative_vgpr_sources(b, rs, in);
+        if (!sources) return missing;
+        ScalarSourceMarks marks;
+        for (int reg : *sources) union_marks(marks, vector_word(rs, reg), &rs, true);
+        marks.memory = marks.memory || rs.sreg_memory_pattern.contains(124);
+        return marks;
+    }
     uint32_t offset = 0;
     if (m0 == rs.sreg.end() || sreg_word_may_be_fabricated(rs, 124) ||
         !relative_constant_offset(b, m0->second, offset))

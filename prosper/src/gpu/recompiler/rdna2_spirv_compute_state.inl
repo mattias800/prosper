@@ -374,6 +374,7 @@
     bool storage_buffer_int64_atomics=false;
     bool packed_r11_storage=true;
     uint32_t compute_pgm_rsrc1=kDefaultComputePgmRsrc1;
+    uint32_t compute_allocated_vgprs=0;
     Fp16OverflowMode compute_fp16_overflow{};
     uint32_t compute_min_subgroup_size=0;             // non-semantic backend contract (4/16/32/64)
     // ADR 0028: this module was compiled through the exact exchange dispatcher (a second chance
