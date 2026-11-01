@@ -498,3 +498,5 @@ and unrelated words do not. Unknown packed effects retain their refusal.
 `test_scalar_dependency_retry` separates dependency repair from Arbitrary admission. Successful
 original bytes return first, repair alone grants no admission, and only the selected attempt
 publishes diagnostics. Named Hard origins retain their veto in every attempt.
+Failed retries that report only a consequence retain the last meaningful cause privately until
+the final attempt is selected; successful retries discard earlier refusal records.

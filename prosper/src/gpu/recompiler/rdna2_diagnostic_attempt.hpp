@@ -32,6 +32,9 @@ public:
     void discard();
     // Select a directly nested attempt, discarding this attempt's earlier records.
     void replace_with(RecompileDiagnosticAttempt& selected);
+    // Stage a failed child without publishing. Keep the earlier cause if the child reports
+    // only consequences; a later admission attempt can still replace this selected failure.
+    void select_failure(RecompileDiagnosticAttempt& selected);
 
 private:
     std::vector<DeferredRecompileDiagnostic> records_;

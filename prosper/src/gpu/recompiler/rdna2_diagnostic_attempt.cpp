@@ -7,6 +7,7 @@
 #include <vector>
 #include <cstdint>
 #include <cassert>
+#include <algorithm>
 
 namespace prosper::gpu {
 namespace {
@@ -50,6 +51,18 @@ void RecompileDiagnosticAttempt::replace_with(RecompileDiagnosticAttempt& select
     records_.clear();
     selected.commit();
     commit();
+}
+
+void RecompileDiagnosticAttempt::select_failure(RecompileDiagnosticAttempt& selected) {
+    assert(active_ && selected.active_ && selected.previous_ == &records_);
+    assert(pending == &selected.records_);
+    // Match log_recompile_diagnostic's cause boundary: route-decline records count too.
+    const bool has_cause =
+        std::any_of(selected.records_.begin(), selected.records_.end(), [](const auto& record) {
+            return record.terminal_only || (record.role && *record.role != "consequent");
+        });
+    if (has_cause) records_.clear();
+    selected.commit(); // joins this still-private parent transaction
 }
 
 bool defer_recompile_diagnostic(const RecompileDiagnosticContext& context, const char* tag,

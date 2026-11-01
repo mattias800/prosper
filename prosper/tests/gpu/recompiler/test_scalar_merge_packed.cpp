@@ -6,6 +6,7 @@
 #include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <gtest/gtest.h>
 #include <bit>

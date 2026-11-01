@@ -78,25 +78,29 @@ recompile_with_arbitrary_placeholders(const RecompileDiagnosticContext& diagnost
         original.commit();
         return module;
     }
-    original.discard();
     if (scope.state.repair_eligible) {
         scope.state.repair = true;
         RecompileDiagnosticAttempt repaired;
         module = compile();
-        if (!module.empty() || !scope.state.eligible) {
-            repaired.commit();
+        if (!module.empty()) {
+            original.replace_with(repaired);
             return module;
         }
-        repaired.discard();
+        original.select_failure(repaired);
+        if (!scope.state.eligible) {
+            original.commit();
+            return module;
+        }
     }
     scope.state.allow = true;
     RecompileDiagnosticAttempt retry;
     module = compile();
     if (module.empty()) {
-        retry.commit();
+        original.select_failure(retry);
+        original.commit();
         return module;
     }
-    retry.commit();
+    original.replace_with(retry);
     const auto reads = arbitrary_placeholder_reads(module);
     observe_arbitrary_placeholder_admission(diagnostic.program_address, reads.fresh_mask,
                                             reads.loop_carry);
