@@ -202,9 +202,8 @@ class UniformWords {
             if (!seen.insert(at).second) continue;
             if (writes(plan.original[at], word)) {
                 definitions.insert(at);
-            } else if (!at) {
-                definitions.insert(entry);
             } else {
+                if (!at) definitions.insert(entry);
                 const auto& incoming = plan.predecessors[at];
                 pending.insert(pending.end(), incoming.begin(), incoming.end());
             }

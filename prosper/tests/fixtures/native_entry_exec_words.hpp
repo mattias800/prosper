@@ -33,6 +33,14 @@ inline Words readfirst_program(bool overwrite) {
     return {0x7e1c0500u, 0x806a810eu, 0xbeeb0380u, 0xd5010002u,
             0x01a90280u, 0xe0702000u, 0x80020200u, 0xbf810000u};
 }
+inline Words pc0_program(bool overwrite) {
+    if (overwrite)
+        return {0xbf800000u, 0xbe8e0380u, 0x806a810eu, 0xbeeb0380u, 0xd5010002u,
+                0x01a90280u, 0xe0702000u, 0x80020200u, 0x7e1c0500u, 0x800f810fu,
+                0xbf07820fu, 0xbf85fff4u, 0xbf810000u};
+    return {0xbf800000u, 0x806a810eu, 0xbeeb0380u, 0xd5010002u, 0x01a90280u, 0xe0702000u,
+            0x80020200u, 0x7e1c0500u, 0x800f810fu, 0xbf07820fu, 0xbf85fff5u, 0xbf810000u};
+}
 inline gpu::ComputeShaderConfig config(bool partial) {
     gpu::ComputeShaderConfig c;
     c.local_x = c.wave_size = c.native_subgroup_size = 64;

@@ -7,6 +7,7 @@
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <cstddef>
 #include <stdexcept>
 #include <cstdint>
 #include <vector>
@@ -21,10 +22,12 @@ struct Frame {
     fixture::Words words;
     std::vector<Rdna2Inst> ins;
     ComputeDispatchLaunchProfile launch;
-    explicit Frame(fixture::Words code = fixture::program()) : words(std::move(code)) {
+    explicit Frame(fixture::Words code = fixture::program(), size_t user_words = 12)
+        : words(std::move(code)) {
         b.native_subgroup_size = 64;
         b.begin(4, nullptr, 64, 1, 1, 64, 0, true, true);
-        const auto c = fixture::config(true);
+        auto c = fixture::config(true);
+        c.user_sgprs.resize(user_words);
         launch = compute_dispatch_launch_profile(c);
         prosper::test::bind_checked_compute_launch(b, c);
         b.saved_mask_original_words = words;
@@ -188,4 +191,17 @@ TEST(NativeEntryExecProof, TheOriginalClosedInstructionInventoryOwnsThePlan) {
     EXPECT_FALSE(escaping.proven());
     Frame unknown({0xbeea047eu, 0xffffffffu, 0xbf810000u});
     EXPECT_FALSE(unknown.proven());
+}
+
+TEST(NativeEntryExecProof, CurrentWordsMustAccountForBackedgesIntoInstructionZero) {
+    for (const bool overwrite : {false, true}) {
+        Frame f(fixture::pc0_program(overwrite), 16);
+        const auto reader = *std::find_if(f.ins.begin(), f.ins.end(), [](const auto& in) {
+            return in.fmt == Rdna2Format::VOP3 && in.opcode == 0x101;
+        });
+        RegState rs;
+        rs.sreg[106] = f.b.uconst(1);
+        rs.sreg[107] = f.b.uconst(0);
+        EXPECT_EQ(native_compute_vcc_data_mask(f.b, rs, reader) != 0u, overwrite);
+    }
 }

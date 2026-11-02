@@ -482,3 +482,6 @@ inventory after specialization and execute both in-range alternatives.
 DS boundary cases distinguish actual address/data widths from dispatcher padding, with wide
 out-of-bank twins. Selector bases, guest-barrier phase routing and marked M0 observations keep
 their independent bounds and root contracts.
+
+The native VCC expression proof also follows backedges into PC0; supplied entry words do not
+hide later vector publications. Complete per-iteration overwrites retain their execution control.

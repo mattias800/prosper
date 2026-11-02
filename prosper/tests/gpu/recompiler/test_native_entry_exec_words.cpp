@@ -109,3 +109,34 @@ TEST(NativeEntryExecWords, ACompleteCurrentOverwriteRetiresTheUnprovedArithmetic
     expected[0] = 1;
     EXPECT_EQ(actual, expected);
 }
+
+TEST(NativeEntryExecWords, APcZeroBackedgeCannotHideAReadfirstPublication) {
+    auto c = fixture::config(false);
+    c.user_sgprs.resize(16);
+    const auto result = fixture::compile(fixture::pc0_program(false), c);
+    EXPECT_TRUE(result.module.empty());
+    if (result.module.empty()) return;
+    bpermute_oracle::Interpreter vm(result.module);
+    vm.native_subgroup_width = 64;
+    vm.supplied_push_constants = c.user_sgprs;
+    const auto actual = vm.run_buffers(64, {{3, fixture::Words(64, fixture::untouched)}}, 3);
+    ASSERT_TRUE(vm.error.empty()) << vm.error;
+    fixture::Words expected(64, 0);
+    expected[0] = 1;
+    EXPECT_EQ(actual, expected);
+}
+
+TEST(NativeEntryExecWords, ACurrentOverwriteRetiresThePcZeroBackedgePublication) {
+    auto c = fixture::config(false);
+    c.user_sgprs.resize(16);
+    const auto result = fixture::compile(fixture::pc0_program(true), c);
+    ASSERT_FALSE(result.module.empty()) << result.reason;
+    bpermute_oracle::Interpreter vm(result.module);
+    vm.native_subgroup_width = 64;
+    vm.supplied_push_constants = c.user_sgprs;
+    const auto actual = vm.run_buffers(64, {{3, fixture::Words(64, fixture::untouched)}}, 3);
+    ASSERT_TRUE(vm.error.empty()) << vm.error;
+    fixture::Words expected(64, 0);
+    expected[0] = 1;
+    EXPECT_EQ(actual, expected);
+}

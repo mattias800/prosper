@@ -43,3 +43,6 @@ missing spill and high-word inputs remain refusals. The integer control retains 
 
 The native entry-word fixture also observes a complete numerical overwrite after a dead
 READFIRST arithmetic relay; the old publication supplies no later mask bit.
+
+A PC0 loop executes its current one-hot mask after a complete per-iteration overwrite,
+independently of an earlier READFIRST publication on the backedge.
