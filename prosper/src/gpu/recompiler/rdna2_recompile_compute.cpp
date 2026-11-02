@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdint>
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/rdna2_native_entry_exec_words.hpp"
 #include "gpu/recompiler/ir/cfg/exec_value_census.hpp"
 #include "gpu/diagnostics/diagnostic_selectors.hpp"
 #include "gpu/recompiler/compiler_choices.hpp"
@@ -1067,6 +1068,8 @@ recompile_compute_once(const uint32_t* code, size_t dwords, const ShaderResource
             IndirectPointerBoundKind::DescriptorRange)
         b.declare_indirect_pointer_descriptor_capture();
     b.declare_guest_scratch(scratch);
+    initialize_native_entry_exec_words(b, compute_dispatch_launch_profile(config), ins, code,
+                                       dwords);
     uint32_t initial_dispatch_active = 0;
     if (partial_barrier_phases || exact_partial_dispatcher)
         initial_dispatch_active = b.invocation_within_extent(

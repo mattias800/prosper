@@ -1,5 +1,9 @@
 # Execution-layer tests
 
+`test_native_entry_exec_words_gpu` executes complete groups and the final 56-worker
+group on a required native Wave64 device, checking retained HIGH, the new LOW, old inactive
+register values and absent-worker output sentinels.
+
 `test_pixel_parameter_producer` drives the actual draw producer/cache with known, absent and
 changed PS user prefixes. `test_native_pixel_parameter_gpu` observes real native interpolation
 and the reused SGPR lifetime in the colour attachment, with two distinct parameter values.
@@ -36,3 +40,9 @@ DS fields as reads; each lane owns a distinct LDS cell.
 `test_native_fp_mask_participation` observes saved physical mask words after a real native
 loop controlled by finite, NaN and mixed floating predicates. The scalar branch is wave-wide;
 missing spill and high-word inputs remain refusals. The integer control retains its old route.
+
+The native entry-word fixture also observes a complete numerical overwrite after a dead
+READFIRST arithmetic relay; the old publication supplies no later mask bit.
+
+A PC0 loop executes its current one-hot mask after a complete per-iteration overwrite,
+independently of an earlier READFIRST publication on the backedge.

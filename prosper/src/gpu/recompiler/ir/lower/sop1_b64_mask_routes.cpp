@@ -3,6 +3,7 @@
 // These routes still emit SPIR-V directly; they are the mask-domain and proof-carrying shapes the
 // IR does not model yet. Each returns nullopt when the instruction is not its shape.
 #include "gpu/recompiler/ir/lower/scalar_lowering_internal.hpp"
+#include "gpu/recompiler/rdna2_native_entry_exec_words.hpp"
 #include "gpu/recompiler/ir/ops/scalar_integer64_values.hpp"
 
 namespace prosper::gpu::ir {
@@ -263,8 +264,10 @@ std::optional<bool> Sop1Lowering::route_b64_mask_ops() {
                 // A fresh entry-site mask may publish its native ballot words. Older saved
                 // pairs copy retained words; a late ballot cannot recover departed lanes.
                 if (m && !data_copied && saved_mask_mov_defines_words(b, in, false, true)) {
-                    rs.sreg[in.dst.value] = b.native_wave_ballot_half(m, 0);
-                    rs.sreg[in.dst.value + 1] = b.native_wave_ballot_half(m, 1);
+                    const auto entry = native_entry_exec_words(b, in);
+                    rs.sreg[in.dst.value] = entry ? (*entry)[0] : b.native_wave_ballot_half(m, 0);
+                    rs.sreg[in.dst.value + 1] =
+                        entry ? (*entry)[1] : b.native_wave_ballot_half(m, 1);
                     rs.sreg_srt.erase(in.dst.value);
                     rs.sreg_srt.erase(in.dst.value + 1);
                     data_copied = true;

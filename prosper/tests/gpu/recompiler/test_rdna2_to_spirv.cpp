@@ -1664,6 +1664,8 @@ int main() {
     gta_pc232_config.local_x = 64;
     gta_pc232_config.exact_thread_extent = true;
     gta_pc232_config.threads_x = 4152;
+    gta_pc232_config.threads_y = gta_pc232_config.threads_z = 1;
+    gta_pc232_config.dispatch_launch = test_fixture::kGta5Pc232OwnedLaunch;
     gta_pc232_config.wave_size = 64;
     gta_pc232_config.native_subgroup_size = 64;
     gta_pc232_config.tgid_x_en = true;
