@@ -1,8 +1,14 @@
 #include "gpu/recompiler/ir/lower/sopp_case_routes.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
+#include <cstdint>
+#include <unordered_set>
 
 namespace prosper::gpu::ir {
+bool sopp_drops_scc_branch(const Rdna2Inst& in, const std::unordered_set<uint32_t>* safe_execz) {
+    return in.fmt == Rdna2Format::SOPP && (in.opcode == 0x04 || in.opcode == 0x05) && safe_execz &&
+           safe_execz->contains(in.pc);
+}
 // clang-format off
 bool SoppCaseRoutes::lower() {
     // Control flow. The only branch we can safely linearize today is the common forward
@@ -44,7 +50,7 @@ bool SoppCaseRoutes::lower() {
             // so the branch LINEARIZES away exactly like a forward s_cbranch_execz. Only these
             // recognized branches are dropped; any other SCC branch is still a real uniform-if we
             // can't model straight-line, so it rejects.
-            if (safe_execz && safe_execz->count(in.pc)) break;   // recognized kill-mask branch -> no-op
+            if (sopp_drops_scc_branch(in, safe_execz)) break;   // recognized kill-mask branch -> no-op
             ok = false;
             break;
         case 0x06: case 0x07:                              // s_cbranch_vccz / vccnz

@@ -1,5 +1,9 @@
 # `tests/gpu/recompiler` — translation tests and the legacy compute execution fixture
 
+`test_native_parameter_tail` authenticates the original terminal trailer before lending the
+native interpolation service. Unknown layouts, numerical M0 observers, truncation and reentry
+stay unproved. The interpreter checks real Input colours; the paired device cases observe discard.
+
 `test_native_entry_exec_words` observes both numeric VCC halves after a loop, CMPX and
 LOW-only replacement. Complete and actual partial groups run in the interpreter; missing
 launch words and a missing spill cannot supply entry-mask authority. Scalar multiplication

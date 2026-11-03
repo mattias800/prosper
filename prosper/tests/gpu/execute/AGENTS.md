@@ -1,5 +1,8 @@
 # Execution-layer tests
 
+The native pixel parameter GPU fixture also checks the saved-mask/SCC0 terminal trailer:
+one genuine Input keeps the colour, another must match an independent always-discard module.
+
 `test_native_entry_exec_words_gpu` executes complete groups and the final 56-worker
 group on a required native Wave64 device, checking retained HIGH, the new LOW, old inactive
 register values and absent-worker output sentinels.

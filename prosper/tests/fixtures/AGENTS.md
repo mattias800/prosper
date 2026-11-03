@@ -1,5 +1,9 @@
 # `prosper/tests/fixtures/` — shared harnesses and hand-built inputs
 
+`native_parameter_tail` extends the native parameter fixture with the original saved-mask/SCC0
+discard trailer. A genuine Input controls both colour and discard; an independent always-discard
+module observes the attachment's clear value on the device.
+
 `native_entry_exec_words` owns a counted-loop entry-mask witness, complete/partial raw
 launches and word-level output expectations. Inactive guest lanes preserve distinct old
 register data; absent workers retain the output sentinel.
