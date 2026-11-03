@@ -1,5 +1,8 @@
 # Execution-layer tests
 
+`test_inactive_destination_storage_gpu` executes the same low16/full64 preservation and
+accumulator contracts on a required Wave64 subgroup, with real output values for every lane.
+
 `test_native_entry_exec_words_gpu` executes complete groups and the final 56-worker
 group on a required native Wave64 device, checking retained HIGH, the new LOW, old inactive
 register values and absent-worker output sentinels.

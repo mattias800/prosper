@@ -4044,7 +4044,16 @@ if(TARGET prosper_core)
             tests/gpu/recompiler/test_scalar_dependency_parameter.cpp
     INCLUDES tests tests/gpu/recompiler
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_inactive_destination_storage
+    SOURCES tests/gpu/recompiler/test_inactive_destination_storage.cpp
+    INCLUDES tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
   if(Vulkan_FOUND)
+    prosper_add_gtest(test_inactive_destination_storage_gpu
+      SOURCES tests/gpu/execute/test_inactive_destination_storage_gpu.cpp
+      INCLUDES tests
+      LIBRARIES prosper_core Vulkan::Vulkan
+      LABELS gpu PROPERTIES TIMEOUT 60)
     prosper_add_gtest(test_native_pixel_parameter_gpu
       SOURCES tests/gpu/execute/test_native_pixel_parameter_gpu.cpp
       INCLUDES tests frontends

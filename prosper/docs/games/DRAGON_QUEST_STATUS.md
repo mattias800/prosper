@@ -814,6 +814,17 @@ route, settings and observed checkpoint; a run with opt-in `PROSPER_NULL_PAGE=1`
 by that setting. No new runtime result or rung change is claimed here.
 
 ## Ruled out — eliminated, do not re-run these
+- **"The real PS parameter service alone restores the November title."** On 2026-11-03
+  the rebased dependency-repair candidate with that service reached the title and Adventure
+  Log, returned through ordinary Circle input and exited normally after 155.63 s / 4,335
+  presentations. Eight pad entries loaded. The exit summary recorded 8,122 fragment drops
+  and 8,122 compute skips over 30 completed alarm windows; sky, sea and glints remained absent.
+  The captured `f4296a638f00fedd` has an authenticated native parameter plan, but the repair
+  attempt then refuses at PC877, `v_lshl_add_u32 v75,v2,1,v2`. Its explicit v2 is complete
+  in current EXEC; the refusal instead observes the stored inactive old v75 as an input.
+  Preserving that SSA alone is no active-lane read. Missing storage, actual accumulation and
+  a subsequent wider observation retain independent obligations. This run is correctness
+  evidence, not a performance comparison or a claim that the title is repaired.
 - **"A straight-line unloaded-vector comparison alone exercises the new PS entry service."**
   The first synthetic interpolation fixture passed the legacy strict route without a guarded
   retry, including with unknown parameter layout. It was not a red-without-fix witness. The

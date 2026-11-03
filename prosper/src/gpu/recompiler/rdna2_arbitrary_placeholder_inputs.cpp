@@ -152,12 +152,16 @@ bool refuse_arbitrary_placeholder_old_destination(SpirvCompute& b, const RegStat
         !vector_write_depends_on_old_word(in, !rs.exec_narrowed) ||
         rdna2_instruction_effects(in).lane_flow == Rdna2LaneFlow::WriteLane)
         return false;
-    // The existing predicate names actual old-word reads, including inactive lanes, partial
-    // words and accumulators. Lane-slot writers preserve their slot map, not ordinary SSA.
+    // A complete active-word writer preserves existing inactive SSA without observing its
+    // bits. Keep its provenance for any later wider read. Missing/reserved storage cannot
+    // preserve a value, and accumulators/subword writers still read the actual old word.
+    const bool active_old_word_read = vector_write_depends_on_old_word(in, true);
     bool refused = false;
     const int maximum =
         b.compute_allocated_vgprs ? static_cast<int>(b.compute_allocated_vgprs - 1) : 255;
     for_each_possible_vector_write(in, maximum, [&](int reg) {
+        const auto old = rs.vreg.find(reg);
+        if (!active_old_word_read && old != rs.vreg.end() && old->second) return;
         if (!refused)
             refused =
                 refuse_arbitrary_placeholder_operand(b, rs, in, {OperandKind::VGPR, reg}, &ok);

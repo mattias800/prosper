@@ -1,5 +1,10 @@
 # `prosper/tests/fixtures/` — shared harnesses and hand-built inputs
 
+`inactive_destination_storage` separates stored inactive SSA from an actual old-destination
+operand during guarded dependency repair. A deliberately unbound compute TIDX stays a Hard
+launch input when observed. Missing/reserved storage, accumulators and a restored wider EXEC
+retain their own guards; genuine matched inputs execute in the interpreter and on Wave64.
+
 `native_entry_exec_words` owns a counted-loop entry-mask witness, complete/partial raw
 launches and word-level output expectations. Inactive guest lanes preserve distinct old
 register data; absent workers retain the output sentinel.

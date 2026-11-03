@@ -663,6 +663,11 @@ executed lane reads. Failed retries publish their actual refusal and no admissio
   false-positive mutations are detected. The underlying producer loss also reproduces on
   strict merged main without an unloaded predicate; it remains separately tracked as
   [#5530](https://github.com/mattias800/prosper/issues/5530). This policy preserves strict successes.
+  Retaining an existing nonzero SSA for inactive lanes is separate from observing its bits:
+  a complete active-word writer may preserve that storage without supplying a missing input.
+  Its marks stay unchanged for later wider reads. Missing/reserved old storage and actual
+  accumulator/subword operands still use the guard; matched interpreter and required-Wave64
+  witnesses distinguish these cases with a real unsupplied launch word, never Arbitrary input.
 
 - **The ordinary LDS callback protects every DS input read.** Compute ADDTID returns before
   that callback. After `v6=7; writelane v6,s0,0` with supplied `s0=13`, its direct store silently

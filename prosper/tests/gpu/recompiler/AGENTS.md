@@ -1,5 +1,9 @@
 # `tests/gpu/recompiler` — translation tests and the legacy compute execution fixture
 
+`test_inactive_destination_storage` observes complete active writes without reading the stored
+inactive word. A wider later read and actual accumulator operands still require genuine input;
+missing or reserved old storage cannot be retained as zero.
+
 `test_native_entry_exec_words` observes both numeric VCC halves after a loop, CMPX and
 LOW-only replacement. Complete and actual partial groups run in the interpreter; missing
 launch words and a missing spill cannot supply entry-mask authority. Scalar multiplication
