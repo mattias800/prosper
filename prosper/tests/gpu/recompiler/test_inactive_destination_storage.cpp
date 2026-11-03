@@ -56,9 +56,16 @@ TEST(InactiveDestinationStorage, ASubsequentWiderReadStillNeedsTheRealInactiveIn
 }
 TEST(InactiveDestinationStorage, AnAccumulatorStillReadsItsOldWordInActiveLanes) {
     for (bool native : {false, true}) {
-        const auto result = f::compile(native, f::OldValue::Placeholder, f::Operation::Accumulate);
+        const auto result = f::compile(native, f::OldValue::Placeholder, f::Operation::Accumulate,
+                                       f::Observation::IndependentSink);
         EXPECT_TRUE(result.module.empty());
         EXPECT_NE(result.roots.find("origin=launch-input word=v0"), std::string::npos);
+        EXPECT_EQ(result.rejected_pc, 3u);   // the FMAC, before any later ordinary source guard
+        EXPECT_EQ(result.rejected_opcode, 0x2bu);
+        const auto supplied = f::compile(native, f::OldValue::Supplied, f::Operation::Accumulate,
+                                         f::Observation::IndependentSink);
+        ASSERT_FALSE(supplied.module.empty()) << supplied.roots;
+        execute(supplied.module, 0x3f000000u, f::Words(64, f::sentinel));
     }
 }
 TEST(InactiveDestinationStorage, AGenuineAccumulatorStillExecutesItsCompleteOperation) {

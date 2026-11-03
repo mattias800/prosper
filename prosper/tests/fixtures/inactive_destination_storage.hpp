@@ -16,22 +16,25 @@ using namespace prosper::gpu;
 using Words = std::vector<uint32_t>;
 enum class OldValue { Missing, Reserved, Placeholder, Supplied };
 enum class Operation { Copy, Accumulate };
-enum class Observation { ActiveOnly, AllLanes };
+enum class Observation { ActiveOnly, AllLanes, IndependentSink };
 inline constexpr uint32_t sentinel = 0xdeadbeefu;
 struct Compilation {
     Words module;
     std::string roots;
+    uint32_t rejected_pc = UINT32_MAX;
+    uint32_t rejected_opcode = UINT32_MAX;
 };
 inline Words program(Operation operation, Observation observation) {
     // LLVM gfx1030 Wave64 encodings: full scratch initialization, CMPX 16>v3, active update.
     Words words{0x7e0402ffu, sentinel, 0x7da80690u,
                 operation == Operation::Copy ? 0x7e000200u : 0x56000200u};
     if (observation == Observation::AllLanes) words.push_back(0xbefe04c1u);
-    words.insert(words.end(), {0x7e040300u, 0xbf810000u}); // v2=v0; END
+    if (observation != Observation::IndependentSink) words.push_back(0x7e040300u); // v2=v0
+    words.push_back(0xbf810000u);
     return words;
 }
 inline Words emit(bool native, OldValue old, Operation operation, Observation observation,
-                  std::string& roots) {
+                  Compilation& result) {
     SpirvCompute b;
     b.begin(4, nullptr, 64, 1, 1, 64, 1, true, true);
     b.native_subgroup_size = native ? 64 : 0;
@@ -70,7 +73,10 @@ inline Words emit(bool native, OldValue old, Operation operation, Observation ob
     if (!emit_body(
             b, rs, origins->instructions, {}, nullptr, true, false,
             [](RegState&, const Rdna2Inst&) { return true; }, words.data(), words.size())) {
-        if (b.diagnostic.placeholder_origins) roots = *b.diagnostic.placeholder_origins;
+        if (b.diagnostic.placeholder_origins) result.roots = *b.diagnostic.placeholder_origins;
+        result.rejected_pc = b.stage_reject_pc;
+        for (const auto& in : origins->instructions)
+            if (in.pc == result.rejected_pc) result.rejected_opcode = in.opcode;
         return {};
     }
     b.store_output_word(rs.vreg.at(2), 1, 0);
@@ -82,7 +88,7 @@ inline Compilation compile(bool native, OldValue old = OldValue::Placeholder,
     Compilation result;
     result.module = recompile_with_arbitrary_placeholders({}, [&] {
         if (!allow_scalar_merge_dependency_repair()) return Words{};
-        return emit(native, old, operation, observation, result.roots);
+        return emit(native, old, operation, observation, result);
     });
     return result;
 }

@@ -668,6 +668,9 @@ executed lane reads. Failed retries publish their actual refusal and no admissio
   Its marks stay unchanged for later wider reads. Missing/reserved old storage and actual
   accumulator/subword operands still use the guard; matched interpreter and required-Wave64
   witnesses distinguish these cases with a real unsupplied launch word, never Arbitrary input.
+  The accumulator twin uses an independent output sink and asserts the producer's PC/opcode:
+  refusal at a later ordinary read previously hid removal of the producer guard. The revised
+  twin detects that mutation at the actual old-word consumer.
 
 - **The ordinary LDS callback protects every DS input read.** Compute ADDTID returns before
   that callback. After `v6=7; writelane v6,s0,0` with supplied `s0=13`, its direct store silently
