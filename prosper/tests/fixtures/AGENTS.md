@@ -284,3 +284,5 @@ do not scan the module. Its bounded diagnostic state has one definition in its s
 The native fragment interpreter accepts an explicit helper inventory, quad-any and whole-wave
 any votes, and terminates killed invocations. It still requires defined outputs from real pixels.
 The device contract owns both feature structs through creation and records each enabled feature.
+
+`native_fragment_any` owns complete-cohort Boolean vote synchronization for the fragment VM.
