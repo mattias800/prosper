@@ -21,6 +21,7 @@
 // is a hard failure rather than a pass.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "arbitrary_placeholder_witness.hpp"
+#include "native_fragment_collective_witness.hpp"
 #include "fixtures/allocated_movrels.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
 #include "gpu/recompiler/ngg_subgroup_shell.hpp"
@@ -2526,6 +2527,15 @@ int main(int argc, char** argv) {
     dump(dir, "arbitrary_placeholder_admission",
          prosper::spv_validation::arbitrary_placeholder_witness(),
          "recompile_with_arbitrary_placeholders");
+    for (bool wave32 : {false, true}) {
+        for (bool whole_quad : {false, true}) {
+            const auto name = std::string("native_fragment_collective_") +
+                              (wave32 ? "32_" : "64_") + (whole_quad ? "wqm" : "exact");
+            dump(dir, name.c_str(),
+                 prosper::spv_validation::native_fragment_collective_witness(wave32, whole_quad),
+                 "recompile_native_fragment_collectives");
+        }
+    }
     // spirv_builder.cpp hand-assembles compute modules that the live frontend creates at runtime
     // (frontends/shared/live/live_compute.cpp: prepare_compare_pipeline / the scale-bias probe), so they
     // reach vkCreateShaderModule exactly like a recompiled shader. #1711 lived here.

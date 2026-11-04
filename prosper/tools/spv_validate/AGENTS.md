@@ -9,3 +9,7 @@ ordinary strict success cannot stand in for this path. No Vulkan device or game 
 
 The allocated MOVRELS witnesses validate both Wave32 and Wave64 declared-bank/OOB modules
 through the existing `recompile_compute` selector. Unknown allocations stay outside this route.
+
+`native_fragment_collective_witness` validates the actually selected native READFIRST retry in
+both widths and exact/WQM execution. Required module modes and admission metadata exclude an
+ordinary legacy success from its coverage; it delegates through the normal fragment compiler.
