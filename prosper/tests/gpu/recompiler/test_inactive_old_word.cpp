@@ -1,8 +1,10 @@
 // Mutations: charge inactive preservation as an active read, or forget its missing outside lanes.
 #include "fixtures/inactive_old_word.hpp"
+#include "fixtures/inactive_compute_word.hpp"
 #include "fixtures/inactive_old_word_values.hpp"
 #include "fixtures/native_pixel_parameter.hpp"
 #include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
+#include "gpu/recompiler/bpermute_spirv_oracle.hpp"
 #include <gtest/gtest.h>
 #include <array>
 #include <bit>
@@ -120,4 +122,25 @@ TEST(InactiveOldWord, AnOriginalStrictSuccessStillNeedsNoArbitraryAdmission) {
             ASSERT_FALSE(result.module.empty()) << result.reason;
             EXPECT_EQ(prosper::gpu::arbitrary_placeholder_reads(result.module).total(), 0u);
         }
+}
+
+TEST(InactiveOldWord, AComputeLoopOverwritesItsOldWordBeforeTheFutureMemoryRead) {
+    namespace compute = prosper::test::inactive_compute_word;
+    const auto code = compute::program();
+    const auto resources = compute::resources();
+    const auto launch = compute::launch();
+    const auto module = prosper::gpu::recompile_compute(
+        code.data(), code.size(), &resources, launch,
+        {prosper::gpu::RecompileDiagnosticStage::Compute, 0x5523c000u});
+    ASSERT_FALSE(module.empty()) << prosper::gpu::last_terminal_reject_reason(0x5523c000u);
+    EXPECT_GT(prosper::gpu::arbitrary_placeholder_reads(module).total(), 0u);
+    for (uint32_t seed : {7u, 13u}) {
+        bpermute_oracle::Interpreter vm(module);
+        vm.native_subgroup_width = 64;
+        vm.supplied_push_constants = launch.user_sgprs;
+        const auto actual = vm.run_buffers(
+            64, {{2, compute::input(seed)}, {3, std::vector<uint32_t>(64, 0xdeadbeefu)}}, 3);
+        ASSERT_TRUE(vm.error.empty()) << vm.error;
+        EXPECT_EQ(actual, compute::expected(seed));
+    }
 }

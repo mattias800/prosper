@@ -4,10 +4,12 @@
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/resources/shader_resources.hpp"
 #include "fixtures/arbitrary_placeholder.hpp"
+#include "fixtures/inactive_compute_word.hpp"
 #include "fixtures/render_runner.h"
 #include "shared/live/live_compute.hpp"
 #include <gtest/gtest.h>
 #include <memory>
+#include <vector>
 
 namespace fixture = prosper::test::arbitrary_placeholder;
 namespace live = prosper::frontend;
@@ -49,6 +51,43 @@ void execute(const fixture::Words& code, const fixture::Words& expected, uint64_
 
 TEST(ArbitraryPlaceholderGpu, TheActualWaveKeepsBothHalvesOfTheRetainedValue) {
     execute(fixture::narrowed_writer(), fixture::expected(true), 0x5497b00200ull);
+}
+
+TEST(ArbitraryPlaceholderGpu, AComputeLoopOverwritesOnlyItsCurrentLanes) {
+    namespace compute = prosper::test::inactive_compute_word;
+    ASSERT_TRUE(prosper::test::render_vk_ctx().ok);
+    const auto shared = shared_vulkan_context();
+    ASSERT_TRUE(shared.valid());
+    const auto launch = compute::launch();
+    if (select_native_compute_subgroup_size(shared, launch, false, false) != 64)
+        GTEST_SKIP() << "enabled exact64 subgroup contract unavailable";
+    live::execute_live_compute_items({});
+    ASSERT_TRUE(live::live_compute_storage_image_device().adopted);
+    const auto code = compute::program();
+    for (uint32_t seed : {7u, 13u}) {
+        auto input = compute::input(seed);
+        std::vector<uint32_t> output(64, 0xdeadbeefu);
+        const auto resources = compute::resources(reinterpret_cast<uint64_t>(input.data()),
+                                                  reinterpret_cast<uint64_t>(output.data()));
+        ComputeItem item;
+        item.code_addr = 0x5523c100u + seed;
+        item.spirv = recompile_compute(code.data(), code.size(), &resources, launch,
+                                       {RecompileDiagnosticStage::Compute, item.code_addr});
+        ASSERT_FALSE(item.spirv.empty()) << last_terminal_reject_reason(item.code_addr);
+        item.required_subgroup_size = 64;
+        item.resources = std::make_shared<ShaderResourceTable>(resources);
+        item.user_sgprs = launch.user_sgprs;
+        item.recompile_config_available = true;
+        item.recompile_config = launch;
+        item.launch.local_x = item.launch.threads_x = 64;
+        item.launch.local_y = item.launch.local_z = item.launch.threads_y = item.launch.threads_z =
+            1;
+        item.launch.groups_x = item.launch.groups_y = item.launch.groups_z = 1;
+        const auto cpu_fills = live::live_compute_cpu_fill_dispatches();
+        ASSERT_TRUE(live::execute_live_compute_items({item}));
+        EXPECT_EQ(live::live_compute_cpu_fill_dispatches(), cpu_fills);
+        EXPECT_EQ(output, compute::expected(seed));
+    }
 }
 
 TEST(ArbitraryPlaceholderGpu, CmpxKeepsExactlyOneLogicalLaneActive) {

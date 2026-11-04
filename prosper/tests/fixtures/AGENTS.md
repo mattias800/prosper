@@ -290,3 +290,6 @@ The device contract owns both feature structs through creation and records each 
 `inactive_old_word` owns LLVM-assembled masked-overwrite streams and their explicit launch layout.
 `inactive_old_word_values` supplies complete native cohorts, real varying colours and per-lane
 positions; the sink preserves an independently initialized value outside the writer.
+
+`inactive_compute_word` owns the masked MOV and genuine future-memory backedge witness, with
+independent scalar-buffer inputs and untouched output sentinels in the inactive half.

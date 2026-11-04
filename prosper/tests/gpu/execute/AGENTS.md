@@ -20,6 +20,8 @@ Wave64 subgroup, checking numeric VCC halves and both nested scalar branch outco
 `test_arbitrary_placeholder_exec` runs the real exact64 production compute backend and checks
 both initialized low lanes and retained arbitrary high lanes. It keeps the actual device
 subgroup-contract gate and rejects CPU-fill substitution.
+The masked MOV loop uses real scalar-buffer data and checks that the inactive half keeps its
+output sentinels while a future memory load supplies the backedge register.
 Runtime-relative bank cases retain provided or genuinely unloaded selected values and reject a
 lost provided candidate even when other possible candidates are unloaded.
 Aliased destinations also retain this check before their temporary map slot becomes a value.
