@@ -271,3 +271,5 @@ Planning and shared write-proof time are nested in resource setup, outside per-b
 
 `allocated_movrels` declares a synthetic private VGPR allocation, runtime index, bank words and
 expected OOB observations shared by compiler and GPU execution tests. It grants no launch value.
+
+`render_topology.h` is the renderer's private same-TU topology-class companion.
