@@ -80,12 +80,17 @@ TEST(NativeFragmentReadfirst, ARealMissingPerspectiveInputStaysHard) {
     // Full EXEC needs no threshold reader: the missing launch word is observed first by
     // READFIRST itself, not by the earlier mask compare. Keep the independent retry marker.
     code.erase(code.begin() + 5, code.begin() + 8);
-    for (bool wave32 : {true, false}) {
-        const auto result = input::compile(code, fixture::mapping(true), wave32);
-        EXPECT_TRUE(result.module.empty());
-        EXPECT_NE(result.reason.find("origin=launch-input word=v0"), std::string::npos)
-            << result.reason;
-        EXPECT_NE(result.reason.find("pc=5"), std::string::npos) << result.reason;
+    for (bool empty_exec : {false, true}) {
+        auto current = code;
+        if (empty_exec) current.insert(current.begin() + 5, 0xbefe0480u); // EXEC = 0
+        for (bool wave32 : {true, false}) {
+            const auto result = input::compile(current, fixture::mapping(true), wave32);
+            EXPECT_TRUE(result.module.empty());
+            EXPECT_NE(result.reason.find("origin=launch-input word=v0"), std::string::npos)
+                << result.reason;
+            EXPECT_NE(result.reason.find(empty_exec ? "pc=6" : "pc=5"), std::string::npos)
+                << result.reason;
+        }
     }
 }
 
