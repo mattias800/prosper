@@ -101,6 +101,14 @@ flip figure understates the difference.
 
 ## Ruled out
 
+- **"A later numerical read of the parameter SGPR observes its launch value."** The current
+  `f0d44d9709d006c3` program replaces `s[20:27]` with a scalar-buffer load at PC2, after the
+  interpolation-only M0 copy. Scalar memory ignores EXEC and completely replaces those words
+  (AMD 70648 sections 3.3 and 7). On main `81c78c4be`, the synthetic load-lifetime CPU witness
+  and both native device witnesses fail at M0, while ten matched controls pass, including real
+  supplied-memory observations after the existing MOV lifetime. The later value and its memory
+  obligation are separate from the automatic entry word ([#5523](https://github.com/mattias800/prosper/issues/5523)).
+
 - **An arbitrary EXECZ branch is the shipped discard fixture.** The first synthetic test's
   strict-route control failed on main with an unresolved branch, independently of the parameter
   input refusal. The replacement uses the captured family's saved-mask/SCC0/EXEC-restore form.

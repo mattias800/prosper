@@ -1,5 +1,9 @@
 # `tests/gpu/recompiler` — translation tests and the legacy compute execution fixture
 
+`test_native_parameter_load` executes genuine scalar-load results after an interpolation-only
+entry use. It keeps the existing MOV control, span boundaries, missing memory and control-before-load
+refusals; the interpreter receives explicitly owned readonly buffer words.
+
 `test_native_parameter_tail` authenticates the original terminal trailer before lending the
 native interpolation service. Unknown layouts, numerical M0 observers, truncation and reentry
 stay unproved. The interpreter checks real Input colours; the paired device cases observe discard.

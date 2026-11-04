@@ -23,6 +23,9 @@ overwrite before control diverges. Numeric M0, LDS/GDS, relative uses, changed o
 unknown layouts remain outside this service. It publishes no SGPR/M0 bits and grants no mask
 authority. The partial scalar inventory names loaded prefix words without declaring other words
 unloaded; ADR 0038's real-input boundary remains separate.
+Complete scalar loads also end the overwritten entry-word lifetime. Their own memory inputs and
+numerical results retain the existing resource and placeholder guards; only legacy SMEM facts
+identify the destination span.
 SMEM store/atomic payloads stay outside the closed service; SOPK wait thresholds also charge
 their encoded scalar source, independently of the explicit source array.
 `rdna2_native_parameter_inventory` completes that plan's original SOURCE with the existing

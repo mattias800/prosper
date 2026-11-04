@@ -1,6 +1,7 @@
 #include "gpu/recompiler/rdna2_native_parameter_base.hpp"
 #include "gpu/pm4/pm4_registers.hpp"
 #include "gpu/recompiler/rdna2_cfg_support.hpp"
+#include "gpu/recompiler/rdna2_instruction_effects.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 
 #include <algorithm>
@@ -84,8 +85,12 @@ bool parameter_load(const Rdna2Inst& in, int word) {
 }
 
 bool replaces_entry_word(const Rdna2Inst& in, int word) {
-    // These scalar moves overwrite the addressed word even under empty EXEC. A generic write
-    // inventory also includes conditional/partial writes, which cannot establish this lifetime.
+    // Scalar loads overwrite their complete destination words independently of EXEC (70648
+    // sections 3.3 and 7). This retires only the entry lifetime, never the load's input obligation.
+    if (in.fmt == Rdna2Format::SMEM &&
+        rdna2_instruction_effects(in).smem == Rdna2ScalarMemory::Load)
+        return writes_word(in, word);
+    // Conditional/partial scalar writes cannot establish this lifetime.
     return in.fmt == Rdna2Format::SOP1 &&
            (in.opcode == kSop1OpcodeMovB32 || in.opcode == kSop1OpcodeMovB64) &&
            overlaps(in.dst.value, in.opcode == kSop1OpcodeMovB64 ? 2u : 1u, word);
