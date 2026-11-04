@@ -101,6 +101,12 @@ flip figure understates the difference.
 
 ## Ruled out
 
+- **"The native READFIRST witness selects the first x strictly above its threshold."** Its
+  assembled predicate is unsigned `threshold <= raw_x`, so equality participates. The first
+  independent device reference used `>` and disagreed only at that boundary. Matching the
+  decoded predicate and adding an explicit equality arm makes both native widths and both
+  scalar destinations agree ([#5523](https://github.com/mattias800/prosper/issues/5523)).
+
 - **"A direct read of an absent VGPR is a READFIRST regression witness."** The first native
   scalar-publication fixture stopped at its marker READLANE, PC0, before reaching READFIRST.
   After an ordinary VMOV creates the marker's SSA value, the unchanged `6a432e48f` compiler
