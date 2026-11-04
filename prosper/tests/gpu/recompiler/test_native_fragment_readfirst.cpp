@@ -82,7 +82,7 @@ TEST(NativeFragmentReadfirst, ARealMissingPerspectiveInputStaysHard) {
     code.erase(code.begin() + 5, code.begin() + 8);
     for (bool empty_exec : {false, true}) {
         auto current = code;
-        if (empty_exec) current.insert(current.begin() + 5, 0xbefe0480u); // EXEC = 0
+        if (empty_exec) current.insert(current.begin() + 5, 0xbefe0480u);   // EXEC = 0
         for (bool wave32 : {true, false}) {
             const auto result = input::compile(current, fixture::mapping(true), wave32);
             EXPECT_TRUE(result.module.empty());
