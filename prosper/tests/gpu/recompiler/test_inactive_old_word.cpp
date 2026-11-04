@@ -4,6 +4,7 @@
 #include "fixtures/inactive_old_word_values.hpp"
 #include "fixtures/native_pixel_parameter.hpp"
 #include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include "gpu/recompiler/bpermute_spirv_oracle.hpp"
 #include <gtest/gtest.h>
 #include <array>
