@@ -8,7 +8,8 @@
 
 namespace prosper::test {
 inline std::vector<uint32_t> native_readfirst_reference(uint32_t width, float threshold,
-                                                        gpu::FloatTransportConfig transport, bool whole_quad_mode = false) {
+                                                        gpu::FloatTransportConfig transport,
+                                                        bool whole_quad_mode = false) {
     using namespace gpu;
     SpirvCompute b;
     b.wave_size = width;
@@ -18,7 +19,8 @@ inline std::vector<uint32_t> native_readfirst_reference(uint32_t width, float th
     b.pstr(extension, "SPV_KHR_maximal_reconvergence");
     b.putv(b.exts, Op_Extension, extension);
     b.put(b.exec, Op_ExecutionMode, {b.f_main, 6023});
-    extension.clear(); b.pstr(extension, "SPV_KHR_quad_control");
+    extension.clear();
+    b.pstr(extension, "SPV_KHR_quad_control");
     b.putv(b.exts, Op_Extension, extension);
     b.put(b.caps, Op_Capability, {5087});
     b.put(b.exec, Op_ExecutionMode, {b.f_main, 5089});
@@ -28,8 +30,8 @@ inline std::vector<uint32_t> native_readfirst_reference(uint32_t width, float th
     const auto entry = b.cur_block;
     const auto selected = b.id(), merge = b.id();
     const auto pixel_valid = whole_quad_mode ? b.btrue() : b.logical_not(b.helper_invocation());
-    const auto active = b.land(pixel_valid,
-        b.ucmp(Op_UGreaterThanEqual, x, b.uconst(fbits(threshold))));
+    const auto active =
+        b.land(pixel_valid, b.ucmp(Op_UGreaterThanEqual, x, b.uconst(fbits(threshold))));
     b.put(b.code, Op_SelectionMerge, {merge, 0});
     b.put(b.code, Op_BranchConditional, {active, selected, merge});
     b.emit_label(selected);

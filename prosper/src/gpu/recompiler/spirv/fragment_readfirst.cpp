@@ -13,7 +13,8 @@ bool require_reconvergence(SpirvCompute& b) {
     for (size_t pc = 0; pc < b.exec.size();) {
         const auto count = b.exec[pc] >> 16;
         if (!count || count > b.exec.size() - pc) return false;
-        if ((b.exec[pc] & 0xffffu) == Op_ExecutionMode && count == 3 && b.exec[pc + 1] == b.f_main) {
+        if ((b.exec[pc] & 0xffffu) == Op_ExecutionMode && count == 3 &&
+            b.exec[pc + 1] == b.f_main) {
             maximal |= b.exec[pc + 2] == kMaximallyReconvergesKHR;
             full_quads |= b.exec[pc + 2] == kRequireFullQuadsKHR;
         }
@@ -46,13 +47,15 @@ bool native_fragment(const SpirvCompute& b) {
 
 uint32_t fragment_collective_entry_exec(SpirvCompute& b) {
     if (!native_fragment_collective_retry_active() || !native_fragment(b) ||
-        !require_reconvergence(b)) return 0;
+        !require_reconvergence(b))
+        return 0;
     // Hardware starts in exact execution: helpers exist but do not own a valid pixel.
     return b.logical_not(b.helper_invocation());
 }
 uint32_t fragment_collective_wqm(SpirvCompute& b, uint32_t active) {
     if (!native_fragment_collective_retry_active() || !native_fragment(b) || !active ||
-        !require_reconvergence(b)) return 0;
+        !require_reconvergence(b))
+        return 0;
     const auto result = b.id();
     b.put(b.code, 5111, {b.t_bool, result, active}); // OpGroupNonUniformQuadAnyKHR
     return result;

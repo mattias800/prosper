@@ -7,19 +7,22 @@ void RenderReconvergenceDevice::note_extension(const char* name) {
     maximal_advertised_ |= std::strcmp(name, "VK_KHR_shader_maximal_reconvergence") == 0;
     quads_advertised_ |= std::strcmp(name, "VK_KHR_shader_quad_control") == 0;
 }
-RenderReconvergenceFeatures RenderReconvergenceDevice::prepare(
-    VkPhysicalDevice physical, VkDeviceCreateInfo& device, std::vector<const char*>& extensions,
-    PFN_vkGetPhysicalDeviceFeatures2 query) {
+RenderReconvergenceFeatures
+RenderReconvergenceDevice::prepare(VkPhysicalDevice physical, VkDeviceCreateInfo& device,
+                                   std::vector<const char*>& extensions,
+                                   PFN_vkGetPhysicalDeviceFeatures2 query) {
     RenderReconvergenceFeatures enabled;
     if (prepared_) return enabled;
     prepared_ = true;
     if (!physical || !query) return enabled;
 #ifdef VK_KHR_shader_maximal_reconvergence
     if (maximal_advertised_) {
-        VkPhysicalDeviceFeatures2 supported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &maximal_};
+        VkPhysicalDeviceFeatures2 supported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                                            &maximal_};
         query(physical, &supported);
         if (maximal_.shaderMaximalReconvergence) {
-            maximal_ = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MAXIMAL_RECONVERGENCE_FEATURES_KHR};
+            maximal_ = {
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MAXIMAL_RECONVERGENCE_FEATURES_KHR};
             maximal_.shaderMaximalReconvergence = VK_TRUE;
             maximal_.pNext = const_cast<void*>(device.pNext);
             device.pNext = &maximal_;

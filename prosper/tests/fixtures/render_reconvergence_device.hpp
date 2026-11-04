@@ -10,9 +10,11 @@ public:
     RenderReconvergenceDevice(const RenderReconvergenceDevice&) = delete;
     RenderReconvergenceDevice& operator=(const RenderReconvergenceDevice&) = delete;
     void note_extension(const char* name);
-    RenderReconvergenceFeatures prepare(VkPhysicalDevice physical, VkDeviceCreateInfo& device,
-        std::vector<const char*>& extensions,
-        PFN_vkGetPhysicalDeviceFeatures2 query = vkGetPhysicalDeviceFeatures2);
+    RenderReconvergenceFeatures
+    prepare(VkPhysicalDevice physical, VkDeviceCreateInfo& device,
+            std::vector<const char*>& extensions,
+            PFN_vkGetPhysicalDeviceFeatures2 query = vkGetPhysicalDeviceFeatures2);
+
 private:
 #ifdef VK_KHR_shader_maximal_reconvergence
     VkPhysicalDeviceShaderMaximalReconvergenceFeaturesKHR maximal_{

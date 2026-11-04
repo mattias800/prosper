@@ -221,14 +221,13 @@ std::optional<bool> Sop1Lowering::route_wqm_b32() {
         }
 
         const auto widened = fragment_collective_wqm(b, mask);
-        if (widened) {
-            mask = widened;
-        }
+        if (widened) { mask = widened; }
         // The separate SCC publication retains its existing refusal.
         rs.scc = 0;
         if (in.dst.value == 126) {
-            if (src_exec_lo) { if (widened) rs.exec = mask; }
-            else if (in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1) {
+            if (src_exec_lo) {
+                if (widened) rs.exec = mask;
+            } else if (in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1) {
                 rs.exec = b.btrue();
                 rs.exec_narrowed = false;
             } else {

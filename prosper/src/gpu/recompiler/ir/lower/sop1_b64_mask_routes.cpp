@@ -177,14 +177,16 @@ std::optional<bool> Sop1Lowering::route_b64_mask_ops() {
             uint32_t m = src_mask(in.src[0]);
             if (!m) { ok = false; return true; }
             const auto widened = fragment_collective_wqm(b, m);
-            if (widened) {
-                m = widened;
-            }
+            if (widened) { m = widened; }
             if (is_exec(in.dst)) {
-                if (is_exec(in.src[0])) { if (widened) rs.exec = m; }
-                else if (in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1) {
+                if (is_exec(in.src[0])) {
+                    if (widened) rs.exec = m;
+                } else if (in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1) {
                     rs.exec = b.btrue(); rs.exec_narrowed = false;      // exec = all lanes on
-                } else { rs.exec = m; rs.exec_narrowed = true; }        // replaced by a (maybe narrowed) mask
+                } else {
+                    rs.exec = m;
+                    rs.exec_narrowed = true;
+                }   // replaced by a (maybe narrowed) mask
             } else { rs.sreg_bool[in.dst.value] = m; rs.sreg_bool_narrowed[in.dst.value] = true;
                 mask_write_clobbers_pair(rs, in.dst.value);   // conservative: WQM widens
                 // Into VCC this is a VCC write, as it is for s_mov_b64 and s_not_b64

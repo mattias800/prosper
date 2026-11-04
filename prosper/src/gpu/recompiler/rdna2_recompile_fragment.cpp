@@ -527,7 +527,9 @@ std::vector<uint32_t> recompile_fragment_impl(
                 b.flat_attrs.insert(in.vintrp_attr);
         }
     }
-    RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse();
+    RegState rs;
+    rs.vcc = b.bfalse();
+    rs.scc = b.bfalse();
     const auto native_exec = fragment_collective_entry_exec(b);
     rs.exec = native_exec ? native_exec : b.btrue();
     rs.exec_narrowed = native_exec != 0;

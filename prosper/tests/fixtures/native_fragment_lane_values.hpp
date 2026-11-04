@@ -26,8 +26,11 @@ native_fragment_lane_values(const std::vector<uint32_t>& module, const std::vect
     for (uint32_t lane = 0; lane < x.size(); ++lane) {
         auto [state, sink] = native_fragment_lane(
             vm, {},
-            {{15, {std::bit_cast<uint32_t>(x[lane]), 0x3f000000u, 0, 0x3f800000u}},
-             {23, {helpers.empty() ? 0u : uint32_t(helpers[lane]), 0, 0, 0}}, {41, {lane, 0, 0, 0}},
+            {{15,
+              {std::bit_cast<uint32_t>(x[lane]), std::bit_cast<uint32_t>((lane & 2u) ? 1.5f : 0.5f),
+               0, 0x3f800000u}},
+             {23, {helpers.empty() ? 0u : uint32_t(helpers[lane]), 0, 0, 0}},
+             {41, {lane, 0, 0, 0}},
              {36, {static_cast<uint32_t>(x.size()), 0, 0, 0}}});
         lanes.push_back(std::move(state));
         output = sink;
@@ -35,7 +38,10 @@ native_fragment_lane_values(const std::vector<uint32_t>& module, const std::vect
     native_fragment_subgroup(vm, lanes);
     std::vector<std::array<uint32_t, 4>> results;
     for (size_t index = 0; index < lanes.size(); ++index) {
-        if (!helpers.empty() && helpers[index]) { results.push_back({}); continue; }
+        if (!helpers.empty() && helpers[index]) {
+            results.push_back({});
+            continue;
+        }
         auto& lane = lanes[index];
         const auto& memory = lane.memory.at(output);
         if (memory.words.size() != 4 ||

@@ -10,7 +10,8 @@
 namespace prosper::test::native_fragment_readfirst {
 using Words = std::vector<uint32_t>;
 inline Words program(bool first = true, bool high = false, float threshold = 2.5f,
-                     bool marker = true, bool whole_quad_mode = false, bool wave32 = false) {
+                     bool marker = true, bool whole_quad_mode = false, bool wave32 = false,
+                     bool wqm_current = false) {
     const Words first_ordinary{
         0x7e0e037fu, 0xd7600028u, 0x00010107u, 0x7d840e28u, 0xbe94047eu, 0x7d8600ffu,
         0x40200000u, 0xbefe046au, 0x7e100500u, 0xbefe0414u, 0x7e040208u, 0x100404ffu,
@@ -36,6 +37,7 @@ inline Words program(bool first = true, bool high = false, float threshold = 2.5
     const auto at = std::find(code.begin(), code.end(), 0x40200000u);
     if (at == code.end()) throw std::runtime_error("missing fixture threshold");
     *at = std::bit_cast<uint32_t>(threshold);
+    if (wqm_current) code.insert(code.begin() + 8, wave32 ? 0xbefe097eu : 0xbefe0a7eu);
     if (whole_quad_mode) code.insert(code.begin() + 4, wave32 ? 0xbefe097eu : 0xbefe0a7eu);
     if (!marker) code.erase(code.begin(), code.begin() + 4);
     return code;

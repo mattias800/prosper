@@ -113,24 +113,33 @@ void helper_witness(bool whole_quad) {
     for (bool wave32 : {true, false}) {
         const auto width = wave32 ? 32u : 64u;
         std::vector<float> x(width, 7.5f);
-        x[0] = x[2] = 2.5f; x[1] = x[3] = 3.5f;
-        std::vector<bool> helpers(width, false); helpers[0] = helpers[2] = true;
-        const auto result = input::compile(fixture::program(true, false, 0, true, whole_quad, wave32),
-                                            fixture::mapping(), wave32);
+        x[0] = x[2] = 2.5f;
+        x[1] = x[3] = 3.5f;
+        std::vector<bool> helpers(width, false);
+        helpers[0] = helpers[2] = true;
+        const auto result = input::compile(
+            fixture::program(true, false, 0, true, whole_quad, wave32), fixture::mapping(), wave32);
         ASSERT_FALSE(result.module.empty()) << result.reason;
         const auto values = prosper::test::native_fragment_lane_values(result.module, x, helpers);
         const auto wanted = std::bit_cast<uint32_t>((whole_quad ? 2.5f : 3.5f) / 8.0f);
-        for (size_t lane = 0; lane < width; ++lane) if (!helpers[lane])
-            EXPECT_EQ(values[lane], (std::array<uint32_t, 4>{wanted, wanted, wanted, 0x3f800000u}));
+        for (size_t lane = 0; lane < width; ++lane)
+            if (!helpers[lane])
+                EXPECT_EQ(values[lane],
+                          (std::array<uint32_t, 4>{wanted, wanted, wanted, 0x3f800000u}));
     }
 }
+}   // namespace
+TEST(NativeFragmentReadfirst, InitialExecExcludesHelpersInBothNativeWidths) {
+    helper_witness(false);
 }
-TEST(NativeFragmentReadfirst, InitialExecExcludesHelpersInBothNativeWidths) { helper_witness(false); }
-TEST(NativeFragmentReadfirst, ExplicitWqmIncludesHelpersInBothNativeWidths) { helper_witness(true); }
+TEST(NativeFragmentReadfirst, ExplicitWqmIncludesHelpersInBothNativeWidths) {
+    helper_witness(true);
+}
 
 TEST(NativeFragmentReadfirst, KilledInvocationsCannotFabricateAnOutputInTheInterpreter) {
     using namespace prosper::gpu;
-    SpirvCompute b; b.begin_fragment(nullptr, 1);
+    SpirvCompute b;
+    b.begin_fragment(nullptr, 1);
     b.discard_unless(b.bfalse());
     b.export_color(0, b.uconst(0), b.uconst(0), b.uconst(0), b.uconst(0x3f800000u));
     try {
@@ -138,5 +147,45 @@ TEST(NativeFragmentReadfirst, KilledInvocationsCannotFabricateAnOutputInTheInter
         FAIL() << "all invocations were killed before the output store";
     } catch (const std::runtime_error& error) {
         EXPECT_STREQ(error.what(), "undefined native fragment output");
+    }
+}
+
+TEST(NativeFragmentReadfirst, WqmWidensOnlyTheSelectedQuadAndRetainsTheHighHalf) {
+    for (bool wave32 : {true, false}) {
+        const auto width = wave32 ? 32u : 64u, base = wave32 ? 16u : 36u;
+        std::vector<float> x(width);
+        for (size_t lane = 0; lane < width; ++lane) x[lane] = (lane & 1u) ? 1.5f : 0.5f;
+        x[base] = x[base + 2] = 6.5f;
+        x[base + 1] = x[base + 3] = 7.5f;
+        std::vector<bool> helpers(width, false);
+        helpers[base] = helpers[base + 2] = true;
+        const auto result =
+            input::compile(fixture::program(true, false, 7.5f, true, false, wave32, true),
+                           fixture::mapping(), wave32);
+        ASSERT_FALSE(result.module.empty()) << result.reason;
+        const auto values = prosper::test::native_fragment_lane_values(result.module, x, helpers);
+        const auto wanted = std::bit_cast<uint32_t>(6.5f / 8.0f);
+        for (size_t lane = 0; lane < width; ++lane)
+            if (!helpers[lane])
+                EXPECT_EQ(values[lane],
+                          (std::array<uint32_t, 4>{wanted, wanted, wanted, 0x3f800000u}));
+    }
+}
+
+TEST(NativeFragmentReadfirst, WholeWaveAnyHarnessDistinguishesTheIndependentlyChosenHighLane) {
+    using namespace prosper::gpu;
+    for (uint32_t width : {32u, 64u}) {
+        SpirvCompute b;
+        b.wave_size = width;
+        b.begin_fragment(nullptr, 1);
+        const auto any =
+            b.fragment_wave_any(b.ucmp(Op_IEqual, b.subgroup_local_id(), b.uconst(37)));
+        const auto color = b.sel(any, b.uconst(0x3f800000u), b.uconst(0));
+        b.export_color(0, color, b.uconst(0), b.uconst(0), b.uconst(0x3f800000u));
+        const auto values =
+            prosper::test::native_fragment_lane_values(b.finish(), std::vector<float>(width, 0.5f));
+        const auto wanted = width == 64 ? 0x3f800000u : 0u;
+        for (const auto& pixel : values)
+            EXPECT_EQ(pixel, (std::array<uint32_t, 4>{wanted, 0, 0, 0x3f800000u}));
     }
 }

@@ -7,12 +7,14 @@
 #include <cstdio>
 
 namespace prosper::test {
-bool render_reconvergence_supported(const std::vector<uint32_t>& module, RenderReconvergenceFeatures enabled,
-                                    uint64_t program, uint64_t identity) {
+bool render_reconvergence_supported(const std::vector<uint32_t>& module,
+                                    RenderReconvergenceFeatures enabled, uint64_t program,
+                                    uint64_t identity) {
     const auto requirement = gpu::fragment_spirv_reconvergence(module);
     const auto bits = static_cast<uint32_t>(requirement);
-    if (requirement != gpu::FragmentReconvergence::Malformed &&
-        (!(bits & 1u) || enabled.maximal) && (!(bits & 2u) || enabled.full_quads)) return true;
+    if (requirement != gpu::FragmentReconvergence::Malformed && (!(bits & 1u) || enabled.maximal) &&
+        (!(bits & 2u) || enabled.full_quads))
+        return true;
     struct Refusal {
         uint64_t program = 0, identity = 0;
         gpu::FragmentReconvergence reason = gpu::FragmentReconvergence::None;
