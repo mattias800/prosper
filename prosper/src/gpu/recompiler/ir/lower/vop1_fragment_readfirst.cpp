@@ -1,6 +1,7 @@
 #include "gpu/recompiler/ir/lower/vop1_fragment_readfirst.hpp"
 #include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include "gpu/recompiler/rdna2_scalar_exec_scopes.hpp"
 #include "gpu/recompiler/spirv/fragment_reconvergence.hpp"
 
 namespace prosper::gpu::ir {
@@ -17,6 +18,9 @@ uint32_t native_fragment_readfirst(SpirvCompute& b, const RegState& rs, const Rd
         in.has_modifier || in.has_sdwa || in.has_dpp || in.src_abs[0] || in.src_neg[0] ||
         in.clamp || in.omod)
         return 0;
+    // The existing closed local-index waterfall already has an exact lane-local lowering.
+    // Leave its admitted retry modules unchanged as well as strict successful modules.
+    if (scalar_scope_local_index_waterfall(b, in)) return 0;
     return fragment_readfirst_value(b, source, rs.exec);
 }
 } // namespace prosper::gpu::ir
