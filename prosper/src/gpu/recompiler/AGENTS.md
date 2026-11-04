@@ -580,3 +580,7 @@ Those dependencies report `unproved-strong-read` and stay Hard.
 
 `rdna2_cfg_descriptor_sregs` inventories direct entry descriptors separately from scalar SSA
 storage. The dispatcher retains its existing per-path retirement; this helper grants no input.
+
+The native fragment READFIRST retry now has a real current-EXEC broadcast in `spirv/`, selected
+by `ir/lower/vop1_fragment_readfirst`. The module declares maximal reconvergence for ordinary
+helper participation; its physical wave contract and ordinary Hard input guards stay separate.

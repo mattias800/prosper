@@ -15,8 +15,8 @@ register data; absent workers retain the output sentinel.
 `native_pixel_parameter` owns the LLVM-assembled entry/interpolation/reused-SGPR program.
 `native_fragment_spirv_oracle` executes unmodified native fragment modules through the integer
 VM with explicit location/builtin words and defined outputs. Its fixed READLANE witness declares
-a complete active native subgroup with uniform fixture inputs; other collectives, partial or
-divergent subgroups and missing resources fail. It supplies no quad/raster packing authority.
+a complete active native subgroup; fixed-lane shuffle and ballot are supported. Other
+collectives, partial or divergent subgroups and missing resources fail. It supplies no quad/raster packing authority.
 The device witness uses real rasterized inputs.
 
 `gta5_compute_cfg_fixture` keeps the complete frozen pc232 program and its separate, explicitly
@@ -273,3 +273,10 @@ Planning and shared write-proof time are nested in resource setup, outside per-b
 expected OOB observations shared by compiler and GPU execution tests. It grants no launch value.
 
 `render_topology.h` is the renderer's private same-TU topology-class companion.
+
+`native_fragment_readfirst` and `native_fragment_lane_values` own explicit current-EXEC and
+per-lane Input witnesses. The subgroup adapter also executes ballot in a complete cohort;
+`native_readfirst_reference` supplies the independent device BroadcastFirst/reduction oracle.
+`render_reconvergence_device` retains its queried feature in the actual device-create chain.
+`render_reconvergence_shader` gates cold module creation on the enabled feature; cache hits
+do not scan the module. Its bounded diagnostic state has one definition in its source.

@@ -6,6 +6,7 @@
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "gpu/recompiler/ir/lower/vop1_integer_lowering.hpp"
+#include "gpu/recompiler/ir/lower/vop1_fragment_readfirst.hpp"
 #include "gpu/recompiler/ir/lower/vop1_output_modifiers.hpp"
 #include "gpu/recompiler/ir/lower/vop1_conversion_lowering.hpp"
 #include "gpu/recompiler/ir/lower/vop1_float_source.hpp"
@@ -47,22 +48,21 @@ bool Vop1CaseRoutes::lower() {
 
 std::optional<bool> Vop1CaseRoutes::early_routes(uint32_t& a) {
     if (in.opcode == 0x02) {   // v_readfirstlane_b32: SGPR dst = value of the lowest active lane
-        if (refuse_arbitrary_scalar_publication(b, rs, in)) {
+        const auto broadcast = native_fragment_readfirst(b, rs, in, a);
+        if (!broadcast && refuse_arbitrary_scalar_publication(b, rs, in)) {
             ok = false;
             return true;
         }
-        // Cross-lane broadcast. Our per-lane scalar model has no cross-lane reduction, so we use
-        // THIS lane's value. SPECULATIVE(confidence: med): exact only when src0 is wave-uniform —
-        // which is the standard use (reading a uniformly-computed VGPR into an SGPR, e.g. the
-        // integer-divide reciprocal in the game's shaders). Writes an SGPR, not a VGPR.
-        rs.sreg[in.dst.value] = a;
+        // The native service supplies one actual subgroup value. The legacy fallback still uses
+        // this lane's value, exact only for an agreeing source; the retry guard owns that proof.
+        rs.sreg[in.dst.value] = broadcast ? broadcast : a;
         rs.sreg_srt.erase(in.dst.value);
         retire_scalar_data_word_mask(rs, in.dst.value);
-        // #3596: record that this scalar is NOT wave-uniform. The value above is one lane's,
+        // #3596: the legacy scalar is NOT wave-uniform. Its value above is one lane's,
         // so any later proof that reasons "it is in an SGPR, therefore it broadcasts" is
         // wrong about it. Tainting the SSA value rather than the register makes the taint
         // survive scalar copies for free.
-        rs.lane_local_scalars.insert(a);
+        if (!broadcast) rs.lane_local_scalars.insert(a);
         return true;
     }
     if (in.opcode == kVop1OpcodeMovreldB32) {   // VGPR[VDST + M0] = SRC0

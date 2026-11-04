@@ -135,4 +135,5 @@ struct RenderVkCtx {
         VK_NULL_HANDLE;   // dedicated 2nd queue when the family has >=2, else == queue
     bool present_queue_shared =
         false;   // present_queue aliases the render queue -> submits need a mutex
+    bool shader_maximal_reconvergence = false;   // enabled, not merely advertised
 };

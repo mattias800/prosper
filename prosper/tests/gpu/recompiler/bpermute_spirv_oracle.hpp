@@ -890,6 +890,11 @@ struct Interpreter {
                   {a[3] == 38 ? std::min(x.words[0], y.words[0])
                               : std::max(x.words[0], y.words[0])},
                   x.defined && y.defined);
+          } else if (a[3] == 73) {
+              if (a.size() != 5 || !int_type(a[0])) fail("FindILsb result type mismatch");
+              const auto bit =
+                  x.words[0] ? static_cast<uint32_t>(std::countr_zero(x.words[0])) : UINT32_MAX;
+              set(l, a[1], a[0], {bit}, x.defined);
           } else if (a[3] == 75) {
               if (a.size() != 5 || ty(a[0]).op != 21 || ty(a[0]).a != std::vector<uint32_t>{32, 1})
                   fail("FindUMsb result type mismatch");

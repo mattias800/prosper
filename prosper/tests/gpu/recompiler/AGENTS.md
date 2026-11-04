@@ -493,3 +493,8 @@ their independent bounds and root contracts.
 
 The native VCC expression proof also follows backedges into PC0; supplied entry words do not
 hide later vector publications. Complete per-iteration overwrites retain their execution control.
+
+`test_native_fragment_readfirst` observes native scalar publication in complete independently
+owned 32/64-lane cohorts, including upper-half, empty-EXEC and numeric VCC destinations.
+Fixed-lane controls, explicit ballot/scan expectations and a real missing launch input keep
+the interpreter and input boundaries separate from the new broadcast.

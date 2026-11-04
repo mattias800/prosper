@@ -50,3 +50,7 @@ enforces the contents.
 `tools/refactor/outline_methods.py` performs the move and routes by name; its `--group` patterns
 are how a method lands here, and it **refuses** a method matching no group rather than filling a
 default bucket. A file called `misc` would undo the point of the folder.
+
+`fragment_readfirst` emits the native fragment current-EXEC broadcast, including empty EXEC.
+`fragment_reconvergence` names its module execution-mode requirement; Vulkan device support
+remains the renderer's responsibility, and these helpers provide no missing register inputs.

@@ -1,5 +1,6 @@
 // Private same-TU companion, included inside prosper::test.
 #pragma once
+// clang-format off: byte-identical mechanical move.
 inline VkPrimitiveTopology pipeline_topology_class(VkPrimitiveTopology topology) {
     // Dynamic topology is core, but unrestricted changes BETWEEN topology classes are not.
     // Retain the class on every device rather than depending on extended_dynamic_state3.
@@ -19,3 +20,4 @@ inline VkPrimitiveTopology pipeline_topology_class(VkPrimitiveTopology topology)
         return topology; // points, patches, and unknown values stay distinct
     }
 }
+// clang-format on

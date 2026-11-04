@@ -32,6 +32,8 @@
 #include "diagnostics/readback_refusal.hpp"        // selected early refusals, without changing authority
 #include "diagnostics/perf/perf_ledger.hpp"         // #3891: always-on alarm ledger
 #include "diagnostics/perf/wave64_refusal.hpp"
+#include "render_reconvergence_device.hpp"
+#include "render_reconvergence_shader.hpp"
 #include "gpu/recompiler/spirv_fragment_vote_lowering.hpp"
 #include "gpu/recompiler/raster_quad_collector.hpp"
 #include "gpu/recompiler/original_fragment_producer.hpp"
@@ -1211,6 +1213,8 @@ inline const RenderVkCtx& render_vk_ctx() {
         // OpImageRead OOB must return zero (#131); enable robustImageAccess when supported.
         // Only features not promoted to core still require extension names below.
         std::vector<const char*> dev_exts;
+        RenderReconvergenceDevice reconvergence_device;
+        bool reconvergence_advertised = false;
         VkPhysicalDeviceImageRobustnessFeatures irf{};
         VkPhysicalDeviceRobustness2FeaturesEXT robust2_features{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
@@ -1337,6 +1341,8 @@ inline const RenderVkCtx& render_vk_ctx() {
           std::vector<VkExtensionProperties> de(ne);
           vkEnumerateDeviceExtensionProperties(r.phys, nullptr, &ne, de.data());
           for (uint32_t i = 0; i < ne; i++) {
+              if (!strcmp(de[i].extensionName, "VK_KHR_shader_maximal_reconvergence"))
+                  reconvergence_advertised = true;
               if (prosper::gpu::breadcrumbs_requested()) {
                   if (const char* name = breadcrumb_support.note_extension(de[i].extensionName))
                       dev_exts.push_back(name);
@@ -1467,9 +1473,12 @@ inline const RenderVkCtx& render_vk_ctx() {
               }
 #endif
           } }
+        const bool reconvergence_enabled =
+            reconvergence_device.prepare(r.phys, reconvergence_advertised, dci, dev_exts);
         dci.enabledExtensionCount = (uint32_t)dev_exts.size();
         dci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
         if (vkCreateDevice(r.phys, &dci, nullptr, &r.dev) != VK_SUCCESS || !r.dev) return r;
+        r.shader_maximal_reconvergence = reconvergence_enabled;
         r.shader_int64_enabled = feats.shaderInt64;
         if (prosper::gpu::breadcrumbs_requested())
             prosper::gpu::breadcrumb_arm_device(r.dev, r.phys, breadcrumb_support,
@@ -9253,10 +9262,15 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     // fragment identity would be worse than not naming it, because a wrong name in a capture reads
     // as a fact. The geometry stage carries no identity counter of its own, so it names itself by
     // digest alone rather than borrowing a neighbour's.
-    auto mkmod = [&](const std::vector<uint32_t>& c, const char* stage,
-                     uint64_t identity) -> VkShaderModule {
+    auto mkmod = [&](const std::vector<uint32_t>& c, const char* stage, uint64_t identity,
+                     uint64_t program = 0) -> VkShaderModule {
+        if (stage[0] == 'f' &&
+            !render_reconvergence_supported(c, ctx.shader_maximal_reconvergence, program, identity))
+            return VK_NULL_HANDLE;
         VkShaderModuleCreateInfo s{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        s.codeSize = c.size() * 4; s.pCode = c.data(); VkShaderModule m = VK_NULL_HANDLE;
+        s.codeSize = c.size() * 4;
+        s.pCode = c.data();
+        VkShaderModule m = VK_NULL_HANDLE;
         // #3210 case 3, the mild one: the result was discarded, but `m` is initialized above and
         // the caller already skips the draw on `!v.vs || !v.fs`. Only the report is new -- the
         // control flow is deliberately unchanged.
@@ -9268,7 +9282,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
                 dev, VK_OBJECT_TYPE_SHADER_MODULE, (uint64_t)m,
                 "guest %s id=%llu spv=%016llx", stage, (unsigned long long)identity,
                 (unsigned long long)prosper::gpu::vk_name_spirv_digest(c.data(), c.size()));
-        return m; };
+        return m;
+    };
     // Per-draw Vulkan objects stay alive until the call or explicit submission batch completes.
     const auto timing_target_ready = timing_enabled ? TimingClock::now() : TimingClock::time_point{};
     constexpr size_t kMaxDescriptorSets = 8;
@@ -12881,7 +12896,8 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
             }
             v.vs = mkmod(bd_vs, bd.mesh_draw ? "ms" : "vs", bd.vs_identity);
             v.gs = bd_gs.empty() ? VK_NULL_HANDLE : mkmod(bd_gs, "gs", 0);
-            v.fs = mkmod(*effective_fs, fragment_votes_lowered ? "fs-proven" : "fs", bd.fs_identity);
+            v.fs = mkmod(*effective_fs, fragment_votes_lowered ? "fs-proven" : "fs", bd.fs_identity,
+                         bd.fs_guest_addr);
             if (backend_trace) {
                 fprintf(stderr,
                         "[backend-trace] draw=%zu create-shaders end vs=%p gs=%p fs=%p\n",

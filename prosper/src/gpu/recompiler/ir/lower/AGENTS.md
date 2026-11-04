@@ -62,3 +62,6 @@ diagnostic selection and refusal order remain together, while descriptor lookup 
 `carry_mask_write` owns carry destinations' mask-domain state as well as their current predicate.
 Wave32 writes one word and preserves an independent VCC high word; Wave64 implicit writes retire
 both old numeric words before publishing the new VCC lifetime. Arithmetic stays in `ops/vector_carry`.
+
+`vop1_fragment_readfirst` selects the real native fragment broadcast during guarded retries.
+The legacy route and its publication guard retain other execution domains and instruction forms.
