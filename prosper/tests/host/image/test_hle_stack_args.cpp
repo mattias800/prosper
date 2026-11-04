@@ -14,6 +14,12 @@
 
 using namespace prosper;
 
+// Assembly names these C symbols directly; their definitions need global C scope.
+extern "C" {
+uint64_t prosper_test_hle_entry_rsp_mod16 = ~uint64_t{0};
+uint64_t prosper_test_hle_entry_rsp = 0;
+}
+
 namespace {
 
 constexpr uint64_t kArgs[10] = {
@@ -24,10 +30,6 @@ constexpr uint64_t kArgs[10] = {
 };
 constexpr uint64_t kReturn = 0xabcddcba01234567ull;
 uint64_t g_seen[10] = {};
-extern "C" {
-uint64_t prosper_test_hle_entry_rsp_mod16 = ~uint64_t{0};
-uint64_t prosper_test_hle_entry_rsp = 0;
-}
 uint64_t g_immediate_return = 0;
 uint64_t g_guest_return = 0;
 bool g_handler_finished = false;
