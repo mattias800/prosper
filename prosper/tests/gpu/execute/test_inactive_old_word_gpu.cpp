@@ -1,5 +1,6 @@
 // Mutation: refusing or zeroing a pure masked overwrite loses its independently expected pixels.
 #include "fixtures/inactive_old_word.hpp"
+#include "fixtures/native_pixel_parameter.hpp"
 #include "fixtures/render_runner.h"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <gtest/gtest.h>

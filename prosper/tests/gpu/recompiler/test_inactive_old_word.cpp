@@ -1,9 +1,9 @@
 // Mutations: charge inactive preservation as an active read, or forget its missing outside lanes.
 #include "fixtures/inactive_old_word.hpp"
 #include "fixtures/inactive_old_word_values.hpp"
+#include "fixtures/native_pixel_parameter.hpp"
 #include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
 #include <gtest/gtest.h>
-#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstddef>
