@@ -86,6 +86,23 @@ void retain_dropped_definition(PlaceholderRoots& roots, const detail::Placeholde
         work.insert(work.end(), predecessors.begin(), predecessors.end());
     }
 }
+
+bool inactive_destination_is_retained(const SpirvCompute& b, const RegState& rs,
+                                      const Rdna2Inst& in, int reg) {
+    // Ordinary predicated writes retain an SSA word, not the WRITELANE slot representation.
+    if (rs.vgpr_lane_slots.contains(reg) || rs.vgpr_lane_mask_slots.contains(reg)) return false;
+    const auto value = rs.vreg.find(reg);
+    if (value != rs.vreg.end() && value->second) return true;
+    const auto* program = rs.placeholder_origin_program ? rs.placeholder_origin_program.get()
+                                                        : b.placeholder_origin_program.get();
+    if (!program) return false;
+    PlaceholderRoots dropped;
+    retain_dropped_definition(dropped, detail::PlaceholderOriginTrace(*program), in.pc,
+                              {PlaceholderFile::Vector, reg});
+    // A never-written word can keep its existing placeholder outside EXEC. A reaching computed
+    // value whose SSA was discarded cannot: replacing that value with zero loses real state.
+    return dropped.empty();
+}
 }   // namespace
 
 bool refuse_arbitrary_placeholder_operand(SpirvCompute& b, const RegState& rs, const Rdna2Inst& in,
@@ -157,9 +174,8 @@ bool refuse_arbitrary_placeholder_old_destination(SpirvCompute& b, const RegStat
                                       (in.opcode == 1 || in.opcode == 2);
     const bool lane_wise = !in.has_modifier && !in.has_dpp &&
                            rdna2_valu_lane_mapped(in.fmt, in.opcode) == Rdna2Answer::Yes;
-    if ((native_interpolation || lane_wise) &&
-        !vector_write_depends_on_old_word(in, /*full_exec=*/true))
-        return false;
+    const bool inactive_only = (native_interpolation || lane_wise) &&
+                               !vector_write_depends_on_old_word(in, /*full_exec=*/true);
     // Partial words and accumulators consume the old word in active lanes. Pure inactive-lane
     // preservation keeps its existing placeholder and Hard outside-EXEC marks; the later reader
     // must still stay inside the actual complete writer's cohort. It supplies no missing input.
@@ -168,9 +184,8 @@ bool refuse_arbitrary_placeholder_old_destination(SpirvCompute& b, const RegStat
     const int maximum =
         b.compute_allocated_vgprs ? static_cast<int>(b.compute_allocated_vgprs - 1) : 255;
     for_each_possible_vector_write(in, maximum, [&](int reg) {
-        if (!refused)
-            refused =
-                refuse_arbitrary_placeholder_operand(b, rs, in, {OperandKind::VGPR, reg}, &ok);
+        if (refused || (inactive_only && inactive_destination_is_retained(b, rs, in, reg))) return;
+        refused = refuse_arbitrary_placeholder_operand(b, rs, in, {OperandKind::VGPR, reg}, &ok);
     });
     return refused;
 }
