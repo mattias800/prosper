@@ -1,3 +1,5 @@
+#include <cstdint>
+#include <vector>
 #include "gpu/recompiler/spirv/fragment_reconvergence.hpp"
 #include <cstddef>
 

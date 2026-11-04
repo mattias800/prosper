@@ -1,5 +1,6 @@
 #pragma once
 // Explicit complete native subgroups with independently owned per-lane FragCoord.x values.
+#include "gpu/recompiler/bpermute_spirv_oracle.hpp"
 #include "fixtures/native_fragment_spirv_oracle.hpp"
 #include <algorithm>
 #include <array>

@@ -1,5 +1,8 @@
 // Mutation: retaining lane-local READFIRST produces a per-pixel x ramp instead of one
 // scalar colour. Compare an independent divergent BroadcastFirst/reduction on the same raster.
+#include "fixtures/native_pixel_parameter.hpp"
+#include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
+#include <cstddef>
 #include "fixtures/native_fragment_readfirst.hpp"
 #include "fixtures/native_readfirst_reference.hpp"
 #include "fixtures/render_runner.h"

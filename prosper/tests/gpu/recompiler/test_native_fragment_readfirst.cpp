@@ -1,5 +1,6 @@
 // Mutation: keep the legacy lane-local READFIRST instead of the current-EXEC broadcast.
 // A varying genuine Input must publish one value even to currently inactive guest lanes.
+#include "fixtures/native_pixel_parameter.hpp"
 #include "fixtures/native_fragment_lane_values.hpp"
 #include "fixtures/native_fragment_readfirst.hpp"
 #include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"

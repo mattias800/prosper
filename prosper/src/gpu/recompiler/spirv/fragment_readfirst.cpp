@@ -1,4 +1,5 @@
 // AMD 70648 12.8: choose the lowest EXEC lane, or lane zero when EXEC is empty.
+#include <cstdint>
 #include "gpu/recompiler/spirv/fragment_reconvergence.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <cstddef>

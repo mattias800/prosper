@@ -1,3 +1,5 @@
+#include <cstdint>
+#include <vector>
 #include "fixtures/render_reconvergence_shader.hpp"
 #include "gpu/recompiler/spirv/fragment_reconvergence.hpp"
 #include <array>

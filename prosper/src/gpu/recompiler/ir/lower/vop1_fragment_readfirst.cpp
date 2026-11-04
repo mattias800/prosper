@@ -1,3 +1,5 @@
+#include "gpu/recompiler/rdna2_decode.hpp"
+#include <cstdint>
 #include "gpu/recompiler/ir/lower/vop1_fragment_readfirst.hpp"
 #include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"

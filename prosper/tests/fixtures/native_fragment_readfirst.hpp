@@ -1,7 +1,7 @@
 #pragma once
 // LLVM gfx1030: a genuine per-lane POS_X input must become one current-EXEC scalar value.
 // The independent unloaded READLANE/compare requests the guarded retry before READFIRST.
-#include "fixtures/native_pixel_parameter.hpp"
+#include "gpu/recompiler/rdna2_to_spirv.hpp"
 #include <algorithm>
 #include <bit>
 #include <cstdint>

@@ -1,6 +1,7 @@
 #pragma once
 // Independent device oracle: native BroadcastFirst inside real shader divergence, followed by
 // an OR reduction at its merge. It uses neither the production ballot/index nor its shuffle.
+#include "gpu/recompiler/float_transport_config.hpp"
 #include "gpu/recompiler/rdna2_to_spirv_internal.hpp"
 #include <cstdint>
 #include <vector>

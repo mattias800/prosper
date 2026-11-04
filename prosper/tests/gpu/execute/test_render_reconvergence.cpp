@@ -1,4 +1,5 @@
 // Mutations: advertise without enabling the feature, or read a mode number from literal data.
+#include "fixtures/native_pixel_parameter.hpp"
 #include "fixtures/render_reconvergence_device.hpp"
 #include "fixtures/render_reconvergence_shader.hpp"
 #include "fixtures/native_fragment_readfirst.hpp"

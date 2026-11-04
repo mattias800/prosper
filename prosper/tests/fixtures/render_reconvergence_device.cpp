@@ -1,3 +1,4 @@
+#include <vector>
 #include "fixtures/render_reconvergence_device.hpp"
 
 namespace prosper::test {
