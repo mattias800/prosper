@@ -8,7 +8,9 @@
 #include <gtest/gtest.h>
 #include <array>
 #include <bit>
+#include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 

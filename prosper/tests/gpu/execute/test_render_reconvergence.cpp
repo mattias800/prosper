@@ -5,6 +5,7 @@
 #include "fixtures/native_fragment_readfirst.hpp"
 #include "gpu/recompiler/spirv/fragment_reconvergence.hpp"
 #include <gtest/gtest.h>
+#include <cstddef>
 #include <cstdint>
 #include <initializer_list>
 #include <vector>
