@@ -20,6 +20,8 @@ Wave64 subgroup, checking numeric VCC halves and both nested scalar branch outco
 `test_arbitrary_placeholder_exec` runs the real exact64 production compute backend and checks
 both initialized low lanes and retained arbitrary high lanes. It keeps the actual device
 subgroup-contract gate and rejects CPU-fill substitution.
+The masked MOV loop uses real scalar-buffer data and checks that the inactive half keeps its
+output sentinels while a future memory load supplies the backedge register.
 Runtime-relative bank cases retain provided or genuinely unloaded selected values and reject a
 lost provided candidate even when other possible candidates are unloaded.
 Aliased destinations also retain this check before their temporary map slot becomes a value.
@@ -56,3 +58,6 @@ independently of an earlier READFIRST publication on the backedge.
 `test_native_fragment_readfirst_gpu` compares real native fragment colours with an independent
 divergent BroadcastFirst/reduction module. `test_render_reconvergence` checks the actual feature
 request chain and the cold shader-module gate, including unsupported and malformed inputs.
+
+`test_inactive_old_word_gpu` observes native interpolation and arithmetic masked overwrites on
+a real attachment in both guest widths, with independent pixel values for active and kept lanes.
