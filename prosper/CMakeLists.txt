@@ -2796,6 +2796,10 @@ if(TARGET prosper_core)
     SOURCES tests/gpu/recompiler/test_native_fragment_readfirst.cpp
     INCLUDES src tests tests/gpu/recompiler
     LIBRARIES prosper_core)
+  prosper_add_gtest(test_inactive_old_word
+    SOURCES tests/gpu/recompiler/test_inactive_old_word.cpp
+    INCLUDES src tests tests/gpu/recompiler
+    LIBRARIES prosper_core)
   prosper_add_gtest(test_native_pixel_parameter
     SOURCES tests/gpu/recompiler/test_native_pixel_parameter.cpp
             tests/gpu/recompiler/test_native_parameter_tail.cpp
@@ -4052,6 +4056,11 @@ if(TARGET prosper_core)
       LIBRARIES prosper_core Vulkan::Vulkan)
     prosper_add_gtest(test_native_fragment_readfirst_gpu
       SOURCES tests/gpu/execute/test_native_fragment_readfirst_gpu.cpp
+      INCLUDES tests frontends
+      LIBRARIES prosper_core Vulkan::Vulkan
+      LABELS gpu PROPERTIES TIMEOUT 60)
+    prosper_add_gtest(test_inactive_old_word_gpu
+      SOURCES tests/gpu/execute/test_inactive_old_word_gpu.cpp
       INCLUDES tests frontends
       LIBRARIES prosper_core Vulkan::Vulkan
       LABELS gpu PROPERTIES TIMEOUT 60)

@@ -101,6 +101,14 @@ flip figure understates the difference.
 
 ## Ruled out
 
+- **"The later Hard v0 roots identify ordinary raw-barycentric source operands."** After #5550,
+  f0d's PC441 is P2 with source v1 and destination v0; 7b's PC1123 has sources s4/v10 and
+  destination v0. The named v0 comes from the old-destination preservation check. A synthetic
+  masked interpolation/arithmetic overwrite reproduces that refusal on `6b50722d0`, while
+  supplied-old-word, expanded-reader and intrinsic-old-input controls distinguish the boundary
+  ([#5523](https://github.com/mattias800/prosper/issues/5523)). This does not supply the real
+  raw launch inputs independently established in #5519.
+
 - **"Maximal reconvergence alone supplies the guest entry EXEC mask."** With real derivative
   helpers at a clipped edge, the broad native READFIRST attempt selected helper x=2.5 instead
   of live x=3.5 in both native widths. Exact entry EXEC must exclude helpers; explicit WQM

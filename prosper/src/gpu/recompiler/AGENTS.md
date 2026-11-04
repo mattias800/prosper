@@ -589,3 +589,8 @@ helper participation; its physical wave contract and ordinary Hard input guards 
 ordinary Arbitrary retry still refuses a scalar publication. It changes no successful old module.
 Its entry EXEC excludes helpers; full quads and maximal reconvergence make helper participation
 explicit, and native WQM widens the existing mask without adding SCC or physical-word authority.
+
+The Arbitrary old-destination guard separates active accumulator/partial-word reads from inactive
+preservation for plain lane-mapped writes and native interpolation. Existing cohort marks retain
+Hard outside lanes; a later expanded reader still requires the actual old input. Other memory
+and cross-lane forms keep their existing guard.

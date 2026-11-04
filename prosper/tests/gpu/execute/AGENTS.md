@@ -56,3 +56,6 @@ independently of an earlier READFIRST publication on the backedge.
 `test_native_fragment_readfirst_gpu` compares real native fragment colours with an independent
 divergent BroadcastFirst/reduction module. `test_render_reconvergence` checks the actual feature
 request chain and the cold shader-module gate, including unsupported and malformed inputs.
+
+`test_inactive_old_word_gpu` observes native interpolation and arithmetic masked overwrites on
+a real attachment in both guest widths, with independent pixel values for active and kept lanes.

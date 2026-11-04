@@ -152,8 +152,18 @@ bool refuse_arbitrary_placeholder_old_destination(SpirvCompute& b, const RegStat
         !vector_write_depends_on_old_word(in, !rs.exec_narrowed) ||
         rdna2_instruction_effects(in).lane_flow == Rdna2LaneFlow::WriteLane)
         return false;
-    // The existing predicate names actual old-word reads, including inactive lanes, partial
-    // words and accumulators. Lane-slot writers preserve their slot map, not ordinary SSA.
+    const bool native_interpolation = rs.vector_native_interpolation &&
+                                      in.fmt == Rdna2Format::VINTRP &&
+                                      (in.opcode == 1 || in.opcode == 2);
+    const bool lane_wise = !in.has_modifier && !in.has_dpp &&
+                           rdna2_valu_lane_mapped(in.fmt, in.opcode) == Rdna2Answer::Yes;
+    if ((native_interpolation || lane_wise) &&
+        !vector_write_depends_on_old_word(in, /*full_exec=*/true))
+        return false;
+    // Partial words and accumulators consume the old word in active lanes. Pure inactive-lane
+    // preservation keeps its existing placeholder and Hard outside-EXEC marks; the later reader
+    // must still stay inside the actual complete writer's cohort. It supplies no missing input.
+    // Lane-slot writers preserve their slot map, not ordinary SSA.
     bool refused = false;
     const int maximum =
         b.compute_allocated_vgprs ? static_cast<int>(b.compute_allocated_vgprs - 1) : 255;
