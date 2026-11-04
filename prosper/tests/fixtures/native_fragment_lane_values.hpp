@@ -6,15 +6,19 @@
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <cstddef>
 #include <stdexcept>
 #include <utility>
 #include <vector>
 
 namespace prosper::test {
 inline std::vector<std::array<uint32_t, 4>>
-native_fragment_lane_values(const std::vector<uint32_t>& module, const std::vector<float>& x) {
+native_fragment_lane_values(const std::vector<uint32_t>& module, const std::vector<float>& x,
+                            const std::vector<bool>& helpers = {}) {
     if (x.size() != 32 && x.size() != 64)
         throw std::runtime_error("fixture requires a complete 32/64-lane subgroup");
+    if (!helpers.empty() && helpers.size() != x.size())
+        throw std::runtime_error("fixture helper inventory has a different size");
     bpermute_oracle::Interpreter vm(module, 4);
     if (!vm.error.empty()) throw std::runtime_error(vm.error);
     std::vector<bpermute_oracle::Lane> lanes;
@@ -23,14 +27,16 @@ native_fragment_lane_values(const std::vector<uint32_t>& module, const std::vect
         auto [state, sink] = native_fragment_lane(
             vm, {},
             {{15, {std::bit_cast<uint32_t>(x[lane]), 0x3f000000u, 0, 0x3f800000u}},
-             {41, {lane, 0, 0, 0}},
+             {23, {helpers.empty() ? 0u : uint32_t(helpers[lane]), 0, 0, 0}}, {41, {lane, 0, 0, 0}},
              {36, {static_cast<uint32_t>(x.size()), 0, 0, 0}}});
         lanes.push_back(std::move(state));
         output = sink;
     }
     native_fragment_subgroup(vm, lanes);
     std::vector<std::array<uint32_t, 4>> results;
-    for (auto& lane : lanes) {
+    for (size_t index = 0; index < lanes.size(); ++index) {
+        if (!helpers.empty() && helpers[index]) { results.push_back({}); continue; }
+        auto& lane = lanes[index];
         const auto& memory = lane.memory.at(output);
         if (memory.words.size() != 4 ||
             !std::all_of(memory.valid.begin(), memory.valid.end(), [](bool v) { return v; }))

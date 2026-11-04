@@ -280,3 +280,7 @@ per-lane Input witnesses. The subgroup adapter also executes ballot in a complet
 `render_reconvergence_device` retains its queried feature in the actual device-create chain.
 `render_reconvergence_shader` gates cold module creation on the enabled feature; cache hits
 do not scan the module. Its bounded diagnostic state has one definition in its source.
+
+The native fragment interpreter accepts an explicit helper inventory, quad-any and whole-wave
+any votes, and terminates killed invocations. It still requires defined outputs from real pixels.
+The device contract owns both feature structs through creation and records each enabled feature.

@@ -7,12 +7,12 @@
 #include <cstdio>
 
 namespace prosper::test {
-bool render_reconvergence_supported(const std::vector<uint32_t>& module, bool device_enabled,
+bool render_reconvergence_supported(const std::vector<uint32_t>& module, RenderReconvergenceFeatures enabled,
                                     uint64_t program, uint64_t identity) {
     const auto requirement = gpu::fragment_spirv_reconvergence(module);
-    if (requirement == gpu::FragmentReconvergence::None ||
-        (requirement == gpu::FragmentReconvergence::Required && device_enabled))
-        return true;
+    const auto bits = static_cast<uint32_t>(requirement);
+    if (requirement != gpu::FragmentReconvergence::Malformed &&
+        (!(bits & 1u) || enabled.maximal) && (!(bits & 2u) || enabled.full_quads)) return true;
     struct Refusal {
         uint64_t program = 0, identity = 0;
         gpu::FragmentReconvergence reason = gpu::FragmentReconvergence::None;
@@ -27,11 +27,11 @@ bool render_reconvergence_supported(const std::vector<uint32_t>& module, bool de
     std::fprintf(
         stderr,
         "[fragment-reconvergence-refused] program=0x%llx identity=%llu reason=%s "
-        "shaderMaximalReconvergence=%d\n",
+        "shaderMaximalReconvergence=%d shaderQuadControl=%d\n",
         static_cast<unsigned long long>(program), static_cast<unsigned long long>(identity),
         requirement == gpu::FragmentReconvergence::Malformed ? "malformed-module"
                                                              : "device-feature-not-enabled",
-        static_cast<int>(device_enabled));
+        static_cast<int>(enabled.maximal), static_cast<int>(enabled.full_quads));
     return false;
 }
 } // namespace prosper::test

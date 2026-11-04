@@ -3,6 +3,7 @@
 // These routes still emit SPIR-V directly; they are the mask-domain and proof-carrying shapes the
 // IR does not model yet. Each returns nullopt when the instruction is not its shape.
 #include "gpu/recompiler/ir/lower/scalar_lowering_internal.hpp"
+#include "gpu/recompiler/spirv/fragment_reconvergence.hpp"
 
 namespace prosper::gpu::ir {
 
@@ -192,8 +193,8 @@ std::optional<bool> Sop1Lowering::route_saveexec_b32() {
 std::optional<bool> Sop1Lowering::route_wqm_b32() {
     if (b.allow_b32_masks && in.opcode == 0x09) {   // s_wqm_b32
         // Wave32 uses the low half of EXEC for the same whole-quad-mode idiom as
-        // s_wqm_b64.  In the per-invocation fragment model helper lanes are implicit, so
-        // widening is an identity on the tracked bool.  Keep this in the mask domain and
+        // s_wqm_b64. The legacy path keeps its implicit-helper identity; the isolated
+        // native collective retry below performs actual quad widening.  Keep this in the mask domain and
         // reject either high half; treating EXEC_LO as scalar data drops Astro's material
         // fragments before their first sample.
         const auto data_value_present = [&](int reg) {
@@ -219,11 +220,14 @@ std::optional<bool> Sop1Lowering::route_wqm_b32() {
             return true;
         }
 
-        // ISA SCC is a reduction over the whole resulting wave mask.  That value cannot be
-        // recovered from one invocation, so poison it exactly like s_wqm_b64 does.
+        const auto widened = fragment_collective_wqm(b, mask);
+        if (widened) {
+            mask = widened;
+        }
+        // The separate SCC publication retains its existing refusal.
         rs.scc = 0;
         if (in.dst.value == 126) {
-            if (src_exec_lo) { /* exec <- wqm(exec): tracked identity */ }
+            if (src_exec_lo) { if (widened) rs.exec = mask; }
             else if (in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1) {
                 rs.exec = b.btrue();
                 rs.exec_narrowed = false;

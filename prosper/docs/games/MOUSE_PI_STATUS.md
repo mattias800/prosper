@@ -101,6 +101,12 @@ flip figure understates the difference.
 
 ## Ruled out
 
+- **"Maximal reconvergence alone supplies the guest entry EXEC mask."** With real derivative
+  helpers at a clipped edge, the broad native READFIRST attempt selected helper x=2.5 instead
+  of live x=3.5 in both native widths. Exact entry EXEC must exclude helpers; explicit WQM
+  then widens it. A separate attempt preserves already accepted modules, and full-quad mode
+  makes the required helper participation explicit ([#5523](https://github.com/mattias800/prosper/issues/5523)).
+
 - **"The native READFIRST witness selects the first x strictly above its threshold."** Its
   assembled predicate is unsigned `threshold <= raw_x`, so equality participates. The first
   independent device reference used `>` and disagreed only at that boundary. Matching the

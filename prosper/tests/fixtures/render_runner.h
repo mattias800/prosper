@@ -1214,7 +1214,6 @@ inline const RenderVkCtx& render_vk_ctx() {
         // Only features not promoted to core still require extension names below.
         std::vector<const char*> dev_exts;
         RenderReconvergenceDevice reconvergence_device;
-        bool reconvergence_advertised = false;
         VkPhysicalDeviceImageRobustnessFeatures irf{};
         VkPhysicalDeviceRobustness2FeaturesEXT robust2_features{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
@@ -1341,8 +1340,7 @@ inline const RenderVkCtx& render_vk_ctx() {
           std::vector<VkExtensionProperties> de(ne);
           vkEnumerateDeviceExtensionProperties(r.phys, nullptr, &ne, de.data());
           for (uint32_t i = 0; i < ne; i++) {
-              if (!strcmp(de[i].extensionName, "VK_KHR_shader_maximal_reconvergence"))
-                  reconvergence_advertised = true;
+              reconvergence_device.note_extension(de[i].extensionName);
               if (prosper::gpu::breadcrumbs_requested()) {
                   if (const char* name = breadcrumb_support.note_extension(de[i].extensionName))
                       dev_exts.push_back(name);
@@ -1473,12 +1471,11 @@ inline const RenderVkCtx& render_vk_ctx() {
               }
 #endif
           } }
-        const bool reconvergence_enabled =
-            reconvergence_device.prepare(r.phys, reconvergence_advertised, dci, dev_exts);
+        const auto reconvergence_enabled = reconvergence_device.prepare(r.phys, dci, dev_exts);
         dci.enabledExtensionCount = (uint32_t)dev_exts.size();
         dci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
         if (vkCreateDevice(r.phys, &dci, nullptr, &r.dev) != VK_SUCCESS || !r.dev) return r;
-        r.shader_maximal_reconvergence = reconvergence_enabled;
+        r.fragment_reconvergence = reconvergence_enabled;
         r.shader_int64_enabled = feats.shaderInt64;
         if (prosper::gpu::breadcrumbs_requested())
             prosper::gpu::breadcrumb_arm_device(r.dev, r.phys, breadcrumb_support,
@@ -9265,7 +9262,7 @@ inline std::vector<uint8_t> render_draw_pass_rgba(std::span<const BackendDraw> d
     auto mkmod = [&](const std::vector<uint32_t>& c, const char* stage, uint64_t identity,
                      uint64_t program = 0) -> VkShaderModule {
         if (stage[0] == 'f' &&
-            !render_reconvergence_supported(c, ctx.shader_maximal_reconvergence, program, identity))
+            !render_reconvergence_supported(c, ctx.fragment_reconvergence, program, identity))
             return VK_NULL_HANDLE;
         VkShaderModuleCreateInfo s{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         s.codeSize = c.size() * 4;

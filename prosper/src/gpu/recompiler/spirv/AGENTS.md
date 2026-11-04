@@ -54,3 +54,6 @@ default bucket. A file called `misc` would undo the point of the folder.
 `fragment_readfirst` emits the native fragment current-EXEC broadcast, including empty EXEC.
 `fragment_reconvergence` names its module execution-mode requirement; Vulkan device support
 remains the renderer's responsibility, and these helpers provide no missing register inputs.
+
+The explicit native collective contract declares both required execution modes. Its real helper
+Input supplies exact entry EXEC; quad-any widens WQM and the separate SCC guard remains in force.

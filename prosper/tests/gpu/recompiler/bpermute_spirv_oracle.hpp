@@ -741,7 +741,7 @@ struct Interpreter {
       const auto &i = ins[l.pc];
       const auto &a = i.a;
       const uint32_t op = i.op;
-      if (op == 334 || op == 335 || op == 339 || op == 345) return;
+      if (op == 334 || op == 335 || op == 339 || op == 345 || op == 5111) return;
       if (op == 224) {
         if (a.size() != 3 || word(l, a[0]) != 2 || word(l, a[1]) != 2 ||
             (word(l, a[2]) & 0x108) != 0x108)
@@ -1083,6 +1083,9 @@ struct Interpreter {
                   break;
               }
           jump(l, target);
+      } else if (op == 252) {
+          if (!a.empty()) fail("bad fragment Kill");
+          l.done = true;
       } else if (op == 253)
           l.done = true;
       else if (op != 246 && op != 247 && op != 8 && op != 317 && op != 0)

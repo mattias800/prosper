@@ -584,3 +584,8 @@ storage. The dispatcher retains its existing per-path retirement; this helper gr
 The native fragment READFIRST retry now has a real current-EXEC broadcast in `spirv/`, selected
 by `ir/lower/vop1_fragment_readfirst`. The module declares maximal reconvergence for ordinary
 helper participation; its physical wave contract and ordinary Hard input guards stay separate.
+
+`rdna2_native_fragment_collectives` isolates an explicit native collective attempt after the
+ordinary Arbitrary retry still refuses a scalar publication. It changes no successful old module.
+Its entry EXEC excludes helpers; full quads and maximal reconvergence make helper participation
+explicit, and native WQM widens the existing mask without adding SCC or physical-word authority.

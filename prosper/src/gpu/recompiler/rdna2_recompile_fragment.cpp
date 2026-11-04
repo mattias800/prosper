@@ -1,4 +1,5 @@
 #include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
+#include "gpu/recompiler/spirv/fragment_reconvergence.hpp"
 #include "gpu/recompiler/rdna2_placeholder_origins.hpp"
 // rdna2_to_spirv.cpp — see rdna2_to_spirv.hpp. Internal SpirvCompute builder + the VALU translator.
 #include <atomic>
@@ -526,7 +527,10 @@ std::vector<uint32_t> recompile_fragment_impl(
                 b.flat_attrs.insert(in.vintrp_attr);
         }
     }
-    RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse(); rs.exec = b.btrue();
+    RegState rs; rs.vcc = b.bfalse(); rs.scc = b.bfalse();
+    const auto native_exec = fragment_collective_entry_exec(b);
+    rs.exec = native_exec ? native_exec : b.btrue();
+    rs.exec_narrowed = native_exec != 0;
     if (b.wave_size == 64) {
         auto scalar_only = proven_wave64_vcc_b32_low_only_pcs(ins, /*include_logical*/ true,
                                                               /*include_high_cselect*/ true);

@@ -1,4 +1,5 @@
 #include <cstdint>
+#include "gpu/recompiler/rdna2_native_fragment_collectives.hpp"
 #include "gpu/recompiler/rdna2_placeholder_origins.hpp"
 #include <vector>
 #include <functional>
@@ -51,7 +52,7 @@ recompile_with_arbitrary_placeholders(const RecompileDiagnosticContext& diagnost
     }
     scope.state.allow = true;
     RecompileDiagnosticAttempt retry;
-    module = compile();
+    module = recompile_native_fragment_collectives(compile);
     if (module.empty()) {
         original.replace_with(retry);
         return module;
