@@ -3,6 +3,7 @@
 // the same SGPR then has a real numerical lifetime. A fixed READLANE relay forces the
 // guarded Arbitrary retry, so an absent real input cannot hide behind legacy strict zeros.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/float_transport_config.hpp"
 #include <atomic>
 #include <cstdint>
 #include <string>
@@ -40,11 +41,12 @@ struct Compilation {
 };
 inline Compilation
 compile(const Words& code, const gpu::PixelSystemInputMapping& inputs, bool wave32 = false,
-        gpu::FloatTransportConfig transport = {gpu::FloatTransportProfile::ExplicitNonFinite32}) {
+        gpu::FloatTransportConfig transport = {gpu::FloatTransportProfile::ExplicitNonFinite32},
+        const gpu::ShaderResourceTable* resources = nullptr) {
     static std::atomic<uint64_t> next{0x5543000000ull};
     const auto address = next.fetch_add(0x100);
     auto module = gpu::recompile_fragment(
-        code.data(), code.size(), nullptr, &inputs, UINT32_MAX, nullptr, wave32,
+        code.data(), code.size(), resources, &inputs, UINT32_MAX, nullptr, wave32,
         {gpu::RecompileDiagnosticStage::Fragment, address}, {}, nullptr, transport);
     return {std::move(module), gpu::last_terminal_reject_reason(address)};
 }

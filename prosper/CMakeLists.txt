@@ -2795,6 +2795,7 @@ if(TARGET prosper_core)
   prosper_add_gtest(test_native_pixel_parameter
     SOURCES tests/gpu/recompiler/test_native_pixel_parameter.cpp
             tests/gpu/recompiler/test_native_parameter_tail.cpp
+            tests/gpu/recompiler/test_native_parameter_load.cpp
             tests/gpu/capture/test_pixel_parameter_inputs.cpp
             tests/gpu/execute/test_pixel_parameter_producer.cpp
     INCLUDES src tests tests/gpu/recompiler

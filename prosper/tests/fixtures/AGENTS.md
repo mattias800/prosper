@@ -1,5 +1,9 @@
 # `prosper/tests/fixtures/` — shared harnesses and hand-built inputs
 
+`native_parameter_load` observes the new scalar-memory lifetime of a former parameter entry word.
+`native_fragment_buffers` supplies explicitly named readonly U32 storage to the fragment interpreter;
+missing buffers remain poison, and declarations grant no data or resource ownership.
+
 `native_parameter_tail` extends the native parameter fixture with the original saved-mask/SCC0
 discard trailer. A genuine Input controls both colour and discard; an independent always-discard
 module observes the attachment's clear value on the device.

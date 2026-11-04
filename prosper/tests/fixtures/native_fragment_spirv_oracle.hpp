@@ -2,7 +2,8 @@
 // Execute an actual native fragment module with explicitly owned Input words. The caller names
 // a complete active subgroup for the fixed READLANE witness. No quad packing, derivative,
 // resource, partial-wave or divergent collective service is inferred from the module.
-#include "bpermute_spirv_oracle.hpp"
+#include "gpu/recompiler/bpermute_spirv_oracle.hpp"
+#include "fixtures/native_fragment_buffers.hpp"
 #include <array>
 #include <map>
 #include <stdexcept>
@@ -93,7 +94,7 @@ inline std::array<uint32_t, 4>
 native_fragment_words(const std::vector<uint32_t>& module,
                       const std::map<uint32_t, std::array<uint32_t, 4>>& locations,
                       const std::map<uint32_t, std::array<uint32_t, 4>>& builtins,
-                      uint32_t width = 1) {
+                      uint32_t width = 1, const NativeFragmentBuffers& buffers = {}) {
     if (width != 1 && width != 32 && width != 64)
         throw std::runtime_error("unsupported native fragment fixture width");
     bpermute_oracle::Interpreter vm(module, 4);
@@ -112,6 +113,7 @@ native_fragment_words(const std::vector<uint32_t>& module,
         lanes.push_back(std::move(invocation.first));
         output = invocation.second;
     }
+    native_fragment_buffers(vm, buffers);
     native_fragment_subgroup(vm, lanes);
     std::array<uint32_t, 4> expected{};
     for (uint32_t i = 0; i < width; ++i) {

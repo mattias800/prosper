@@ -1,5 +1,8 @@
 # Execution-layer tests
 
+The native parameter fixture observes loaded scalar words alongside genuine interpolation in both
+native fragment wave widths. The old MOV control exercises the same memory interface independently.
+
 The native pixel parameter GPU fixture also checks the saved-mask/SCC0 terminal trailer:
 one genuine Input keeps the colour, another must match an independent always-discard module.
 
