@@ -1,6 +1,8 @@
 // #5497: a once-through local index waterfall may read a word defined only in its
 // current EXEC cohort. The scalar temporary must not invent an undefined lane.
 #include "gpu/recompiler/rdna2_to_spirv.hpp"
+#include "gpu/recompiler/rdna2_arbitrary_placeholder.hpp"
+#include "gpu/recompiler/spirv/fragment_reconvergence.hpp"
 #include "gpu/recompiler/rdna2_cfg_local_index_waterfall.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 #include "bpermute_spirv_oracle.hpp"
@@ -330,4 +332,18 @@ TEST(LocalIndexWaterfall, SdwaSelectionDoesNotProveThePlainIdentityCompare) {
         ASSERT_TRUE(changed);
         EXPECT_EQ(local_index_waterfall_latch(instructions, 12), UINT32_MAX) << pc;
     }
+}
+
+// Mutation: replace an already exact local-index retry with the new general broadcast.
+TEST(LocalIndexWaterfall, AnAlreadyAdmittedRetryRetainsItsExistingModuleContract) {
+    auto code = program();
+    // Same unloaded-only marker as the native READFIRST witness. Its VMOV creates real SSA;
+    // the fixed READLANE comparison requests the retry independently of the waterfall.
+    code.insert(code.begin(), {0x7e0e037fu, 0xd7600028u, 0x00010107u, 0x7d840e28u});
+    PixelSystemInputMapping inputs{1u << 8, 1u << 8};
+    inputs.parameter_launch = {true, 0};
+    const auto module = recompile_fragment(code.data(), code.size(), nullptr, &inputs);
+    ASSERT_FALSE(module.empty());
+    EXPECT_GT(arbitrary_placeholder_reads(module).total(), 0u);
+    EXPECT_EQ(fragment_spirv_reconvergence(module), FragmentReconvergence::None);
 }

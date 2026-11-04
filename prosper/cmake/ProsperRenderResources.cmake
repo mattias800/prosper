@@ -34,6 +34,8 @@ if(TARGET Vulkan::Vulkan)
     test_fragment_loop_vcc_scratch
     test_fragment_numeric_mbcnt
     test_native_pixel_parameter_gpu
+    test_native_fragment_readfirst_gpu
+    test_render_reconvergence
     test_fragment_partial_wave_exec
     test_fragment_proven_votes
     test_fragment_scalar_bank
@@ -103,7 +105,10 @@ if(TARGET Vulkan::Vulkan)
     endif()
   endforeach()
   if(_prosper_render_resources_needed)
-    add_library(prosper_render_resources STATIC tests/fixtures/render_resource_contracts.cpp)
+    add_library(prosper_render_resources STATIC
+      tests/fixtures/render_resource_contracts.cpp
+      tests/fixtures/render_reconvergence_device.cpp
+      tests/fixtures/render_reconvergence_shader.cpp)
     target_include_directories(prosper_render_resources PRIVATE src tests frontends)
     target_link_libraries(prosper_render_resources PRIVATE Vulkan::Vulkan)
     foreach(_consumer IN LISTS _prosper_render_resource_consumers)

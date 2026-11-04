@@ -1,9 +1,10 @@
 #pragma once
 // Execute an actual native fragment module with explicitly owned Input words. The caller names
-// a complete active subgroup for the fixed READLANE witness. No quad packing, derivative,
+// a complete active subgroup for fixed READLANE and ballot witnesses. No quad packing, derivative,
 // resource, partial-wave or divergent collective service is inferred from the module.
 #include "gpu/recompiler/bpermute_spirv_oracle.hpp"
 #include "fixtures/native_fragment_buffers.hpp"
+#include "fixtures/native_fragment_any.hpp"
 #include <array>
 #include <map>
 #include <stdexcept>
@@ -67,6 +68,27 @@ inline void native_fragment_subgroup(bpermute_oracle::Interpreter& vm,
         const auto site = lanes.front().pc;
         const auto& collective = vm.ins.at(site);
         const auto& a = collective.a;
+        if (native_fragment_any(vm, lanes, site)) continue;
+        if (collective.op ==
+            339) {   // OpGroupNonUniformBallot over the explicitly supplied subgroup
+            if ((lanes.size() != 32 && lanes.size() != 64) || a.size() != 4)
+                throw std::runtime_error("unsupported native fragment ballot");
+            const auto& type = vm.ty(a[0]);
+            if (type.op != 23 || type.a.size() != 2 || type.a[1] != 4 || !vm.uint_type(type.a[0]))
+                throw std::runtime_error("unsupported native fragment ballot type");
+            std::vector<uint32_t> bits(4);
+            for (uint32_t index = 0; index < lanes.size(); ++index) {
+                auto& lane = lanes[index];
+                if (lane.done || lane.pc != site || vm.word(lane, a[2]) != 3)
+                    throw std::runtime_error("partial/divergent native fragment ballot");
+                if (vm.boolean(lane, a[3])) bits[index / 32] |= 1u << (index % 32);
+            }
+            for (auto& lane : lanes) {
+                vm.set(lane, a[1], a[0], bits);
+                ++lane.pc;
+            }
+            continue;
+        }
         if ((lanes.size() != 32 && lanes.size() != 64) || collective.op != 345 || a.size() != 5 ||
             !vm.uint_type(a[0]))
             throw std::runtime_error("unsupported native fragment collective");

@@ -52,3 +52,7 @@ READFIRST arithmetic relay; the old publication supplies no later mask bit.
 
 A PC0 loop executes its current one-hot mask after a complete per-iteration overwrite,
 independently of an earlier READFIRST publication on the backedge.
+
+`test_native_fragment_readfirst_gpu` compares real native fragment colours with an independent
+divergent BroadcastFirst/reduction module. `test_render_reconvergence` checks the actual feature
+request chain and the cold shader-module gate, including unsupported and malformed inputs.

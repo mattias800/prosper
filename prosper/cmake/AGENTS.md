@@ -6,3 +6,6 @@ changing another build directory. Keep runtime source behavior outside this fold
 
 `ProsperRenderResources.cmake` links the renderer resource-contract source into its existing fixture,
 tool and live-renderer consumers. Its target inventory includes dump-gated consumers.
+
+The renderer resource target also owns cold device-feature and shader-reconvergence contracts;
+its archive is linked once by every renderer consumer, including the live frontend.

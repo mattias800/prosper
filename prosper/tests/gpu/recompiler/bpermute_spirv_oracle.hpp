@@ -741,7 +741,7 @@ struct Interpreter {
       const auto &i = ins[l.pc];
       const auto &a = i.a;
       const uint32_t op = i.op;
-      if (op == 334 || op == 335 || op == 339 || op == 345) return;
+      if (op == 334 || op == 335 || op == 339 || op == 345 || op == 5111) return;
       if (op == 224) {
         if (a.size() != 3 || word(l, a[0]) != 2 || word(l, a[1]) != 2 ||
             (word(l, a[2]) & 0x108) != 0x108)
@@ -890,6 +890,11 @@ struct Interpreter {
                   {a[3] == 38 ? std::min(x.words[0], y.words[0])
                               : std::max(x.words[0], y.words[0])},
                   x.defined && y.defined);
+          } else if (a[3] == 73) {
+              if (a.size() != 5 || !int_type(a[0])) fail("FindILsb result type mismatch");
+              const auto bit =
+                  x.words[0] ? static_cast<uint32_t>(std::countr_zero(x.words[0])) : UINT32_MAX;
+              set(l, a[1], a[0], {bit}, x.defined);
           } else if (a[3] == 75) {
               if (a.size() != 5 || ty(a[0]).op != 21 || ty(a[0]).a != std::vector<uint32_t>{32, 1})
                   fail("FindUMsb result type mismatch");
@@ -1078,6 +1083,9 @@ struct Interpreter {
                   break;
               }
           jump(l, target);
+      } else if (op == 252) {
+          if (!a.empty()) fail("bad fragment Kill");
+          l.done = true;
       } else if (op == 253)
           l.done = true;
       else if (op != 246 && op != 247 && op != 8 && op != 317 && op != 0)

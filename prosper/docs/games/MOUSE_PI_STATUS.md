@@ -101,6 +101,25 @@ flip figure understates the difference.
 
 ## Ruled out
 
+- **"Maximal reconvergence alone supplies the guest entry EXEC mask."** With real derivative
+  helpers at a clipped edge, the broad native READFIRST attempt selected helper x=2.5 instead
+  of live x=3.5 in both native widths. Exact entry EXEC must exclude helpers; explicit WQM
+  then widens it. A separate attempt preserves already accepted modules, and full-quad mode
+  makes the required helper participation explicit ([#5523](https://github.com/mattias800/prosper/issues/5523)).
+
+- **"The native READFIRST witness selects the first x strictly above its threshold."** Its
+  assembled predicate is unsigned `threshold <= raw_x`, so equality participates. The first
+  independent device reference used `>` and disagreed only at that boundary. Matching the
+  decoded predicate and adding an explicit equality arm makes both native widths and both
+  scalar destinations agree ([#5523](https://github.com/mattias800/prosper/issues/5523)).
+
+- **"A direct read of an absent VGPR is a READFIRST regression witness."** The first native
+  scalar-publication fixture stopped at its marker READLANE, PC0, before reaching READFIRST.
+  After an ordinary VMOV creates the marker's SSA value, the unchanged `6a432e48f` compiler
+  passes both fixed-lane controls, the independent lane37 ballot and the real missing-input twin;
+  all four separately named Native32/64 READFIRST witnesses fail at the intended PC8 publication
+  ([#5523](https://github.com/mattias800/prosper/issues/5523)).
+
 - **"A later numerical read of the parameter SGPR observes its launch value."** The current
   `f0d44d9709d006c3` program replaces `s[20:27]` with a scalar-buffer load at PC2, after the
   interpolation-only M0 copy. Scalar memory ignores EXEC and completely replaces those words

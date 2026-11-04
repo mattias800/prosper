@@ -3,6 +3,7 @@
 // These routes still emit SPIR-V directly; they are the mask-domain and proof-carrying shapes the
 // IR does not model yet. Each returns nullopt when the instruction is not its shape.
 #include "gpu/recompiler/ir/lower/scalar_lowering_internal.hpp"
+#include "gpu/recompiler/spirv/fragment_reconvergence.hpp"
 #include "gpu/recompiler/rdna2_native_entry_exec_words.hpp"
 #include "gpu/recompiler/ir/ops/scalar_integer64_values.hpp"
 
@@ -163,8 +164,8 @@ std::optional<bool> Sop1Lowering::route_b64_mask_ops() {
         };
         if (in.opcode == 0x0a) {                    // s_wqm_b64: whole-quad-mode mask widen
             // WQM widens a lane mask to whole 2x2 quads so derivative/sample helper lanes stay
-            // active. In our per-invocation scalar SPIR-V model each lane is one bool and helper
-            // lanes are implicit in the fragment stage, so WQM-widening a mask is the IDENTITY.
+            // active. The legacy path keeps its implicit-helper identity. The isolated
+            // native collective retry below widens the actual per-lane predicate.
             // VERIFIED(round-trip llvm-mc gfx1030): SOP1 op 0x0a. Common PS preamble around
             // image_sample (real game shaders 26-29,39), where it is `s_wqm_b64 exec,exec`.
             // exec_narrowed handling mirrors s_mov_b64 (0x04): the exec<-exec self case is a true
@@ -175,11 +176,17 @@ std::optional<bool> Sop1Lowering::route_b64_mask_ops() {
             // rs.scc was POISONED above so later SCC consumers reject instead of misreading.
             uint32_t m = src_mask(in.src[0]);
             if (!m) { ok = false; return true; }
+            const auto widened = fragment_collective_wqm(b, m);
+            if (widened) { m = widened; }
             if (is_exec(in.dst)) {
-                if (is_exec(in.src[0])) { /* exec <- wqm(exec): identity; exec & narrowed unchanged */ }
-                else if (in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1) {
+                if (is_exec(in.src[0])) {
+                    if (widened) rs.exec = m;
+                } else if (in.src[0].kind == OperandKind::InlineInt && in.src[0].value == -1) {
                     rs.exec = b.btrue(); rs.exec_narrowed = false;      // exec = all lanes on
-                } else { rs.exec = m; rs.exec_narrowed = true; }        // replaced by a (maybe narrowed) mask
+                } else {
+                    rs.exec = m;
+                    rs.exec_narrowed = true;
+                }   // replaced by a (maybe narrowed) mask
             } else { rs.sreg_bool[in.dst.value] = m; rs.sreg_bool_narrowed[in.dst.value] = true;
                 mask_write_clobbers_pair(rs, in.dst.value);   // conservative: WQM widens
                 // Into VCC this is a VCC write, as it is for s_mov_b64 and s_not_b64
