@@ -101,6 +101,13 @@ flip figure understates the difference.
 
 ## Ruled out
 
+- **An arbitrary EXECZ branch is the shipped discard fixture.** The first synthetic test's
+  strict-route control failed on main with an unresolved branch, independently of the parameter
+  input refusal. The replacement uses the captured family's saved-mask/SCC0/EXEC-restore form.
+  Its old-route byte control explicitly overwrites legacy-tainted values before the later
+  comparison; merely erasing READLANE did not make that comparison a strict success. On main,
+  the three new service witnesses then fail while all five genuine/refusal/byte controls pass.
+
 - **"An unavailable DCC tail revokes a descriptor already learned for the same target."** A
   pixel-only temporal reseed is not such a revocation. Clearing that association broke all
   three existing guest-write-drain variants at their DCC→colour→DCC assertion during #4627

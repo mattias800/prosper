@@ -3,6 +3,8 @@
 #include "gpu/recompiler/pixel_parameter_launch.hpp"
 #include "gpu/recompiler/rdna2_decode.hpp"
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -16,6 +18,10 @@ struct SpirvCompute;
 // source SGPR follows an unconditional complete overwrite of its entry lifetime.
 std::shared_ptr<const NativeParameterBasePlan>
 native_parameter_base_plan(const PixelParameterLaunch&, const std::vector<Rdna2Inst>&);
+// Complete original SOURCE with the already supported bounded terminal trailers. The existing
+// plan still proves every entry use; trailer retention supplies no branch or entry-state fact.
+std::shared_ptr<const NativeParameterBasePlan>
+native_parameter_base_plan(const PixelParameterLaunch&, const uint32_t* code, size_t dwords);
 bool native_parameter_base_load(const NativeParameterBasePlan&, const Rdna2Inst&);
 // Recursive regions may contain original instructions and synthetic END only. A reused PC or
 // an unrelated stream cannot inherit the original program's closed interpolation service.

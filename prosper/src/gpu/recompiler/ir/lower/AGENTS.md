@@ -31,6 +31,8 @@ moves, preserve emission order, and qualify relocations with token read-back and
 `sopp_case_routes.*` owns the existing SOPP opcode switch, including branch refusals, hint handling,
 the allocation callback and barrier emission. It borrows the original emitter state and safe-branch
 set; the relocation preserves the direct-emission path.
+Its shared dropped-SCC-branch predicate also bounds the emitter's implicit-input guard:
+an already linearized kill branch reads no SCC value; numerical SCC consumers still do.
 
 `buffer_opcode_case_routes.*` classifies the existing MUBUF/MTBUF opcode groups using references
 to the emitter's original locals. Descriptor resolution, access and disposition reporting remain

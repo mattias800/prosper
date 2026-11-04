@@ -25,6 +25,9 @@ authority. The partial scalar inventory names loaded prefix words without declar
 unloaded; ADR 0038's real-input boundary remains separate.
 SMEM store/atomic payloads stay outside the closed service; SOPK wait thresholds also charge
 their encoded scalar source, independently of the explicit source array.
+`rdna2_native_parameter_inventory` completes that plan's original SOURCE with the existing
+bounded terminal-tail inventory. It adds no mask/entry fact or numerical M0 binding; every
+retained instruction still passes the original closed-service checks.
 Memory addresses and descriptor spans use legacy memory widths, separately from ALU widths.
 
 `rdna2_loop_vcc_carry` owns the VCC exit merge separately from numeric register PHIs. A mask

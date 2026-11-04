@@ -211,6 +211,7 @@ bool emit_alu(SpirvCompute& b, RegState& rs, const Rdna2Inst& in, bool& ok, bool
         refuse_arbitrary_placeholder_old_destination(b, rs, in, ok))
         return true;
     if ((rdna2_instruction_effects(in).implicit_reads & kRdna2ImplicitScc) &&
+        !ir::sopp_drops_scc_branch(in, safe_execz) &&
         refuse_arbitrary_placeholder_operand(b, rs, in, {OperandKind::Special, 253}, &ok))
         return true;
     PortableMaskHalfInstruction portable_halves(b, rs, in, ok);
