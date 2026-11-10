@@ -412,6 +412,8 @@ def test_any_tree_sweeps_undecidable_too(root: Path) -> None:
         time.sleep(0.3)
         check("a split cwd/exe process is refused by --yes alone", refuse.returncode, 1)
         check("and it is still running", proc.poll(), None)
+        check("split evidence is undecidable, not another lane",
+              "UNDECIDABLE" in refuse.stdout and "cwd and exe disagree" in refuse.stdout, True)
         check("the refusal names both trees", ("at-a" in refuse.stdout or "wt-a" in refuse.stdout)
               and ("at-b" in refuse.stdout or "wt-b" in refuse.stdout), True)
 

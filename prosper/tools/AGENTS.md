@@ -1481,6 +1481,9 @@ system utility dispatch must not determine whether a refusal fixture actually ex
 - **Changing only argv[0] fixes renamed multicall sleep fixtures.** A real coreutils-single
   binary then stays alive but resets comm to `sleep`, erasing the lookalike and split-name arms.
   Copied Python waiters retain the intended comm and executable identity instead. #5554.
+- **Naming both trees proves a split cwd/exe refusal.** The output also names the current tree
+  when refusing a process owned wholly by another lane. Moving the fixture's cwd to its executable
+  tree passed that assertion; the arm now requires the actual undecidable-disagreement reason. #5554.
 - A `std::vector<uint32_t>` return type alone does not identify a SPIR-V emitter. The owned-wide
   proof returns decoded PCs and the strict gate initially misclassified it (#3987). Classify that
   analysis function explicitly and validate real x4/x8 consuming modules with complete backing;
