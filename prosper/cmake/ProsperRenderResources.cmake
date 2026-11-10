@@ -35,6 +35,7 @@ if(TARGET Vulkan::Vulkan)
     test_fragment_numeric_mbcnt
     test_native_pixel_parameter_gpu
     test_native_fragment_readfirst_gpu
+    test_inactive_old_word_gpu
     test_render_reconvergence
     test_fragment_partial_wave_exec
     test_fragment_proven_votes

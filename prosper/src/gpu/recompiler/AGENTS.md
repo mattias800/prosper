@@ -113,6 +113,8 @@ knowing the inputs does not supply a computation that the ordinary representatio
 The same input boundary charges implicit old destinations through the existing
 `vector_write_depends_on_old_word` predicate and write footprint. Full overwrites do not read
 the old word; WRITELANE owns its separate slot-map update. No new transfer facts are inferred.
+An inactive-only old destination may retain its existing SSA or a never-written placeholder;
+missing computed backing and lane-slot representations keep the ordinary Hard read guard.
 Wide scalar readers check both consumed words before their direct map lookups. Implicit SCC
 readers use the canonical effects table. Retry entry SCC starts as storage only; the existing
 condition tracking follows real writers and retains unloaded-only conditions at their read PCs.
@@ -589,3 +591,8 @@ helper participation; its physical wave contract and ordinary Hard input guards 
 ordinary Arbitrary retry still refuses a scalar publication. It changes no successful old module.
 Its entry EXEC excludes helpers; full quads and maximal reconvergence make helper participation
 explicit, and native WQM widens the existing mask without adding SCC or physical-word authority.
+
+The Arbitrary old-destination guard separates active accumulator/partial-word reads from inactive
+preservation for plain lane-mapped writes and native interpolation. Existing cohort marks retain
+Hard outside lanes; a later expanded reader still requires the actual old input. Other memory
+and cross-lane forms keep their existing guard.
