@@ -1462,6 +1462,10 @@ cross-lane operation whether or not you meant it that way.
 Both fail closed where `/proc` is unreadable: without it, ownership cannot be established, and
 "I could not tell whose this is" must never render as "it is yours".
 
+`test_lanekill.py` uses copied Python waiters for distinct process names and executable owners.
+Their readiness handshake checks the live comm, executable and cwd before ownership assertions;
+system utility dispatch must not determine whether a refusal fixture actually exists.
+
 - **`wt_stash.py`** — park uncommitted work in a ref that is really private to one worktree, plus
   `check`, which asks whether the shared stash stack is currently holding somebody else's work.
   A worktree isolates `HEAD`, the index and the working tree; it does **not** isolate `refs/stash`,
@@ -1474,6 +1478,9 @@ Both fail closed where `/proc` is unreadable: without it, ownership cannot be es
 
 ## Ruled out
 
+- **Changing only argv[0] fixes renamed multicall sleep fixtures.** A real coreutils-single
+  binary then stays alive but resets comm to `sleep`, erasing the lookalike and split-name arms.
+  Copied Python waiters retain the intended comm and executable identity instead. #5554.
 - A `std::vector<uint32_t>` return type alone does not identify a SPIR-V emitter. The owned-wide
   proof returns decoded PCs and the strict gate initially misclassified it (#3987). Classify that
   analysis function explicitly and validate real x4/x8 consuming modules with complete backing;

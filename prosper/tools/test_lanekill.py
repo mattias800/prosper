@@ -37,6 +37,8 @@ live process, which needs a real process, so it cannot run where the rest cannot
 from __future__ import annotations
 
 import os
+import select
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -89,6 +91,33 @@ def wait_exit(proc: subprocess.Popen, timeout: float = 10.0):
     while proc.poll() is None and time.monotonic() < deadline:
         time.sleep(0.05)
     return proc.poll()
+
+
+def start_named_waiter(binary: Path, cwd: Path) -> subprocess.Popen:
+    """Keep distinct comm/exe/cwd evidence without dispatching a renamed system utility."""
+    shutil.copy(sys.executable, binary)
+    proc = subprocess.Popen(
+        [str(binary), "-S", "-c", "import time; print('ready', flush=True); time.sleep(120)"],
+        cwd=cwd, env={**os.environ, "PYTHONHOME": sys.base_prefix},
+        stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        ready, _, _ = select.select([proc.stdout], [], [], 10.0)
+        if not ready or proc.stdout.readline() != "ready\n" or proc.poll() is not None:
+            raise RuntimeError(f"waiter {binary.name} did not become ready")
+        info = Path(f"/proc/{proc.pid}")
+        if ((info / "comm").read_text().strip() != binary.name
+                or not os.path.samefile(info / "exe", binary)
+                or not os.path.samefile(info / "cwd", cwd)):
+            raise RuntimeError(f"waiter {binary.name} has the wrong process identity")
+    except BaseException:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        raise
+    finally:
+        proc.stdout.close()
+    return proc
 
 
 def git(repo: Path, *args: str) -> str:
@@ -302,6 +331,7 @@ def test_end_to_end_spares_the_other_lane(root: Path) -> None:
 
     mine = subprocess.Popen(["sleep", "120"], cwd=str(a))
     other = subprocess.Popen(["sleep", "120"], cwd=str(b))
+    procs = [mine, other]
     time.sleep(0.4)
     try:
         # census first: must kill NOTHING even though a match is ours
@@ -316,10 +346,9 @@ def test_end_to_end_spares_the_other_lane(root: Path) -> None:
         # to `pattern in comm` reintroduces exactly the `pkill -f` over-match this tool contrasts
         # itself against, and the ownership filter would NOT save it -- the blast radius is my own
         # worktree, where everything is fair game. Nothing else in the suite notices.
-        import shutil
         lookalike_bin = a / "sleepx"
-        shutil.copy("/bin/sleep", str(lookalike_bin))
-        lookalike = subprocess.Popen([str(lookalike_bin), "120"], cwd=str(a))
+        lookalike = start_named_waiter(lookalike_bin, a)
+        procs.append(lookalike)
         time.sleep(0.4)
 
         run = subprocess.run([sys.executable, str(HERE / "lanekill.py"), "sleep", "--yes"],
@@ -331,7 +360,7 @@ def test_end_to_end_spares_the_other_lane(root: Path) -> None:
         check("output names the other lane", "ANOTHER LANE" in run.stdout, True)
         check("a LOOKALIKE name in my own tree is untouched", lookalike.poll(), None)
     finally:
-        for pr in (mine, other, lookalike):
+        for pr in procs:
             if pr.poll() is None:
                 pr.kill()
             pr.wait()
@@ -369,16 +398,13 @@ def test_any_tree_sweeps_undecidable_too(root: Path) -> None:
     So this builds a genuinely undecidable process -- binary in one tree, cwd in another, which is
     the ambiguity `attribute()` refuses -- and drives the real tool twice.
     """
-    import shutil
-
     repo = build_repo(root)
     a, b = root / "wt-a", root / "wt-b"
     git(repo, "worktree", "add", "-q", "-b", "at-a", str(a))
     git(repo, "worktree", "add", "-q", "-b", "at-b", str(b))
 
     binary = b / "psplit"                      # exe lives in wt-b ...
-    shutil.copy("/bin/sleep", str(binary))
-    proc = subprocess.Popen([str(binary), "120"], cwd=str(a))   # ... cwd is wt-a
+    proc = start_named_waiter(binary, a)         # ... cwd is wt-a
     time.sleep(0.4)
     try:
         refuse = subprocess.run([sys.executable, str(HERE / "lanekill.py"), "psplit", "--yes"],
