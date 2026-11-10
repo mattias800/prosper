@@ -13,20 +13,23 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
 namespace fixture = prosper::test::inactive_old_word;
 namespace input = prosper::test::native_pixel_parameter;
 using Writer = fixture::Writer;
-void witness(Writer writer, uint32_t width, bool provided = false, bool expanded = false) {
+void witness(Writer writer, uint32_t width, bool provided = false, bool expanded = false,
+             bool reserved_nop = false) {
     std::vector<float> x(width, 0.5f), red(width);
     x[width == 32 ? 17 : 37] = 7.5f;
     for (size_t lane = 0; lane < width; ++lane) red[lane] = 0.375f + 0.125f * (lane % 3);
     for (float threshold : {0.0f, 2.5f, 9.5f}) {
         SCOPED_TRACE(threshold);
-        const auto result = input::compile(fixture::program(writer, provided, expanded, threshold),
-                                           fixture::mapping(), width == 32);
+        auto code = fixture::program(writer, provided, expanded, threshold);
+        if (reserved_nop) code = fixture::with_reserved_nop(std::move(code));
+        const auto result = input::compile(code, fixture::mapping(), width == 32);
         ASSERT_FALSE(result.module.empty()) << result.reason;
         EXPECT_GT(prosper::gpu::arbitrary_placeholder_reads(result.module).total(), 0u);
         const auto values = fixture::values(result.module, x, red);
@@ -64,6 +67,27 @@ TEST(InactiveOldWord, GenuineOldWordsKeepTheirValueAcrossEitherReaderScope) {
     for (Writer writer : {Writer::Interpolate, Writer::Multiply, Writer::Accumulate, Writer::Half})
         for (uint32_t width : {32u, 64u})
             for (bool expanded : {false, true}) witness(writer, width, true, expanded);
+}
+
+TEST(InactiveOldWord, AReservedNopDestinationCannotBecomeAnInactiveSsaOperand) {
+    for (Writer writer : {Writer::Interpolate, Writer::Multiply})
+        for (bool wave32 : {false, true}) {
+            const auto result = input::compile(fixture::with_reserved_nop(fixture::program(writer)),
+                                               fixture::mapping(), wave32);
+            EXPECT_TRUE(result.module.empty()) << "a reserved ID zero is not an SSA operand";
+            if (result.module.empty()) {
+                EXPECT_NE(result.reason.find("hard-placeholder-read"), std::string::npos)
+                    << result.reason;
+                EXPECT_NE(result.reason.find("origin=launch-input word=v0"), std::string::npos)
+                    << result.reason;
+            }
+        }
+}
+
+TEST(InactiveOldWord, ARealDefinitionAfterNopStillRetainsItsValue) {
+    for (Writer writer : {Writer::Interpolate, Writer::Multiply})
+        for (uint32_t width : {32u, 64u})
+            for (bool expanded : {false, true}) witness(writer, width, true, expanded, true);
 }
 
 TEST(InactiveOldWord, AnExpandedReaderStillOwesTheUnwrittenLaunchLanes) {

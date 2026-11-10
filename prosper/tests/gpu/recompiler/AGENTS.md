@@ -502,3 +502,5 @@ the interpreter and input boundaries separate from the new broadcast.
 `test_inactive_old_word` executes complete overwrites within their actual mask while retaining
 unavailable lanes outside it. Expanded readers, missing real sources, active accumulators and
 partial-word updates keep separate refusal controls; the strict successful route stays separate.
+NOP reservations distinguish an absent placeholder from a present zero ID, while a later real
+definition still executes normally.

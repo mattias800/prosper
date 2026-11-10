@@ -92,7 +92,9 @@ bool inactive_destination_is_retained(const SpirvCompute& b, const RegState& rs,
     // Ordinary predicated writes retain an SSA word, not the WRITELANE slot representation.
     if (rs.vgpr_lane_slots.contains(reg) || rs.vgpr_lane_mask_slots.contains(reg)) return false;
     const auto value = rs.vreg.find(reg);
-    if (value != rs.vreg.end() && value->second) return true;
+    // NOP can reserve an entry without assigning an SSA value. vreg_old returns that zero ID
+    // verbatim, so only an absent entry may use its canonical placeholder fallback.
+    if (value != rs.vreg.end()) return value->second != 0;
     const auto* program = rs.placeholder_origin_program ? rs.placeholder_origin_program.get()
                                                         : b.placeholder_origin_program.get();
     if (!program) return false;

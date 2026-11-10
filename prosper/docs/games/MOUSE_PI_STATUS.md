@@ -101,6 +101,10 @@ flip figure understates the difference.
 
 ## Ruled out
 
+- **"A zero-ID VGPR entry can use the never-written fallback."** NOP can reserve such an entry;
+  four native P2/MUL variants emitted invalid SPIR-V when it was treated like an absent word.
+  Keep its read guard until a real definition supplies SSA ([#5553](https://github.com/mattias800/prosper/pull/5553)).
+
 - **"Every plain masked overwrite can retain its existing inactive backing."** The first
   old-destination guard relaxation passed its ten focused CPU cases, but full qualification
   failed the existing WRITELANE lost-destination CPU/GPU twins: it produced `{22,0,...}` where

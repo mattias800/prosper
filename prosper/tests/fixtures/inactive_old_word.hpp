@@ -47,6 +47,11 @@ inline Words program(Writer writer, bool provided = false, bool expanded = false
     append(kExport);
     return code;
 }
+inline Words with_reserved_nop(Words code) {
+    // Supply the NOP lowering's decoded s0 source. NOP itself writes no guest VGPR.
+    code.insert(code.begin(), {0xbe800380u, 0x7e000000u});
+    return code;
+}
 inline uint32_t writer_pc(Writer writer, bool provided = false) {
     return kPrefix.size() + (provided ? kProvided.size() : 0) +
            (writer == Writer::Interpolate ? 1u : 0u);
